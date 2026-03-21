@@ -39,7 +39,7 @@ void ForwardPassBase::reset_context() {
 }
 
 ggml_cgraph* ForwardPassBase::new_graph() {
-    return ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);;
+    return ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
 }
 
 ggml_tensor* ForwardPassBase::embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens) {

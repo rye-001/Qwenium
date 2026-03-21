@@ -13,7 +13,7 @@
 
 #include "../qwen3-core/qwen3-model.h"
 #include "../qwen3-core/gguf-loader.h"
-#include "../qwen3-core/forward-pass.h"
+#include "../qwen3-core/forward-pass-factory.h"
 #include "../qwen3-core/tokenizer.h"
 #include "../qwen3-core/sampling.h"
 #include "../qwen3-core/grammar.h"
@@ -196,7 +196,7 @@ void limit_memory(size_t max_bytes) {
 // ============================================================================
 
 struct SpeculativeBridge {
-    Qwen3ForwardPass& forward_pass;
+    ForwardPassBase* forward_pass;
     ggml_backend_sched_t scheduler;
 
     // Verify: run draft tokens as a mini-prefill, return [K * vocab_size] logits
@@ -205,20 +205,20 @@ struct SpeculativeBridge {
             -> std::vector<float>
         {
             ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf = forward_pass.build_prefill_graph(
+            ggml_cgraph* gf = forward_pass->build_prefill_graph(
                 const_cast<std::vector<int32_t>&>(draft), start_pos, slot);
             ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass.set_inputs(gf, const_cast<std::vector<int32_t>&>(draft), start_pos);
+            forward_pass->set_inputs(gf, const_cast<std::vector<int32_t>&>(draft), start_pos);
             ggml_backend_sched_graph_compute(scheduler, gf);
-            forward_pass.advance_cache(draft.size(), slot);
-            return forward_pass.get_output_logits(gf);
+            forward_pass->advance_cache(draft.size(), slot);
+            return forward_pass->get_output_logits(gf);
         };
     }
 
     // Rewind: set cache position back (discards unverified KV entries)
     qwen3::SpeculativeDecoder::RewindCacheFunc make_rewind(uint32_t slot) {
         return [this, slot](int /*slot_id*/, int new_pos) {
-            forward_pass.set_cache_pos(slot, new_pos);
+            forward_pass->set_cache_pos(slot, new_pos);
         };
     }
 };
@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
         }
         
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
-        Qwen3ForwardPass forward_pass(model, &model.get_metadata(), args.context_length, 2);
+        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 2);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 
@@ -387,21 +387,21 @@ int main(int argc, char** argv) {
 
         // Prefill System Prompt into Slot 0
         ggml_backend_sched_reset(scheduler);
-        ggml_cgraph* gf_system = forward_pass.build_prefill_graph(system_tokens, 0, 0); // Slot 0
+        ggml_cgraph* gf_system = forward_pass->build_prefill_graph(system_tokens, 0, 0); // Slot 0
         ggml_backend_sched_alloc_graph(scheduler, gf_system);
-        forward_pass.set_inputs(gf_system, system_tokens, 0);
+        forward_pass->set_inputs(gf_system, system_tokens, 0);
         ggml_backend_sched_graph_compute(scheduler, gf_system);
-        forward_pass.advance_cache(system_tokens.size(), 0); // Slot 0
+        forward_pass->advance_cache(system_tokens.size(), 0); // Slot 0
 
         // Clone System Prefix to Slot 1 for the user session
-        forward_pass.clone_slot(0, 1, system_tokens.size());
+        forward_pass->clone_slot(0, 1, system_tokens.size());
         
         const int32_t eos_token_id = model.get_metadata().eos_token_id;
         const std::string im_end_str = "<|im_end|>";
         const std::string eos_str = "<|endoftext|>";
 
         // Speculative bridge for chat mode (slot 1)
-        SpeculativeBridge bridge{forward_pass, scheduler};
+        SpeculativeBridge bridge{forward_pass.get(), scheduler};
 
         while (true) {
             std::cout << "\nUser: ";
@@ -440,18 +440,18 @@ int main(int argc, char** argv) {
             
             // Use Slot 1 for User Session
             const uint32_t session_slot = 1;
-            int current_pos = forward_pass.get_cache_pos(session_slot);
+            int current_pos = forward_pass->get_cache_pos(session_slot);
 
             // Process only the new tokens
             ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf = forward_pass.build_prefill_graph(new_tokens, current_pos, session_slot);
+            ggml_cgraph* gf = forward_pass->build_prefill_graph(new_tokens, current_pos, session_slot);
             ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass.set_inputs(gf, new_tokens, current_pos);
+            forward_pass->set_inputs(gf, new_tokens, current_pos);
             ggml_backend_sched_graph_compute(scheduler, gf);
-            forward_pass.advance_cache(new_tokens.size(), session_slot);
+            forward_pass->advance_cache(new_tokens.size(), session_slot);
             all_tokens.insert(all_tokens.end(), new_tokens.begin(), new_tokens.end());
 
-            std::vector<float> logits = forward_pass.get_output_logits(gf);
+            std::vector<float> logits = forward_pass->get_output_logits(gf);
             size_t vocab_size = model.get_metadata().vocab_size;
             std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
             int next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
@@ -487,21 +487,21 @@ int main(int argc, char** argv) {
 
                 // --- Speculative step: try to get bonus tokens ---
                 if (use_speculative) {
-                    int spec_pos = forward_pass.get_cache_pos(session_slot);
+                    int spec_pos = forward_pass->get_cache_pos(session_slot);
 
                     // Normal decode for current token first
                     std::vector<int32_t> current_token_vec = { next_token_id };
                     int decode_pos = spec_pos;
 
                     ggml_backend_sched_reset(scheduler);
-                    ggml_cgraph* gf_token = forward_pass.build_prefill_graph(current_token_vec, decode_pos, session_slot);
+                    ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, session_slot);
                     ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                    forward_pass.set_inputs(gf_token, current_token_vec, decode_pos);
+                    forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
                     ggml_backend_sched_graph_compute(scheduler, gf_token);
-                    forward_pass.advance_cache(1, session_slot);
+                    forward_pass->advance_cache(1, session_slot);
 
                     // Now try speculative step
-                    int after_decode_pos = forward_pass.get_cache_pos(session_slot);
+                    int after_decode_pos = forward_pass->get_cache_pos(session_slot);
                     auto result = spec->try_speculative_step(
                         prompt_tokens_for_pld,
                         generated_tokens,
@@ -540,7 +540,7 @@ int main(int argc, char** argv) {
                         }
                     } else {
                         // No draft found — get next token from the decode we already did
-                        std::vector<float> token_logits = forward_pass.get_output_logits(gf_token);
+                        std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
                         last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
                         next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
                         if (grammar) {
@@ -552,16 +552,16 @@ int main(int argc, char** argv) {
 
                 // --- Normal (non-speculative) decode path ---
                 std::vector<int32_t> current_token_vec = { next_token_id };
-                int decode_pos = forward_pass.get_cache_pos(session_slot);
+                int decode_pos = forward_pass->get_cache_pos(session_slot);
 
                 ggml_backend_sched_reset(scheduler);
-                ggml_cgraph* gf_token = forward_pass.build_prefill_graph(current_token_vec, decode_pos, session_slot);
+                ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, session_slot);
                 ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                forward_pass.set_inputs(gf_token, current_token_vec, decode_pos);
+                forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
                 ggml_backend_sched_graph_compute(scheduler, gf_token);
-                forward_pass.advance_cache(1, session_slot);
+                forward_pass->advance_cache(1, session_slot);
 
-                std::vector<float> token_logits = forward_pass.get_output_logits(gf_token);
+                std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
                 last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
                 
                 next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
@@ -583,14 +583,14 @@ int main(int argc, char** argv) {
             // so the next turn sees a properly terminated assistant message
             std::string im_end_suffix = "<|im_end|>\n";
             std::vector<int32_t> im_end_tokens = tokenizer->encode(im_end_suffix);
-            int end_pos = forward_pass.get_cache_pos(session_slot);
+            int end_pos = forward_pass->get_cache_pos(session_slot);
             
             ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf_end = forward_pass.build_prefill_graph(im_end_tokens, end_pos, session_slot);
+            ggml_cgraph* gf_end = forward_pass->build_prefill_graph(im_end_tokens, end_pos, session_slot);
             ggml_backend_sched_alloc_graph(scheduler, gf_end);
-            forward_pass.set_inputs(gf_end, im_end_tokens, end_pos);
+            forward_pass->set_inputs(gf_end, im_end_tokens, end_pos);
             ggml_backend_sched_graph_compute(scheduler, gf_end);
-            forward_pass.advance_cache(im_end_tokens.size(), session_slot);
+            forward_pass->advance_cache(im_end_tokens.size(), session_slot);
             all_tokens.insert(all_tokens.end(), im_end_tokens.begin(), im_end_tokens.end());
 
 
@@ -660,17 +660,17 @@ int main(int argc, char** argv) {
         }
 
         ggml_backend_sched_t scheduler = model.get_scheduler();
-        Qwen3ForwardPass forward_pass(model, &model.get_metadata(), args.context_length);
+        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length);
 
         // Prefill phase
         ggml_backend_sched_reset(scheduler);            
-        ggml_cgraph* gf = forward_pass.build_prefill_graph(tokens, 0, 0); // Slot 0
+        ggml_cgraph* gf = forward_pass->build_prefill_graph(tokens, 0, 0); // Slot 0
         ggml_backend_sched_alloc_graph(scheduler, gf);
-        forward_pass.set_inputs(gf, tokens, 0);
+        forward_pass->set_inputs(gf, tokens, 0);
         ggml_backend_sched_graph_compute(scheduler, gf);
-        forward_pass.advance_cache(tokens.size(), 0); // Slot 0
+        forward_pass->advance_cache(tokens.size(), 0); // Slot 0
 
-        std::vector<float> logits = forward_pass.get_output_logits(gf);
+        std::vector<float> logits = forward_pass->get_output_logits(gf);
         size_t vocab_size = model.get_metadata().vocab_size;
         std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
         int next_token_id = sampler->sample(last_token_logits, tokens, vocab);
@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> generated_tokens;
 
         // Speculative bridge for single-prompt mode (slot 0)
-        SpeculativeBridge bridge{forward_pass, scheduler};
+        SpeculativeBridge bridge{forward_pass.get(), scheduler};
         
         for (int i = 0; i < args.max_tokens; ++i) {
             std::string decoded_token = tokenizer->decode(next_token_id);
@@ -713,17 +713,17 @@ int main(int argc, char** argv) {
 
                 // Normal decode for current token
                 std::vector<int32_t> current_token_vec = { next_token_id };
-                int decode_pos = forward_pass.get_cache_pos(slot);
+                int decode_pos = forward_pass->get_cache_pos(slot);
 
                 ggml_backend_sched_reset(scheduler);
-                ggml_cgraph* gf_token = forward_pass.build_prefill_graph(current_token_vec, decode_pos, slot);
+                ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, slot);
                 ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                forward_pass.set_inputs(gf_token, current_token_vec, decode_pos);
+                forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
                 ggml_backend_sched_graph_compute(scheduler, gf_token);
-                forward_pass.advance_cache(1, slot);
+                forward_pass->advance_cache(1, slot);
 
                 // Try speculative
-                int after_decode_pos = forward_pass.get_cache_pos(slot);
+                int after_decode_pos = forward_pass->get_cache_pos(slot);
                 auto result = spec->try_speculative_step(
                     prompt_tokens_for_pld,
                     generated_tokens,
@@ -756,7 +756,7 @@ int main(int argc, char** argv) {
                         goto end_single_generation;
                     }
                 } else {
-                    std::vector<float> token_logits = forward_pass.get_output_logits(gf_token);
+                    std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
                     last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
                     next_token_id = sampler->sample(last_token_logits, tokens, vocab);
                     if (grammar) {
@@ -768,16 +768,16 @@ int main(int argc, char** argv) {
 
             // --- Normal decode path ---
             std::vector<int32_t> current_token_vec = { next_token_id };
-            int current_pos = forward_pass.get_cache_pos(0); // Slot 0
+            int current_pos = forward_pass->get_cache_pos(0); // Slot 0
             
             ggml_backend_sched_reset(scheduler);            
-            ggml_cgraph* gf_token = forward_pass.build_prefill_graph(current_token_vec, current_pos, 0); // Slot 0
+            ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, current_pos, 0); // Slot 0
             ggml_backend_sched_alloc_graph(scheduler, gf_token);
-            forward_pass.set_inputs(gf_token, current_token_vec, current_pos);
+            forward_pass->set_inputs(gf_token, current_token_vec, current_pos);
             ggml_backend_sched_graph_compute(scheduler, gf_token);
-            forward_pass.advance_cache(1, 0); // Slot 0
+            forward_pass->advance_cache(1, 0); // Slot 0
 
-            std::vector<float> token_logits = forward_pass.get_output_logits(gf_token);
+            std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
             last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
             
             next_token_id = sampler->sample(last_token_logits, tokens, vocab);

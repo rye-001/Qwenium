@@ -360,74 +360,42 @@ ggml_tensor* Qwen35ForwardPass::build_ssm_layer(
     k_conv = ggml_l2_norm(ctx_, k_conv, meta_.rms_norm_eps);
 
     // ========================================================
-    // 6. Delta net recurrence (token-by-token unrolled in graph)
+    // 6. Delta net recurrence (fused op)
     // ========================================================
 
-    // Read recurrent state S from cache for this slot
     ggml_tensor* rec_all = ssm_cache_->get_recurrent_tensor(ssm_cache_layer);
     const int64_t rec_slot_floats = head_v_dim * head_k_dim * num_v_heads;
 
     ggml_tensor* S = ggml_view_1d(ctx_, rec_all,
         rec_slot_floats, slot_idx * rec_all->nb[1]);
-    S = ggml_reshape_4d(ctx_, S, head_v_dim, head_k_dim, num_v_heads, 1);
+    S = ggml_reshape_4d(ctx_, S, head_v_dim, head_k_dim, num_v_heads, n_seqs);
     set_tensor_name(gf, S, "ssm_state_in", il);
 
-    // Collect outputs per token
-    std::vector<ggml_tensor*> token_outputs;
-    token_outputs.reserve(n_seq_tokens);
+    ggml_tensor* result = ggml_gated_delta_net(ctx_,
+        q_conv, k_conv, v_conv, decay_gate, beta, S);
+    set_tensor_name(gf, result, "ssm_gdn_result", il);
 
-    for (int64_t t = 0; t < n_seq_tokens; ++t) {
-        // Slice token t from Q, K, V: [d, H, n_tokens, 1] → [d, H, 1, 1]
-        ggml_tensor* q_t = ggml_view_4d(ctx_, q_conv,
-            head_k_dim, num_k_heads, 1, 1,
-            q_conv->nb[1], q_conv->nb[2], q_conv->nb[3],
-            t * q_conv->nb[2]);
+    // Output: [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
+    ggml_tensor* output = ggml_view_4d(ctx_, result,
+        head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+        ggml_row_size(result->type, head_v_dim),
+        ggml_row_size(result->type, head_v_dim * num_v_heads),
+        ggml_row_size(result->type, head_v_dim * num_v_heads * n_seq_tokens), 0);
+    set_tensor_name(gf, output, "ssm_delta_out", il);
 
-        ggml_tensor* k_t = ggml_view_4d(ctx_, k_conv,
-            head_k_dim, num_k_heads, 1, 1,
-            k_conv->nb[1], k_conv->nb[2], k_conv->nb[3],
-            t * k_conv->nb[2]);
+    // New state: [head_v_dim, head_k_dim, num_v_heads, n_seqs]
+    ggml_tensor* new_state = ggml_view_4d(ctx_, result,
+        head_v_dim, head_k_dim, num_v_heads, n_seqs,
+        ggml_row_size(result->type, head_v_dim),
+        ggml_row_size(result->type, head_v_dim * head_k_dim),
+        ggml_row_size(result->type, head_v_dim * head_k_dim * num_v_heads),
+        ggml_row_size(result->type, head_v_dim * num_v_heads * n_seq_tokens * n_seqs));
 
-        ggml_tensor* v_t = ggml_view_4d(ctx_, v_conv,
-            head_v_dim, num_v_heads, 1, 1,
-            v_conv->nb[1], v_conv->nb[2], v_conv->nb[3],
-            t * v_conv->nb[2]);
-
-        // Slice gate_t and beta_t: [1, H, n_tokens, 1] → [1, H, 1, 1]
-        ggml_tensor* gate_t = ggml_view_4d(ctx_, decay_gate,
-            1, num_v_heads, 1, 1,
-            decay_gate->nb[1], decay_gate->nb[2], decay_gate->nb[3],
-            t * decay_gate->nb[2]);
-
-        ggml_tensor* beta_t = ggml_view_4d(ctx_, beta,
-            1, num_v_heads, 1, 1,
-            beta->nb[1], beta->nb[2], beta->nb[3],
-            t * beta->nb[2]);
-
-        ggml_tensor* S_new = nullptr;
-        ggml_tensor* o_t = build_delta_net_step(gf, S, q_t, k_t, v_t, gate_t, beta_t, &S_new, il);
-
-        S = S_new;  // Chain state to next token
-        token_outputs.push_back(o_t);
-    }
-
-    // Write final state back to cache
+    // Write new state back to cache
     ggml_tensor* rec_dst = ggml_view_1d(ctx_, rec_all,
         rec_slot_floats, slot_idx * rec_all->nb[1]);
-    ggml_tensor* S_flat = ggml_reshape_1d(ctx_, S, rec_slot_floats);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx_, S_flat, rec_dst));
-
-    // Concatenate token outputs: each is [d, H, 1, 1] → stack into [d, H, n_tokens, 1]
-    ggml_tensor* output;
-    if (n_seq_tokens == 1) {
-        output = token_outputs[0];
-    } else {
-        output = token_outputs[0];
-        for (int64_t t = 1; t < n_seq_tokens; ++t) {
-            output = ggml_concat(ctx_, output, token_outputs[t], 2);  // concat on dim 2 (tokens)
-        }
-    }
-    set_tensor_name(gf, output, "ssm_delta_out", il);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx_,
+        ggml_reshape_1d(ctx_, new_state, rec_slot_floats), rec_dst));
 
     // ========================================================
     // 7. Gated normalization
