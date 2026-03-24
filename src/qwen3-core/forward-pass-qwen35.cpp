@@ -54,7 +54,7 @@ Qwen35ForwardPass::Qwen35ForwardPass(
 
     ssm_cache_ = std::make_unique<ssm_state_cache>(
         n_ssm_layers, max_batch_size,
-        meta_.ssm_state_size, meta_.ssm_group_count,
+        meta_.ssm_state_size, meta_.ssm_time_step_rank,  // 32, not ssm_group_count (16)
         conv_dim, meta_.ssm_conv_kernel,
         cache_backend
     );
@@ -359,6 +359,11 @@ ggml_tensor* Qwen35ForwardPass::build_ssm_layer(
     q_conv = ggml_l2_norm(ctx_, q_conv, meta_.rms_norm_eps);
     k_conv = ggml_l2_norm(ctx_, k_conv, meta_.rms_norm_eps);
 
+    if (num_k_heads != num_v_heads) {
+        q_conv = ggml_repeat_4d(ctx_, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        k_conv = ggml_repeat_4d(ctx_, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+    }    
+
     // ========================================================
     // 6. Delta net recurrence (fused op)
     // ========================================================
@@ -535,18 +540,477 @@ ggml_tensor* Qwen35ForwardPass::build_delta_net_step(
     return o;
 }
 
+// ============================================================
+// build_decoding_graph — multi-slot single-token decode
+// ============================================================
+
 ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     const std::vector<int32_t>& tokens,
     const std::vector<uint32_t>& slots,
     const std::vector<int32_t>& positions)
 {
-    throw std::runtime_error("qwen35: batched decoding not yet implemented");
+    reset_context();
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
+
+    const uint32_t n_layers = meta_.block_count;
+    const size_t n_batch    = tokens.size();
+    const int64_t n_embd    = meta_.embedding_length;
+
+    // 1. Token embedding (batched)
+    ggml_tensor* inpL = embedding(gf, tokens);
+    set_tensor_name(gf, inpL, "inpL");
+
+    // 2. Position tensor
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_batch);
+    ggml_set_input(inp_pos);
+    set_tensor_name(gf, inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    // 3. Attention mask + gather indices (used by attention layers only)
+    uint32_t max_pos = 0;
+    for (int32_t p : positions) {
+        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
+    }
+    uint32_t n_kv_len = max_pos + 1;
+
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+        n_kv_len, 1, 1, n_batch);
+    ggml_set_input(kq_mask);
+    ggml_set_name(kq_mask, "kq_mask_b");
+    ggml_build_forward_expand(gf, kq_mask);
+
+    uint32_t n_total_indices = n_batch * n_kv_len;
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_set_input(gather_indices);
+    ggml_set_name(gather_indices, "gather_indices");
+
+    // 4. Layer loop
+    ggml_tensor* cur;
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        ggml_tensor* inpSA = inpL;
+        auto& block = model_.get_block(il);
+
+        // Pre-attention/SSM norm
+        cur = build_norm(gf, inpL, block.attn_norm_weight, il);
+
+        if (meta_.is_ssm_layer(il)) {
+            int32_t ssm_idx = ssm_layer_map_[il];
+            cur = build_batched_ssm_layer(gf, cur, ssm_idx, slots, il);
+        } else {
+            int32_t kv_idx = kv_layer_map_[il];
+            cur = build_batched_attention_layer(gf, cur, inp_pos,
+                kq_mask, gather_indices, kv_idx, slots, positions, il);
+        }
+
+        // Residual after attention/SSM
+        cur = ggml_add(ctx_, cur, inpSA);
+
+        ggml_tensor* ffn_residual = cur;
+
+        // Post-attention norm + FFN + residual
+        cur = build_norm(gf, cur, block.ffn_norm_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight,
+                         block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ggml_add(ctx_, cur, ffn_residual);
+
+        inpL = cur;
+    }
+
+    // 5. Output head
+    cur = build_norm(gf, inpL, model_.get_output_norm_weight(), -1);
+    if (model_.get_output_weight() != nullptr) {
+        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+    } else {
+        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+    }
+    ggml_set_name(cur, "logits");
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
 }
 
-void Qwen35ForwardPass::set_batched_inputs(ggml_cgraph* gf,
+// ============================================================
+// build_batched_ssm_layer — GatedDeltaNet for multi-slot decode
+//
+// Batches the initial projections (matmuls on full [n_embd, n_batch]),
+// then per-slot loop for state-dependent conv + fused recurrence,
+// then collects outputs into [n_embd, n_batch].
+// ============================================================
+
+ggml_tensor* Qwen35ForwardPass::build_batched_ssm_layer(
+    ggml_cgraph* gf,
+    ggml_tensor* cur,         // [n_embd, n_batch]
+    int ssm_cache_layer,
+    const std::vector<uint32_t>& slots,
+    int il)
+{
+    auto& block = model_.get_block(il);
+    const size_t n_batch = slots.size();
+
+    const int64_t d_inner      = meta_.ssm_inner_size;     // 2048
+    const int64_t head_k_dim   = meta_.ssm_state_size;     // 128
+    const int64_t num_k_heads  = meta_.ssm_group_count;    // 16
+    const int64_t num_v_heads  = meta_.ssm_time_step_rank; // 16
+    const int64_t head_v_dim   = d_inner / num_v_heads;    // 128
+    const int64_t n_embd       = meta_.embedding_length;   // 1024
+
+    const int64_t conv_kernel_size = meta_.ssm_conv_kernel; // 4
+    const int64_t conv_channels = d_inner + 2 * num_k_heads * head_k_dim; // 6144
+
+    // ========================================================
+    // A. Batched projections (all slots at once)
+    // ========================================================
+
+    // [6144, n_batch]
+    ggml_tensor* qkv_mixed = ggml_mul_mat(ctx_, block.attn_qkv_weight, cur);
+
+    // [2048, n_batch]
+    ggml_tensor* z_all = ggml_mul_mat(ctx_, block.attn_gate_weight, cur);
+
+    // Beta: sigmoid([num_v_heads, n_batch])
+    ggml_tensor* beta_all = ggml_mul_mat(ctx_, block.ssm_beta_weight, cur);
+    beta_all = ggml_sigmoid(ctx_, beta_all);
+
+    // Decay gate: softplus(alpha + dt_bias) * A → [num_v_heads, n_batch]
+    ggml_tensor* alpha_all = ggml_mul_mat(ctx_, block.ssm_alpha_weight, cur);
+    ggml_tensor* alpha_biased = ggml_add(ctx_, alpha_all, block.ssm_dt_bias);
+    ggml_tensor* alpha_sp = ggml_softplus(ctx_, alpha_biased);
+    ggml_tensor* gate_all = ggml_mul(ctx_, alpha_sp, block.ssm_a);
+
+    // ========================================================
+    // B. Per-slot loop: conv + recurrence + gated norm + output proj
+    // ========================================================
+
+    ggml_tensor* conv_all_tensor = ssm_cache_->get_conv_tensor(ssm_cache_layer);
+    ggml_tensor* rec_all_tensor  = ssm_cache_->get_recurrent_tensor(ssm_cache_layer);
+
+    const int64_t conv_state_elems = (conv_kernel_size - 1) * conv_channels;
+    const int64_t rec_slot_floats  = head_v_dim * head_k_dim * num_v_heads;
+    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+
+    std::vector<ggml_tensor*> slot_outputs;
+    slot_outputs.reserve(n_batch);
+
+    for (size_t b = 0; b < n_batch; ++b) {
+        uint32_t slot_idx = slots[b];
+
+        // --- Slice this slot's projections ---
+
+        // qkv_b: [conv_channels, 1]
+        ggml_tensor* qkv_b = ggml_view_2d(ctx_, qkv_mixed,
+            conv_channels, 1,
+            qkv_mixed->nb[1], b * qkv_mixed->nb[1]);
+
+        // z_b: [d_inner, 1]
+        ggml_tensor* z_b = ggml_view_2d(ctx_, z_all,
+            d_inner, 1,
+            z_all->nb[1], b * z_all->nb[1]);
+
+        // beta_b: [num_v_heads, 1] → [1, num_v_heads, 1, 1]
+        ggml_tensor* beta_b = ggml_view_2d(ctx_, beta_all,
+            num_v_heads, 1,
+            beta_all->nb[1], b * beta_all->nb[1]);
+        beta_b = ggml_reshape_4d(ctx_, beta_b, 1, num_v_heads, 1, 1);
+
+        // gate_b: [num_v_heads, 1] → [1, num_v_heads, 1, 1]
+        ggml_tensor* gate_b = ggml_view_2d(ctx_, gate_all,
+            num_v_heads, 1,
+            gate_all->nb[1], b * gate_all->nb[1]);
+        gate_b = ggml_reshape_4d(ctx_, gate_b, 1, num_v_heads, 1, 1);
+
+        // --- Conv1D with per-slot state ---
+
+        ggml_tensor* conv_state = ggml_view_1d(ctx_, conv_all_tensor,
+            conv_state_elems, slot_idx * conv_all_tensor->nb[1]);
+        conv_state = ggml_reshape_3d(ctx_, conv_state,
+            conv_kernel_size - 1, conv_channels, 1);
+
+        // qkv_b → [conv_channels, 1, 1] → transpose → [1, conv_channels, 1]
+        ggml_tensor* qkv_b_3d = ggml_reshape_3d(ctx_, qkv_b, conv_channels, 1, 1);
+        ggml_tensor* qkv_b_t = ggml_transpose(ctx_, qkv_b_3d);
+
+        // Concat: [conv_kernel-1 + 1, conv_channels, 1] = [conv_kernel, conv_channels, 1]
+        ggml_tensor* conv_input = ggml_concat(ctx_, conv_state, qkv_b_t, 0);
+
+        // Update conv state cache: last (conv_kernel-1) entries
+        ggml_tensor* last_conv = ggml_view_3d(ctx_, conv_input,
+            conv_kernel_size - 1, conv_channels, 1,
+            conv_input->nb[1], conv_input->nb[2],
+            (conv_input->ne[0] - (conv_kernel_size - 1)) * ggml_element_size(conv_input));
+        ggml_tensor* conv_dst = ggml_view_1d(ctx_, conv_all_tensor,
+            conv_state_elems, slot_idx * conv_all_tensor->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx_, last_conv, conv_dst));
+
+        // Depthwise conv1d + SiLU
+        ggml_tensor* conv_out = ggml_ssm_conv(ctx_, conv_input, block.ssm_conv1d_weight);
+        conv_out = ggml_silu(ctx_, conv_out);
+
+        // --- QKV split from conv output ---
+
+        const int64_t nb1_qkv = ggml_row_size(conv_out->type, qkv_dim);
+
+        ggml_tensor* q_conv = ggml_view_4d(ctx_, conv_out,
+            head_k_dim, num_k_heads, 1, 1,
+            ggml_row_size(conv_out->type, head_k_dim),
+            nb1_qkv, nb1_qkv, 0);
+
+        ggml_tensor* k_conv = ggml_view_4d(ctx_, conv_out,
+            head_k_dim, num_k_heads, 1, 1,
+            ggml_row_size(conv_out->type, head_k_dim),
+            nb1_qkv, nb1_qkv,
+            head_k_dim * num_k_heads * ggml_element_size(conv_out));
+
+        ggml_tensor* v_conv = ggml_view_4d(ctx_, conv_out,
+            head_v_dim, num_v_heads, 1, 1,
+            ggml_row_size(conv_out->type, head_v_dim),
+            nb1_qkv, nb1_qkv,
+            ggml_row_size(conv_out->type, 2 * head_k_dim * num_k_heads));
+
+        // L2 normalize Q and K
+        q_conv = ggml_l2_norm(ctx_, q_conv, meta_.rms_norm_eps);
+        k_conv = ggml_l2_norm(ctx_, k_conv, meta_.rms_norm_eps);
+
+        if (num_k_heads != num_v_heads) {
+            q_conv = ggml_repeat_4d(ctx_, q_conv, head_k_dim, num_v_heads, 1, 1);
+            k_conv = ggml_repeat_4d(ctx_, k_conv, head_k_dim, num_v_heads, 1, 1);
+        }    
+
+        // --- Fused delta net recurrence ---
+
+        ggml_tensor* S = ggml_view_1d(ctx_, rec_all_tensor,
+            rec_slot_floats, slot_idx * rec_all_tensor->nb[1]);
+        S = ggml_reshape_4d(ctx_, S, head_v_dim, head_k_dim, num_v_heads, 1);
+
+        ggml_tensor* gdn_result = ggml_gated_delta_net(ctx_,
+            q_conv, k_conv, v_conv, gate_b, beta_b, S);
+
+        // Output: [head_v_dim, num_v_heads, 1, 1]
+        ggml_tensor* output = ggml_view_4d(ctx_, gdn_result,
+            head_v_dim, num_v_heads, 1, 1,
+            ggml_row_size(gdn_result->type, head_v_dim),
+            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads),
+            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads), 0);
+
+        // New state: [head_v_dim, head_k_dim, num_v_heads, 1]
+        ggml_tensor* new_state = ggml_view_4d(ctx_, gdn_result,
+            head_v_dim, head_k_dim, num_v_heads, 1,
+            ggml_row_size(gdn_result->type, head_v_dim),
+            ggml_row_size(gdn_result->type, head_v_dim * head_k_dim),
+            ggml_row_size(gdn_result->type, head_v_dim * head_k_dim * num_v_heads),
+            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads * 1));
+
+        // Write new state back to cache
+        ggml_tensor* rec_dst = ggml_view_1d(ctx_, rec_all_tensor,
+            rec_slot_floats, slot_idx * rec_all_tensor->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx_,
+            ggml_reshape_1d(ctx_, new_state, rec_slot_floats), rec_dst));
+
+        // --- Gated normalization ---
+
+        ggml_tensor* z_b_4d = ggml_reshape_4d(ctx_, z_b,
+            head_v_dim, num_v_heads, 1, 1);
+        ggml_tensor* out_normed = build_norm(gf, output, block.ssm_norm_weight, il);
+        ggml_tensor* gated = ggml_mul(ctx_, out_normed, ggml_silu(ctx_, z_b_4d));
+
+        // --- Output projection → [n_embd, 1] ---
+
+        ggml_tensor* flat = ggml_reshape_2d(ctx_, gated, d_inner, 1);
+        ggml_tensor* out_b = ggml_mul_mat(ctx_, block.ssm_out_weight, flat);
+
+        slot_outputs.push_back(out_b);
+    }
+
+    // ========================================================
+    // C. Concat slot outputs → [n_embd, n_batch]
+    // ========================================================
+
+    ggml_tensor* result;
+    if (n_batch == 1) {
+        result = slot_outputs[0];
+    } else {
+        result = slot_outputs[0];
+        for (size_t b = 1; b < n_batch; ++b) {
+            result = ggml_concat(ctx_, result, slot_outputs[b], 1);
+        }
+    }
+    result = ggml_reshape_2d(ctx_, result, n_embd, n_batch);
+
+    return result;
+}
+
+// ============================================================
+// build_batched_attention_layer — Qwen35 attention for multi-slot decode
+//
+// Joint Q+Gate projection, Q/K norms, partial RoPE, sigmoid gating.
+// KV cache: per-slot write, gathered read, shared mask.
+// ============================================================
+
+ggml_tensor* Qwen35ForwardPass::build_batched_attention_layer(
+    ggml_cgraph* gf,
+    ggml_tensor* cur,            // [n_embd, n_batch]
+    ggml_tensor* inp_pos,        // [n_batch]
+    ggml_tensor* kq_mask,        // [n_kv_len, 1, 1, n_batch]
+    ggml_tensor* gather_indices, // [n_batch * n_kv_len]
+    int kv_cache_layer,
+    const std::vector<uint32_t>& slots,
+    const std::vector<int32_t>& positions,
+    int il)
+{
+    const int n_embd_head = meta_.attention_key_length;
+    const int n_head      = meta_.attention_head_count;
+    const int n_head_kv   = meta_.attention_head_count_kv;
+    const size_t n_batch  = slots.size();
+    auto& block = model_.get_block(il);
+
+    const int n_rot = (meta_.rope_dimension_count > 0)
+        ? meta_.rope_dimension_count : n_embd_head;
+
+    // A. Joint Q+Gate projection → [(n_embd_head*2)*n_head, n_batch]
+    ggml_tensor* Qcur_full = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
+
+    // B. Extract Q via strided view → [n_embd_head, n_head, n_batch]
+    ggml_tensor* Qcur = ggml_view_3d(ctx_, Qcur_full,
+        n_embd_head, n_head, n_batch,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+
+    Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
+
+    // C. K and V projections
+    ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
+    ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
+
+    Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_batch);
+    Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_batch);
+
+    Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
+
+    // D. Extract Gate → [n_embd_head*n_head, n_batch]
+    ggml_tensor* gate = ggml_view_3d(ctx_, Qcur_full,
+        n_embd_head, n_head, n_batch,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx_, gate, n_embd_head * n_head, n_batch);
+
+    // E. RoPE
+    const float freq_base = meta_.rope_freq_base;
+    Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr,
+        n_rot, GGML_ROPE_TYPE_NEOX,
+        meta_.context_length, freq_base,
+        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr,
+        n_rot, GGML_ROPE_TYPE_NEOX,
+        meta_.context_length, freq_base,
+        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    // F. Per-slot KV cache write
+    const int n_embd_k = n_head_kv * n_embd_head;
+    const int n_embd_v = n_head_kv * n_embd_head;
+
+    ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx_, Kcur, n_embd_k, 1, n_batch);
+    ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx_, Vcur, n_embd_v, 1, n_batch);
+
+    for (size_t b = 0; b < n_batch; ++b) {
+        ggml_tensor* k_slice = ggml_view_2d(ctx_, k_storage_fmt,
+            n_embd_k, 1, k_storage_fmt->nb[1], b * k_storage_fmt->nb[2]);
+        ggml_tensor* v_slice = ggml_view_2d(ctx_, v_storage_fmt,
+            n_embd_v, 1, v_storage_fmt->nb[1], b * v_storage_fmt->nb[2]);
+
+        ggml_build_forward_expand(gf, kv_cache_->cpy_k(ctx_, k_slice, kv_cache_layer, slots[b]));
+        ggml_build_forward_expand(gf, kv_cache_->cpy_v(ctx_, v_slice, kv_cache_layer, slots[b]));
+    }
+
+    // G. Gather KV for all slots
+    uint32_t max_pos = 0;
+    for (int32_t p : positions) {
+        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
+    }
+    uint32_t n_kv_len = max_pos + 1;
+
+    ggml_tensor* k_gathered = kv_cache_->gather_k(ctx_, gf, kv_cache_layer,
+        gather_indices, n_batch, n_kv_len);
+    ggml_tensor* v_gathered = kv_cache_->gather_v(ctx_, gf, kv_cache_layer,
+        gather_indices, n_batch, n_kv_len);
+
+    // Reshape to 4D: [n_embd_head, n_head_kv, n_kv_len, n_batch]
+    ggml_tensor* k_view = ggml_view_4d(ctx_, k_gathered,
+        n_embd_head, n_head_kv, n_kv_len, n_batch,
+        n_embd_head * sizeof(float),
+        n_embd_k * sizeof(float),
+        n_embd_k * n_kv_len * sizeof(float), 0);
+    ggml_tensor* v_view = ggml_view_4d(ctx_, v_gathered,
+        n_embd_head, n_head_kv, n_kv_len, n_batch,
+        n_embd_head * sizeof(float),
+        n_embd_v * sizeof(float),
+        n_embd_v * n_kv_len * sizeof(float), 0);
+
+    // H. Attention
+    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+    cur = build_attn_mha(gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
+
+    // I. Gate sigmoid
+    cur = ggml_mul(ctx_, cur, ggml_sigmoid(ctx_, gate));
+
+    // J. Output projection
+    cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
+
+    return cur;
+}
+
+// ============================================================
+// set_batched_inputs — fill input tensors for batched decode
+// ============================================================
+
+void Qwen35ForwardPass::set_batched_inputs(
+    ggml_cgraph* gf,
     const std::vector<int32_t>& tokens,
     const std::vector<uint32_t>& slots,
     const std::vector<int32_t>& positions)
 {
-    throw std::runtime_error("qwen35: batched inputs not yet implemented");
+    const size_t n_batch = tokens.size();
+    if (slots.size() != n_batch || positions.size() != n_batch) {
+        throw std::runtime_error("Input vector size mismatch in set_batched_inputs");
+    }
+
+    // 1. Token IDs
+    ggml_tensor* tokens_tensor = ggml_graph_get_tensor(gf, "tokens");
+    if (!tokens_tensor) throw std::runtime_error("tokens tensor not found");
+    ggml_backend_tensor_set(tokens_tensor, tokens.data(), 0, n_batch * sizeof(int32_t));
+
+    // 2. Position IDs
+    ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
+    if (!inp_pos) throw std::runtime_error("inp_pos tensor not found");
+    ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_batch * sizeof(int32_t));
+
+    // 3. Attention mask (causal, per-slot positions)
+    ggml_tensor* kq_mask_t = ggml_graph_get_tensor(gf, "kq_mask_b");
+    if (!kq_mask_t) throw std::runtime_error("kq_mask_b tensor not found");
+
+    const uint32_t n_kv_dim = kq_mask_t->ne[0];
+    std::vector<float> mask_data(n_kv_dim * n_batch);
+    for (uint32_t b = 0; b < n_batch; ++b) {
+        const int32_t current_pos = positions[b];
+        for (uint32_t j = 0; j < n_kv_dim; ++j) {
+            mask_data[b * n_kv_dim + j] = ((int32_t)j <= current_pos) ? 0.0f : -INFINITY;
+        }
+    }
+    ggml_backend_tensor_set(kq_mask_t, mask_data.data(), 0, n_kv_dim * n_batch * sizeof(float));
+
+    // 4. KV gather indices
+    ggml_tensor* gather_indices = ggml_graph_get_tensor(gf, "gather_indices");
+    if (gather_indices) {
+        uint32_t n_total_indices = gather_indices->ne[0];
+        uint32_t n_kv_len = n_total_indices / n_batch;
+        std::vector<int32_t> indices(n_total_indices);
+
+        for (uint32_t b = 0; b < n_batch; ++b) {
+            uint32_t slot_idx = slots[b];
+            for (uint32_t t = 0; t < n_kv_len; ++t) {
+                indices[b * n_kv_len + t] = slot_idx * kv_cache_->get_n_ctx_max() + t;
+            }
+        }
+        ggml_backend_tensor_set(gather_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
+    }
 }

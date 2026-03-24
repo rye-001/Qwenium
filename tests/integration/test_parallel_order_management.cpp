@@ -14,6 +14,11 @@
 #include <chrono>
 #include <algorithm>
 
+static std::string get_model_path() {
+    const char* path = std::getenv("QWEN_MODEL_PATH");
+    return path ? std::string(path) : "";
+}
+
 // ============================================================
 // SYSTEM PROMPT
 // ============================================================
@@ -682,14 +687,14 @@ int main(int argc, char* argv[]) {
     std::cout << "PARALLEL Order Management DSL Tests" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    const std::string MODEL_QWEN2_14B = "./qwen2.5-coder-14b-instruct-q4_0.gguf";
+    const std::string MODEL_QWEN = get_model_path();// "./qwen2.5-coder-14b-instruct-q4_0.gguf";
 
     auto test_cases = get_test_cases();
     uint32_t batch_size = test_cases.size();
 
     // Load model with batch support
     std::cout << "\n[Loading Model]" << std::endl;
-    ParallelModelRunner runner(MODEL_QWEN2_14B, batch_size);
+    ParallelModelRunner runner(MODEL_QWEN, batch_size);
     if (!runner.load()) {
         std::cerr << "Failed to load model. Exiting." << std::endl;
         return 1;

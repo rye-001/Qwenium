@@ -88,8 +88,7 @@ private:
     std::vector<int32_t> kv_layer_map_;    // [24] → 0..5 or -1
     std::vector<int32_t> ssm_layer_map_;   // [24] → 0..17 or -1
 
-    // --- Qwen35-specific attention builder ---
-    // Joint Q+Gate projection, gate sigmoid, partial RoPE
+    // --- Qwen35-specific attention builder (single-slot prefill) ---
     ggml_tensor* build_attention_layer(
         ggml_cgraph* gf,
         simple_kv_cache* kv_cache,
@@ -100,7 +99,7 @@ private:
         uint32_t slot_idx,
         int il);                  // physical layer index (for tensor names)
 
-    // --- SSM layer builder (stub for now, real impl in later step) ---
+    // --- SSM layer builder (single-slot prefill) ---
     ggml_tensor* build_ssm_layer(
         ggml_cgraph* gf,
         ggml_tensor* cur,         // [n_embd, n_tokens] — normed input
@@ -109,12 +108,33 @@ private:
         uint32_t slot_idx,
         int il);
 
-
-    // Delta net: single token recurrence step
+    // Delta net: single token recurrence step (used by prefill path)
     // S:[d,d,H,1] q/k/v:[d,H,1,1] gate/beta:[1,H,1,1]
     // Returns output [d,H,1,1], *S_out = new state [d,d,H,1]
     ggml_tensor* build_delta_net_step(ggml_cgraph* gf,
         ggml_tensor* S, ggml_tensor* q_t, ggml_tensor* k_t, ggml_tensor* v_t,
         ggml_tensor* gate_t, ggml_tensor* beta_t,
         ggml_tensor** S_out, int il);
+
+    // --- Batched decode builders (multi-slot, 1 token per slot) ---
+
+    // Batched attention: joint Q+Gate, sigmoid gating, gathered KV
+    ggml_tensor* build_batched_attention_layer(
+        ggml_cgraph* gf,
+        ggml_tensor* cur,         // [n_embd, n_batch]
+        ggml_tensor* inp_pos,     // [n_batch]
+        ggml_tensor* kq_mask,     // [n_kv_len, 1, 1, n_batch]
+        ggml_tensor* gather_indices, // [n_batch * n_kv_len]
+        int kv_cache_layer,
+        const std::vector<uint32_t>& slots,
+        const std::vector<int32_t>& positions,
+        int il);
+
+    // Batched SSM: batched projections, per-slot conv + recurrence
+    ggml_tensor* build_batched_ssm_layer(
+        ggml_cgraph* gf,
+        ggml_tensor* cur,         // [n_embd, n_batch]
+        int ssm_cache_layer,
+        const std::vector<uint32_t>& slots,
+        int il);
 };

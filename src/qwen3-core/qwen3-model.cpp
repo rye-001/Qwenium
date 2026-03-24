@@ -216,14 +216,10 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
         token_embd_weight_ = tensors.at("token_embd.weight");
         output_norm_weight_ = tensors.at("output_norm.weight");
 
-        // Output weight: qwen2 has dedicated output.weight, qwen3/qwen35 use weight tying
-        if (metadata_.architecture == "qwen2") {
-            auto it = tensors.find("output.weight");
-            if (it != tensors.end()) {
-                output_weight_ = it->second;
-            }
+        auto it = tensors.find("output.weight");
+        if (it != tensors.end()) {
+            output_weight_ = it->second;
         }
-        // qwen35 and qwen3: output_weight_ stays nullptr (weight tying)
 
         blocks_.resize(metadata_.block_count);
         for (uint32_t i = 0; i < metadata_.block_count; ++i) {

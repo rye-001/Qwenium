@@ -8,6 +8,10 @@
 #include <vector>
 #include <string>
 
+static std::string get_model_path() {
+    const char* path = std::getenv("QWEN_MODEL_PATH");
+    return path ? std::string(path) : "";
+}
 struct GGUFHeader {
     uint32_t magic;
     uint32_t version;
@@ -79,7 +83,8 @@ bool skip_value(std::ifstream& file, GGUFValueType type) {
 }
 
 int main() {
-    std::ifstream file("qwen2.5-coder-14b-instruct-q4_0.gguf", std::ios::binary); // Qwen3-0.6B-Q8_0.gguf
+    std::string modelPath = get_model_path();
+    std::ifstream file(modelPath, std::ios::binary); // Qwen3-0.6B-Q8_0.gguf
     if (!file) {
         std::cerr << "Failed to open file" << std::endl;
         return 1;
