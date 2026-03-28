@@ -7,6 +7,8 @@
 #include <numeric>
 #include <vector>
 
+#include <iostream>
+
 namespace qwen3 {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
@@ -30,9 +32,20 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits,
     // Get valid tokens from grammar
     std::vector<int32_t> valid_tokens = grammar_->get_valid_tokens(token_strs);
     
-    if (valid_tokens.empty()) {
-        return;  // Grammar allows all tokens (or error - be permissive)
+    // if (valid_tokens.empty()) {
+    //     return;  // Grammar allows all tokens (or error - be permissive)
+    // }
+
+if (valid_tokens.empty()) {
+    std::cerr << "[Grammar] WARNING: No valid tokens — grammar is stuck!" << std::endl;
+    // Force EOS instead of going permissive
+    for (size_t i = 0; i < logits.size(); ++i) {
+        logits[i] = -std::numeric_limits<float>::infinity();
     }
+    // Allow only EOS
+    logits[151643] = 0.0f; // Qwen2 EOS token ID — adjust if needed
+    return;
+}    
     
     // Build fast lookup set
     std::unordered_set<int32_t> valid_set(valid_tokens.begin(), valid_tokens.end());

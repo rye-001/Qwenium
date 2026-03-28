@@ -27,8 +27,6 @@
 // #include "./tensor_tracer.h"
 
 void debug_computed_tensor(ggml_tensor* tensor, const char* name);
-void print_token(std::string str);
-std::string make_readable(std::string str);
 size_t calculate_scratch_size(const Qwen3Metadata& metadata,
                                size_t max_context_length = 2048,
                                size_t batch_size = 512);
@@ -205,7 +203,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string grammar_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        grammar = qwen3::Grammar::parse_impl(grammar_str, pretokenized_literals);
+        const auto& literals = get_pretokenized_literals(model.get_metadata().architecture);
+
+        grammar = qwen3::Grammar::parse_impl(grammar_str, literals);
         if (!grammar) {
             std::cerr << "Error: Failed to parse grammar file."
 ;            return 1;
@@ -264,19 +264,6 @@ int main(int argc, char** argv) {
 ;    }
     
     return 0;
-}
-
-std::string make_readable(std::string str) {
-        size_t pos = 0;
-    while ((pos = str.find("\xC4\xA0", pos)) != std::string::npos) {
-        str.replace(pos, 2, " ");
-        pos += 1;
-    }
-    return str;
-}
-
-void print_token(std::string str) {
-    std::cout << make_readable(str) << std::flush;
 }
 
 void llama_log_set(ggml_log_callback log_callback, void * user_data) {

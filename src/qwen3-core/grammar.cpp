@@ -826,6 +826,27 @@ namespace qwen3
                 }
             }
         }
+
+
+// --- DEBUG: dump state after accept ---
+std::cerr << "[accept] token_id=" << token_id
+          << " old_stacks=" << impl_->stacks.size()
+          << " new_stacks=" << new_stacks.size() << std::endl;
+for (size_t i = 0; i < new_stacks.size(); ++i) {
+    auto& s = new_stacks[i];
+    if (s.pos) {
+        std::cerr << "  [" << i << "] type=" << s.pos->type
+                  << " token_idx=" << s.token_idx;
+        if (s.pos->type == llama_grammar_element::LITERAL) {
+            std::cerr << " literal=\"" << impl_->literal_values[s.pos->value] << "\"";
+            auto it = impl_->pretokenized_literals.find(impl_->literal_values[s.pos->value]);
+            std::cerr << " in_map=" << (it != impl_->pretokenized_literals.end());
+        }
+        std::cerr << " continuations=" << s.continuations.size() << std::endl;
+    }
+}
+
+
         impl_->stacks = new_stacks;
     }
 

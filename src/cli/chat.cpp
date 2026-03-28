@@ -3,10 +3,6 @@
 
 #include "chat.h"
 
-// Defined in main.cpp — will move to a shared header later
-extern std::string apply_chat_template(const std::vector<ChatMessage>& history, bool add_assistant_prompt);
-extern void print_token(std::string str);
-
 int run_chat(
     Qwen3Model& model,
     const CliArgs& args,
@@ -54,7 +50,8 @@ int run_chat(
         std::string system_content = args.system_prompt;
         if (system_content.empty()) {
             // std::ifstream file("system_prompt.txt");
-            std::ifstream file("tests/system_prompt_order_mngmt.txt");
+            // std::ifstream file("tests/system_prompt_order_mngmt.txt");
+            std::ifstream file("tests/system_prompt_account_mngmt.txt");
             if (file) {
                 std::stringstream buffer;
                 buffer << file.rdbuf();

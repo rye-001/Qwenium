@@ -6,11 +6,14 @@ import sys
 from transformers import AutoTokenizer
 
 # A regex to find all quoted literals in a GBNF file, handling escaped quotes.
-LITERAL_REGEX = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
+LITERAL_REGEX = re.compile(r'"([^"\\\n]*(?:\\.[^"\\\n]*)*)"')
 
 def find_unique_literals(gbnf_content):
     """Extracts all unique literal strings from GBNF content."""
-    return set(LITERAL_REGEX.findall(gbnf_content))
+    # Strip comment lines before matching
+    lines = [line for line in gbnf_content.splitlines() if not line.strip().startswith('#')]
+    cleaned = '\n'.join(lines)
+    return set(LITERAL_REGEX.findall(cleaned))
 
 def generate_header_content(tokenized_literals):
     """Generates the C++ header content from the tokenized data."""
@@ -38,6 +41,17 @@ def generate_header_content(tokenized_literals):
 
     header.append("};")
     return "\n".join(header)
+
+def encode_literal(tokenizer, literal):
+    """Encode a literal fragment, preserving leading whitespace correctly."""
+    if not literal:
+        return []
+    SENTINEL = "\x00"
+    sentinel_ids = tokenizer.encode(SENTINEL, add_special_tokens=False)
+    combined_ids = tokenizer.encode(SENTINEL + literal, add_special_tokens=False)
+    if combined_ids[:len(sentinel_ids)] == sentinel_ids:
+        return combined_ids[len(sentinel_ids):]
+    return combined_ids
 
 def main():
     """Main function to run the script."""
@@ -79,7 +93,7 @@ def main():
     
     for literal in literals:
         # Original literal (no leading space)
-        token_ids = tokenizer.encode(literal, add_special_tokens=False)
+        token_ids = encode_literal(tokenizer, literal);
         tokenized_literals[literal] = token_ids
         
         # Space-prefixed variant for literals that:
@@ -92,7 +106,7 @@ def main():
             len(literal) > 1):
             
             space_literal = " " + literal
-            space_token_ids = tokenizer.encode(space_literal, add_special_tokens=False)
+            space_token_ids = encode_literal(tokenizer, literal)
             
             # Only add if the tokenization is different
             # (the space-prefixed version produces different token IDs)
@@ -108,7 +122,7 @@ def main():
             literal.isidentifier()):
             
             newline_literal = "\n" + literal
-            newline_token_ids = tokenizer.encode(newline_literal, add_special_tokens=False)
+            newline_token_ids = encode_literal(tokenizer, literal)
             
             # Only add if different from both original and space-prefixed
             if (newline_token_ids != token_ids and 

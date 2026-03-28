@@ -3,10 +3,6 @@
 
 #include "complete.h"
 
-// TODO: Move these includes once headers are settled
-
-extern void print_token(std::string str);
-
 int run_complete(
     Qwen3Model& model,
     const CliArgs& args,

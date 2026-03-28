@@ -45,3 +45,16 @@ inline std::string apply_chat_template(const std::vector<ChatMessage>& history, 
     }
     return prompt_stream.str();
 }
+
+inline std::string make_readable(std::string str) {
+        size_t pos = 0;
+    while ((pos = str.find("\xC4\xA0", pos)) != std::string::npos) {
+        str.replace(pos, 2, " ");
+        pos += 1;
+    }
+    return str;
+}
+
+inline void print_token(std::string str) {
+    std::cout << make_readable(str) << std::flush;
+}

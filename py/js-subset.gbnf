@@ -2,9 +2,8 @@
 # 
 # This grammar is designed to work with token-level constrained generation.
 # Key design decisions:
-# 1. No character classes - they don't work correctly with token boundaries
-# 2. Whitespace handled as explicit " " literals with optional markers
-# 3. String content uses predefined literals instead of [^"]*
+# 1. Whitespace handled as explicit " " literals with optional markers
+# 2. String content uses predefined literals instead of [^"]*
 #
 # DSL: [forEach, accounts, account, [getSupportTickets, {accountId: $account.id}]]
 # JS:  for (const account of accounts) { await getSupportTickets({ accountId: account.id }); }
@@ -77,4 +76,6 @@ param_value ::= expression
 variable ::= identifier ("." identifier)*
 identifier ::= "accounts" | "account" | "ticket" | "tickets" | "orders" | "critical_tickets" | "id" | "severity" | "length"
 
-string ::= "\"" [^"]* "\""
+# string ::= "\"" [^"]* "\""
+string ::= "\"" string_value "\""
+string_value ::= "gold" | "platinum" | "standard" | "high" | "medium" | "low" | "critical" | "active" | "suspended" | "open" | "in_progress" | "resolved" | "closed" | "processing" | "completed" | "cancelled"
