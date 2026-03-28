@@ -7,8 +7,6 @@ add_library(qwen3-core STATIC
     forward-pass-qwen35.cpp
     forward-pass-factory.cpp
     tokenizer.cpp
-    sampling.cpp
-    grammar.cpp
 )
 
 target_include_directories(qwen3-core PUBLIC

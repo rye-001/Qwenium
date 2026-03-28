@@ -76,6 +76,7 @@ include_directories(${ggml_SOURCE_DIR}/include)
 # Core library components
 add_subdirectory(src/qwen3-core)
 add_subdirectory(src/kv-cache)
+add_subdirectory(src/sampling)
 
 # Main CLI executable
 add_subdirectory(src/cli)

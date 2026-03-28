@@ -19,7 +19,7 @@
 #include "qwen3-core/qwen3-model.h"
 #include "qwen3-core/forward-pass.h"
 #include "qwen3-core/tokenizer.h"
-#include "qwen3-core/sampling.h"
+#include "sampling/sampling.h"
 #include "kv-cache/simple-kv-cache.h"
 
 #include <iostream>

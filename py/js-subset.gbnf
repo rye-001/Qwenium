@@ -1,81 +1,67 @@
 # JavaScript Subset Grammar - Token-Aligned Version
-# 
-# This grammar is designed to work with token-level constrained generation.
-# Key design decisions:
-# 1. Whitespace handled as explicit " " literals with optional markers
-# 2. String content uses predefined literals instead of [^"]*
 #
-# DSL: [forEach, accounts, account, [getSupportTickets, {accountId: $account.id}]]
-# JS:  for (const account of accounts) { await getSupportTickets({ accountId: account.id }); }
+# Bugs fixed vs original:
+# 1. function_call: removed " "? around optional object (caused double-space in empty calls)
+# 2. root: statement ("\n" statement)* allows multi-statement programs
+# 3. expression: added number alternative [0-9] ([0-9])* for numeric comparisons
+# 4. block: uses "{" "\n" (statement "\n")* "}" for consistent newline layout
+# 5. if_else: else branch is now optional
 
-root ::= statement
+root ::= statement ("\n" statement)*
 
 statement ::= for_of | let_decl | if_else | parallel_block | await_call
 
 # forEach -> for...of
-# DSL: [forEach, collection, item, body]
-# JS:  for (const item of collection) { body }
 for_of ::= "for" " " "(" "const" " " identifier " " "of" " " identifier ")" " "? block
 
 # let -> const assignment
-# DSL: [let, varname, expression]
-# JS:  const varname = expression;
 let_decl ::= "const" " " identifier " "? "=" " "? expression " "? ";"
 
-# if -> if/else
-# DSL: [if, condition, then_expr, else_expr]
-# JS:  if (condition) { then } else { else }
-if_else ::= "if" " "? "(" " "? condition " "? ")" " "? block " "? "else" " "? block
+# if -> if (optional else)
+if_else ::= "if" " "? "(" " "? condition " "? ")" " "? block (" "? "else" " "? block)?
 
 # parallel -> Promise.all
-# DSL: [parallel, [expr1, expr2, ...]]
-# JS:  await Promise.all([ expr1, expr2, ... ]);
 parallel_block ::= "await" " " "Promise.all" " "? "(" " "? "[" " "? await_call_list " "? "]" " "? ")" " "? ";"
 
 # function_call -> await func(obj)
-# DSL: [getAccounts, {priority: "high"}]
-# JS:  await getAccounts({ priority: "high" });
 await_call ::= "await" " " function_call " "? ";"
 
 await_call_list ::= await_call_item (" "? "," " "? await_call_item)*
 await_call_item ::= "await" " " function_call
 
-# Block: { statements }
-block ::= "{" " "? statement* " "? "}"
+# Block: always uses newlines
+block ::= "{" "\n" (statement "\n")* "}"
 
 # Expressions
-expression ::= await_expr | count_expr | variable | string
+expression ::= await_expr | count_expr | number | variable | string
 
 # await expression (for assignment)
 await_expr ::= "await" " " function_call
 
 # count -> array.length
-# DSL: [count, $array]
-# JS:  array.length
 count_expr ::= identifier "." "length"
+
+# number: one or more digits (OP_PLUS not implemented, so digit (digit)*)
+number ::= [0-9] ([0-9])*
 
 # Conditions
 condition ::= expression " "? comparator " "? expression
 comparator ::= ">" | "<" | "===" | ">=" | "<="
 
-# Function calls
-function_call ::= function_name " "? "(" " "? object? " "? ")"
+# Function calls: no spaces around optional object (fixes double-space bug)
+function_call ::= function_name " "? "(" object? ")"
 function_name ::= "getAccounts" | "getSupportTickets" | "getOpenOrders" | "reassignAccount" | "addAccountNote"
 
 # Object literals
-# DSL: {accountId: $account.id, priority: "high"}
-# JS:  { accountId: account.id, priority: "high" }
 object ::= "{" " "? (param (" "? "," " "? param)*)? " "? "}"
 param ::= param_key " "? ":" " "? param_value
 param_key ::= "accountId" | "teamId" | "priority" | "tier" | "note" | "severity"
 param_value ::= expression
 
 # Variables
-# DSL: $account.id
-# JS:  account.id
 variable ::= identifier ("." identifier)*
 identifier ::= "accounts" | "account" | "ticket" | "tickets" | "orders" | "critical_tickets" | "id" | "severity" | "length"
 
-# string ::= "\"" [^"]* "\""
+# Strings
 string ::= "\"" string_value "\""
 string_value ::= "gold" | "platinum" | "standard" | "high" | "medium" | "low" | "critical" | "active" | "suspended" | "open" | "in_progress" | "resolved" | "closed" | "processing" | "completed" | "cancelled"

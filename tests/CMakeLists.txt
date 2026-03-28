@@ -23,6 +23,7 @@ add_executable(qwen3-unit-tests
 target_link_libraries(qwen3-unit-tests PRIVATE
     GTest::gtest_main
     qwen3-core
+    sampling
     ggml
 )
 
@@ -39,6 +40,7 @@ add_executable(qwen3-integration-tests
 target_link_libraries(qwen3-integration-tests PRIVATE
     GTest::gtest_main
     qwen3-core
+    sampling
     ggml
 )
 
@@ -53,6 +55,7 @@ add_executable(qwen3-order-mngmt-test
 # Link libraries
 target_link_libraries(qwen3-order-mngmt-test PRIVATE
     qwen3-core
+    sampling
     ggml
 )
 
@@ -64,6 +67,7 @@ add_executable(qwen3-parallel-order-mngmt-test
 # Link libraries
 target_link_libraries(qwen3-parallel-order-mngmt-test PRIVATE
     qwen3-core
+    sampling
     ggml
 )
 

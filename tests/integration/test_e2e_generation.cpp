@@ -3,7 +3,7 @@
 #include "qwen3-core/gguf-loader.h"
 #include "qwen3-core/forward-pass.h"
 #include "qwen3-core/tokenizer.h"
-#include "qwen3-core/sampling.h"
+#include "sampling/sampling.h"
 #include <memory>
 #include <vector>
 #include <string>

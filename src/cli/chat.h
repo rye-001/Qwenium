@@ -14,10 +14,10 @@
 #include "../qwen3-core/qwen3-model.h"
 #include "../qwen3-core/forward-pass-factory.h"
 #include "../qwen3-core/tokenizer.h"
-#include "../qwen3-core/sampling.h"
-#include "../qwen3-core/grammar.h"
-#include "../qwen3-core/speculative.h"
-#include "../qwen3-core/vocab_utils.h"
+#include "../sampling/sampling.h"
+#include "../sampling/grammar.h"
+#include "../sampling/speculative.h"
+#include "../sampling/vocab_utils.h"
 
 
 

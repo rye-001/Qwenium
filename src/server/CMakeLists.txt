@@ -47,7 +47,8 @@ target_link_libraries(http_server PRIVATE
     inference_server
     httplib::httplib
     nlohmann_json::nlohmann_json
-    qwen3-core          # Your existing model/inference library
+    qwen3-core          
+    sampling
     Threads::Threads
 )
 

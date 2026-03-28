@@ -5,7 +5,7 @@
 
 #include "ggml-backend.h"
 #include "../qwen3-core/forward-pass-base.h"
-#include "../qwen3-core/speculative.h"
+#include "../sampling/speculative.h"
 
 struct SpeculativeBridge {
     ForwardPassBase* forward_pass;

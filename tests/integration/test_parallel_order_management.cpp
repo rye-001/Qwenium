@@ -2,8 +2,8 @@
 #include "qwen3-core/gguf-loader.h"
 #include "qwen3-core/forward-pass-factory.h"
 #include "qwen3-core/tokenizer.h"
-#include "qwen3-core/sampling.h"
-#include "qwen3-core/vocab_utils.h"
+#include "sampling/sampling.h"
+#include "sampling/vocab_utils.h"
 #include <memory>
 #include <vector>
 #include <string>
