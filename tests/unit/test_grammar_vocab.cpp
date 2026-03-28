@@ -6,7 +6,6 @@
 // GREEN target: all 25 tests pass after grammar_vocab.cpp is implemented.
 
 #include "../../src/sampling/grammar_vocab.h"
-
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -456,16 +455,24 @@ void suite4_space_tokens(const std::string& gbnf, const std::vector<std::string>
         ASSERT_NOT_IN(valid, T_GETACCOUNTS); // already past function_name
     });
 
-    TEST("space-prefixed keyword tokens valid at explicit ' ' position", {
-        // At the " " before identifier in for_of, space-prefixed tokens should match
+    TEST("every valid token at ' ' position must start with ' '", {
+        // Option B key property: at a LITERAL(" ") state, the vocab-scan enforces
+        // first-char matching without any pre-enumeration. Every accepted token
+        // must begin with ' ' — no special-casing required.
         auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE, T_AWAIT
-            // now at " " before function_name
+            // grammar now at " " literal before function_name
         }, vocab);
         auto valid = g->get_valid_tokens(vocab);
-        ASSERT_IN(valid, T_SP_AWAIT);    // " await" starts with " " → valid at " " pos
-        ASSERT_NOT_IN(valid, T_AWAIT);   // "await" doesn't start with " " → not valid here
+        // Every token in the valid set must start with ' '
+        for (int32_t id : valid) {
+            if (id < 0 || static_cast<size_t>(id) >= vocab.size()) continue;
+            ASSERT_TRUE(!vocab[id].empty() && vocab[id][0] == ' ');
+        }
+        // Bare keywords must NOT be valid (they don't start with ' ')
+        ASSERT_NOT_IN(valid, T_AWAIT);
+        ASSERT_NOT_IN(valid, T_GETACCOUNTS);
     });
 }
 

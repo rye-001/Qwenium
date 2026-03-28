@@ -17,6 +17,7 @@ add_executable(qwen3-unit-tests
     unit/test_qwen35_hybrid_cache.cpp
     unit/test_qwen35_forward_attn.cpp
     unit/test_qwen35_generation.cpp
+    unit/test_grammar_vocab.cpp
 )
 
 # Link libraries for unit tests

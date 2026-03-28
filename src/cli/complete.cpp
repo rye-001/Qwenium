@@ -6,7 +6,7 @@
 int run_complete(
     Qwen3Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::Grammar>& grammar,
+    std::unique_ptr<qwen3::GrammarVocab>& grammar,
     qwen3::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,

@@ -15,7 +15,7 @@
 #include "../qwen3-core/forward-pass-factory.h"
 #include "../qwen3-core/tokenizer.h"
 #include "../sampling/sampling.h"
-#include "../sampling/grammar.h"
+#include "../sampling/grammar_vocab.h"
 #include "../sampling/speculative.h"
 #include "../sampling/vocab_utils.h"
 
@@ -31,7 +31,7 @@ namespace qwen3 {
 int run_complete(
     Qwen3Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::Grammar>& grammar,        // nullable
+    std::unique_ptr<qwen3::GrammarVocab>& grammar,        // nullable
     qwen3::SpeculativeDecoder* spec,                  // nullable
     bool use_speculative,
     std::function<void(int32_t)> log_token,

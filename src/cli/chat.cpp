@@ -6,7 +6,7 @@
 int run_chat(
     Qwen3Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::Grammar>& grammar,
+    std::unique_ptr<qwen3::GrammarVocab>& grammar,
     qwen3::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,
@@ -20,6 +20,15 @@ int run_chat(
         Tokenizer* tokenizer = model.get_tokenizer();
         const auto vocab = tokenizer->get_vocabulary();
 
+
+// Build decoded vocab: decoded_vocab[i] = actual UTF-8 string for token i
+const auto& raw_vocab = tokenizer->get_vocabulary();
+std::vector<std::string> decoded_vocab;
+decoded_vocab.reserve(raw_vocab.size());
+for (size_t i = 0; i < raw_vocab.size(); ++i) {
+    decoded_vocab.push_back(tokenizer->decode(static_cast<int32_t>(i)));
+}        
+
         std::unique_ptr<qwen3::Sampler> sampler;
         if (args.temperature > 0.0f) {
             sampler = std::make_unique<qwen3::TemperatureSampler>(
@@ -30,6 +39,9 @@ int run_chat(
         if (grammar) {
             sampler->set_grammar(grammar.get());
         }
+        
+        const int32_t eos_token_id = model.get_metadata().eos_token_id;
+        sampler->set_eos_token_id(eos_token_id);
     
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
@@ -79,7 +91,6 @@ int run_chat(
         // Clone System Prefix to Slot 1 for the user session
         forward_pass->clone_slot(0, 1, system_tokens.size());
         
-        const int32_t eos_token_id = model.get_metadata().eos_token_id;
         const std::string im_end_str = "<|im_end|>";
         const std::string eos_str = "<|endoftext|>";
 
@@ -137,15 +148,16 @@ int run_chat(
             std::vector<float> logits = forward_pass->get_output_logits(gf);
             size_t vocab_size = model.get_metadata().vocab_size;
             std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
-            int next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
+            int next_token_id = sampler->sample(last_token_logits, all_tokens, decoded_vocab);
+            
+
             if (grammar) {
-                grammar->accept_token(next_token_id, vocab);
+                grammar->accept_token(next_token_id, decoded_vocab);
             }
            
             std::string assistant_response = "";
             std::cout << "Assistant: " << std::flush;
 
-            // PLD: prompt_tokens = all tokens seen so far (system + user turns)
             // generated_tokens = tokens generated in this assistant turn
             std::vector<int32_t> prompt_tokens_for_pld = all_tokens;
             std::vector<int32_t> generated_tokens;
@@ -164,74 +176,9 @@ int run_chat(
                 all_tokens.push_back(next_token_id);
                 generated_tokens.push_back(next_token_id);
 
-                if (grammar && grammar->is_accepting_state()) {
-                    break;
-                }
-
-                // --- Speculative step: try to get bonus tokens ---
-                if (use_speculative) {
-                    int spec_pos = forward_pass->get_cache_pos(session_slot);
-
-                    // Normal decode for current token first
-                    std::vector<int32_t> current_token_vec = { next_token_id };
-                    int decode_pos = spec_pos;
-
-                    ggml_backend_sched_reset(scheduler);
-                    ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, session_slot);
-                    ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                    forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
-                    ggml_backend_sched_graph_compute(scheduler, gf_token);
-                    forward_pass->advance_cache(1, session_slot);
-
-                    // Now try speculative step
-                    int after_decode_pos = forward_pass->get_cache_pos(session_slot);
-                    auto result = spec->try_speculative_step(
-                        prompt_tokens_for_pld,
-                        generated_tokens,
-                        session_slot,
-                        after_decode_pos,
-                        bridge.make_verify(session_slot),
-                        bridge.make_rewind(session_slot),
-                        eos_token_id);
-
-                    if (result.attempted() && result.total_tokens() > 0) {
-                        // Deliver accepted draft tokens
-                        for (int32_t t : result.accepted_tokens) {
-                            std::string bonus_str = tokenizer->decode(t);
-                            log_token(t);
-                            print_token(bonus_str);
-                            assistant_response += bonus_str;
-                            all_tokens.push_back(t);
-                            generated_tokens.push_back(t);
-                            i++;
-
-                            if (t == eos_token_id || bonus_str == im_end_str || bonus_str == eos_str) {
-                                goto end_chat_generation;  // Break out of outer loop
-                            }
-                        }
-
-                        // Deliver bonus token (the correct token at mismatch or after full acceptance)
-                        if (result.has_bonus) {
-                            next_token_id = result.bonus_token;
-                            continue;  // Skip the normal decode below, we already have next token
-                        }
-
-                        // If no bonus (EOS was the mismatch), get next token normally
-                        if (!result.has_bonus) {
-                            // EOS was hit in draft verification
-                            goto end_chat_generation;
-                        }
-                    } else {
-                        // No draft found — get next token from the decode we already did
-                        std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
-                        last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
-                        next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
-                        if (grammar) {
-                            grammar->accept_token(next_token_id, vocab);
-                        }
-                    }
-                    continue;
-                }
+                // if (grammar && grammar->is_accepting_state()) {
+                //     break;
+                // }
 
                 // --- Normal (non-speculative) decode path ---
                 std::vector<int32_t> current_token_vec = { next_token_id };
@@ -247,20 +194,18 @@ int run_chat(
                 std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
                 last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
                 
-                next_token_id = sampler->sample(last_token_logits, all_tokens, vocab);
+                next_token_id = sampler->sample(last_token_logits, all_tokens, decoded_vocab);
+
                 if (grammar) {
-                    grammar->accept_token(next_token_id, vocab);
+                    grammar->accept_token(next_token_id, decoded_vocab);
                 }
+
+                if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
+                    break;
+                }
+
             }
             end_chat_generation:
-
-            // Print PLD stats for this turn
-            if (use_speculative && args.verbose) {
-                auto& s = spec->stats();
-                std::cout << "\n[PLD] drafts=" << s.drafts_found
-                          << " accept_rate=" << (int)(s.acceptance_rate() * 100) << "%"
-                          << " tokens/step=" << s.tokens_per_step() << std::endl;
-            }
 
             // After generation ends, we must add the <|im_end|>\n tokens to the cache
             // so the next turn sees a properly terminated assistant message
@@ -278,21 +223,6 @@ int run_chat(
 
 
             chat_history.push_back({"assistant", assistant_response});
-        }
-
-        // Print final PLD stats
-        if (use_speculative) {
-            auto& s = spec->stats();
-            std::cout << "\n[PLD Final Stats]"
-                      << " drafts_attempted=" << s.drafts_attempted
-                      << " drafts_found=" << s.drafts_found
-                      << " tokens_drafted=" << s.tokens_drafted
-                      << " tokens_accepted=" << s.tokens_accepted
-                      << " bonus_tokens=" << s.bonus_tokens
-                      << " accept_rate=" << (int)(s.acceptance_rate() * 100) << "%"
-                      << " tokens_per_step=" << s.tokens_per_step()
-                      << std::endl;
-        }
-    
+        }    
     return 0;
 }

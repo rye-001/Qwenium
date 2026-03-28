@@ -19,10 +19,9 @@
 #include "../qwen3-core/forward-pass-factory.h"
 #include "../qwen3-core/tokenizer.h"
 #include "../sampling/sampling.h"
-#include "../sampling/grammar.h"
 #include "../sampling/speculative.h"
-#include "./pretokenized_literals.h"
 #include "../sampling/vocab_utils.h"
+#include "../sampling/grammar_vocab.h"
 
 // #include "./tensor_tracer.h"
 
@@ -195,7 +194,7 @@ int main(int argc, char** argv) {
     }
 
     // --- Grammar Setup ---
-    std::unique_ptr<qwen3::Grammar> grammar;
+    std::unique_ptr<qwen3::GrammarVocab> grammar;
     if (!args.grammar_file.empty()) {
         std::ifstream file(args.grammar_file);
         if (!file) {
@@ -203,12 +202,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string grammar_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        const auto& literals = get_pretokenized_literals(model.get_metadata().architecture);
 
-        grammar = qwen3::Grammar::parse_impl(grammar_str, literals);
+        grammar = qwen3::GrammarVocab::parse_impl(grammar_str);
         if (!grammar) {
-            std::cerr << "Error: Failed to parse grammar file."
-;            return 1;
+            std::cerr << "Error: Failed to parse grammar file." << std::endl;
+            return 1;
         }
         std::cout << "Successfully loaded and parsed grammar from: " << args.grammar_file << std::endl;
     }
