@@ -59,11 +59,13 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         std::vector<ChatMessage> chat_history;
 
         // System Prompt Prefill
-        std::string system_content = args.system_prompt;
-        if (system_content.empty()) {
+        std::string system_content;
+        std::string sys_prompt_file = args.system_prompt;
+        if (!sys_prompt_file.empty()) {
             // std::ifstream file("system_prompt.txt");
             // std::ifstream file("tests/system_prompt_order_mngmt.txt");
-            std::ifstream file("tests/system_prompt_account_mngmt.txt");
+            // std::ifstream file("tests/system_prompt_account_mngmt.txt");
+            std::ifstream file(sys_prompt_file);
             if (file) {
                 std::stringstream buffer;
                 buffer << file.rdbuf();
@@ -166,7 +168,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             for (int i = 0; i < args.max_tokens; ++i) {
                 std::string decoded_token = tokenizer->decode(next_token_id);
 
-                if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
+                if (next_token_id == eos_token_id) {
                     break;
                 }
 
@@ -200,7 +202,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     grammar->accept_token(next_token_id, decoded_vocab);
                 }
 
-                if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
+                if (next_token_id == eos_token_id) {
                     break;
                 }
 

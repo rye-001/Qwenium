@@ -36,7 +36,7 @@ public:
 
 protected:
     void apply_vocab_pruning(std::vector<float>& logits);
-    void apply_grammar_constraints(std::vector<float>& logits,
+    void apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                    const std::vector<std::string>& token_strs);
 
     GrammarVocab* grammar_     = nullptr;

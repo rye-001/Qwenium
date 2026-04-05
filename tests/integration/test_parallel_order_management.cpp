@@ -687,7 +687,8 @@ int main(int argc, char* argv[]) {
     std::cout << "PARALLEL Order Management DSL Tests" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    const std::string MODEL_QWEN = get_model_path();// "./qwen2.5-coder-14b-instruct-q4_0.gguf";
+    // const std::string MODEL_QWEN = get_model_path();
+    const std::string MODEL_QWEN = get_model_path() != "" ? get_model_path() : "./qwen2.5-coder-14b-instruct-q4_0.gguf";
 
     auto test_cases = get_test_cases();
     uint32_t batch_size = test_cases.size();

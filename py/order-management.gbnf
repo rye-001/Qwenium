@@ -1,0 +1,119 @@
+# order-management.gbnf
+# Grammar for Order Management System JavaScript code generator.
+# Matches exactly the syntax described in the system prompt ALLOWED SYNTAX section.
+#
+# Design notes:
+#   - sp  = [ \t\n\r]* handles ALL inter-statement whitespace (no mandatory nl)
+#   - ws  = [ \t]+    required non-newline whitespace (keyword separators)
+#   - No trailing nl/nl? on any statement — sp at the start of the next
+#     statement absorbs newlines, indentation, and blank lines cleanly.
+#   - promise_all_expr is a const_rhs alternative so
+#     "const x = await Promise.all(...)" is covered alongside the bare
+#     "await Promise.all(...);" form via await_stmt.
+#   - identifier covers null/undefined/true/false via [a-zA-Z_][a-zA-Z0-9_]*
+#   - string  [^"]* allows any dynamic content the model generates
+#   - number  [0-9]+ covers integers and decimals
+
+root ::= statement+
+
+statement ::= sp (const_decl | for_loop | if_stmt | await_stmt)
+
+# const x = await fn({...});
+# const x = await Promise.all(...);
+# const x = expr;
+const_decl ::= "const" ws identifier sp "=" sp const_rhs ";"
+
+const_rhs ::= promise_all_expr
+            | await_expr
+            | array_method_expr
+            | member_expr
+            | string
+            | number
+
+# for (const x of expr) { ... }
+for_loop ::= "for" sp "(" "const" ws identifier ws "of" ws member_expr ")" sp block
+
+# if (condition) { }
+# if (condition) { } else { }
+# if (condition) { } else if (...) { } else { }
+if_stmt ::= "if" sp "(" sp condition sp ")" sp block (sp "else" sp (if_stmt | block))?
+
+# await fn({...});
+await_stmt ::= "await" ws fn_call ";"
+
+# { statement* }
+block ::= "{" statement* sp "}"
+
+# await Promise.all(expr.map(async (x) => { ... }))
+promise_all_expr ::= "await" ws "Promise.all" sp "(" sp member_expr "." "map" sp "(" sp "async" sp "(" sp identifier sp ")" sp "=>" sp block sp ")" sp ")"
+
+# await fn({...})  — expression form, used in const_rhs
+await_expr ::= "await" ws fn_call
+
+# expr.filter/map/find(x => ...)
+array_method_expr ::= member_expr "." method_name sp "(" sp lambda sp ")"
+method_name       ::= "filter" | "find" | "map"
+lambda            ::= identifier sp "=>" sp (condition | value)
+
+# fn_name({ param: value, ... })
+fn_call ::= fn_name sp "(" sp object sp ")"
+
+fn_name ::= "getCustomers"
+          | "getOrders"
+          | "getLineItems"
+          | "getProduct"
+          | "getProducts"
+          | "getShipment"
+          | "getPayments"
+          | "updateOrderStatus"
+          | "cancelOrder"
+          | "addOrderNote"
+          | "flagOrder"
+          | "createShipment"
+          | "updateShipment"
+          | "processPayment"
+          | "refundPayment"
+          | "updateStock"
+          | "assignToRep"
+
+# { key: value, ... }  or  {}
+object     ::= "{" sp param_list? sp "}"
+param_list ::= param (sp "," sp param)*
+param      ::= identifier sp ":" sp value
+
+# Values in params and conditions
+value ::= string | number | member_expr
+
+# identifier.field.field  (also covers bare identifier)
+member_expr ::= identifier ("." identifier)*
+
+# Conditions: one or more terms chained with && or ||
+condition ::= cond_term (sp logic_op sp cond_term)*
+
+# Single condition term:
+#   !shipment
+#   payments.length > 0
+#   order.status === "confirmed"
+#   shipment    (truthy check)
+cond_term ::= "!" member_expr
+            | value sp comparator sp value
+            | value
+
+comparator ::= "===" | "!==" | ">=" | "<=" | ">" | "<"
+
+logic_op ::= "&&" | "||"
+
+# Dynamic string content — model generates whatever is needed
+string ::= "\"" [^"]* "\""
+
+# Integer or decimal number
+number ::= [0-9]+ ("." [0-9]+)?
+
+# Dynamic identifier — variable names chosen by the model
+identifier ::= [a-zA-Z_] [a-zA-Z0-9_]*
+
+# Required whitespace (space/tab, no newlines — for keyword separation)
+ws ::= [ \t]+
+
+# Optional whitespace including newlines (indentation, blank lines)
+sp ::= [ \t\n\r]*

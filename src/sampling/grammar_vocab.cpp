@@ -66,8 +66,6 @@ struct GrammarVocab::Impl {
                                      std::vector<const Elem*> conts,
                                      std::vector<GrammarState>& out);
 
-    // ---- Option B: character-level token consumption ----
-    //
     // consume_token: try to consume token_str[offset:] starting from (pos, char_idx).
     //   On success, appends resulting GrammarState(s) to `result`.
     //   On mismatch, appends nothing.
@@ -192,7 +190,7 @@ void GrammarVocab::Impl::explore_alternatives(
 }
 
 // ============================================================================
-// Option B: token consumption
+//  token consumption
 // ============================================================================
 
 void GrammarVocab::Impl::advance_after_terminal(
@@ -431,15 +429,33 @@ private:
         return {{Elem::LITERAL, (uint32_t)(literals_.size()-1)}};
     }
 
+    // Read one char from a char-class body, handling backslash escapes
+    // (\n \r \t \\ and pass-through for anything else).
+    char read_cc_char() {
+        char c = *pos_++;
+        if (c != '\\') return c;
+        if (pos_ >= end_) throw std::runtime_error("Unterminated escape in char class");
+        char e = *pos_++;
+        switch (e) {
+            case 'n':  return '\n';
+            case 'r':  return '\r';
+            case 't':  return '\t';
+            case '\\': return '\\';
+            case ']':  return ']';
+            default:   return e;
+        }
+    }
+
     Rule parse_char_class() {
         pos_++; // skip [
         bool neg = (pos_ < end_ && *pos_ == '^') ? (pos_++, true) : false;
         std::set<char> chars;
         while (pos_ < end_ && *pos_ != ']') {
-            char c = *pos_++;
+            char c = read_cc_char();
+            // Peek for a range: c-e (but not c-] which ends the class)
             if (pos_ + 1 < end_ && *pos_ == '-' && *(pos_+1) != ']') {
-                pos_++;
-                char e = *pos_++;
+                pos_++; // skip '-'
+                char e = read_cc_char();
                 for (char ch = c; ch <= e; ch++) chars.insert(ch);
             } else { chars.insert(c); }
         }
@@ -567,4 +583,26 @@ void GrammarVocab::accept_token(int32_t token_id, const std::vector<std::string>
     impl_->stacks = std::move(new_stacks);
 }
 
+void GrammarVocab::dump_expected() const {
+    if (!impl_) return;
+    std::cerr << "  Grammar active paths: " << impl_->stacks.size() << "\n";
+    for (size_t i = 0; i < impl_->stacks.size(); ++i) {
+        const auto& state = impl_->stacks[i];
+        if (!state.pos) continue;
+        if (state.pos->type == Elem::LITERAL) {
+            const std::string& lit = impl_->literal_values[state.pos->value];
+            std::cerr << "    [" << i << "] LITERAL: "" << lit << "" (at char_idx " << state.char_idx;
+            if (state.char_idx < lit.size()) {
+                std::cerr << ", expecting '" << lit[state.char_idx] << "')";
+            } else {
+                std::cerr << ", complete)";
+            }
+            std::cerr << "\n";
+        } else if (state.pos->type == Elem::CHAR_CLASS) {
+            std::cerr << "    [" << i << "] CHAR_CLASS\n";
+        } else if (state.pos->type == Elem::END) {
+            std::cerr << "    [" << i << "] END (accepting state)\n";
+        }
+    }
+}
 } // namespace qwen3

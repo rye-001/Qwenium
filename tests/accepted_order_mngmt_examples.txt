@@ -1,0 +1,207 @@
+# Accepted JavaScript examples for order-management.gbnf
+# 18 examples, all verified parseable by the grammar.
+# Format: User prompt → generated JS output
+
+================================================================================
+[01] sysprompt_01_simple_query
+User: Get all gold tier customers
+================================================================================
+const customers = await getCustomers({ tier: "gold" });
+
+================================================================================
+[02] sysprompt_02_nested_loops_cancel
+User: Cancel all pending orders for suspended customers
+================================================================================
+const customers = await getCustomers({ status: "suspended" });
+for (const customer of customers) {
+  const orders = await getOrders({ customerId: customer.id, status: "pending" });
+  for (const order of orders) {
+    await cancelOrder({ orderId: order.id, reason: "Customer suspended" });
+  }
+}
+
+================================================================================
+[03] sysprompt_03_conditional_flag
+User: For each order over $1000, if payment is pending, flag it for review
+================================================================================
+const orders = await getOrders({ minTotal: 1000 });
+for (const order of orders) {
+  const payments = await getPayments({ orderId: order.id, status: "pending" });
+  if (payments.length > 0) {
+    await flagOrder({ orderId: order.id, reason: "High value with pending payment" });
+  }
+}
+
+================================================================================
+[04] tc_01_simple_product_query
+User: Get all products in the electronics category
+================================================================================
+const products = await getProducts({ category: "electronics" });
+
+================================================================================
+[05] tc_02_update_status_loop
+User: Update all orders with status 'shipped' to 'delivered'
+================================================================================
+const orders = await getOrders({ status: "shipped" });
+for (const order of orders) {
+  await updateOrderStatus({ orderId: order.id, status: "delivered" });
+}
+
+================================================================================
+[06] tc_03_platinum_note_nested_loop
+User: For each platinum customer, get their pending orders and add a note saying 'Priority customer'
+================================================================================
+const customers = await getCustomers({ tier: "platinum" });
+for (const customer of customers) {
+  const orders = await getOrders({ customerId: customer.id, status: "pending" });
+  for (const order of orders) {
+    await addOrderNote({ orderId: order.id, note: "Priority customer" });
+  }
+}
+
+================================================================================
+[07] tc_04_refund_and_cancel
+User: Find orders over $500 with failed payments. Refund the payment and cancel the order with reason 'Payment failed'
+================================================================================
+const orders = await getOrders({ minTotal: 500 });
+for (const order of orders) {
+  const payments = await getPayments({ orderId: order.id, status: "failed" });
+  if (payments.length > 0) {
+    await refundPayment({ paymentId: payments.id, reason: "Payment failed" });
+    await cancelOrder({ orderId: order.id, reason: "Payment failed" });
+  }
+}
+
+================================================================================
+[08] tc_05_stock_check_nested_condition
+User: For each order in 'confirmed' status, check if all products in its line items are in stock. If any product has stock < quantity ordered, flag the order with reason 'Insufficient stock'
+================================================================================
+const orders = await getOrders({ status: "confirmed" });
+for (const order of orders) {
+  const lineItems = await getLineItems({ orderId: order.id });
+  for (const item of lineItems) {
+    const product = await getProduct({ productId: item.productId });
+    if (product.stock < item.quantity) {
+      await flagOrder({ orderId: order.id, reason: "Insufficient stock" });
+    }
+  }
+}
+
+================================================================================
+[09] tc_06_eu_high_value_flag
+User: For customers in the EU region, get all completed orders. If total > $10000, flag all pending orders for that customer with reason 'High-value customer'
+================================================================================
+const customers = await getCustomers({ region: "EU" });
+for (const customer of customers) {
+  const orders = await getOrders({ customerId: customer.id, status: "completed" });
+  if (orders.length > 10000) {
+    const pendingOrders = await getOrders({ customerId: customer.id, status: "pending" });
+    for (const order of pendingOrders) {
+      await flagOrder({ orderId: order.id, reason: "High-value customer" });
+    }
+  }
+}
+
+================================================================================
+[10] tc_07_promise_all_parallel
+User: For the given order, update stock for all line items in parallel using Promise.all
+================================================================================
+const lineItems = await getLineItems({ orderId: orderId });
+const results = await Promise.all(lineItems.map(async (item) => {
+  const product = await getProduct({ productId: item.productId });
+  await updateStock({ productId: item.productId, quantity: item.quantity });
+}));
+
+================================================================================
+[11] tc_08_shipment_create_or_update
+User: For each confirmed order, get its shipment. If no shipment exists, create one with carrier 'default'. Then update order status to 'shipped'
+================================================================================
+const orders = await getOrders({ status: "confirmed" });
+for (const order of orders) {
+  const shipment = await getShipment({ orderId: order.id });
+  if (!shipment) {
+    await createShipment({ orderId: order.id, carrier: "default" });
+  }
+  await updateOrderStatus({ orderId: order.id, status: "shipped" });
+}
+
+================================================================================
+[12] tc_09_gold_eu_full_pipeline
+User: Find all gold tier customers in EU region with pending orders over $200. For each matching order, process payment with method 'express', then update order to confirmed, then create shipment with carrier 'premium'
+================================================================================
+const customers = await getCustomers({ tier: "gold", region: "EU" });
+for (const customer of customers) {
+  const orders = await getOrders({ customerId: customer.id, status: "pending", minTotal: 200 });
+  for (const order of orders) {
+    await processPayment({ orderId: order.id, amount: order.total, method: "express" });
+    await updateOrderStatus({ orderId: order.id, status: "confirmed" });
+    await createShipment({ orderId: order.id, carrier: "premium" });
+  }
+}
+
+================================================================================
+[13] edge_01_else_if_chain
+User: For each pending order, flag it if total > $1000, add a note if total > $500, otherwise confirm it
+================================================================================
+const orders = await getOrders({ status: "pending" });
+for (const order of orders) {
+  if (order.total > 1000) {
+    await flagOrder({ orderId: order.id, reason: "High value" });
+  } else if (order.total > 500) {
+    await addOrderNote({ orderId: order.id, note: "Medium value" });
+  } else {
+    await updateOrderStatus({ orderId: order.id, status: "confirmed" });
+  }
+}
+
+================================================================================
+[14] edge_02_array_filter_const_rhs
+User: Get all pending orders and keep only those with total over $500
+================================================================================
+const orders = await getOrders({ status: "pending" });
+const highValue = orders.filter(o => o.total > 500);
+
+================================================================================
+[15] edge_03_decimal_number
+User: For all books under $9.99, restock to 100 units
+================================================================================
+const products = await getProducts({ category: "books" });
+for (const product of products) {
+  if (product.price < 9.99) {
+    await updateStock({ productId: product.id, quantity: 100 });
+  }
+}
+
+================================================================================
+[16] edge_04_logical_and_condition
+User: Flag all pending orders that have both a total over $100 and more than 5 items
+================================================================================
+const orders = await getOrders({ status: "pending" });
+for (const order of orders) {
+  if (order.total > 100 && order.itemCount > 5) {
+    await flagOrder({ orderId: order.id, reason: "Large order" });
+  }
+}
+
+================================================================================
+[17] edge_05_truthy_condition
+User: For all shipped orders, if a shipment exists mark it as delivered
+================================================================================
+const orders = await getOrders({ status: "shipped" });
+for (const order of orders) {
+  const shipment = await getShipment({ orderId: order.id });
+  if (shipment) {
+    await updateShipment({ shipmentId: shipment.id, status: "delivered" });
+  }
+}
+
+================================================================================
+[18] edge_06_not_equal_comparator
+User: For each pending order, confirm it if its status is not 'cancelled'
+================================================================================
+const orders = await getOrders({ status: "pending" });
+for (const order of orders) {
+  if (order.status !== "cancelled") {
+    await updateOrderStatus({ orderId: order.id, status: "confirmed" });
+  }
+}

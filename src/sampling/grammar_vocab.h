@@ -28,6 +28,7 @@ public:
 
     void reset();
     bool is_accepting_state() const;
+    void dump_expected() const;
 
 private:
     struct Impl;

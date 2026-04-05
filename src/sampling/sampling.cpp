@@ -19,7 +19,7 @@ void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     }
 }
 
-void Sampler::apply_grammar_constraints(std::vector<float>& logits,
+void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                         const std::vector<std::string>& token_strs) {
     if (!grammar_) return;
 
@@ -27,7 +27,16 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits,
     std::vector<int32_t> valid_tokens = grammar_->get_valid_tokens(token_strs);
 
     if (valid_tokens.empty()) {
-        std::cerr << "[GrammarVocab] WARNING: no valid tokens — grammar stuck, forcing EOS" << std::endl;
+        std::cerr << "[GrammarVocab] ERROR: Grammar is stuck! No valid tokens found in vocabulary.\n";
+        std::cerr << "  Context (last 5 tokens):\n";
+        int start = std::max(0, (int)last_tokens.size() - 5);
+        for (size_t i = start; i < last_tokens.size(); ++i) {
+            std::cerr << "'" << token_strs[last_tokens[i]] << "' ";
+        }
+        std::cerr << "\n";
+        grammar_->dump_expected();
+        std::cerr << "  Action: Forcing EOS to prevent crash.\n" << std::endl;
+
         for (size_t i = 0; i < logits.size(); ++i)
             logits[i] = -std::numeric_limits<float>::infinity();
         // Find EOS by scanning vocab strings — no hardcoded IDs.
@@ -71,7 +80,7 @@ int GreedySampler::sample(std::vector<float>& logits,
     if (logits.empty()) throw std::runtime_error("Cannot sample from empty logits");
     apply_vocab_pruning(logits);
     if (grammar_ && !token_strs.empty())
-        apply_grammar_constraints(logits, token_strs);
+        apply_grammar_constraints(logits, last_tokens, token_strs);
     auto max_it = std::max_element(logits.begin(), logits.end());
     return static_cast<int>(std::distance(logits.begin(), max_it));
 }
@@ -111,7 +120,7 @@ int TemperatureSampler::sample(std::vector<float>& logits,
     apply_vocab_pruning(logits);
 
     if (grammar_ && !token_strs.empty())
-        apply_grammar_constraints(logits, token_strs);
+        apply_grammar_constraints(logits, last_tokens, token_strs);
 
     apply_repetition_penalty(logits, last_tokens);
 
