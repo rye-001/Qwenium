@@ -74,6 +74,19 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
 
 // ---- GreedySampler ----
 
+void GreedySampler::apply_repetition_penalty(std::vector<float>& logits,
+                                              const std::vector<int32_t>& last_tokens) {
+    if (repetition_penalty_ == 1.0f || last_tokens.empty()) return;
+    const size_t lookback = std::min(static_cast<size_t>(repetition_lookback_), last_tokens.size());
+    std::unordered_set<int32_t> recent(last_tokens.end() - lookback, last_tokens.end());
+    for (int32_t id : recent) {
+        if (id >= 0 && static_cast<size_t>(id) < logits.size()) {
+            logits[id] = logits[id] < 0 ? logits[id] * repetition_penalty_
+                                        : logits[id] / repetition_penalty_;
+        }
+    }
+}
+
 int GreedySampler::sample(std::vector<float>& logits,
                           const std::vector<int32_t>& last_tokens,
                           const std::vector<std::string>& token_strs) {
@@ -81,6 +94,7 @@ int GreedySampler::sample(std::vector<float>& logits,
     apply_vocab_pruning(logits);
     if (grammar_ && !token_strs.empty())
         apply_grammar_constraints(logits, last_tokens, token_strs);
+    apply_repetition_penalty(logits, last_tokens);
     auto max_it = std::max_element(logits.begin(), logits.end());
     return static_cast<int>(std::distance(logits.begin(), max_it));
 }

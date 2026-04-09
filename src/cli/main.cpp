@@ -113,6 +113,9 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--ctx-size") {
             if (i + 1 >= argc) return false;
             args.context_length = std::stoi(argv[++i]);
+        } else if (arg == "--kv-quant-bits") {
+            if (i + 1 >= argc) return false;
+            args.kv_quant_bits = std::stoi(argv[++i]);
         } else if (arg == "--speculative") {
             args.speculative = true;
         } else if (arg == "--pld-ngram") {

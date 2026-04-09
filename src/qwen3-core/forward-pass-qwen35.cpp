@@ -11,7 +11,7 @@
 
 Qwen35ForwardPass::Qwen35ForwardPass(
     const Qwen3Model& model, const Qwen3Metadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
     : ForwardPassBase(model, metadata)
 {
     ggml_backend_t cache_backend = model_.has_metal_backend()
@@ -58,6 +58,20 @@ Qwen35ForwardPass::Qwen35ForwardPass(
         conv_dim, meta_.ssm_conv_kernel,
         cache_backend
     );
+
+    // TurboQuant compressed backing store (Phase 1)
+    if (kv_quant_bits >= 2 && kv_quant_bits <= 4) {
+        uint32_t head_dim = meta_.attention_key_length;
+        tq_store_ = std::make_unique<CompressedKVStore>(
+            n_attn_layers,
+            max_batch_size,
+            context_len,
+            n_embd_k, n_embd_v,
+            head_dim, kv_quant_bits);
+        printf("TurboQuant KV compression: %d-bit, %.1fx theoretical compression\n",
+               kv_quant_bits,
+               static_cast<float>(n_embd_k * 4) / tq_store_->compressed_bytes_per_token_k());
+    }
 }
 
 // ============================================================

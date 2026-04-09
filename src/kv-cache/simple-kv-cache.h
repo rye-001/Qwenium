@@ -50,7 +50,8 @@ public:
 
     uint32_t get_n_ctx_max() const { return n_ctx_max; }
 
-        ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }
+    ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }
+    ggml_tensor* get_v_cache_tensor(int layer) { return v_cache[layer]; }
 
 
 private:

@@ -72,6 +72,41 @@ target_link_libraries(qwen3-parallel-order-mngmt-test PRIVATE
     ggml
 )
 
+# TurboQuant unit tests (GTest, no model needed)
+add_executable(qwen3-turboquant-tests
+    unit/test_turboquant.cpp
+)
+
+target_link_libraries(qwen3-turboquant-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+)
+
+gtest_discover_tests(qwen3-turboquant-tests)
+
+# Compressed KV store unit tests (GTest, no model needed)
+add_executable(qwen3-compressed-kv-tests
+    unit/test_compressed_kv_store.cpp
+)
+
+target_link_libraries(qwen3-compressed-kv-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+)
+
+gtest_discover_tests(qwen3-compressed-kv-tests)
+
+# Parallel grammar test (Non-GTest)
+add_executable(qwen3-parallel-grammar-test
+    integration/test_parallel_grammar.cpp
+)
+
+target_link_libraries(qwen3-parallel-grammar-test PRIVATE
+    qwen3-core
+    sampling
+    ggml
+)
+
 # HTTP Server Integration Test (GTest)
 add_executable(qwen3-http-server-test
     integration/test_http_server.cpp

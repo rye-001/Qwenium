@@ -46,9 +46,20 @@ protected:
 
 class GreedySampler : public Sampler {
 public:
+    explicit GreedySampler(float repetition_penalty = 1.2f,
+                           int   repetition_lookback = 32)
+        : repetition_penalty_(repetition_penalty),
+          repetition_lookback_(repetition_lookback) {}
+
     int sample(std::vector<float>& logits,
                const std::vector<int32_t>& last_tokens,
                const std::vector<std::string>& token_strs = {}) override;
+
+private:
+    void apply_repetition_penalty(std::vector<float>& logits,
+                                  const std::vector<int32_t>& last_tokens);
+    float repetition_penalty_;
+    int   repetition_lookback_;
 };
 
 class TemperatureSampler : public Sampler {

@@ -54,7 +54,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         }
         
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
-        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 2);
+        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 2, args.kv_quant_bits);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 
@@ -83,12 +83,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
 
         // Prefill System Prompt into Slot 0
-        ggml_backend_sched_reset(scheduler);
-        ggml_cgraph* gf_system = forward_pass->build_prefill_graph(system_tokens, 0, 0); // Slot 0
-        ggml_backend_sched_alloc_graph(scheduler, gf_system);
-        forward_pass->set_inputs(gf_system, system_tokens, 0);
-        ggml_backend_sched_graph_compute(scheduler, gf_system);
-        forward_pass->advance_cache(system_tokens.size(), 0); // Slot 0
+        forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
 
         // Clone System Prefix to Slot 1 for the user session
         forward_pass->clone_slot(0, 1, system_tokens.size());
@@ -139,15 +134,9 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             int current_pos = forward_pass->get_cache_pos(session_slot);
 
             // Process only the new tokens
-            ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf = forward_pass->build_prefill_graph(new_tokens, current_pos, session_slot);
-            ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass->set_inputs(gf, new_tokens, current_pos);
-            ggml_backend_sched_graph_compute(scheduler, gf);
-            forward_pass->advance_cache(new_tokens.size(), session_slot);
+            std::vector<float> logits = forward_pass->run_prefill(new_tokens, current_pos, session_slot, scheduler);
             all_tokens.insert(all_tokens.end(), new_tokens.begin(), new_tokens.end());
 
-            std::vector<float> logits = forward_pass->get_output_logits(gf);
             size_t vocab_size = model.get_metadata().vocab_size;
             std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
             int next_token_id = sampler->sample(last_token_logits, all_tokens, decoded_vocab);
@@ -186,14 +175,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 std::vector<int32_t> current_token_vec = { next_token_id };
                 int decode_pos = forward_pass->get_cache_pos(session_slot);
 
-                ggml_backend_sched_reset(scheduler);
-                ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, session_slot);
-                ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
-                ggml_backend_sched_graph_compute(scheduler, gf_token);
-                forward_pass->advance_cache(1, session_slot);
-
-                std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
+                std::vector<float> token_logits = forward_pass->run_prefill(current_token_vec, decode_pos, session_slot, scheduler);
                 last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
                 
                 next_token_id = sampler->sample(last_token_logits, all_tokens, decoded_vocab);
@@ -215,12 +197,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             std::vector<int32_t> im_end_tokens = tokenizer->encode(im_end_suffix);
             int end_pos = forward_pass->get_cache_pos(session_slot);
             
-            ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf_end = forward_pass->build_prefill_graph(im_end_tokens, end_pos, session_slot);
-            ggml_backend_sched_alloc_graph(scheduler, gf_end);
-            forward_pass->set_inputs(gf_end, im_end_tokens, end_pos);
-            ggml_backend_sched_graph_compute(scheduler, gf_end);
-            forward_pass->advance_cache(im_end_tokens.size(), session_slot);
+            forward_pass->run_prefill(im_end_tokens, end_pos, session_slot, scheduler);
             all_tokens.insert(all_tokens.end(), im_end_tokens.begin(), im_end_tokens.end());
 
 

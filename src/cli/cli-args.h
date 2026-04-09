@@ -22,6 +22,8 @@ struct CliArgs {
     std::string token_log_path;
     std::string grammar_file;
     std::string system_prompt;
+    // TurboQuant KV cache compression (0 = disabled, 2/3/4 = bit width)
+    int kv_quant_bits = 0;
     // PLD options
     bool speculative = false;
     int pld_ngram_size = 3;

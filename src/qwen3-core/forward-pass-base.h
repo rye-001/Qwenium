@@ -6,6 +6,7 @@
 
 #include "qwen3-model.h"
 #include "../kv-cache/simple-kv-cache.h"
+#include "ggml-backend.h"
 
 struct ggml_context;
 struct ggml_tensor;
@@ -40,6 +41,25 @@ public:
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
+
+    // ── TurboQuant per-layer compute ────────────────────────────
+    // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
+    // When TQ is enabled, processes one layer at a time with compressed KV.
+    // When TQ is disabled, delegates to the existing monolithic path.
+    // Returns output logits.
+    virtual std::vector<float> run_prefill(
+        const std::vector<int32_t>& tokens,
+        int pos, uint32_t slot_idx,
+        ggml_backend_sched_t scheduler) {
+        // Default: monolithic path (subclasses override for TQ)
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+        advance_cache(tokens.size(), slot_idx);
+        return get_output_logits(gf);
+    }
 
     virtual void set_batched_inputs(ggml_cgraph* gf,
         const std::vector<int32_t>& tokens,

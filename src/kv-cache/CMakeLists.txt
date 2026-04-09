@@ -2,6 +2,8 @@
 add_library(qwen3-kv-cache STATIC
     simple-kv-cache.cpp
     ssm-state-cache.cpp
+    turboquant.cpp
+    compressed_kv_store.cpp
 )
 
 target_include_directories(qwen3-kv-cache PUBLIC

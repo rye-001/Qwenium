@@ -3,6 +3,7 @@
 #include "forward-pass-base.h"
 #include "../kv-cache/simple-kv-cache.h"
 #include "../kv-cache/ssm-state-cache.h"
+#include "../kv-cache/compressed_kv_store.h"
 
 /**
  * Forward pass for Qwen3.5 hybrid SSM/attention architecture.
@@ -22,7 +23,8 @@
 class Qwen35ForwardPass : public ForwardPassBase {
 public:
     Qwen35ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1);
+                      uint32_t context_len, uint32_t max_batch_size = 1,
+                      int kv_quant_bits = 0);
     ~Qwen35ForwardPass() override = default;
 
     // --- Graph building ---
@@ -55,6 +57,7 @@ public:
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);
         if (ssm_cache_) ssm_cache_->clone_slot(src_slot, dst_slot);
+        if (tq_store_) tq_store_->clone_slot(src_slot, dst_slot, n_tokens);
     }
 
 
@@ -71,6 +74,7 @@ public:
     // --- Accessors ---
     simple_kv_cache* get_kv_cache_ptr() { return kv_cache_.get(); }
     ssm_state_cache* get_ssm_cache_ptr() { return ssm_cache_.get(); }
+    CompressedKVStore* get_tq_store() { return tq_store_.get(); }
 
     // Physical layer → cache index mappings
     int32_t get_kv_layer_index(uint32_t physical_layer) const {
@@ -83,6 +87,7 @@ public:
 private:
     std::unique_ptr<simple_kv_cache> kv_cache_;    // 6 layers (attention only)
     std::unique_ptr<ssm_state_cache> ssm_cache_;   // 18 layers (SSM only)
+    std::unique_ptr<CompressedKVStore> tq_store_;   // TurboQuant (optional)
 
     // Physical layer index → cache layer index (-1 = not this cache type)
     std::vector<int32_t> kv_layer_map_;    // [24] → 0..5 or -1
