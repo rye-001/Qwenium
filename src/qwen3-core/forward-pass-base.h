@@ -70,11 +70,23 @@ public:
     std::vector<float> get_output_logits(ggml_cgraph* gf);
     std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
 
+    // ── SnapKV configuration ─────────────────────────────────────
+    void set_snapkv_config(uint32_t budget, uint32_t window) {
+        snapkv_budget_ = budget;
+        snapkv_window_ = window;
+    }
+    uint32_t snapkv_budget() const { return snapkv_budget_; }
+    uint32_t snapkv_window() const { return snapkv_window_; }
+
 protected:
     const Qwen3Metadata& meta_;
     const Qwen3Model& model_;
     struct ggml_context* ctx_;
     std::vector<uint8_t> ctx_buffer_;
+
+    // SnapKV: post-prefill KV eviction (0 = disabled)
+    uint32_t snapkv_budget_ = 0;
+    uint32_t snapkv_window_ = 32;
 
     // --- Context management ---
     // Reset the ggml context (call at the start of every graph build)

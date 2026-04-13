@@ -8,4 +8,6 @@ std::unique_ptr<ForwardPassBase> create_forward_pass(
     const Qwen3Metadata* metadata,
     uint32_t context_len,
     uint32_t max_batch_size = 1,
-    int kv_quant_bits = 0);
+    int kv_quant_bits = 0,
+    uint32_t snapkv_budget = 0,
+    uint32_t snapkv_window = 32);

@@ -97,6 +97,30 @@ target_link_libraries(qwen3-compressed-kv-tests PRIVATE
 
 gtest_discover_tests(qwen3-compressed-kv-tests)
 
+# SnapKV CLI config tests (GTest, no model needed)
+add_executable(qwen3-snapkv-cli-tests
+    unit/test_snapkv_cli.cpp
+)
+
+target_link_libraries(qwen3-snapkv-cli-tests PRIVATE
+    GTest::gtest_main
+)
+
+gtest_discover_tests(qwen3-snapkv-cli-tests)
+
+# SnapKV eviction + compaction unit tests (GTest, no model needed)
+add_executable(qwen3-snapkv-eviction-tests
+    unit/test_snapkv_eviction.cpp
+)
+
+target_link_libraries(qwen3-snapkv-eviction-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+    ggml
+)
+
+gtest_discover_tests(qwen3-snapkv-eviction-tests)
+
 # Parallel grammar test (Non-GTest)
 add_executable(qwen3-parallel-grammar-test
     integration/test_parallel_grammar.cpp
