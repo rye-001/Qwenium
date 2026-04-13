@@ -1,5 +1,6 @@
 #include "forward-pass.h"
 #include "../kv-cache/turboquant.h"
+#include "../kv-cache/snapkv-eviction.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -1000,11 +1001,39 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
     int pos, uint32_t slot_idx,
     ggml_backend_sched_t scheduler)
 {
-    // If TQ not enabled, use the default monolithic path
+    const bool do_snapkv = snapkv_budget_ > 0 && tokens.size() > snapkv_window_;
+
+    // ── Non-TQ path (monolithic graph) ──────────────────────────────────
     if (!tq_store_) {
-        return ForwardPassBase::run_prefill(tokens, pos, slot_idx, scheduler);
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+
+        // Mark kq_soft at last layer as output so scheduler keeps it
+        const uint32_t scoring_layer = meta_.block_count - 1;
+        if (do_snapkv) {
+            char name[32];
+            snprintf(name, sizeof(name), "kq_soft.%d", scoring_layer);
+            ggml_tensor* kq = ggml_graph_get_tensor(gf, name);
+            if (kq) ggml_set_output(kq);
+        }
+
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+
+        advance_cache(tokens.size(), slot_idx);
+        auto logits = get_output_logits(gf);
+
+        if (do_snapkv) {
+            apply_snapkv_from_graph(gf, scoring_layer, tokens.size(),
+                meta_.block_count, snapkv_budget_, snapkv_window_,
+                slot_idx, kv_cache_.get(), nullptr, nullptr);
+        }
+
+        return logits;
     }
 
+    // ── TQ path ─────────────────────────────────────────────────────────
     const uint32_t n_layers = meta_.block_count;
     const uint32_t n_tokens = tokens.size();
     const int hidden_dim = meta_.embedding_length;
@@ -1044,6 +1073,7 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
     // ── Batched layer compute ────────────────────────────────────────────
     // TQ_LAYER_BATCH layers share one graph_compute call → cuts scheduler
     // overhead and hidden-state CPU↔Metal round-trips by TQ_LAYER_BATCH×.
+    bool tq_advanced = false;
     for (uint32_t il0 = 0; il0 < n_layers; il0 += TQ_LAYER_BATCH) {
         const uint32_t il1 = std::min(il0 + TQ_LAYER_BATCH, n_layers);
 
@@ -1053,6 +1083,16 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
 
         // 2. Build fused graph for [il0, il1)
         ggml_cgraph* gf = _build_layer_batch_graph(il0, il1, tokens, pos, slot_idx, n_tokens);
+
+        // SnapKV: if this batch contains the scoring layer, mark kq_soft as output
+        const uint32_t scoring_layer = n_layers - 1;
+        const bool batch_has_scoring = do_snapkv && (scoring_layer >= il0 && scoring_layer < il1);
+        if (batch_has_scoring) {
+            char sname[32];
+            snprintf(sname, sizeof(sname), "kq_soft.%d", scoring_layer);
+            ggml_tensor* kq = ggml_graph_get_tensor(gf, sname);
+            if (kq) ggml_set_output(kq);
+        }
 
         // 3. Allocate and set inputs
         ggml_backend_sched_reset(scheduler);
@@ -1092,7 +1132,23 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         // 6. Compress KV for each layer from its persistent scratch slot
         for (uint32_t il = il0; il < il1; ++il)
             _tq_compress_new(il, slot_idx, tq_store_->get_pos(slot_idx), n_tokens, il);
+
+        // 7. SnapKV: evict from compressed store using this batch's kq_soft
+        if (batch_has_scoring) {
+            tq_store_->advance(slot_idx, n_tokens);
+
+            apply_snapkv_from_graph(gf, scoring_layer, n_tokens,
+                n_layers, snapkv_budget_, snapkv_window_,
+                slot_idx, nullptr, tq_store_.get(),
+                [this](uint32_t s) { _tq_invalidate_watermarks(s); });
+
+            tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
+            tq_advanced = true;
+        }
     }
+
+    if (!tq_advanced)
+        tq_store_->advance(slot_idx, n_tokens);
 
     // ── Output head ──────────────────────────────────────────────────────
     // Build a minimal graph for final norm + LM head
@@ -1113,9 +1169,6 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         hidden.data(), 0,
         static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
     ggml_backend_sched_graph_compute(scheduler, gf_out);
-
-    // Advance the TQ position tracker (sequence length source of truth)
-    tq_store_->advance(slot_idx, n_tokens);
 
     return get_output_logits(gf_out);
 }

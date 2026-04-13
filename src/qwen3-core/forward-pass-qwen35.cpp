@@ -1,4 +1,5 @@
 #include "forward-pass-qwen35.h"
+#include "../kv-cache/snapkv-eviction.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -734,14 +735,55 @@ void Qwen35ForwardPass::_tq_compress_attn_layer(
     tq_scratch_valid_pos_[kv_idx][slot_idx] = pos + n_tokens;
 }
 
+// Find the last attention layer (for SnapKV scoring)
+static uint32_t _find_last_attn_layer(const Qwen3Metadata& meta) {
+    for (int32_t il = meta.block_count - 1; il >= 0; --il) {
+        if (meta.is_full_attention_layer(il)) return il;
+    }
+    return meta.block_count - 1;  // fallback
+}
+
 std::vector<float> Qwen35ForwardPass::run_prefill(
     const std::vector<int32_t>& tokens,
     int pos, uint32_t slot_idx,
     ggml_backend_sched_t scheduler)
 {
-    if (!tq_store_)
-        return ForwardPassBase::run_prefill(tokens, pos, slot_idx, scheduler);
+    const bool do_snapkv = snapkv_budget_ > 0 && tokens.size() > snapkv_window_;
 
+    // ── Non-TQ path (monolithic graph) ──────────────────────────────────
+    if (!tq_store_) {
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+
+        const uint32_t scoring_layer = _find_last_attn_layer(meta_);
+        if (do_snapkv) {
+            char name[32];
+            snprintf(name, sizeof(name), "kq_soft.%d", scoring_layer);
+            ggml_tensor* kq = ggml_graph_get_tensor(gf, name);
+            if (kq) ggml_set_output(kq);
+        }
+
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+
+        advance_cache(tokens.size(), slot_idx);
+        auto logits = get_output_logits(gf);
+
+        if (do_snapkv) {
+            // n_kv_layers for compaction (only 6 attention layers have KV)
+            uint32_t n_kv_layers = 0;
+            for (uint32_t il = 0; il < meta_.block_count; ++il)
+                if (meta_.is_full_attention_layer(il)) ++n_kv_layers;
+            apply_snapkv_from_graph(gf, scoring_layer, tokens.size(),
+                n_kv_layers, snapkv_budget_, snapkv_window_,
+                slot_idx, kv_cache_.get(), nullptr, nullptr);
+        }
+
+        return logits;
+    }
+
+    // ── TQ path ─────────────────────────────────────────────────────────
     const uint32_t n_layers  = meta_.block_count;
     const uint32_t n_tokens  = tokens.size();
     const int      hidden_dim = meta_.embedding_length;
@@ -775,6 +817,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
     // ── Batched layer compute ────────────────────────────────────────────
     // TQ_LAYER_BATCH layers share one graph_compute call.
     // Each attention layer uses its persistent scratch slot (kv_layer_map_[il]).
+    bool tq_advanced = false;
     for (uint32_t il0 = 0; il0 < n_layers; il0 += TQ_LAYER_BATCH) {
         const uint32_t il1 = std::min(il0 + TQ_LAYER_BATCH, n_layers);
 
@@ -788,6 +831,16 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 
         // 2. Build fused graph for [il0, il1)
         ggml_cgraph* gf = _build_qwen35_batch_graph(il0, il1, n_tokens, slot_idx);
+
+        // SnapKV: if this batch contains the scoring layer, mark kq_soft as output
+        const uint32_t scoring_layer = _find_last_attn_layer(meta_);
+        const bool batch_has_scoring = do_snapkv && (scoring_layer >= il0 && scoring_layer < il1);
+        if (batch_has_scoring) {
+            char sname[32];
+            snprintf(sname, sizeof(sname), "kq_soft.%d", scoring_layer);
+            ggml_tensor* kq = ggml_graph_get_tensor(gf, sname);
+            if (kq) ggml_set_output(kq);
+        }
 
         // 3. Allocate and set inputs
         ggml_backend_sched_reset(scheduler);
@@ -833,7 +886,27 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
                     tq_store_->get_pos(slot_idx), n_tokens, kv_idx);
             }
         }
+
+        // 7. SnapKV: evict from compressed store using this batch's kq_soft
+        if (batch_has_scoring) {
+            tq_store_->advance(slot_idx, n_tokens);
+
+            uint32_t n_kv_layers = 0;
+            for (uint32_t il = 0; il < meta_.block_count; ++il)
+                if (meta_.is_full_attention_layer(il)) ++n_kv_layers;
+
+            apply_snapkv_from_graph(gf, scoring_layer, n_tokens,
+                n_kv_layers, snapkv_budget_, snapkv_window_,
+                slot_idx, nullptr, tq_store_.get(),
+                [this](uint32_t s) { _tq_invalidate_watermarks(s); });
+
+            tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
+            tq_advanced = true;
+        }
     }
+
+    if (!tq_advanced)
+        tq_store_->advance(slot_idx, n_tokens);
 
     // ── Output head ──────────────────────────────────────────────────────
     reset_context();
@@ -850,7 +923,6 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
         static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
     ggml_backend_sched_graph_compute(scheduler, gf_out);
 
-    tq_store_->advance(slot_idx, n_tokens);
     return get_output_logits(gf_out);
 }
 

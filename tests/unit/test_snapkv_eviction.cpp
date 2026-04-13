@@ -396,3 +396,90 @@ TEST(SnapKVCompact, SimpleKVCacheCompactIdentity) {
         }
     }
 }
+
+// ============================================================================
+// 11. pool_attention_to_importance — basic pooling
+// ============================================================================
+
+TEST(SnapKVPool, BasicPooling) {
+    // 2 heads, 4 KV positions, 3 query tokens (observation window = 3)
+    // kq_soft shape: [n_kv=4, n_tokens=3, n_heads=2]
+    const uint32_t n_kv = 4, n_tokens = 3, n_heads = 2;
+    // Layout: data[h * n_tokens * n_kv + t * n_kv + j]
+    std::vector<float> attn(n_kv * n_tokens * n_heads, 0.0f);
+
+    // Head 0: all queries attend uniformly (0.25 each)
+    for (uint32_t t = 0; t < n_tokens; ++t)
+        for (uint32_t j = 0; j < n_kv; ++j)
+            attn[0 * n_tokens * n_kv + t * n_kv + j] = 0.25f;
+
+    // Head 1: query 0 attends only to pos 0, query 1 to pos 1, query 2 to pos 2
+    attn[1 * n_tokens * n_kv + 0 * n_kv + 0] = 1.0f;
+    attn[1 * n_tokens * n_kv + 1 * n_kv + 1] = 1.0f;
+    attn[1 * n_tokens * n_kv + 2 * n_kv + 2] = 1.0f;
+
+    auto importance = pool_attention_to_importance(
+        attn.data(), n_kv, n_tokens, n_heads, /*obs_window=*/3);
+
+    ASSERT_EQ(importance.size(), 2u);
+    ASSERT_EQ(importance[0].size(), 4u);
+    ASSERT_EQ(importance[1].size(), 4u);
+
+    // Head 0: each position gets 0.25 * 3 queries = 0.75
+    for (uint32_t j = 0; j < n_kv; ++j) {
+        EXPECT_NEAR(importance[0][j], 0.75f, 1e-5f);
+    }
+
+    // Head 1: positions 0,1,2 get 1.0 each, position 3 gets 0.0
+    EXPECT_NEAR(importance[1][0], 1.0f, 1e-5f);
+    EXPECT_NEAR(importance[1][1], 1.0f, 1e-5f);
+    EXPECT_NEAR(importance[1][2], 1.0f, 1e-5f);
+    EXPECT_NEAR(importance[1][3], 0.0f, 1e-5f);
+}
+
+// ============================================================================
+// 12. pool_attention_to_importance — obs_window < n_tokens
+// ============================================================================
+
+TEST(SnapKVPool, WindowSubset) {
+    // 1 head, 5 KV positions, 10 query tokens, obs_window = 3
+    // Only the last 3 queries should contribute
+    const uint32_t n_kv = 5, n_tokens = 10, n_heads = 1;
+    std::vector<float> attn(n_kv * n_tokens * n_heads, 0.0f);
+
+    // Queries 0-6 attend to pos 0 (should be ignored by window)
+    for (uint32_t t = 0; t < 7; ++t)
+        attn[t * n_kv + 0] = 1.0f;
+
+    // Queries 7-9 (observation window) attend to pos 4
+    for (uint32_t t = 7; t < 10; ++t)
+        attn[t * n_kv + 4] = 1.0f;
+
+    auto importance = pool_attention_to_importance(
+        attn.data(), n_kv, n_tokens, n_heads, /*obs_window=*/3);
+
+    ASSERT_EQ(importance.size(), 1u);
+    // Only window queries (7,8,9) counted. They all attend to pos 4.
+    EXPECT_NEAR(importance[0][4], 3.0f, 1e-5f);
+    EXPECT_NEAR(importance[0][0], 0.0f, 1e-5f);  // non-window queries ignored
+}
+
+// ============================================================================
+// 13. pool_attention_to_importance — obs_window >= n_tokens (use all)
+// ============================================================================
+
+TEST(SnapKVPool, WindowLargerThanTokens) {
+    const uint32_t n_kv = 3, n_tokens = 2, n_heads = 1;
+    std::vector<float> attn(n_kv * n_tokens * n_heads, 0.0f);
+
+    attn[0 * n_kv + 1] = 0.5f;  // query 0 → pos 1
+    attn[1 * n_kv + 2] = 0.3f;  // query 1 → pos 2
+
+    // obs_window=10 > n_tokens=2 → use all tokens
+    auto importance = pool_attention_to_importance(
+        attn.data(), n_kv, n_tokens, n_heads, /*obs_window=*/10);
+
+    EXPECT_NEAR(importance[0][0], 0.0f, 1e-5f);
+    EXPECT_NEAR(importance[0][1], 0.5f, 1e-5f);
+    EXPECT_NEAR(importance[0][2], 0.3f, 1e-5f);
+}
