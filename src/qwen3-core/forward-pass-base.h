@@ -78,6 +78,36 @@ public:
     uint32_t snapkv_budget() const { return snapkv_budget_; }
     uint32_t snapkv_window() const { return snapkv_window_; }
 
+    // ── SnapKV dual position tracking ──────────────────────────────
+    // After eviction, seq_pos tracks the logical sequence position (for RoPE)
+    // while the cache's physical position tracks the compacted length.
+    // When seq_pos > 0, get_cache_pos() should return seq_pos instead of
+    // the physical cache position.
+
+    // Called after SnapKV compaction to set the logical sequence position.
+    void snapkv_set_seq_pos(uint32_t slot_idx, uint32_t original_length) {
+        if (slot_idx >= snapkv_seq_pos_.size())
+            snapkv_seq_pos_.resize(slot_idx + 1, 0);
+        snapkv_seq_pos_[slot_idx] = original_length;
+    }
+
+    // Advance the logical sequence position (call alongside advance_cache).
+    void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens) {
+        if (slot_idx < snapkv_seq_pos_.size() && snapkv_seq_pos_[slot_idx] > 0)
+            snapkv_seq_pos_[slot_idx] += n_tokens;
+    }
+
+    // Reset seq_pos tracking for a slot (call on clear_slot).
+    void snapkv_clear_seq_pos(uint32_t slot_idx) {
+        if (slot_idx < snapkv_seq_pos_.size())
+            snapkv_seq_pos_[slot_idx] = 0;
+    }
+
+    // Get the logical sequence position (0 = SnapKV not active for this slot).
+    uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const {
+        return (slot_idx < snapkv_seq_pos_.size()) ? snapkv_seq_pos_[slot_idx] : 0;
+    }
+
 protected:
     const Qwen3Metadata& meta_;
     const Qwen3Model& model_;
@@ -87,6 +117,10 @@ protected:
     // SnapKV: post-prefill KV eviction (0 = disabled)
     uint32_t snapkv_budget_ = 0;
     uint32_t snapkv_window_ = 32;
+
+    // Per-slot logical sequence position after SnapKV compaction.
+    // 0 = SnapKV not active (use physical cache position).
+    std::vector<uint32_t> snapkv_seq_pos_;
 
     // --- Context management ---
     // Reset the ggml context (call at the start of every graph build)

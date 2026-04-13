@@ -121,6 +121,20 @@ target_link_libraries(qwen3-snapkv-eviction-tests PRIVATE
 
 gtest_discover_tests(qwen3-snapkv-eviction-tests)
 
+# SnapKV position tracking tests (GTest)
+add_executable(qwen3-snapkv-position-tests
+    unit/test_snapkv_position.cpp
+)
+
+target_link_libraries(qwen3-snapkv-position-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+    qwen3-core
+    ggml
+)
+
+gtest_discover_tests(qwen3-snapkv-position-tests)
+
 # Parallel grammar test (Non-GTest)
 add_executable(qwen3-parallel-grammar-test
     integration/test_parallel_grammar.cpp

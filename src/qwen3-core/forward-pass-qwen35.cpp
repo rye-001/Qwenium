@@ -775,9 +775,11 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
             uint32_t n_kv_layers = 0;
             for (uint32_t il = 0; il < meta_.block_count; ++il)
                 if (meta_.is_full_attention_layer(il)) ++n_kv_layers;
+            uint32_t original_seq_len = pos + tokens.size();
             apply_snapkv_from_graph(gf, scoring_layer, tokens.size(),
                 n_kv_layers, snapkv_budget_, snapkv_window_,
                 slot_idx, kv_cache_.get(), nullptr, nullptr);
+            snapkv_set_seq_pos(slot_idx, original_seq_len);
         }
 
         return logits;
@@ -890,6 +892,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
         // 7. SnapKV: evict from compressed store using this batch's kq_soft
         if (batch_has_scoring) {
             tq_store_->advance(slot_idx, n_tokens);
+            uint32_t original_seq_len = pos + n_tokens;
 
             uint32_t n_kv_layers = 0;
             for (uint32_t il = 0; il < meta_.block_count; ++il)
@@ -901,6 +904,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
                 [this](uint32_t s) { _tq_invalidate_watermarks(s); });
 
             tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
+            snapkv_set_seq_pos(slot_idx, original_seq_len);
             tq_advanced = true;
         }
     }

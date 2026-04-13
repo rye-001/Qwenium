@@ -1025,9 +1025,14 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         auto logits = get_output_logits(gf);
 
         if (do_snapkv) {
+            // Record the original sequence length BEFORE compaction
+            uint32_t original_seq_len = pos + tokens.size();
             apply_snapkv_from_graph(gf, scoring_layer, tokens.size(),
                 meta_.block_count, snapkv_budget_, snapkv_window_,
                 slot_idx, kv_cache_.get(), nullptr, nullptr);
+            // Set logical seq_pos so get_cache_pos() returns the correct
+            // RoPE position for subsequent decode tokens.
+            snapkv_set_seq_pos(slot_idx, original_seq_len);
         }
 
         return logits;
@@ -1136,6 +1141,7 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         // 7. SnapKV: evict from compressed store using this batch's kq_soft
         if (batch_has_scoring) {
             tq_store_->advance(slot_idx, n_tokens);
+            uint32_t original_seq_len = pos + n_tokens;
 
             apply_snapkv_from_graph(gf, scoring_layer, n_tokens,
                 n_layers, snapkv_budget_, snapkv_window_,
@@ -1143,6 +1149,7 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
                 [this](uint32_t s) { _tq_invalidate_watermarks(s); });
 
             tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
+            snapkv_set_seq_pos(slot_idx, original_seq_len);
             tq_advanced = true;
         }
     }
