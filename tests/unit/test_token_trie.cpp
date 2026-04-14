@@ -1,8 +1,9 @@
-// test_token_trie.cpp — Phase 1 unit tests for TokenTrie
-// TDD: these tests are written before the implementation.
+// test_token_trie.cpp — Unit tests for TokenTrie (Phase 1) and
+// grammar integration equivalence tests (Phase 2).
 
 #include <gtest/gtest.h>
 #include "../../src/sampling/token-trie.h"
+#include "../../src/sampling/grammar_vocab.h"
 
 #include <algorithm>
 #include <set>
@@ -320,4 +321,265 @@ TEST(TokenTrie, Equivalence_FirstCharMatchesBruteForce) {
         EXPECT_EQ(sorted(trie_result), sorted(brute))
             << "Mismatch for char " << c;
     }
+}
+
+// ===========================================================================
+// Phase 2: Grammar integration equivalence tests
+//
+// Verify that get_valid_tokens() with a trie attached produces identical
+// results to the brute-force path (no trie).
+// Uses the same grammar and vocab from test_grammar_vocab.cpp.
+// ===========================================================================
+
+// --- Reuse the grammar vocab from test_grammar_vocab.cpp ---
+enum TokId : int32_t {
+    T_CONST = 0, T_FOR, T_OF, T_IF, T_ELSE, T_AWAIT,
+    T_SP_CONST, T_SP_FOR, T_SP_OF, T_SP_IF, T_SP_ELSE, T_SP_AWAIT,
+    T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_SEMI, T_DOT, T_COMMA,
+    T_COLON, T_EQ, T_GT, T_LT, T_GTE, T_LTE, T_TRIPLE_EQ,
+    T_SPACE, T_NEWLINE,
+    T_QUOTE,
+    T_GETACCOUNTS, T_GETSUPPORTTICKETS, T_GETOPENORDERS,
+    T_REASSIGNACCOUNT, T_ADDACCOUNTNOTE,
+    T_SP_GETACCOUNTS,
+    T_GET, T_ACCOUNTS_S,
+    T_ACCOUNTID, T_TEAMID, T_PRIORITY, T_TIER, T_NOTE, T_SEVERITY,
+    T_ACCOUNTS, T_ACCOUNT, T_TICKET, T_TICKETS, T_ORDERS,
+    T_CRITICAL_TICKETS, T_ID, T_LENGTH,
+    T_GOLD, T_PLATINUM, T_STANDARD, T_HIGH, T_MEDIUM, T_LOW,
+    T_CRITICAL, T_ACTIVE, T_SUSPENDED, T_OPEN, T_IN_PROGRESS,
+    T_RESOLVED, T_CLOSED, T_PROCESSING, T_COMPLETED, T_CANCELLED,
+    T_0, T_1, T_2, T_3, T_4, T_5, T_6, T_7, T_8, T_9,
+    T_EOS,
+    VOCAB_SIZE
+};
+
+static std::vector<std::string> build_grammar_vocab() {
+    std::vector<std::string> v(VOCAB_SIZE);
+    v[T_CONST]="const"; v[T_FOR]="for"; v[T_OF]="of"; v[T_IF]="if";
+    v[T_ELSE]="else"; v[T_AWAIT]="await";
+    v[T_SP_CONST]=" const"; v[T_SP_FOR]=" for"; v[T_SP_OF]=" of";
+    v[T_SP_IF]=" if"; v[T_SP_ELSE]=" else"; v[T_SP_AWAIT]=" await";
+    v[T_LPAREN]="("; v[T_RPAREN]=")"; v[T_LBRACE]="{"; v[T_RBRACE]="}";
+    v[T_SEMI]=";"; v[T_DOT]="."; v[T_COMMA]=","; v[T_COLON]=":";
+    v[T_EQ]="="; v[T_GT]=">"; v[T_LT]="<"; v[T_GTE]=">=";
+    v[T_LTE]="<="; v[T_TRIPLE_EQ]="===";
+    v[T_SPACE]=" "; v[T_NEWLINE]="\n"; v[T_QUOTE]="\"";
+    v[T_GETACCOUNTS]="getAccounts"; v[T_GETSUPPORTTICKETS]="getSupportTickets";
+    v[T_GETOPENORDERS]="getOpenOrders"; v[T_REASSIGNACCOUNT]="reassignAccount";
+    v[T_ADDACCOUNTNOTE]="addAccountNote";
+    v[T_SP_GETACCOUNTS]=" getAccounts";
+    v[T_GET]="get"; v[T_ACCOUNTS_S]="Accounts";
+    v[T_ACCOUNTID]="accountId"; v[T_TEAMID]="teamId";
+    v[T_PRIORITY]="priority"; v[T_TIER]="tier";
+    v[T_NOTE]="note"; v[T_SEVERITY]="severity";
+    v[T_ACCOUNTS]="accounts"; v[T_ACCOUNT]="account";
+    v[T_TICKET]="ticket"; v[T_TICKETS]="tickets";
+    v[T_ORDERS]="orders"; v[T_CRITICAL_TICKETS]="critical_tickets";
+    v[T_ID]="id"; v[T_LENGTH]="length";
+    v[T_GOLD]="gold"; v[T_PLATINUM]="platinum"; v[T_STANDARD]="standard";
+    v[T_HIGH]="high"; v[T_MEDIUM]="medium"; v[T_LOW]="low";
+    v[T_CRITICAL]="critical"; v[T_ACTIVE]="active";
+    v[T_SUSPENDED]="suspended"; v[T_OPEN]="open";
+    v[T_IN_PROGRESS]="in_progress"; v[T_RESOLVED]="resolved";
+    v[T_CLOSED]="closed"; v[T_PROCESSING]="processing";
+    v[T_COMPLETED]="completed"; v[T_CANCELLED]="cancelled";
+    v[T_0]="0"; v[T_1]="1"; v[T_2]="2"; v[T_3]="3"; v[T_4]="4";
+    v[T_5]="5"; v[T_6]="6"; v[T_7]="7"; v[T_8]="8"; v[T_9]="9";
+    v[T_EOS]="<|endoftext|>";
+    return v;
+}
+
+static std::string load_test_gbnf() {
+    return R"GBNF(
+root ::= statement ("\n" statement)*
+
+statement ::= for_of | let_decl | if_else | parallel_block | await_call
+
+for_of ::= "for" " " "(" "const" " " identifier " " "of" " " identifier ")" " "? block
+
+let_decl ::= "const" " " identifier " "? "=" " "? expression " "? ";"
+
+if_else ::= "if" " "? "(" " "? condition " "? ")" " "? block (" "? "else" " "? block)?
+
+parallel_block ::= "await" " " "Promise.all" " "? "(" " "? "[" " "? await_call_list " "? "]" " "? ")" " "? ";"
+
+await_call ::= "await" " " function_call " "? ";"
+
+await_call_list ::= await_call_item (" "? "," " "? await_call_item)*
+await_call_item ::= "await" " " function_call
+
+block ::= "{" "\n" (statement "\n")* "}"
+
+expression ::= await_expr | count_expr | number | variable | string
+
+await_expr ::= "await" " " function_call
+
+count_expr ::= identifier "." "length"
+
+number ::= [0-9] ([0-9])*
+
+condition ::= expression " "? comparator " "? expression
+comparator ::= ">" | "<" | "===" | ">=" | "<="
+
+function_call ::= function_name " "? "(" object? ")"
+function_name ::= "getAccounts" | "getSupportTickets" | "getOpenOrders" | "reassignAccount" | "addAccountNote"
+
+object ::= "{" " "? (param (" "? "," " "? param)*)? " "? "}"
+param ::= param_key " "? ":" " "? param_value
+param_key ::= "accountId" | "teamId" | "priority" | "tier" | "note" | "severity"
+param_value ::= expression
+
+variable ::= identifier ("." identifier)*
+identifier ::= "accounts" | "account" | "ticket" | "tickets" | "orders" | "critical_tickets" | "id" | "severity" | "length"
+
+string ::= "\"" string_value "\""
+string_value ::= "gold" | "platinum" | "standard" | "high" | "medium" | "low" | "critical" | "active" | "suspended" | "open" | "in_progress" | "resolved" | "closed" | "processing" | "completed" | "cancelled"
+)GBNF";
+}
+
+// Helper: compare get_valid_tokens with and without trie at a given grammar state.
+// Feeds `prefix_tokens` first, then checks equivalence at the current position.
+static void assert_equivalence_at(const std::string& gbnf,
+                                   const std::vector<std::string>& vocab,
+                                   const TokenTrie& trie,
+                                   const std::vector<int32_t>& prefix_tokens,
+                                   const std::string& description) {
+    // Brute-force: no trie
+    auto g_brute = qwen3::GrammarVocab::parse_impl(gbnf);
+    ASSERT_NE(g_brute, nullptr);
+    for (int32_t t : prefix_tokens) g_brute->accept_token(t, vocab);
+    auto brute_result = sorted(g_brute->get_valid_tokens(vocab));
+
+    // Trie-accelerated
+    auto g_trie = qwen3::GrammarVocab::parse_impl(gbnf);
+    ASSERT_NE(g_trie, nullptr);
+    g_trie->set_token_trie(&trie);
+    for (int32_t t : prefix_tokens) g_trie->accept_token(t, vocab);
+    auto trie_result = sorted(g_trie->get_valid_tokens(vocab));
+
+    EXPECT_EQ(trie_result, brute_result) << "Equivalence failure: " << description;
+}
+
+// --- Equivalence tests ---
+
+TEST(TokenTrieGrammar, Equivalence_InitialState) {
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie, {}, "initial state");
+}
+
+TEST(TokenTrieGrammar, Equivalence_AfterConst) {
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST},
+        "after 'const'");
+}
+
+TEST(TokenTrieGrammar, Equivalence_MidLiteral_AfterGet) {
+    // After "get" — grammar is mid-literal in "getAccounts" etc.
+    // This is the critical partial-consumption case.
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT, T_SPACE, T_GET},
+        "mid-literal after 'get'");
+}
+
+TEST(TokenTrieGrammar, Equivalence_AtSpaceBeforeFuncName) {
+    // At the " " literal before function_name — space-prefixed tokens test
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT},
+        "at ' ' before function_name");
+}
+
+TEST(TokenTrieGrammar, Equivalence_AtComparator) {
+    // After "orders.length" — at comparator position (mix of LITERAL states)
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH},
+        "at comparator position");
+}
+
+TEST(TokenTrieGrammar, Equivalence_AtDigitPosition) {
+    // After ">" — at number/CHAR_CLASS position
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT},
+        "at digit (CHAR_CLASS) position");
+}
+
+TEST(TokenTrieGrammar, Equivalence_AfterDigit) {
+    // After "5" — digits or ")" valid
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT, T_5},
+        "after digit '5'");
+}
+
+TEST(TokenTrieGrammar, Equivalence_MultiStatementBoundary) {
+    // After first full statement + newline — at second statement start
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_RPAREN, T_SEMI,
+         T_NEWLINE},
+        "at second statement start");
+}
+
+TEST(TokenTrieGrammar, Equivalence_InsideObject) {
+    // Inside object parameter — after "{ tier:"
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_LBRACE, T_SPACE,
+         T_TIER, T_COLON},
+        "inside object after 'tier:'");
+}
+
+TEST(TokenTrieGrammar, Equivalence_FullSequenceThenCheck) {
+    // Drive through a full complex sequence, check at the end
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    // Full platinum example up to the for loop body start
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_LBRACE, T_SPACE,
+         T_TIER, T_COLON, T_SPACE, T_QUOTE, T_PLATINUM, T_QUOTE,
+         T_SPACE, T_RBRACE, T_RPAREN, T_SEMI,
+         T_NEWLINE,
+         T_FOR, T_SPACE, T_LPAREN, T_CONST, T_SPACE, T_ACCOUNT,
+         T_SPACE, T_OF, T_SPACE, T_ACCOUNTS, T_RPAREN, T_SPACE,
+         T_LBRACE, T_NEWLINE},
+        "after for loop header, inside block body");
 }

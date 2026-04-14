@@ -11,6 +11,7 @@
 // complete at the same recursion depth. Direct self-recursion is unaffected.
 
 #include "grammar_vocab.h"
+#include "token-trie.h"
 
 #include <algorithm>
 #include <cctype>
@@ -494,6 +495,8 @@ private:
 GrammarVocab::GrammarVocab()  : impl_(std::make_unique<Impl>()) {}
 GrammarVocab::~GrammarVocab() = default;
 
+void GrammarVocab::set_token_trie(const TokenTrie* trie) { trie_ = trie; }
+
 std::unique_ptr<GrammarVocab> GrammarVocab::parse_impl(const std::string& gbnf_str) {
     if (gbnf_str.empty()) return nullptr;
 
@@ -536,18 +539,35 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
         if (state.pos->type == Elem::LITERAL) {
             const std::string& lit = impl_->literal_values[state.pos->value];
             if (state.char_idx >= lit.size()) continue;
-            const char expected_first = lit[state.char_idx];
 
-            for (size_t i = 0; i < vocab.size(); ++i) {
-                if (vocab[i].empty()) continue;
-                if (vocab[i][0] != expected_first) continue; // O(1) pre-filter
+            if (trie_) {
+                // Trie fast path: collect only candidate tokens whose string
+                // could possibly match the remaining literal suffix.
+                std::vector<int32_t> candidates;
+                trie_->collect_by_prefix(lit, state.char_idx, candidates);
 
-                std::vector<Impl::GrammarState> result;
-                Impl::consume_token(impl_.get(), vocab[i], 0,
-                                    state.pos, state.char_idx,
-                                    state.continuations, result);
-                if (!result.empty())
-                    valid_set.insert(static_cast<int32_t>(i));
+                for (int32_t tok_id : candidates) {
+                    std::vector<Impl::GrammarState> result;
+                    Impl::consume_token(impl_.get(), vocab[tok_id], 0,
+                                        state.pos, state.char_idx,
+                                        state.continuations, result);
+                    if (!result.empty())
+                        valid_set.insert(tok_id);
+                }
+            } else {
+                // Brute-force fallback: scan all vocab tokens
+                const char expected_first = lit[state.char_idx];
+                for (size_t i = 0; i < vocab.size(); ++i) {
+                    if (vocab[i].empty()) continue;
+                    if (vocab[i][0] != expected_first) continue;
+
+                    std::vector<Impl::GrammarState> result;
+                    Impl::consume_token(impl_.get(), vocab[i], 0,
+                                        state.pos, state.char_idx,
+                                        state.continuations, result);
+                    if (!result.empty())
+                        valid_set.insert(static_cast<int32_t>(i));
+                }
             }
 
         } else if (state.pos->type == Elem::CHAR_CLASS) {
