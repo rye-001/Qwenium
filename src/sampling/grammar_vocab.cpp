@@ -572,12 +572,22 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
 
         } else if (state.pos->type == Elem::CHAR_CLASS) {
             const auto& cc = impl_->char_classes[state.pos->value];
-            for (size_t i = 0; i < vocab.size(); ++i) {
-                if (vocab[i].empty()) continue;
-                const char fc = vocab[i][0];
-                const bool in_set  = cc.first.count(fc) > 0;
-                const bool allowed = cc.second ? !in_set : in_set;
-                if (allowed) valid_set.insert(static_cast<int32_t>(i));
+
+            if (trie_) {
+                // Trie fast path for CHAR_CLASS
+                std::vector<int32_t> candidates;
+                trie_->collect_by_char_class(cc.first, cc.second, candidates);
+                for (int32_t tok_id : candidates)
+                    valid_set.insert(tok_id);
+            } else {
+                // Brute-force fallback
+                for (size_t i = 0; i < vocab.size(); ++i) {
+                    if (vocab[i].empty()) continue;
+                    const char fc = vocab[i][0];
+                    const bool in_set  = cc.first.count(fc) > 0;
+                    const bool allowed = cc.second ? !in_set : in_set;
+                    if (allowed) valid_set.insert(static_cast<int32_t>(i));
+                }
             }
         }
         // END state: grammar accepting, contributes no further tokens

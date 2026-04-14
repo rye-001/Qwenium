@@ -583,3 +583,32 @@ TEST(TokenTrieGrammar, Equivalence_FullSequenceThenCheck) {
          T_LBRACE, T_NEWLINE},
         "after for loop header, inside block body");
 }
+
+// --- Phase 3: CHAR_CLASS-specific equivalence tests ---
+
+TEST(TokenTrieGrammar, Equivalence_NegatedCharClass) {
+    // Grammar with negated char class: string content is [^"]*
+    // This tests the trie CHAR_CLASS path with negation.
+    auto vocab = build_grammar_vocab();
+    std::string gbnf = R"GBNF(
+root ::= "\"" [^"]* "\""
+)GBNF";
+    TokenTrie trie;
+    trie.build(vocab);
+    // After opening quote, [^"]* is active — everything except quote is valid
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_QUOTE},
+        "negated char class [^\"] after opening quote");
+}
+
+TEST(TokenTrieGrammar, Equivalence_CharClassDigitSequence) {
+    // Exercise multi-digit: at [0-9] with prior digits consumed
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    // After ">53" — still in number, CHAR_CLASS active
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT, T_5, T_3},
+        "CHAR_CLASS after multi-digit '53'");
+}
