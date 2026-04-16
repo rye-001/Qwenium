@@ -117,6 +117,45 @@ void CompressedKVStore::decompress_token_v(
     decompress_token(compressed_v_[layer].data() + off, dst, n_embd_v_, n_heads_v_);
 }
 
+void CompressedKVStore::compact(
+    uint32_t layer, uint32_t slot,
+    const std::vector<uint32_t>& retained_positions)
+{
+    assert(layer < n_layers_ && slot < n_slots_);
+
+    const size_t n_retained = retained_positions.size();
+    if (n_retained == 0) return;
+
+    // Use a temp buffer to avoid overwriting data we still need to read.
+    // Size = max of K and V per-token bytes × n_retained.
+    size_t max_bpt = std::max(bytes_per_token_k_, bytes_per_token_v_);
+    std::vector<uint8_t> tmp(n_retained * max_bpt);
+
+    // Compact K
+    for (size_t i = 0; i < n_retained; ++i) {
+        size_t src_off = token_offset_k(slot, retained_positions[i]);
+        std::memcpy(tmp.data() + i * bytes_per_token_k_,
+                    compressed_k_[layer].data() + src_off,
+                    bytes_per_token_k_);
+    }
+    size_t dst_base_k = token_offset_k(slot, 0);
+    std::memcpy(compressed_k_[layer].data() + dst_base_k,
+                tmp.data(),
+                n_retained * bytes_per_token_k_);
+
+    // Compact V
+    for (size_t i = 0; i < n_retained; ++i) {
+        size_t src_off = token_offset_v(slot, retained_positions[i]);
+        std::memcpy(tmp.data() + i * bytes_per_token_v_,
+                    compressed_v_[layer].data() + src_off,
+                    bytes_per_token_v_);
+    }
+    size_t dst_base_v = token_offset_v(slot, 0);
+    std::memcpy(compressed_v_[layer].data() + dst_base_v,
+                tmp.data(),
+                n_retained * bytes_per_token_v_);
+}
+
 void CompressedKVStore::clone_slot(
     uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens)
 {

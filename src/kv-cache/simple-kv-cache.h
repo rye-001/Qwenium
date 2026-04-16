@@ -38,6 +38,11 @@ public:
     void set_pos(uint32_t p, uint32_t slot_idx = 0);
     uint32_t get_pos(uint32_t slot_idx = 0) const { return positions[slot_idx]; }
 
+    // SnapKV: compact all layers for a slot, keeping only the listed positions.
+    // `retained_positions` must be sorted and unique.
+    // Updates the position counter to retained_positions.size().
+    void compact(uint32_t slot_idx, const std::vector<uint32_t>& retained_positions);
+
     // Direct memory copy between slots using backend copy
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens);
 

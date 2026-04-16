@@ -133,6 +133,57 @@ void simple_kv_cache::set_pos(uint32_t p, uint32_t slot_idx) {
     positions[slot_idx] = p;
 }
 
+void simple_kv_cache::compact(uint32_t slot_idx,
+                              const std::vector<uint32_t>& retained_positions) {
+    GGML_ASSERT(slot_idx < n_batch_max);
+
+    const uint32_t n_retained = retained_positions.size();
+    if (n_retained == 0) {
+        positions[slot_idx] = 0;
+        return;
+    }
+
+    // Read retained rows into a temp buffer, then write them back contiguously.
+    // Each row = n_embd floats (we use element-size-agnostic byte copies via
+    // ggml_backend_tensor_get/set which handle any type).
+    const size_t k_row_bytes = n_embd_k * ggml_type_size(type_k);
+    const size_t v_row_bytes = n_embd_v * ggml_type_size(type_v);
+    const size_t max_row_bytes = std::max(k_row_bytes, v_row_bytes);
+
+    std::vector<uint8_t> tmp(n_retained * max_row_bytes);
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        const size_t slot_offset_k = slot_idx * k_cache[il]->nb[2];
+        const size_t slot_offset_v = slot_idx * v_cache[il]->nb[2];
+
+        // Compact K
+        for (uint32_t i = 0; i < n_retained; ++i) {
+            size_t src_off = slot_offset_k + retained_positions[i] * k_cache[il]->nb[1];
+            ggml_backend_tensor_get(k_cache[il], tmp.data() + i * k_row_bytes,
+                                    src_off, k_row_bytes);
+        }
+        for (uint32_t i = 0; i < n_retained; ++i) {
+            size_t dst_off = slot_offset_k + i * k_cache[il]->nb[1];
+            ggml_backend_tensor_set(k_cache[il], tmp.data() + i * k_row_bytes,
+                                    dst_off, k_row_bytes);
+        }
+
+        // Compact V
+        for (uint32_t i = 0; i < n_retained; ++i) {
+            size_t src_off = slot_offset_v + retained_positions[i] * v_cache[il]->nb[1];
+            ggml_backend_tensor_get(v_cache[il], tmp.data() + i * v_row_bytes,
+                                    src_off, v_row_bytes);
+        }
+        for (uint32_t i = 0; i < n_retained; ++i) {
+            size_t dst_off = slot_offset_v + i * v_cache[il]->nb[1];
+            ggml_backend_tensor_set(v_cache[il], tmp.data() + i * v_row_bytes,
+                                    dst_off, v_row_bytes);
+        }
+    }
+
+    positions[slot_idx] = n_retained;
+}
+
 void simple_kv_cache::clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) {
     GGML_ASSERT(src_slot < n_batch_max);
     GGML_ASSERT(dst_slot < n_batch_max);

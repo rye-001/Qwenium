@@ -34,6 +34,12 @@ public:
 
     // ── Bulk operations ──────────────────────────────────────────────────────
 
+    // Compact: keep only the positions listed in `retained` (sorted, unique).
+    // Moves compressed data so retained[i] becomes position i.
+    // Does NOT update the position counter — caller must call set_pos() after.
+    void compact(uint32_t layer, uint32_t slot,
+                 const std::vector<uint32_t>& retained_positions);
+
     // Clone all layers' compressed data from src_slot to dst_slot.
     // Also copies the source slot's position counter.
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens);

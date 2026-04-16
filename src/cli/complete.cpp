@@ -75,7 +75,7 @@ int run_complete(
         }
 
         ggml_backend_sched_t scheduler = model.get_scheduler();
-        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 1, args.kv_quant_bits);
+        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 1, args.kv_quant_bits, args.snapkv_budget, args.snapkv_window);
 
         // Prefill phase
         using Clock = std::chrono::steady_clock;

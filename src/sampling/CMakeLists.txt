@@ -3,6 +3,7 @@ add_library(sampling STATIC
     sampling.cpp
     grammar.cpp
     grammar_vocab.cpp
+    token-trie.cpp
 )
 
 target_include_directories(sampling PUBLIC

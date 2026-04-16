@@ -24,6 +24,9 @@ struct CliArgs {
     std::string system_prompt;
     // TurboQuant KV cache compression (0 = disabled, 2/3/4 = bit width)
     int kv_quant_bits = 0;
+    // SnapKV post-prefill KV eviction (0 = disabled)
+    uint32_t snapkv_budget = 0;
+    uint32_t snapkv_window = 32;
     // PLD options
     bool speculative = false;
     int pld_ngram_size = 3;

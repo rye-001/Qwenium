@@ -6,10 +6,15 @@
 
 namespace qwen3 {
 
+class TokenTrie;  // forward declaration
+
 // Option B: vocab-scan grammar — no pretokenized literals map.
 // Every LITERAL state resolves valid tokens by scanning vocab at runtime.
 // GrammarState tracks char_idx (chars consumed of current literal)
 // instead of token_idx (index into pre-baked token sequence).
+//
+// When a TokenTrie is attached via set_token_trie(), LITERAL states use
+// trie-based candidate narrowing instead of O(vocab_size) brute-force scan.
 class GrammarVocab {
 public:
     GrammarVocab();
@@ -17,6 +22,11 @@ public:
 
     // Parse GBNF — no map, no tokenizer, no offline step.
     static std::unique_ptr<GrammarVocab> parse_impl(const std::string& gbnf_str);
+
+    // Attach an externally-owned trie built from the vocabulary.
+    // The trie must outlive this GrammarVocab instance.
+    // When set, get_valid_tokens() uses trie lookups for LITERAL states.
+    void set_token_trie(const TokenTrie* trie);
 
     // Vocab-scan: find all token IDs that are valid at current grammar position.
     // vocab[i] is the decoded string of token i.
@@ -33,6 +43,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    const TokenTrie* trie_ = nullptr;
 };
 
 } // namespace qwen3

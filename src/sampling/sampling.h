@@ -1,6 +1,7 @@
 #pragma once
 
 #include "grammar_vocab.h"
+#include "token-trie.h"
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -34,6 +35,10 @@ public:
         eos_token_id_ = id;
     }
 
+    // Build and attach a TokenTrie from the vocabulary for accelerated
+    // grammar-constrained decoding. Called once; the trie is immutable.
+    void build_token_trie(const std::vector<std::string>& vocab);
+
 protected:
     void apply_vocab_pruning(std::vector<float>& logits);
     void apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
@@ -42,6 +47,7 @@ protected:
     GrammarVocab* grammar_     = nullptr;
     const std::unordered_set<int32_t>* pruned_vocab_ = nullptr;
     int32_t eos_token_id_ = -1;
+    std::unique_ptr<TokenTrie> token_trie_;
 };
 
 class GreedySampler : public Sampler {

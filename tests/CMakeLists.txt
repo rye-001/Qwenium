@@ -97,6 +97,56 @@ target_link_libraries(qwen3-compressed-kv-tests PRIVATE
 
 gtest_discover_tests(qwen3-compressed-kv-tests)
 
+# SnapKV CLI config tests (GTest, no model needed)
+add_executable(qwen3-snapkv-cli-tests
+    unit/test_snapkv_cli.cpp
+)
+
+target_link_libraries(qwen3-snapkv-cli-tests PRIVATE
+    GTest::gtest_main
+)
+
+gtest_discover_tests(qwen3-snapkv-cli-tests)
+
+# SnapKV eviction + compaction unit tests (GTest, no model needed)
+add_executable(qwen3-snapkv-eviction-tests
+    unit/test_snapkv_eviction.cpp
+)
+
+target_link_libraries(qwen3-snapkv-eviction-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+    ggml
+)
+
+gtest_discover_tests(qwen3-snapkv-eviction-tests)
+
+# SnapKV position tracking tests (GTest)
+add_executable(qwen3-snapkv-position-tests
+    unit/test_snapkv_position.cpp
+)
+
+target_link_libraries(qwen3-snapkv-position-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+    qwen3-core
+    ggml
+)
+
+gtest_discover_tests(qwen3-snapkv-position-tests)
+
+# TokenTrie unit tests (GTest, no model needed)
+add_executable(qwen3-token-trie-tests
+    unit/test_token_trie.cpp
+)
+
+target_link_libraries(qwen3-token-trie-tests PRIVATE
+    GTest::gtest_main
+    sampling
+)
+
+gtest_discover_tests(qwen3-token-trie-tests)
+
 # Parallel grammar test (Non-GTest)
 add_executable(qwen3-parallel-grammar-test
     integration/test_parallel_grammar.cpp
@@ -124,3 +174,6 @@ target_link_libraries(qwen3-http-server-test PRIVATE
 
 target_compile_features(qwen3-http-server-test PRIVATE cxx_std_17)
 gtest_discover_tests(qwen3-http-server-test)
+
+# Grammar regression tests (non-GTest standalone executables)
+add_subdirectory(grammar)
