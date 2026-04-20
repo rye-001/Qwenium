@@ -73,6 +73,10 @@ void simple_kv_cache::init_cache() {
 
 }
 
+size_t simple_kv_cache::memory_bytes() const {
+    return buf ? ggml_backend_buffer_get_size(buf.get()) : 0;
+}
+
 ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uint32_t n_kv, uint32_t slot_idx) {
     return ggml_view_2d(ctx_compute, 
         k_cache[il],

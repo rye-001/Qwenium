@@ -1,12 +1,13 @@
 #pragma once
 
+#include "layer_state.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <vector>
 #include <memory>
 #include <cstdint>
 
-class simple_kv_cache {
+class simple_kv_cache : public LayerState {
 public:
     simple_kv_cache(
         uint32_t n_layers,
@@ -32,11 +33,22 @@ public:
     // Copy v_cur into cache for slot_idx at current position
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx = 0);
 
+    // LayerState interface.
+    void   reset_sequence(int seq_id) override { clear_slot(static_cast<uint32_t>(seq_id)); }
+    size_t memory_bytes() const override;
+
     void advance(uint32_t n_tokens, uint32_t slot_idx = 0);
     void clear_slot(uint32_t slot_idx);
     void clear_all();
     void set_pos(uint32_t p, uint32_t slot_idx = 0);
     uint32_t get_pos(uint32_t slot_idx = 0) const { return positions[slot_idx]; }
+
+    // O(1) head-pointer truncation: discard everything after pos.
+    // KV data is not zeroed; next writes will overwrite it.
+    // Used by grammar backtracking and speculative-decoding rejection.
+    void truncate_to_position(int pos, uint32_t slot_idx = 0) {
+        positions[slot_idx] = static_cast<uint32_t>(pos);
+    }
 
     // SnapKV: compact all layers for a slot, keeping only the listed positions.
     // `retained_positions` must be sorted and unique.

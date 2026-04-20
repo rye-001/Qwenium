@@ -7,6 +7,7 @@ add_library(qinf-state STATIC
     turboquant.cpp
     snapkv.cpp
     ssm_state_cache.cpp
+    recurrent_state.cpp
 )
 
 target_include_directories(qinf-state PUBLIC

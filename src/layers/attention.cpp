@@ -465,3 +465,130 @@ ggml_tensor* build_qwen35_batched_attention(
 
     return cur;
 }
+
+// ── AttentionLayer ────────────────────────────────────────────────────────────
+
+AttentionLayer::AttentionLayer(
+    ggml_tensor* w_q, ggml_tensor* w_k, ggml_tensor* w_v, ggml_tensor* w_out,
+    ggml_tensor* w_q_norm, ggml_tensor* w_k_norm,
+    ggml_tensor* q_bias, ggml_tensor* k_bias, ggml_tensor* v_bias,
+    simple_kv_cache* kv_cache,
+    const Hparams& hp)
+    : w_q_(w_q), w_k_(w_k), w_v_(w_v), w_out_(w_out),
+      w_q_norm_(w_q_norm), w_k_norm_(w_k_norm),
+      q_bias_(q_bias), k_bias_(k_bias), v_bias_(v_bias),
+      kv_cache_(kv_cache), hp_(hp) {}
+
+ggml_tensor* AttentionLayer::build(
+    ggml_context*      ctx,
+    ggml_cgraph*       gf,
+    ggml_tensor*       input,
+    int                layer_idx,
+    Phase              phase,
+    const PrefillArgs& prefill_args,
+    const DecodeArgs*  decode_args)
+{
+    if (phase == Phase::Prefill)
+        return build_prefill(ctx, gf, input, layer_idx, prefill_args);
+    return build_decode(ctx, gf, input, layer_idx, *decode_args);
+}
+
+AttentionLayer::QKV AttentionLayer::project_qkv(
+    ggml_context* ctx, ggml_cgraph* /*gf*/,
+    ggml_tensor* input, ggml_tensor* inp_pos,
+    int il, uint32_t n_tokens)
+{
+    const int n_embd = (int)input->ne[0];
+
+    ggml_tensor* Qcur = ggml_mul_mat(ctx, w_q_, input);
+    set_name(Qcur, "Qcur", il);
+    if (hp_.has_bias) {
+        Qcur = ggml_add(ctx, Qcur, q_bias_);
+    }
+
+    ggml_tensor* Kcur = ggml_mul_mat(ctx, w_k_, input);
+    set_name(Kcur, "Kcur", il);
+    if (hp_.has_bias) {
+        Kcur = ggml_add(ctx, Kcur, k_bias_);
+    }
+
+    ggml_tensor* Vcur = ggml_mul_mat(ctx, w_v_, input);
+    set_name(Vcur, "Vcur", il);
+    if (hp_.has_bias) {
+        Vcur = ggml_add(ctx, Vcur, v_bias_);
+    }
+
+    Qcur = ggml_reshape_3d(ctx, Qcur, hp_.n_embd_head, hp_.n_head,    n_tokens);
+    Kcur = ggml_reshape_3d(ctx, Kcur, hp_.n_embd_head, hp_.n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx, Vcur, hp_.n_embd_head, hp_.n_head_kv, n_tokens);
+
+    if (hp_.has_q_norm) {
+        Qcur = ggml_rms_norm(ctx, Qcur, hp_.rms_norm_eps);
+        Qcur = ggml_mul(ctx, Qcur, ggml_repeat(ctx, w_q_norm_,
+                        ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                           hp_.n_embd_head, hp_.n_head, n_tokens)));
+        set_name(Qcur, "Qcur_normed", il);
+
+        Kcur = ggml_rms_norm(ctx, Kcur, hp_.rms_norm_eps);
+        Kcur = ggml_mul(ctx, Kcur, ggml_repeat(ctx, w_k_norm_,
+                        ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                           hp_.n_embd_head, hp_.n_head_kv, n_tokens)));
+        set_name(Kcur, "Kcur_normed", il);
+    }
+
+    // RoPE.
+    Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
+                         hp_.n_rot, GGML_ROPE_TYPE_NEOX, hp_.context_len,
+                         hp_.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    set_name(Qcur, "Qcur_roped", il);
+
+    Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
+                         hp_.n_rot, GGML_ROPE_TYPE_NEOX, hp_.context_len,
+                         hp_.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    set_name(Kcur, "Kcur_roped", il);
+
+    (void)n_embd;
+    return {Qcur, Kcur, Vcur};
+}
+
+ggml_tensor* AttentionLayer::build_prefill(
+    ggml_context* ctx, ggml_cgraph* gf,
+    ggml_tensor* input, int layer_idx,
+    const PrefillArgs& args)
+{
+    QKV qkv = project_qkv(ctx, gf, input, args.inp_pos, layer_idx, args.n_tokens);
+
+    ggml_tensor* attn_out = build_attention(
+        ctx, gf, kv_cache_,
+        qkv.q, qkv.k, qkv.v,
+        layer_idx, hp_.kq_scale,
+        args.n_tokens, args.slot_idx,
+        layer_idx, hp_.n_embd_head, hp_.n_head_kv);
+    set_name(attn_out, "attn_out", layer_idx);
+
+    ggml_tensor* out = ggml_mul_mat(ctx, w_out_, attn_out);
+    set_name(out, "attn_proj", layer_idx);
+    return out;
+}
+
+ggml_tensor* AttentionLayer::build_decode(
+    ggml_context* ctx, ggml_cgraph* gf,
+    ggml_tensor* input, int layer_idx,
+    const DecodeArgs& args)
+{
+    uint32_t n_batch = (uint32_t)input->ne[1];
+    QKV qkv = project_qkv(ctx, gf, input, args.inp_pos, layer_idx, n_batch);
+
+    ggml_tensor* attn_out = build_batched_attention(
+        ctx, gf, kv_cache_,
+        qkv.q, qkv.k, qkv.v,
+        layer_idx, hp_.kq_scale,
+        *args.slots, *args.positions,
+        args.kq_mask, args.gather_indices,
+        layer_idx);
+    set_name(attn_out, "attn_out_dec", layer_idx);
+
+    ggml_tensor* out = ggml_mul_mat(ctx, w_out_, attn_out);
+    set_name(out, "attn_proj_dec", layer_idx);
+    return out;
+}

@@ -182,3 +182,54 @@ gtest_discover_tests(qwen3-http-server-test)
 
 # Grammar regression tests (non-GTest standalone executables)
 add_subdirectory(grammar)
+
+# ── Phase 2 unit tests ────────────────────────────────────────────────────────
+
+# Layer and state interface tests (no model file needed).
+# Covers: LayerState, KVCache conformance + truncate_to_position,
+#         RecurrentState checkpoint/restore, AttentionLayer both phases,
+#         FFN Phase parameter, kv_cache build/position/truncate.
+add_executable(qwen3-layer-tests
+    unit/test_layer_state.cpp
+    unit/test_kv_cache.cpp
+    unit/test_recurrent_state.cpp
+    unit/test_attention.cpp
+    unit/test_ffn.cpp
+)
+
+target_link_libraries(qwen3-layer-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    qinf-state
+    ggml
+)
+
+target_compile_features(qwen3-layer-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-layer-tests)
+
+# Weight-binding tests (no model file, no ggml compute).
+add_executable(qwen3-weight-binding-tests
+    unit/test_weight_binding.cpp
+)
+
+target_link_libraries(qwen3-weight-binding-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+)
+
+target_compile_features(qwen3-weight-binding-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-weight-binding-tests)
+
+# Loader unit tests (no model file needed).
+# Covers: GGUFLoader construction, Tokenizer build, ASCII round-trip.
+add_executable(qwen3-loader-tests
+    unit/test_loader.cpp
+)
+
+target_link_libraries(qwen3-loader-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+)
+
+target_compile_features(qwen3-loader-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-loader-tests)

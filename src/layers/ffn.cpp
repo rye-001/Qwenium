@@ -11,7 +11,8 @@ ggml_tensor* build_ffn_swiglu(
     ggml_tensor*  gate,
     ggml_tensor*  up,
     ggml_tensor*  down,
-    int           il)
+    int           il,
+    Phase         /*phase*/)
 {
     char name[128];
 

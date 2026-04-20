@@ -1,5 +1,5 @@
 #pragma once
-// compressed_kv_store.h — TurboQuant compressed backing store for KV cache.
+// kv_cache_compressed.h — TurboQuant compressed backing store for KV cache.
 //
 // Pure C++, no ggml dependency. Manages compressed byte buffers indexed by
 // [layer][slot][position]. Compress/decompress is done per-head using the
@@ -11,16 +11,21 @@
 //   3. For clone_slot(), memcpy compressed data (fast)
 //   4. (Phase 2) Before graph compute, call decompress to restore F32
 
+#include "layer_state.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
-class CompressedKVStore {
+class CompressedKVStore : public LayerState {
 public:
     // head_dim must be a power of 2 (for WHT). n_embd_k = n_heads_kv * head_dim.
     CompressedKVStore(uint32_t n_layers, uint32_t n_slots, uint32_t n_ctx_max,
                       uint32_t n_embd_k, uint32_t n_embd_v,
                       uint32_t head_dim, int bits, int block_size = 32);
+
+    // LayerState interface.
+    void   reset_sequence(int seq_id) override { clear_slot(static_cast<uint32_t>(seq_id)); }
+    size_t memory_bytes() const override       { return total_compressed_bytes(); }
 
     // ── Per-token compress/decompress ────────────────────────────────────────
     // src/dst: float[n_embd_k] or float[n_embd_v] for a single token.
