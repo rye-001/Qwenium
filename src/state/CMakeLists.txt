@@ -1,5 +1,5 @@
 # Per-sequence state: kv_cache_simple, kv_cache_compressed, turboquant, snapkv.
-# deltanet_state and ssm_state are added in Phase 3.
+# deltanet_state added in Phase 3 (PR 3.D.1).
 
 add_library(qinf-state STATIC
     kv_cache_simple.cpp
@@ -8,6 +8,7 @@ add_library(qinf-state STATIC
     snapkv.cpp
     ssm_state_cache.cpp
     recurrent_state.cpp
+    deltanet_state.cpp
 )
 
 target_include_directories(qinf-state PUBLIC

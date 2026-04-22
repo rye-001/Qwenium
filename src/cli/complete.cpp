@@ -77,7 +77,9 @@ int run_complete(
         ggml_backend_sched_t scheduler = model.get_scheduler();
         const auto& cmp_meta = model.get_metadata();
         std::unique_ptr<ForwardPassBase> forward_pass;
-        if (cmp_meta.architecture == "qwen35")
+        if (cmp_meta.architecture == "qwen35moe")
+            forward_pass = std::make_unique<Qwen36ForwardPass>(model, &cmp_meta, args.context_length, 1, args.kv_quant_bits);
+        else if (cmp_meta.architecture == "qwen35")
             forward_pass = std::make_unique<Qwen35ForwardPass>(model, &cmp_meta, args.context_length, 1, args.kv_quant_bits);
         else
             forward_pass = std::make_unique<Qwen3ForwardPass>(model, &cmp_meta, args.context_length, 1, args.kv_quant_bits);

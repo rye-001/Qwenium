@@ -183,6 +183,96 @@ gtest_discover_tests(qwen3-http-server-test)
 # Grammar regression tests (non-GTest standalone executables)
 add_subdirectory(grammar)
 
+# ── Phase 3 unit tests ────────────────────────────────────────────────────────
+
+# DeltaNetState tests (PR 3.D.1) — no model file needed.
+add_executable(qwen3-deltanet-state-tests
+    unit/test_deltanet_state.cpp
+)
+
+target_link_libraries(qwen3-deltanet-state-tests PRIVATE
+    GTest::gtest_main
+    qinf-state
+    ggml
+)
+
+target_compile_features(qwen3-deltanet-state-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-deltanet-state-tests)
+
+# DeltaNetLayer tests (PR 3.D.2-4) — no model file needed.
+add_executable(qwen3-deltanet-tests
+    unit/test_deltanet.cpp
+)
+
+target_link_libraries(qwen3-deltanet-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    qinf-state
+    ggml
+)
+
+target_compile_features(qwen3-deltanet-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-deltanet-tests)
+
+# MoELayer tests (PR 3.M.1-3) — no model file needed.
+add_executable(qwen3-moe-tests
+    unit/test_moe.cpp
+)
+
+target_link_libraries(qwen3-moe-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+
+target_compile_features(qwen3-moe-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-moe-tests)
+
+# MoE residency tracker tests (PR 3.M.4) — pure C++, no ggml compute.
+add_executable(qwen3-moe-residency-tests
+    unit/test_moe_residency.cpp
+)
+
+target_link_libraries(qwen3-moe-residency-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+)
+
+target_compile_features(qwen3-moe-residency-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-moe-residency-tests)
+
+# Qwen36ForwardPass smoke tests (PR 3.I.2).
+# Model-file tests self-skip when QWEN36_MODEL_PATH is unset.
+add_executable(qwen36-forward-tests
+    unit/test_qwen36_forward.cpp
+)
+
+target_link_libraries(qwen36-forward-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qwen3-core
+    ggml
+)
+
+target_compile_features(qwen36-forward-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen36-forward-tests)
+
+# Qwen 3.6 hparam + inventory validation tests (PR 3.I.1).
+# Pure-unit tests (no model file) run unconditionally.
+# Model-file integration tests self-skip when QWEN_MODEL_PATH is unset.
+add_executable(qwen36-hparams-tests
+    unit/test_qwen36_hparams.cpp
+)
+
+target_link_libraries(qwen36-hparams-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+    qinf-models
+)
+
+target_compile_features(qwen36-hparams-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen36-hparams-tests)
+
 # ── Phase 2 unit tests ────────────────────────────────────────────────────────
 
 # Layer and state interface tests (no model file needed).

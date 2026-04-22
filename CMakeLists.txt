@@ -13,6 +13,7 @@ option(QWEN3_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
 option(QWEN3_ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
 option(QWEN3_STATIC_LINK "Build static binaries" OFF)
 option(GGML_USE_METAL "Enable Metal for GPU acceleration on Apple devices" OFF)
+option(QINF_MOE_FALLBACK "Use ggml_mul_mat_id fallback for MoE expert dispatch (ON=fallback path, OFF=fused Metal kernel — Phase 4 only)" ON)
 
 # Set standard output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

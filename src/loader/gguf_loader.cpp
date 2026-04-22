@@ -212,9 +212,11 @@ size_t QwenGGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
 
 void QwenGGUFLoader::validate_architecture(const Qwen3Metadata &meta) const
 {
-    if (meta.architecture != "qwen3" && meta.architecture != "qwen2" && meta.architecture != "qwen35")
+    if (meta.architecture != "qwen3" && meta.architecture != "qwen2" &&
+        meta.architecture != "qwen35" && meta.architecture != "qwen35moe")
     {
-        throw GGUFLoadError("Invalid model architecture: " + meta.architecture + ", expected 'qwen3', 'qwen2' or 'qwen35'");
+        throw GGUFLoadError("Invalid model architecture: '" + meta.architecture +
+                            "', expected one of: 'qwen3', 'qwen2', 'qwen35', 'qwen35moe'");
     }
     std::cout << "Validated model architecture: " << meta.architecture << std::endl;
 }
@@ -359,8 +361,19 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
         } else if (key == prefix + "rope.dimension_count") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.rope_dimension_count = read_value_from_mem<uint32_t>(offset);
-        }
-        else {
+        } else if (key == prefix + "expert_count") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.expert_count = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "expert_used_count") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.expert_used_count = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "expert_feed_forward_length") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.expert_feed_forward_length = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "expert_shared_feed_forward_length") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.expert_shared_feed_forward_length = read_value_from_mem<uint32_t>(offset);
+        } else {
             skip_gguf_value_from_mem(offset, type);
         }
     }
@@ -417,10 +430,62 @@ void QwenGGUFLoader::parse_tensor_inventory(size_t& offset, uint64_t tensor_coun
               << " tensor metadata entries." << std::endl;
 }
 
+void validate_qwen35moe_inventory(const Qwen3Metadata& meta)
+{
+    const auto& inventory = meta.tensor_inventory;
+
+    auto require = [&](const std::string& name) {
+        if (inventory.find(name) == inventory.end()) {
+            throw GGUFLoadError(
+                "qwen35moe: missing tensor '" + name +
+                "': expected in model weights, got absent");
+        }
+    };
+
+    require("token_embd.weight");
+    require("output_norm.weight");
+
+    // MoE tensor names present in every block regardless of layer type
+    static const std::vector<std::string> moe_tensors = {
+        "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"
+    };
+    static const std::vector<std::string> attn_tensors = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+    };
+    static const std::vector<std::string> dn_tensors = {
+        "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
+        "ssm_alpha.weight", "ssm_beta.weight",
+        "attn_qkv.weight", "attn_gate.weight",
+        "ssm_norm.weight", "ssm_out.weight"
+    };
+
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        require(p + "attn_norm.weight");
+        require(p + "post_attention_norm.weight");
+        for (const auto& t : moe_tensors) require(p + t);
+
+        if (meta.is_full_attention_layer(i)) {
+            for (const auto& t : attn_tensors) require(p + t);
+        } else {
+            for (const auto& t : dn_tensors) require(p + t);
+        }
+    }
+}
+
 void QwenGGUFLoader::validate_tensor_inventory() const
 {
     std::cout << "Validating tensor inventory..." << std::endl;
     const auto &inventory = metadata_.tensor_inventory;
+
+    if (metadata_.architecture == "qwen35moe") {
+        validate_qwen35moe_inventory(metadata_);
+        std::cout << "Tensor inventory validation passed." << std::endl;
+        return;
+    }
 
     // Global tensors
     if (inventory.find("token_embd.weight") == inventory.end()) {

@@ -18,6 +18,8 @@
 // Your existing headers
 #include "qwen3-core/qwen3-model.h"
 #include "models/qwen3.h"
+#include "models/qwen35.h"
+#include "models/qwen36.h"
 #include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "state/kv_cache_simple.h"
@@ -88,9 +90,16 @@ public:
         sampler_ = std::make_unique<qwen3::GreedySampler>();
         
         // Initialize forward pass with MAX_SLOTS slots
-        forward_pass_ = std::make_unique<Qwen3ForwardPass>(
-            model_, &model_.get_metadata(), max_ctx_per_slot_, MAX_SLOTS
-        );
+        const auto& srv_meta = model_.get_metadata();
+        if (srv_meta.architecture == "qwen35moe")
+            forward_pass_ = std::make_unique<Qwen36ForwardPass>(
+                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
+        else if (srv_meta.architecture == "qwen35")
+            forward_pass_ = std::make_unique<Qwen35ForwardPass>(
+                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
+        else
+            forward_pass_ = std::make_unique<Qwen3ForwardPass>(
+                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
         
         scheduler_ = model_.get_scheduler();
         
@@ -308,7 +317,7 @@ private:
     }
 
     Qwen3Model model_;
-    std::unique_ptr<Qwen3ForwardPass> forward_pass_;
+    std::unique_ptr<ForwardPassBase> forward_pass_;
     std::unique_ptr<Tokenizer> tokenizer_;
     std::unique_ptr<qwen3::GreedySampler> sampler_;
     ggml_backend_sched_t scheduler_;
