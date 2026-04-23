@@ -56,7 +56,9 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
         const auto& chat_meta = model.get_metadata();
         std::unique_ptr<ForwardPassBase> forward_pass;
-        if (chat_meta.architecture == "qwen35")
+        if (chat_meta.architecture == "qwen35moe")
+            forward_pass = std::make_unique<Qwen36ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
+        else if (chat_meta.architecture == "qwen35")
             forward_pass = std::make_unique<Qwen35ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
         else
             forward_pass = std::make_unique<Qwen3ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);

@@ -7,6 +7,7 @@ add_library(qinf-models STATIC
     forward_pass_base.cpp
     qwen3.cpp
     qwen35.cpp
+    qwen36.cpp
 )
 
 target_include_directories(qinf-models PUBLIC

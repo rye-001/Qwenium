@@ -14,6 +14,7 @@
 #include "../qwen3-core/qwen3-model.h"
 #include "../models/qwen3.h"
 #include "../models/qwen35.h"
+#include "../models/qwen36.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
 #include "../sampling/grammar_vocab.h"

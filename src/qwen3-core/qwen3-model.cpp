@@ -228,7 +228,51 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
             // Shared: attention norm (pre-attention RMS norm)
             blocks_[i].attn_norm_weight = tensors.at(prefix + "attn_norm.weight");
 
-            // FFN (shared by all layer types in all architectures)
+            if (metadata_.architecture == "qwen35moe") {
+                // Pre-FFN norm (called post_attention_norm in this family)
+                blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
+
+                // MoE FFN tensors present in every layer
+                auto require = [&](const std::string& key) -> ggml_tensor* {
+                    auto it = tensors.find(key);
+                    if (it == tensors.end()) {
+                        throw GGUFLoadError(
+                            "qwen35moe: missing tensor '" + key +
+                            "': expected in block weights, got absent");
+                    }
+                    return it->second;
+                };
+                blocks_[i].moe_router_weight     = require(prefix + "ffn_gate_inp.weight");
+                blocks_[i].moe_shexp_gate        = require(prefix + "ffn_gate_inp_shexp.weight");
+                blocks_[i].moe_exp_gate_weight   = require(prefix + "ffn_gate_exps.weight");
+                blocks_[i].moe_exp_up_weight     = require(prefix + "ffn_up_exps.weight");
+                blocks_[i].moe_exp_down_weight   = require(prefix + "ffn_down_exps.weight");
+                blocks_[i].moe_shexp_gate_w      = require(prefix + "ffn_gate_shexp.weight");
+                blocks_[i].moe_shexp_up_weight   = require(prefix + "ffn_up_shexp.weight");
+                blocks_[i].moe_shexp_down_weight = require(prefix + "ffn_down_shexp.weight");
+
+                if (metadata_.is_full_attention_layer(i)) {
+                    blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                    blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                    blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                    blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
+                    blocks_[i].attn_q_norm_weight = require(prefix + "attn_q_norm.weight");
+                    blocks_[i].attn_k_norm_weight = require(prefix + "attn_k_norm.weight");
+                } else {
+                    blocks_[i].ssm_a             = require(prefix + "ssm_a");
+                    blocks_[i].ssm_conv1d_weight  = require(prefix + "ssm_conv1d.weight");
+                    blocks_[i].ssm_dt_bias        = require(prefix + "ssm_dt.bias");
+                    blocks_[i].ssm_alpha_weight   = require(prefix + "ssm_alpha.weight");
+                    blocks_[i].ssm_beta_weight    = require(prefix + "ssm_beta.weight");
+                    blocks_[i].attn_qkv_weight    = require(prefix + "attn_qkv.weight");
+                    blocks_[i].attn_gate_weight   = require(prefix + "attn_gate.weight");
+                    blocks_[i].ssm_norm_weight    = require(prefix + "ssm_norm.weight");
+                    blocks_[i].ssm_out_weight     = require(prefix + "ssm_out.weight");
+                }
+                continue;
+            }
+
+            // FFN (shared by qwen2/qwen3/qwen35)
             blocks_[i].ffn_gate_weight = tensors.at(prefix + "ffn_gate.weight");
             blocks_[i].ffn_up_weight   = tensors.at(prefix + "ffn_up.weight");
             blocks_[i].ffn_down_weight = tensors.at(prefix + "ffn_down.weight");
@@ -289,7 +333,8 @@ bool Qwen3Model::validate_architecture() const
     if (!is_loaded_) {
         return false;
     }
-    return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" || metadata_.architecture == "qwen35";
+    return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" ||
+           metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe";
 }
 
 Qwen3ModelSize Qwen3Model::detect_model_size() const

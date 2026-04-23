@@ -105,3 +105,9 @@ private:
 
 // Factory function for creating a loader
 std::unique_ptr<QwenGGUFLoader> create_gguf_loader();
+
+// Validates the tensor inventory of a loaded qwen35moe model. Exposed as a
+// free function so unit tests can inject a crafted inventory to exercise the
+// fail-loud error contract without needing a real GGUF file.
+// Throws GGUFLoadError naming the missing tensor if any required key is absent.
+void validate_qwen35moe_inventory(const Qwen3Metadata& meta);

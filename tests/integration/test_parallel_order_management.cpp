@@ -2,6 +2,7 @@
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "models/qwen35.h"
+#include "models/qwen36.h"
 #include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "sampling/vocab_utils.h"
@@ -485,6 +486,8 @@ public:
             const auto& meta = model_->get_metadata();
             if (meta.architecture == "qwen35")
                 forward_pass_ = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, max_batch_size_);
+            else if (meta.architecture == "qwen35moe")
+                forward_pass_ = std::make_unique<Qwen36ForwardPass>(*model_, &meta, 2048, max_batch_size_);
             else
                 forward_pass_ = std::make_unique<Qwen3ForwardPass>(*model_, &meta, 2048, max_batch_size_);
 

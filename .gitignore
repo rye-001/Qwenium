@@ -55,3 +55,4 @@ __pycache__/
 *.orig
 tests/debug_gguf
 collected_tokens.txt
+temp/
