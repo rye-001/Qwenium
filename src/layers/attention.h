@@ -82,16 +82,15 @@ ggml_tensor* build_batched_attention(
     ggml_tensor*                    gather_indices,
     int                             il);
 
-// ── Qwen3.5 attention variants ───────────────────────────────────────────────
-// Qwen3.5 uses a joint Q+Gate projection, Q/K RMS norms, partial RoPE, and
-// sigmoid gating after the attention output. These differ structurally from the
+// ── Gated attention variants (Qwen3.5, Qwen3.6) ─────────────────────────────
+// These models use a joint Q+Gate projection, Q/K RMS norms, partial RoPE, and
+// sigmoid gating after the attention output. They differ structurally from the
 // Qwen2/3 attention above, so they live as separate free functions.
 
-// Prefill / single-slot attention for Qwen3.5.
+// Prefill / single-slot gated attention.
 // Takes raw normed input cur; performs Q/K/V projections, Q/K norms, partial
 // RoPE, KV cache write + full-history MHA, then sigmoid gating + output proj.
-// Extracted from Qwen35ForwardPass::build_attention_layer — identical logic.
-ggml_tensor* build_qwen35_attention(
+ggml_tensor* build_gated_attention(
     ggml_context*    ctx,
     ggml_cgraph*     gf,
     simple_kv_cache* kv_cache,
@@ -115,11 +114,10 @@ ggml_tensor* build_qwen35_attention(
     int              context_length,
     float            rms_norm_eps);
 
-// Decode / batched multi-slot attention for Qwen3.5.
-// Same Qwen3.5-specific projections/norms/gating as above, but operates on
-// a batch of slots with pre-built kq_mask and gather_indices.
-// Extracted from Qwen35ForwardPass::build_batched_attention_layer — identical logic.
-ggml_tensor* build_qwen35_batched_attention(
+// Decode / batched multi-slot gated attention.
+// Same gated projections/norms/gating as above, but operates on a batch of
+// slots with pre-built kq_mask and gather_indices.
+ggml_tensor* build_gated_batched_attention(
     ggml_context*                   ctx,
     ggml_cgraph*                    gf,
     simple_kv_cache*                kv_cache,

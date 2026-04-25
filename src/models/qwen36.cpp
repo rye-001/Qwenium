@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <stdexcept>
 
 // ── Constructor ──────────────────────────────────────────────────────────────
@@ -48,6 +49,10 @@ Qwen36ForwardPass::Qwen36ForwardPass(
     }
     const int n_kv_layers = kv_idx;  // 10
     const int n_dn_layers = dn_idx;  // 30
+
+    std::cout << "[qwen36] Hybrid cache: " << n_kv_layers
+              << " attention layers (KV), " << n_dn_layers
+              << " DeltaNet layers (recurrent state)" << std::endl;
 
     // KV cache — 10 attention layers, F32, on Metal if available.
     ggml_backend_t cache_backend = model_.has_metal_backend()
@@ -200,10 +205,10 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
         // ── Attention or DeltaNet ───────────────────────────────────────────
         if (m.is_full_attention_layer(il)) {
             int kv_idx = kv_layer_map_[il];
-            // Qwen3.6 uses a joint Q+Gate projection: Q weight outputs
-            // [(n_embd_head*2)*n_head, n_tokens]. build_qwen35_attention
+            // Gated attention: joint Q+Gate projection, Q weight outputs
+            // [(n_embd_head*2)*n_head, n_tokens]. build_gated_attention
             // handles the strided view split, sigmoid gating, and out-proj.
-            cur = build_qwen35_attention(
+            cur = build_gated_attention(
                 ctx_, gf, kv_cache_.get(), cur, inp_pos,
                 kv_idx, n_tok, slot_idx, il,
                 blk.attn_q_weight, blk.attn_q_norm_weight,
@@ -307,7 +312,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
 
         if (m.is_full_attention_layer(il)) {
             int kv_idx = kv_layer_map_[il];
-            cur = build_qwen35_batched_attention(
+            cur = build_gated_batched_attention(
                 ctx_, gf, kv_cache_.get(), cur, inp_pos,
                 kq_mask, gather_indices,
                 kv_idx, slots, positions, il,

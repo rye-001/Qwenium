@@ -1,8 +1,9 @@
 #pragma once
 
 #include "forward_pass_base.h"
+#include "../layers/deltanet.h"
+#include "../state/deltanet_state.h"
 #include "../state/kv_cache_simple.h"
-#include "../state/ssm_state_cache.h"
 #include "../state/kv_cache_compressed.h"
 
 /**
@@ -35,7 +36,17 @@ public:
                     const std::vector<int32_t>& tokens,
                     int pos) override;
 
-    // --- Cache management (delegates to KV, SSM, and TQ caches) ---
+    ggml_cgraph* build_decoding_graph(
+        const std::vector<int32_t>& tokens,
+        const std::vector<uint32_t>& slots,
+        const std::vector<int32_t>& positions) override;
+
+    void set_batched_inputs(ggml_cgraph* gf,
+        const std::vector<int32_t>& tokens,
+        const std::vector<uint32_t>& slots,
+        const std::vector<int32_t>& positions) override;
+
+        // --- Cache management (delegates to KV, SSM, and TQ caches) ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (tq_store_) tq_store_->advance(slot_idx, n_tokens);
         else if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);
@@ -46,7 +57,7 @@ public:
     void clear_slot(uint32_t slot_idx) override {
         if (tq_store_) tq_store_->clear_slot(slot_idx);  // resets position + data
         if (kv_cache_) kv_cache_->clear_slot(slot_idx);
-        if (ssm_cache_) ssm_cache_->clear_slot(slot_idx);
+        if (dn_state_) dn_state_->clear_slot(slot_idx);
         _tq_invalidate_watermarks(slot_idx);
         snapkv_clear_seq_pos(slot_idx);
     }
@@ -73,24 +84,13 @@ public:
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {
         if (tq_store_) tq_store_->clone_slot(src_slot, dst_slot, n_tokens);  // copies pos too
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);
-        if (ssm_cache_) ssm_cache_->clone_slot(src_slot, dst_slot);
+        if (dn_state_) dn_state_->clone_slot(src_slot, dst_slot);
         _tq_invalidate_watermarks(dst_slot);  // scratch for dst is stale
     }
 
-
-    ggml_cgraph* build_decoding_graph(
-        const std::vector<int32_t>& tokens,
-        const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions) override;
-
-    void set_batched_inputs(ggml_cgraph* gf,
-        const std::vector<int32_t>& tokens,
-        const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions) override;
-
     // --- Accessors ---
     simple_kv_cache* get_kv_cache_ptr() { return kv_cache_.get(); }
-    ssm_state_cache* get_ssm_cache_ptr() { return ssm_cache_.get(); }
+    DeltaNetState*   get_dn_state_ptr() { return dn_state_.get(); }
     CompressedKVStore* get_tq_store() { return tq_store_.get(); }
 
     // ── TurboQuant per-layer compute ────────────────────────────
@@ -109,7 +109,7 @@ public:
 
 private:
     std::unique_ptr<simple_kv_cache> kv_cache_;       // attention layers (null when TQ enabled)
-    std::unique_ptr<ssm_state_cache> ssm_cache_;      // SSM layers (always present)
+    std::unique_ptr<DeltaNetState>   dn_state_;       // DeltaNet recurrent state (always present)
     std::unique_ptr<CompressedKVStore> tq_store_;     // TurboQuant compressed store (optional)
     std::unique_ptr<simple_kv_cache> tq_scratch_cache_; // persistent F32 scratch for TQ (n_kv_layers)
 
@@ -125,34 +125,6 @@ private:
     // Physical layer index → cache layer index (-1 = not this cache type)
     std::vector<int32_t> kv_layer_map_;    // [24] → 0..5 or -1
     std::vector<int32_t> ssm_layer_map_;   // [24] → 0..17 or -1
-
-    // --- Qwen35-specific attention builder (single-slot prefill) ---
-    ggml_tensor* build_attention_layer(
-        ggml_cgraph* gf,
-        simple_kv_cache* kv_cache,
-        ggml_tensor* cur,         // [n_embd, n_tokens] — normed input
-        ggml_tensor* inp_pos,     // [n_tokens] — position IDs
-        int kv_cache_layer,       // mapped KV cache index (0..5)
-        uint32_t n_tokens,
-        uint32_t slot_idx,
-        int il);                  // physical layer index (for tensor names)
-
-    // --- SSM layer builder (single-slot prefill) ---
-    ggml_tensor* build_ssm_layer(
-        ggml_cgraph* gf,
-        ggml_tensor* cur,         // [n_embd, n_tokens] — normed input
-        int ssm_cache_layer,      // mapped SSM cache index (0..17)
-        uint32_t n_tokens,
-        uint32_t slot_idx,
-        int il);
-
-    // Delta net: single token recurrence step (used by prefill path)
-    // S:[d,d,H,1] q/k/v:[d,H,1,1] gate/beta:[1,H,1,1]
-    // Returns output [d,H,1,1], *S_out = new state [d,d,H,1]
-    ggml_tensor* build_delta_net_step(ggml_cgraph* gf,
-        ggml_tensor* S, ggml_tensor* q_t, ggml_tensor* k_t, ggml_tensor* v_t,
-        ggml_tensor* gate_t, ggml_tensor* beta_t,
-        ggml_tensor** S_out, int il);
 
     // ── TurboQuant per-layer / batch helpers ─────────────────────
     // Single-layer graph (kept for reference; run_prefill uses the batch variant).
@@ -173,23 +145,4 @@ private:
 
     // --- Batched decode builders (multi-slot, 1 token per slot) ---
 
-    // Batched attention: joint Q+Gate, sigmoid gating, gathered KV
-    ggml_tensor* build_batched_attention_layer(
-        ggml_cgraph* gf,
-        ggml_tensor* cur,         // [n_embd, n_batch]
-        ggml_tensor* inp_pos,     // [n_batch]
-        ggml_tensor* kq_mask,     // [n_kv_len, 1, 1, n_batch]
-        ggml_tensor* gather_indices, // [n_batch * n_kv_len]
-        int kv_cache_layer,
-        const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions,
-        int il);
-
-    // Batched SSM: batched projections, per-slot conv + recurrence
-    ggml_tensor* build_batched_ssm_layer(
-        ggml_cgraph* gf,
-        ggml_tensor* cur,         // [n_embd, n_batch]
-        int ssm_cache_layer,
-        const std::vector<uint32_t>& slots,
-        int il);
 };

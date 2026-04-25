@@ -1,5 +1,6 @@
 #include "qwen35.h"
 #include "../layers/attention.h"
+#include "../layers/deltanet.h"
 #include "../layers/ffn.h"
 #include "../state/snapkv.h"
 
@@ -60,16 +61,26 @@ Qwen35ForwardPass::Qwen35ForwardPass(
         );
     }
 
-    // SSM state cache — GatedDeltaNet layers only
+    // DeltaNet recurrent state — GatedDeltaNet layers only
     // conv_channels = d_inner + 2 * n_group * d_state = 2048 + 2*16*128 = 6144
-    uint32_t conv_dim = meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size;
+    const uint32_t d_inner_dn     = meta_.ssm_inner_size;
+    const uint32_t num_v_heads_dn = meta_.ssm_time_step_rank;
+    const uint32_t num_k_heads_dn = meta_.ssm_group_count;
+    const uint32_t head_v_dim_dn  = d_inner_dn / num_v_heads_dn;
+    const uint32_t conv_channels_dn =
+        d_inner_dn + 2 * num_k_heads_dn * meta_.ssm_state_size;
 
-    ssm_cache_ = std::make_unique<ssm_state_cache>(
-        n_ssm_layers, max_batch_size,
-        meta_.ssm_state_size, meta_.ssm_time_step_rank,
-        conv_dim, meta_.ssm_conv_kernel,
+    DeltaNetState::Hparams dn_hp{
+        n_ssm_layers,
+        max_batch_size,
+        head_v_dim_dn,
+        meta_.ssm_state_size,  // head_k_dim
+        num_v_heads_dn,
+        conv_channels_dn,
+        meta_.ssm_conv_kernel,
         cache_backend
-    );
+    };
+    dn_state_ = std::make_unique<DeltaNetState>(dn_hp);
 
     // TurboQuant compressed backing store + persistent scratch cache
     if (kv_quant_bits >= 2 && kv_quant_bits <= 4) {
@@ -141,8 +152,23 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         set_tensor_name(gf, cur, "attn_norm", il);
 
         if (meta_.is_ssm_layer(il)) {
-            int32_t ssm_idx = ssm_layer_map_[il];
-            cur = build_ssm_layer(gf, cur, ssm_idx, n_tokens, slot_idx, il);
+            uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
+            cur = build_deltanet_layer(
+                ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
+                block.attn_qkv_weight, block.attn_gate_weight,
+                block.ssm_beta_weight, block.ssm_alpha_weight,
+                block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
+                block.ssm_norm_weight, block.ssm_out_weight,
+                static_cast<int>(meta_.embedding_length),
+                static_cast<int>(meta_.ssm_inner_size),
+                static_cast<int>(meta_.ssm_state_size),
+                static_cast<int>(meta_.ssm_group_count),
+                static_cast<int>(meta_.ssm_time_step_rank),
+                static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
+                static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
+                static_cast<int>(meta_.ssm_conv_kernel),
+                meta_.rms_norm_eps,
+                il);
         } else {
             // TQ: use 1-layer scratch (layer 0) for all attention layers.
             // kv_idx maps to scratch layer 0 always; physical separation is
@@ -150,8 +176,21 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
             simple_kv_cache* attn_cache = tq_scratch_cache_ ? tq_scratch_cache_.get()
                                                              : kv_cache_.get();
             int32_t kv_idx = tq_scratch_cache_ ? 0 : kv_layer_map_[il];
-            cur = build_attention_layer(gf, attn_cache, cur, inp_pos,
-                                         kv_idx, n_tokens, slot_idx, il);
+            const int n_embd_head = meta_.attention_key_length;
+            const int n_rot = (meta_.rope_dimension_count > 0)
+                ? meta_.rope_dimension_count : n_embd_head;
+            cur = ::build_gated_attention(
+                ctx_, gf, attn_cache, cur, inp_pos, kv_idx, n_tokens, slot_idx, il,
+                block.attn_q_weight, block.attn_q_norm_weight,
+                block.attn_k_weight, block.attn_k_norm_weight,
+                block.attn_v_weight, block.attn_output_weight,
+                n_embd_head,
+                meta_.attention_head_count,
+                meta_.attention_head_count_kv,
+                n_rot,
+                meta_.rope_freq_base,
+                static_cast<int>(meta_.context_length),
+                meta_.rms_norm_eps);
         }
 
         // Residual connection after attention/SSM
@@ -180,233 +219,6 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // 3. Output head
     build_output_head(gf, inpL);
     return gf;
-}
-
-// ============================================================
-// build_attention_layer — thin wrapper around ::build_qwen35_attention
-// ============================================================
-
-// Implementation lives in src/layers/attention.cpp.
-// All new code should call the free function ::build_qwen35_attention directly.
-ggml_tensor* Qwen35ForwardPass::build_attention_layer(
-    ggml_cgraph* gf,
-    simple_kv_cache* kv_cache,
-    ggml_tensor* cur,
-    ggml_tensor* inp_pos,
-    int kv_cache_layer,
-    uint32_t n_tokens,
-    uint32_t slot_idx,
-    int il)
-{
-    auto& block = model_.get_block(il);
-    const int n_embd_head = meta_.attention_key_length;
-    const int n_rot = (meta_.rope_dimension_count > 0)
-        ? meta_.rope_dimension_count : n_embd_head;
-    return ::build_qwen35_attention(
-        ctx_, gf, kv_cache, cur, inp_pos, kv_cache_layer, n_tokens, slot_idx, il,
-        block.attn_q_weight, block.attn_q_norm_weight,
-        block.attn_k_weight, block.attn_k_norm_weight,
-        block.attn_v_weight, block.attn_output_weight,
-        n_embd_head,
-        meta_.attention_head_count,
-        meta_.attention_head_count_kv,
-        n_rot,
-        meta_.rope_freq_base,
-        static_cast<int>(meta_.context_length),
-        meta_.rms_norm_eps);
-}
-
-// ============================================================
-// build_ssm_layer — GatedDeltaNet pipeline
-//   Projections → Conv1D → QKV split → L2 norm → [delta net STUB] →
-//   Gated norm with z → Output projection
-// ============================================================
-
-ggml_tensor* Qwen35ForwardPass::build_ssm_layer(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,
-    int ssm_cache_layer,
-    uint32_t n_tokens,
-    uint32_t slot_idx,
-    int il)
-{
-    auto& block = model_.get_block(il);
-
-    // Dimensions (confirmed via llama.cpp debug output)
-    const int64_t d_inner      = meta_.ssm_inner_size;     // 2048
-    const int64_t head_k_dim   = meta_.ssm_state_size;     // 128
-    const int64_t num_k_heads  = meta_.ssm_group_count;    // 16
-    const int64_t num_v_heads  = meta_.ssm_time_step_rank; // 16
-    const int64_t head_v_dim   = d_inner / num_v_heads;    // 128
-    const int64_t n_embd       = meta_.embedding_length;   // 1024
-
-    const int64_t conv_kernel_size = meta_.ssm_conv_kernel; // 4
-    // conv_channels = d_inner + 2 * n_group * d_state = 2048 + 2*16*128 = 6144
-    const int64_t conv_channels = d_inner + 2 * num_k_heads * head_k_dim;
-
-    const int64_t n_seqs       = 1;
-    const int64_t n_seq_tokens = n_tokens;
-
-    // ========================================================
-    // 1. Input projections
-    // ========================================================
-
-    // QKV mixed: attn_qkv [1024, 6144] @ cur → [6144, n_tokens]
-    ggml_tensor* qkv_mixed = ggml_mul_mat(ctx_, block.attn_qkv_weight, cur);
-    qkv_mixed = ggml_reshape_3d(ctx_, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
-    set_tensor_name(gf, qkv_mixed, "ssm_qkv", il);
-
-    // Z (output gate): attn_gate [1024, 2048] @ cur → [2048, n_tokens]
-    ggml_tensor* z = ggml_mul_mat(ctx_, block.attn_gate_weight, cur);
-    set_tensor_name(gf, z, "ssm_z", il);
-
-    // ========================================================
-    // 2. Gate projections
-    // ========================================================
-
-    // Beta: sigmoid(ssm_beta @ cur) → [1, num_v_heads, n_tokens, 1]
-    ggml_tensor* beta = ggml_mul_mat(ctx_, block.ssm_beta_weight, cur);
-    beta = ggml_reshape_4d(ctx_, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    beta = ggml_sigmoid(ctx_, beta);
-    set_tensor_name(gf, beta, "ssm_beta", il);
-
-    // Alpha → decay gate: softplus(alpha + dt_bias) * A_log
-    ggml_tensor* alpha = ggml_mul_mat(ctx_, block.ssm_alpha_weight, cur);
-    alpha = ggml_reshape_3d(ctx_, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor* alpha_biased = ggml_add(ctx_, alpha, block.ssm_dt_bias);
-    ggml_tensor* alpha_sp = ggml_softplus(ctx_, alpha_biased);
-    ggml_tensor* decay_gate = ggml_mul(ctx_, alpha_sp, block.ssm_a);
-    decay_gate = ggml_reshape_4d(ctx_, decay_gate, 1, num_v_heads, n_seq_tokens, n_seqs);
-    set_tensor_name(gf, decay_gate, "ssm_gate", il);
-
-    // ========================================================
-    // 3. Causal Conv1D
-    // ========================================================
-
-    // Read conv state from cache for this slot
-    ggml_tensor* conv_all = ssm_cache_->get_conv_tensor(ssm_cache_layer);
-    const int64_t conv_state_elems = (conv_kernel_size - 1) * conv_channels;
-
-    ggml_tensor* conv_states = ggml_view_1d(ctx_, conv_all,
-        conv_state_elems, slot_idx * conv_all->nb[1]);
-    conv_states = ggml_reshape_3d(ctx_, conv_states,
-        conv_kernel_size - 1, conv_channels, n_seqs);
-    set_tensor_name(gf, conv_states, "ssm_conv_st", il);
-
-    ggml_tensor* qkv_t = ggml_transpose(ctx_, qkv_mixed);
-    ggml_tensor* conv_input = ggml_concat(ctx_, conv_states, qkv_t, 0);
-    set_tensor_name(gf, conv_input, "ssm_conv_in", il);
-
-    // Update conv state cache
-    ggml_tensor* last_conv = ggml_view_3d(ctx_, conv_input,
-        conv_kernel_size - 1, conv_channels, n_seqs,
-        conv_input->nb[1], conv_input->nb[2],
-        (conv_input->ne[0] - (conv_kernel_size - 1)) * ggml_element_size(conv_input));
-    ggml_tensor* conv_dst = ggml_view_1d(ctx_, conv_all,
-        conv_state_elems, slot_idx * conv_all->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx_, last_conv, conv_dst));
-
-    // Depthwise conv1d + SiLU
-    ggml_tensor* conv_out = ggml_ssm_conv(ctx_, conv_input, block.ssm_conv1d_weight);
-    conv_out = ggml_silu(ctx_, conv_out);
-    set_tensor_name(gf, conv_out, "ssm_conv_out", il);
-
-    // ========================================================
-    // 4. Split conv output into Q, K, V
-    // ========================================================
-
-    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-    const int64_t nb1_qkv = ggml_row_size(conv_out->type, qkv_dim);
-
-    ggml_tensor* q_conv = ggml_view_4d(ctx_, conv_out,
-        head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-        ggml_row_size(conv_out->type, head_k_dim),
-        nb1_qkv, nb1_qkv * n_seq_tokens, 0);
-
-    ggml_tensor* k_conv = ggml_view_4d(ctx_, conv_out,
-        head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-        ggml_row_size(conv_out->type, head_k_dim),
-        nb1_qkv, nb1_qkv * n_seq_tokens,
-        head_k_dim * num_k_heads * ggml_element_size(conv_out));
-
-    ggml_tensor* v_conv = ggml_view_4d(ctx_, conv_out,
-        head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-        ggml_row_size(conv_out->type, head_v_dim),
-        nb1_qkv, nb1_qkv * n_seq_tokens,
-        ggml_row_size(conv_out->type, 2 * head_k_dim * num_k_heads));
-
-    // ========================================================
-    // 5. L2 normalize Q and K
-    // ========================================================
-
-    q_conv = ggml_l2_norm(ctx_, q_conv, meta_.rms_norm_eps);
-    k_conv = ggml_l2_norm(ctx_, k_conv, meta_.rms_norm_eps);
-
-    if (num_k_heads != num_v_heads) {
-        q_conv = ggml_repeat_4d(ctx_, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx_, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-    }    
-
-    // ========================================================
-    // 6. Delta net recurrence (fused op)
-    // ========================================================
-
-    ggml_tensor* rec_all = ssm_cache_->get_recurrent_tensor(ssm_cache_layer);
-    const int64_t rec_slot_floats = head_v_dim * head_k_dim * num_v_heads;
-
-    ggml_tensor* S = ggml_view_1d(ctx_, rec_all,
-        rec_slot_floats, slot_idx * rec_all->nb[1]);
-    S = ggml_reshape_4d(ctx_, S, head_v_dim, head_k_dim, num_v_heads, n_seqs);
-    set_tensor_name(gf, S, "ssm_state_in", il);
-
-    ggml_tensor* result = ggml_gated_delta_net(ctx_,
-        q_conv, k_conv, v_conv, decay_gate, beta, S);
-    set_tensor_name(gf, result, "ssm_gdn_result", il);
-
-    // Output: [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
-    ggml_tensor* output = ggml_view_4d(ctx_, result,
-        head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-        ggml_row_size(result->type, head_v_dim),
-        ggml_row_size(result->type, head_v_dim * num_v_heads),
-        ggml_row_size(result->type, head_v_dim * num_v_heads * n_seq_tokens), 0);
-    set_tensor_name(gf, output, "ssm_delta_out", il);
-
-    // New state: [head_v_dim, head_k_dim, num_v_heads, n_seqs]
-    ggml_tensor* new_state = ggml_view_4d(ctx_, result,
-        head_v_dim, head_k_dim, num_v_heads, n_seqs,
-        ggml_row_size(result->type, head_v_dim),
-        ggml_row_size(result->type, head_v_dim * head_k_dim),
-        ggml_row_size(result->type, head_v_dim * head_k_dim * num_v_heads),
-        ggml_row_size(result->type, head_v_dim * num_v_heads * n_seq_tokens * n_seqs));
-
-    // Write new state back to cache
-    ggml_tensor* rec_dst = ggml_view_1d(ctx_, rec_all,
-        rec_slot_floats, slot_idx * rec_all->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx_,
-        ggml_reshape_1d(ctx_, new_state, rec_slot_floats), rec_dst));
-
-    // ========================================================
-    // 7. Gated normalization
-    // ========================================================
-
-    ggml_tensor* z_4d = ggml_reshape_4d(ctx_, z,
-        head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor* out_normed = build_norm(gf, output, block.ssm_norm_weight, il);
-    ggml_tensor* z_silu = ggml_silu(ctx_, z_4d);
-    ggml_tensor* gated = ggml_mul(ctx_, out_normed, z_silu);
-    set_tensor_name(gf, gated, "ssm_gated", il);
-
-    // ========================================================
-    // 8. Output projection
-    // ========================================================
-
-    ggml_tensor* flat = ggml_reshape_3d(ctx_, gated,
-        head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
-    cur = ggml_mul_mat(ctx_, block.ssm_out_weight, flat);
-    set_tensor_name(gf, cur, "ssm_output", il);
-    cur = ggml_reshape_2d(ctx_, cur, n_embd, n_seq_tokens * n_seqs);
-
-    return cur;
 }
 
 // ============================================================
@@ -472,15 +284,47 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_layer_graph(
     ggml_tensor* cur = build_norm(gf, inpL, block.attn_norm_weight, il);
 
     if (meta_.is_ssm_layer(il)) {
-        cur = build_ssm_layer(gf, cur, ssm_layer_map_[il], n_tokens, slot_idx, il);
+        uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
+        cur = build_deltanet_layer(
+            ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
+            block.attn_qkv_weight, block.attn_gate_weight,
+            block.ssm_beta_weight, block.ssm_alpha_weight,
+            block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
+            block.ssm_norm_weight, block.ssm_out_weight,
+            static_cast<int>(meta_.embedding_length),
+            static_cast<int>(meta_.ssm_inner_size),
+            static_cast<int>(meta_.ssm_state_size),
+            static_cast<int>(meta_.ssm_group_count),
+            static_cast<int>(meta_.ssm_time_step_rank),
+            static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
+            static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
+            static_cast<int>(meta_.ssm_conv_kernel),
+            meta_.rms_norm_eps,
+            il);
     } else {
         ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
         ggml_set_input(inp_pos);
         ggml_set_name(inp_pos, "inp_pos");
         ggml_build_forward_expand(gf, inp_pos);
 
-        cur = build_attention_layer(gf, tq_scratch_cache_.get(), cur, inp_pos,
-                                    scratch_layer, n_tokens, slot_idx, il);
+        {
+            const int n_embd_head = meta_.attention_key_length;
+            const int n_rot = (meta_.rope_dimension_count > 0)
+                ? meta_.rope_dimension_count : n_embd_head;
+            cur = ::build_gated_attention(
+                ctx_, gf, tq_scratch_cache_.get(), cur, inp_pos,
+                scratch_layer, n_tokens, slot_idx, il,
+                block.attn_q_weight, block.attn_q_norm_weight,
+                block.attn_k_weight, block.attn_k_norm_weight,
+                block.attn_v_weight, block.attn_output_weight,
+                n_embd_head,
+                meta_.attention_head_count,
+                meta_.attention_head_count_kv,
+                n_rot,
+                meta_.rope_freq_base,
+                static_cast<int>(meta_.context_length),
+                meta_.rms_norm_eps);
+        }
     }
 
     cur = ggml_add(ctx_, cur, inpSA);
@@ -525,11 +369,43 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_batch_graph(
         cur = build_norm(gf, cur, block.attn_norm_weight, il);
 
         if (meta_.is_ssm_layer(il)) {
-            cur = build_ssm_layer(gf, cur, ssm_layer_map_[il], n_tokens, slot_idx, il);
+            uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
+            cur = build_deltanet_layer(
+                ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
+                block.attn_qkv_weight, block.attn_gate_weight,
+                block.ssm_beta_weight, block.ssm_alpha_weight,
+                block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
+                block.ssm_norm_weight, block.ssm_out_weight,
+                static_cast<int>(meta_.embedding_length),
+                static_cast<int>(meta_.ssm_inner_size),
+                static_cast<int>(meta_.ssm_state_size),
+                static_cast<int>(meta_.ssm_group_count),
+                static_cast<int>(meta_.ssm_time_step_rank),
+                static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
+                static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
+                static_cast<int>(meta_.ssm_conv_kernel),
+                meta_.rms_norm_eps,
+                il);
         } else {
             // Each attention layer uses its persistent scratch slot (kv_layer_map_[il])
-            cur = build_attention_layer(gf, tq_scratch_cache_.get(), cur, inp_pos,
-                                        kv_layer_map_[il], n_tokens, slot_idx, il);
+            {
+                const int n_embd_head = meta_.attention_key_length;
+                const int n_rot = (meta_.rope_dimension_count > 0)
+                    ? meta_.rope_dimension_count : n_embd_head;
+                cur = ::build_gated_attention(
+                    ctx_, gf, tq_scratch_cache_.get(), cur, inp_pos,
+                    kv_layer_map_[il], n_tokens, slot_idx, il,
+                    block.attn_q_weight, block.attn_q_norm_weight,
+                    block.attn_k_weight, block.attn_k_norm_weight,
+                    block.attn_v_weight, block.attn_output_weight,
+                    n_embd_head,
+                    meta_.attention_head_count,
+                    meta_.attention_head_count_kv,
+                    n_rot,
+                    meta_.rope_freq_base,
+                    static_cast<int>(meta_.context_length),
+                    meta_.rms_norm_eps);
+            }
         }
 
         cur = ggml_add(ctx_, cur, inpSA);
@@ -865,81 +741,6 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 }
 
 // ============================================================
-// build_delta_net_step — single token recurrence
-//
-// The 6-step GatedDeltaNet algorithm:
-//   1. g = exp(gate)                    // decay ∈ (0,1]
-//   2. S = g * S                        // decay old state
-//   3. retrieved = S^T @ k              // what state predicts
-//   4. delta = beta * (v - retrieved)   // error correction
-//   5. S = S + k ⊗ delta               // outer product update
-//   6. o = S^T @ q / sqrt(d_k)         // read output
-// ============================================================
-
-ggml_tensor* Qwen35ForwardPass::build_delta_net_step(
-    ggml_cgraph* gf,
-    ggml_tensor* S,        // [d, d, H, 1]
-    ggml_tensor* q_t,      // [d, H, 1, 1]
-    ggml_tensor* k_t,      // [d, H, 1, 1]
-    ggml_tensor* v_t,      // [d, H, 1, 1]
-    ggml_tensor* gate_t,   // [1, H, 1, 1]
-    ggml_tensor* beta_t,   // [1, H, 1, 1]
-    ggml_tensor** S_out,
-    int il)
-{
-    const int64_t d = S->ne[0];  // head_v_dim = head_k_dim = 128
-    const int64_t H = S->ne[2];  // num_heads = 16
-
-    // Step 1: g = exp(gate_t)
-    // gate_t is already -exp(A_log) * softplus(...), so exp(gate_t) ∈ (0, 1]
-    ggml_tensor* g = ggml_exp(ctx_, gate_t);  // [1, H, 1, 1]
-
-    // Step 2: S = g * S  (broadcast g across dims 0 and 1)
-    // Reshape g to [1, 1, H, 1] for broadcasting with S [d, d, H, 1]
-    ggml_tensor* g_bc = ggml_reshape_4d(ctx_, g, 1, 1, H, 1);
-    ggml_tensor* S_decayed = ggml_mul(ctx_, S, g_bc);  // [d, d, H, 1]
-
-    // Step 3: retrieved = S^T @ k per head
-    // Reshape k_t to [d, 1, H, 1] for batched matmul
-    ggml_tensor* k_col = ggml_reshape_4d(ctx_, k_t, d, 1, H, 1);
-    // ggml_mul_mat(a, b) = a^T @ b, so mul_mat(S_decayed, k_col):
-    //   S_decayed^T [d, d, H, 1]^T @ k_col [d, 1, H, 1] = [d, 1, H, 1]
-    ggml_tensor* retrieved = ggml_mul_mat(ctx_, S_decayed, k_col);  // [d, 1, H, 1]
-
-    // Step 4: delta = beta * (v - retrieved)
-    ggml_tensor* v_col = ggml_reshape_4d(ctx_, v_t, d, 1, H, 1);
-    ggml_tensor* diff = ggml_sub(ctx_, v_col, retrieved);  // [d, 1, H, 1]
-    // beta_t [1, H, 1, 1] → reshape to [1, 1, H, 1] for broadcasting
-    ggml_tensor* beta_bc = ggml_reshape_4d(ctx_, beta_t, 1, 1, H, 1);
-    ggml_tensor* delta = ggml_mul(ctx_, diff, beta_bc);    // [d, 1, H, 1]
-
-    // Step 5: S = S_decayed + k ⊗ delta (outer product per head)
-    // k_col: [d, 1, H, 1], delta: [d, 1, H, 1]
-    // Need: result[i][j][h] = k[i][h] * delta[j][h]  →  [d, d, H, 1]
-    //
-    // Approach: transpose delta to [1, d, H, 1], then repeat both to [d, d, H, 1]
-    ggml_tensor* delta_row = ggml_permute(ctx_, delta, 1, 0, 2, 3);  // [1, d, H, 1]
-    delta_row = ggml_cont(ctx_, delta_row);  // contiguous after permute
-
-    // Repeat to S's shape [d, d, H, 1]
-    ggml_tensor* k_rep = ggml_repeat(ctx_, k_col, S_decayed);       // [d, d, H, 1]
-    ggml_tensor* delta_rep = ggml_repeat(ctx_, delta_row, S_decayed); // [d, d, H, 1]
-
-    ggml_tensor* outer = ggml_mul(ctx_, k_rep, delta_rep);  // [d, d, H, 1]
-    *S_out = ggml_add(ctx_, S_decayed, outer);              // [d, d, H, 1]
-
-    // Step 6: o = S_new^T @ q / sqrt(d)
-    ggml_tensor* q_col = ggml_reshape_4d(ctx_, q_t, d, 1, H, 1);
-    ggml_tensor* o = ggml_mul_mat(ctx_, *S_out, q_col);  // [d, 1, H, 1]
-    o = ggml_scale(ctx_, o, 1.0f / sqrtf(float(d)));
-
-    // Reshape to [d, H, 1, 1] to match expected output shape
-    o = ggml_reshape_4d(ctx_, o, d, H, 1, 1);
-
-    return o;
-}
-
-// ============================================================
 // build_decoding_graph — multi-slot single-token decode
 // ============================================================
 
@@ -996,12 +797,47 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
         cur = build_norm(gf, inpL, block.attn_norm_weight, il);
 
         if (meta_.is_ssm_layer(il)) {
-            int32_t ssm_idx = ssm_layer_map_[il];
-            cur = build_batched_ssm_layer(gf, cur, ssm_idx, slots, il);
+            uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
+            DeltaNetLayer::PrefillArgs pa_unused{1, 0};
+            DeltaNetLayer::DecodeArgs da{slots};
+            DeltaNetLayer dn_layer(
+                block.attn_qkv_weight, block.attn_gate_weight,
+                block.ssm_beta_weight, block.ssm_alpha_weight,
+                block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
+                block.ssm_norm_weight, block.ssm_out_weight,
+                dn_state_.get(),
+                DeltaNetLayer::Hparams{
+                    static_cast<int>(meta_.embedding_length),
+                    static_cast<int>(meta_.ssm_inner_size),
+                    static_cast<int>(meta_.ssm_state_size),
+                    static_cast<int>(meta_.ssm_group_count),
+                    static_cast<int>(meta_.ssm_time_step_rank),
+                    static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
+                    static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
+                    static_cast<int>(meta_.ssm_conv_kernel),
+                    meta_.rms_norm_eps
+                });
+            cur = dn_layer.build(ctx_, gf, cur, dn_idx, Phase::Decode, pa_unused, &da);
         } else {
-            int32_t kv_idx = kv_layer_map_[il];
-            cur = build_batched_attention_layer(gf, cur, inp_pos,
-                kq_mask, gather_indices, kv_idx, slots, positions, il);
+            {
+                int32_t kv_idx = kv_layer_map_[il];
+                const int n_embd_head = meta_.attention_key_length;
+                const int n_rot = (meta_.rope_dimension_count > 0)
+                    ? meta_.rope_dimension_count : n_embd_head;
+                cur = ::build_gated_batched_attention(
+                    ctx_, gf, kv_cache_.get(), cur, inp_pos,
+                    kq_mask, gather_indices, kv_idx, slots, positions, il,
+                    block.attn_q_weight, block.attn_q_norm_weight,
+                    block.attn_k_weight, block.attn_k_norm_weight,
+                    block.attn_v_weight, block.attn_output_weight,
+                    n_embd_head,
+                    meta_.attention_head_count,
+                    meta_.attention_head_count_kv,
+                    n_rot,
+                    meta_.rope_freq_base,
+                    static_cast<int>(meta_.context_length),
+                    meta_.rms_norm_eps);
+            }
         }
 
         // Residual after attention/SSM
@@ -1029,251 +865,6 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     ggml_build_forward_expand(gf, cur);
 
     return gf;
-}
-
-// ============================================================
-// build_batched_ssm_layer — GatedDeltaNet for multi-slot decode
-//
-// Batches the initial projections (matmuls on full [n_embd, n_batch]),
-// then per-slot loop for state-dependent conv + fused recurrence,
-// then collects outputs into [n_embd, n_batch].
-// ============================================================
-
-ggml_tensor* Qwen35ForwardPass::build_batched_ssm_layer(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,         // [n_embd, n_batch]
-    int ssm_cache_layer,
-    const std::vector<uint32_t>& slots,
-    int il)
-{
-    auto& block = model_.get_block(il);
-    const size_t n_batch = slots.size();
-
-    const int64_t d_inner      = meta_.ssm_inner_size;     // 2048
-    const int64_t head_k_dim   = meta_.ssm_state_size;     // 128
-    const int64_t num_k_heads  = meta_.ssm_group_count;    // 16
-    const int64_t num_v_heads  = meta_.ssm_time_step_rank; // 16
-    const int64_t head_v_dim   = d_inner / num_v_heads;    // 128
-    const int64_t n_embd       = meta_.embedding_length;   // 1024
-
-    const int64_t conv_kernel_size = meta_.ssm_conv_kernel; // 4
-    const int64_t conv_channels = d_inner + 2 * num_k_heads * head_k_dim; // 6144
-
-    // ========================================================
-    // A. Batched projections (all slots at once)
-    // ========================================================
-
-    // [6144, n_batch]
-    ggml_tensor* qkv_mixed = ggml_mul_mat(ctx_, block.attn_qkv_weight, cur);
-
-    // [2048, n_batch]
-    ggml_tensor* z_all = ggml_mul_mat(ctx_, block.attn_gate_weight, cur);
-
-    // Beta: sigmoid([num_v_heads, n_batch])
-    ggml_tensor* beta_all = ggml_mul_mat(ctx_, block.ssm_beta_weight, cur);
-    beta_all = ggml_sigmoid(ctx_, beta_all);
-
-    // Decay gate: softplus(alpha + dt_bias) * A → [num_v_heads, n_batch]
-    ggml_tensor* alpha_all = ggml_mul_mat(ctx_, block.ssm_alpha_weight, cur);
-    ggml_tensor* alpha_biased = ggml_add(ctx_, alpha_all, block.ssm_dt_bias);
-    ggml_tensor* alpha_sp = ggml_softplus(ctx_, alpha_biased);
-    ggml_tensor* gate_all = ggml_mul(ctx_, alpha_sp, block.ssm_a);
-
-    // ========================================================
-    // B. Per-slot loop: conv + recurrence + gated norm + output proj
-    // ========================================================
-
-    ggml_tensor* conv_all_tensor = ssm_cache_->get_conv_tensor(ssm_cache_layer);
-    ggml_tensor* rec_all_tensor  = ssm_cache_->get_recurrent_tensor(ssm_cache_layer);
-
-    const int64_t conv_state_elems = (conv_kernel_size - 1) * conv_channels;
-    const int64_t rec_slot_floats  = head_v_dim * head_k_dim * num_v_heads;
-    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-
-    std::vector<ggml_tensor*> slot_outputs;
-    slot_outputs.reserve(n_batch);
-
-    for (size_t b = 0; b < n_batch; ++b) {
-        uint32_t slot_idx = slots[b];
-
-        // --- Slice this slot's projections ---
-
-        // qkv_b: [conv_channels, 1]
-        ggml_tensor* qkv_b = ggml_view_2d(ctx_, qkv_mixed,
-            conv_channels, 1,
-            qkv_mixed->nb[1], b * qkv_mixed->nb[1]);
-
-        // z_b: [d_inner, 1]
-        ggml_tensor* z_b = ggml_view_2d(ctx_, z_all,
-            d_inner, 1,
-            z_all->nb[1], b * z_all->nb[1]);
-
-        // beta_b: [num_v_heads, 1] → [1, num_v_heads, 1, 1]
-        ggml_tensor* beta_b = ggml_view_2d(ctx_, beta_all,
-            num_v_heads, 1,
-            beta_all->nb[1], b * beta_all->nb[1]);
-        beta_b = ggml_reshape_4d(ctx_, beta_b, 1, num_v_heads, 1, 1);
-
-        // gate_b: [num_v_heads, 1] → [1, num_v_heads, 1, 1]
-        ggml_tensor* gate_b = ggml_view_2d(ctx_, gate_all,
-            num_v_heads, 1,
-            gate_all->nb[1], b * gate_all->nb[1]);
-        gate_b = ggml_reshape_4d(ctx_, gate_b, 1, num_v_heads, 1, 1);
-
-        // --- Conv1D with per-slot state ---
-
-        ggml_tensor* conv_state = ggml_view_1d(ctx_, conv_all_tensor,
-            conv_state_elems, slot_idx * conv_all_tensor->nb[1]);
-        conv_state = ggml_reshape_3d(ctx_, conv_state,
-            conv_kernel_size - 1, conv_channels, 1);
-
-        // qkv_b → [conv_channels, 1, 1] → transpose → [1, conv_channels, 1]
-        ggml_tensor* qkv_b_3d = ggml_reshape_3d(ctx_, qkv_b, conv_channels, 1, 1);
-        ggml_tensor* qkv_b_t = ggml_transpose(ctx_, qkv_b_3d);
-
-        // Concat: [conv_kernel-1 + 1, conv_channels, 1] = [conv_kernel, conv_channels, 1]
-        ggml_tensor* conv_input = ggml_concat(ctx_, conv_state, qkv_b_t, 0);
-
-        // Update conv state cache: last (conv_kernel-1) entries
-        ggml_tensor* last_conv = ggml_view_3d(ctx_, conv_input,
-            conv_kernel_size - 1, conv_channels, 1,
-            conv_input->nb[1], conv_input->nb[2],
-            (conv_input->ne[0] - (conv_kernel_size - 1)) * ggml_element_size(conv_input));
-        ggml_tensor* conv_dst = ggml_view_1d(ctx_, conv_all_tensor,
-            conv_state_elems, slot_idx * conv_all_tensor->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx_, last_conv, conv_dst));
-
-        // Depthwise conv1d + SiLU
-        ggml_tensor* conv_out = ggml_ssm_conv(ctx_, conv_input, block.ssm_conv1d_weight);
-        conv_out = ggml_silu(ctx_, conv_out);
-
-        // --- QKV split from conv output ---
-
-        const int64_t nb1_qkv = ggml_row_size(conv_out->type, qkv_dim);
-
-        ggml_tensor* q_conv = ggml_view_4d(ctx_, conv_out,
-            head_k_dim, num_k_heads, 1, 1,
-            ggml_row_size(conv_out->type, head_k_dim),
-            nb1_qkv, nb1_qkv, 0);
-
-        ggml_tensor* k_conv = ggml_view_4d(ctx_, conv_out,
-            head_k_dim, num_k_heads, 1, 1,
-            ggml_row_size(conv_out->type, head_k_dim),
-            nb1_qkv, nb1_qkv,
-            head_k_dim * num_k_heads * ggml_element_size(conv_out));
-
-        ggml_tensor* v_conv = ggml_view_4d(ctx_, conv_out,
-            head_v_dim, num_v_heads, 1, 1,
-            ggml_row_size(conv_out->type, head_v_dim),
-            nb1_qkv, nb1_qkv,
-            ggml_row_size(conv_out->type, 2 * head_k_dim * num_k_heads));
-
-        // L2 normalize Q and K
-        q_conv = ggml_l2_norm(ctx_, q_conv, meta_.rms_norm_eps);
-        k_conv = ggml_l2_norm(ctx_, k_conv, meta_.rms_norm_eps);
-
-        if (num_k_heads != num_v_heads) {
-            q_conv = ggml_repeat_4d(ctx_, q_conv, head_k_dim, num_v_heads, 1, 1);
-            k_conv = ggml_repeat_4d(ctx_, k_conv, head_k_dim, num_v_heads, 1, 1);
-        }    
-
-        // --- Fused delta net recurrence ---
-
-        ggml_tensor* S = ggml_view_1d(ctx_, rec_all_tensor,
-            rec_slot_floats, slot_idx * rec_all_tensor->nb[1]);
-        S = ggml_reshape_4d(ctx_, S, head_v_dim, head_k_dim, num_v_heads, 1);
-
-        ggml_tensor* gdn_result = ggml_gated_delta_net(ctx_,
-            q_conv, k_conv, v_conv, gate_b, beta_b, S);
-
-        // Output: [head_v_dim, num_v_heads, 1, 1]
-        ggml_tensor* output = ggml_view_4d(ctx_, gdn_result,
-            head_v_dim, num_v_heads, 1, 1,
-            ggml_row_size(gdn_result->type, head_v_dim),
-            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads),
-            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads), 0);
-
-        // New state: [head_v_dim, head_k_dim, num_v_heads, 1]
-        ggml_tensor* new_state = ggml_view_4d(ctx_, gdn_result,
-            head_v_dim, head_k_dim, num_v_heads, 1,
-            ggml_row_size(gdn_result->type, head_v_dim),
-            ggml_row_size(gdn_result->type, head_v_dim * head_k_dim),
-            ggml_row_size(gdn_result->type, head_v_dim * head_k_dim * num_v_heads),
-            ggml_row_size(gdn_result->type, head_v_dim * num_v_heads * 1));
-
-        // Write new state back to cache
-        ggml_tensor* rec_dst = ggml_view_1d(ctx_, rec_all_tensor,
-            rec_slot_floats, slot_idx * rec_all_tensor->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx_,
-            ggml_reshape_1d(ctx_, new_state, rec_slot_floats), rec_dst));
-
-        // --- Gated normalization ---
-
-        ggml_tensor* z_b_4d = ggml_reshape_4d(ctx_, z_b,
-            head_v_dim, num_v_heads, 1, 1);
-        ggml_tensor* out_normed = build_norm(gf, output, block.ssm_norm_weight, il);
-        ggml_tensor* gated = ggml_mul(ctx_, out_normed, ggml_silu(ctx_, z_b_4d));
-
-        // --- Output projection → [n_embd, 1] ---
-
-        ggml_tensor* flat = ggml_reshape_2d(ctx_, gated, d_inner, 1);
-        ggml_tensor* out_b = ggml_mul_mat(ctx_, block.ssm_out_weight, flat);
-
-        slot_outputs.push_back(out_b);
-    }
-
-    // ========================================================
-    // C. Concat slot outputs → [n_embd, n_batch]
-    // ========================================================
-
-    ggml_tensor* result;
-    if (n_batch == 1) {
-        result = slot_outputs[0];
-    } else {
-        result = slot_outputs[0];
-        for (size_t b = 1; b < n_batch; ++b) {
-            result = ggml_concat(ctx_, result, slot_outputs[b], 1);
-        }
-    }
-    result = ggml_reshape_2d(ctx_, result, n_embd, n_batch);
-
-    return result;
-}
-
-// ============================================================
-// build_batched_attention_layer — thin wrapper around ::build_qwen35_batched_attention
-// ============================================================
-
-// Implementation lives in src/layers/attention.cpp.
-// All new code should call the free function ::build_qwen35_batched_attention directly.
-ggml_tensor* Qwen35ForwardPass::build_batched_attention_layer(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,
-    ggml_tensor* inp_pos,
-    ggml_tensor* kq_mask,
-    ggml_tensor* gather_indices,
-    int kv_cache_layer,
-    const std::vector<uint32_t>& slots,
-    const std::vector<int32_t>& positions,
-    int il)
-{
-    auto& block = model_.get_block(il);
-    const int n_embd_head = meta_.attention_key_length;
-    const int n_rot = (meta_.rope_dimension_count > 0)
-        ? meta_.rope_dimension_count : n_embd_head;
-    return ::build_qwen35_batched_attention(
-        ctx_, gf, kv_cache_.get(), cur, inp_pos, kq_mask, gather_indices,
-        kv_cache_layer, slots, positions, il,
-        block.attn_q_weight, block.attn_q_norm_weight,
-        block.attn_k_weight, block.attn_k_norm_weight,
-        block.attn_v_weight, block.attn_output_weight,
-        n_embd_head,
-        meta_.attention_head_count,
-        meta_.attention_head_count_kv,
-        n_rot,
-        meta_.rope_freq_base,
-        static_cast<int>(meta_.context_length),
-        meta_.rms_norm_eps);
 }
 
 // ============================================================

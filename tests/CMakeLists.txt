@@ -273,6 +273,20 @@ target_link_libraries(qwen36-hparams-tests PRIVATE
 target_compile_features(qwen36-hparams-tests PRIVATE cxx_std_17)
 gtest_discover_tests(qwen36-hparams-tests)
 
+# Norm helper unit tests — no model file needed.
+add_executable(qwen3-norm-tests
+    unit/test_norm.cpp
+)
+
+target_link_libraries(qwen3-norm-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+
+target_compile_features(qwen3-norm-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-norm-tests)
+
 # ── Phase 2 unit tests ────────────────────────────────────────────────────────
 
 # Layer and state interface tests (no model file needed).
@@ -323,3 +337,45 @@ target_link_libraries(qwen3-loader-tests PRIVATE
 
 target_compile_features(qwen3-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(qwen3-loader-tests)
+
+# TransformerBlock unit tests — no model file needed.
+# Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.
+add_executable(qwen3-transformer-block-tests
+    unit/test_transformer_block.cpp
+)
+
+target_link_libraries(qwen3-transformer-block-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    qinf-state
+    ggml
+)
+
+target_compile_features(qwen3-transformer-block-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-transformer-block-tests)
+
+# ── TQ prefill canary tests ───────────────────────────────────────────────────
+# Regression gate for the TurboQuant prefill path (_build_layer_batch_graph).
+# Prerequisite for the build_transformer_layer extraction PR.
+# Self-skips when QWEN3_MODEL_PATH is unset or the model file is absent.
+# See: docs/kv-cache-unification.md open question #3.
+add_executable(qwen3-tq-prefill-tests
+    unit/test_qwen3_tq_prefill.cpp
+)
+
+# Bake the source-tree fixture path into the binary so it resolves correctly
+# regardless of the working directory from which tests are invoked.
+target_compile_definitions(qwen3-tq-prefill-tests PRIVATE
+    QWEN3_TQ_BASELINE_DEFAULT="${CMAKE_SOURCE_DIR}/tests/fixtures/qwen3_tq_prefill_baseline.json"
+)
+
+target_link_libraries(qwen3-tq-prefill-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qwen3-core
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(qwen3-tq-prefill-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-tq-prefill-tests)

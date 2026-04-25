@@ -1,4 +1,5 @@
 #include "attention.h"
+#include "norm.h"
 #include "../state/kv_cache_simple.h"
 
 #include "ggml.h"
@@ -224,24 +225,10 @@ ggml_tensor* build_batched_attention(
     return build_attn_mha(ctx, gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
 }
 
-// ── Qwen3.5 attention helpers ─────────────────────────────────────────────────
-
-// Inline RMS norm + weight mul — replicates ForwardPassBase::build_norm.
-// The intermediate rms_norm tensor is named "cur_rms_normed.N" to match the
-// original (set_tensor_name is called inside build_norm before the mul).
-static ggml_tensor* qwen35_norm(
-    ggml_context* ctx, ggml_tensor* cur, ggml_tensor* weight, float eps, int il)
-{
-    cur = ggml_rms_norm(ctx, cur, eps);
-    set_name(cur, "cur_rms_normed", il);
-    cur = ggml_mul(ctx, cur, weight);
-    return cur;
-}
-
-// ── build_qwen35_attention ────────────────────────────────────────────────────
-// Extracted from Qwen35ForwardPass::build_attention_layer (src/models/qwen35.cpp).
-// Logic is identical — ctx_/meta_/model_ member accesses become explicit params.
-ggml_tensor* build_qwen35_attention(
+// ── build_gated_attention ─────────────────────────────────────────────────────
+// Gated attention variant used by Qwen3.5 and Qwen3.6: joint Q+Gate projection,
+// Q/K RMS norms, partial RoPE, sigmoid gating on the output.
+ggml_tensor* build_gated_attention(
     ggml_context*    ctx,
     ggml_cgraph*     gf,
     simple_kv_cache* kv_cache,
@@ -276,7 +263,7 @@ ggml_tensor* build_qwen35_attention(
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     set_name(Qcur, "Qcur", il);
 
-    Qcur = qwen35_norm(ctx, Qcur, w_q_norm, rms_norm_eps, il);
+    Qcur = build_rms_norm(ctx, Qcur, w_q_norm, rms_norm_eps, il);
     set_name(Qcur, "Qcur_normed", il);
 
     // C. K and V projections
@@ -286,7 +273,7 @@ ggml_tensor* build_qwen35_attention(
     Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_head, n_head_kv, n_tokens);
     Vcur = ggml_reshape_3d(ctx, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-    Kcur = qwen35_norm(ctx, Kcur, w_k_norm, rms_norm_eps, il);
+    Kcur = build_rms_norm(ctx, Kcur, w_k_norm, rms_norm_eps, il);
     set_name(Kcur, "Kcur_normed", il);
 
     // D. Extract Gate (offset by n_embd_head within each interleaved pair)
@@ -344,10 +331,10 @@ ggml_tensor* build_qwen35_attention(
     return cur;
 }
 
-// ── build_qwen35_batched_attention ────────────────────────────────────────────
-// Extracted from Qwen35ForwardPass::build_batched_attention_layer (src/models/qwen35.cpp).
-// Logic is identical — ctx_/kv_cache_ member accesses become explicit params.
-ggml_tensor* build_qwen35_batched_attention(
+// ── build_gated_batched_attention ─────────────────────────────────────────────
+// Batched decode variant of build_gated_attention: same projections/norms/gating,
+// operates on a batch of slots with pre-built kq_mask and gather_indices.
+ggml_tensor* build_gated_batched_attention(
     ggml_context*                ctx,
     ggml_cgraph*                 gf,
     simple_kv_cache*             kv_cache,
@@ -384,7 +371,7 @@ ggml_tensor* build_qwen35_batched_attention(
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
 
-    Qcur = qwen35_norm(ctx, Qcur, w_q_norm, rms_norm_eps, il);
+    Qcur = build_rms_norm(ctx, Qcur, w_q_norm, rms_norm_eps, il);
 
     // C. K and V projections
     ggml_tensor* Kcur = ggml_mul_mat(ctx, w_k, cur);
@@ -393,7 +380,7 @@ ggml_tensor* build_qwen35_batched_attention(
     Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_head, n_head_kv, n_batch);
     Vcur = ggml_reshape_3d(ctx, Vcur, n_embd_head, n_head_kv, n_batch);
 
-    Kcur = qwen35_norm(ctx, Kcur, w_k_norm, rms_norm_eps, il);
+    Kcur = build_rms_norm(ctx, Kcur, w_k_norm, rms_norm_eps, il);
 
     // D. Extract Gate → [n_embd_head*n_head, n_batch]
     ggml_tensor* gate = ggml_view_3d(ctx, Qcur_full,

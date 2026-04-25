@@ -102,12 +102,6 @@ private:
     // Attention subgraph construction is in src/layers/attention.cpp.
 
     // ── Per-layer / batched graph builders (TurboQuant Phase 2) ───
-    // Single-layer builder — kept for reference; run_prefill uses the batch variant.
-    ggml_cgraph* _build_single_layer_graph(
-        uint32_t il, const std::vector<int32_t>& tokens,
-        int pos, uint32_t slot_idx, uint32_t n_tokens,
-        uint32_t scratch_layer = 0);
-
     // Batch builder: builds [il_start, il_end) layers in one ggml context.
     // Each attention layer in the batch uses scratch cache slot scratch_idx (0-based).
     ggml_cgraph* _build_layer_batch_graph(

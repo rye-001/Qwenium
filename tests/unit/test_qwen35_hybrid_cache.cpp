@@ -83,32 +83,32 @@ TEST_F(Qwen35HybridCacheTest, KVCacheLayerCount) {
 }
 
 // ============================================================
-// Test: SSM state cache exists and has 18 layers
+// Test: DeltaNet state exists and has 18 layers
 // ============================================================
 TEST_F(Qwen35HybridCacheTest, SSMCacheExists) {
     SKIP_IF_NO_MODEL();
 
     Qwen35ForwardPass fp(*model_, &model_->get_metadata(), 2048, 2);
 
-    auto* ssm = fp.get_ssm_cache_ptr();
-    ASSERT_NE(ssm, nullptr) << "SSM state cache should be allocated for qwen35";
-    EXPECT_EQ(ssm->get_n_ssm_layers(), 18u);
+    auto* dn = fp.get_dn_state_ptr();
+    ASSERT_NE(dn, nullptr) << "DeltaNet state should be allocated for qwen35";
+    EXPECT_EQ(dn->n_dn_layers(), 18u);
 }
 
 // ============================================================
-// Test: SSM cache dimensions match model metadata
+// Test: DeltaNet state dimensions match model metadata
 // ============================================================
 TEST_F(Qwen35HybridCacheTest, SSMCacheDimensions) {
     SKIP_IF_NO_MODEL();
 
     Qwen35ForwardPass fp(*model_, &model_->get_metadata(), 2048, 2);
 
-    auto* ssm = fp.get_ssm_cache_ptr();
-    ASSERT_NE(ssm, nullptr);
+    auto* dn = fp.get_dn_state_ptr();
+    ASSERT_NE(dn, nullptr);
 
-    EXPECT_EQ(ssm->get_d_state(), 128u);     // ssm.state_size
-    EXPECT_EQ(ssm->get_n_heads(), 16u);      // ssm.group_count
-    EXPECT_EQ(ssm->get_conv_kernel(), 4u);   // ssm.conv_kernel
+    EXPECT_EQ(dn->head_k_dim(),  128u);   // ssm.state_size
+    EXPECT_EQ(dn->num_v_heads(),  16u);   // ssm.time_step_rank
+    EXPECT_EQ(dn->conv_kernel(),   4u);   // ssm.conv_kernel
 }
 
 // ============================================================

@@ -8,6 +8,8 @@ add_library(qinf-layers STATIC
     deltanet.cpp
     moe.cpp
     moe_residency.cpp
+    norm.cpp
+    transformer_block.cpp
 )
 
 target_include_directories(qinf-layers PUBLIC

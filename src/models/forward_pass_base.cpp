@@ -1,6 +1,7 @@
 #include "forward_pass_base.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
+#include "../layers/norm.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -76,10 +77,7 @@ ggml_tensor* ForwardPassBase::build_norm(
     ggml_tensor* mw,
     int il) const
 {
-    cur = ggml_rms_norm(ctx_, cur, meta_.rms_norm_eps);
-    set_tensor_name(gf, cur, "cur_rms_normed", il);
-    cur = ggml_mul(ctx_, cur, mw);
-    return cur;
+    return build_rms_norm(ctx_, cur, mw, meta_.rms_norm_eps, il);
 }
 
 // Thin wrapper — implementation lives in src/layers/attention.cpp.

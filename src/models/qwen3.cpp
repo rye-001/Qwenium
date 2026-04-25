@@ -1,6 +1,7 @@
 #include "qwen3.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
+#include "../layers/transformer_block.h"
 #include "../state/turboquant.h"
 #include "../state/snapkv.h"
 
@@ -110,14 +111,8 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         n_embd_head = hidden_dim / n_head;
     }
 
-    int vocab_size = meta_.vocab_size;  // From final output projection
-    const int n_rot = n_embd_head;
-    int n_embd_k = n_head_kv * n_embd_head;
-    int n_embd_v = n_head_kv * n_embd_head;
-    
     // 1. Token embedding lookup
     const size_t n_tokens = tokens.size();
-    ggml_tensor * cur;
 
     // Token embedding lookup
     ggml_tensor * inpL = embedding(gf, tokens);
@@ -135,113 +130,36 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
     // }
 
     // 2. Loop through each transformer block
-    for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor * inpSA = inpL;
+    TransformerBlockHparams blk_hp;
+    blk_hp.is_qwen2      = (meta_.architecture == "qwen2");
+    blk_hp.n_head        = n_head;
+    blk_hp.n_head_kv     = n_head_kv;
+    blk_hp.n_embd_head   = n_embd_head;
+    blk_hp.freq_base     = meta_.rope_freq_base;
+    blk_hp.context_length = static_cast<int>(meta_.context_length);
+    blk_hp.rms_norm_eps  = meta_.rms_norm_eps;
+
+    for (uint32_t il = 0; il < static_cast<uint32_t>(n_layers); ++il) {
         auto& block = model_.get_block(il);
+        TransformerBlockWeights w;
+        w.attn_norm = block.attn_norm_weight;
+        w.q         = block.attn_q_weight;
+        w.k         = block.attn_k_weight;
+        w.v         = block.attn_v_weight;
+        w.q_bias    = block.attn_q_bias;
+        w.k_bias    = block.attn_k_bias;
+        w.v_bias    = block.attn_v_bias;
+        w.q_norm    = block.attn_q_norm_weight;
+        w.k_norm    = block.attn_k_norm_weight;
+        w.out       = block.attn_output_weight;
+        w.ffn_norm  = block.ffn_norm_weight;
+        w.ffn_gate  = block.ffn_gate_weight;
+        w.ffn_up    = block.ffn_up_weight;
+        w.ffn_down  = block.ffn_down_weight;
 
-        // A. RMS Normalization before attention
-        cur = build_norm(gf, inpL, block.attn_norm_weight, il);
-        set_tensor_name(gf, cur, "cur_normed", il);
-
-        // B. Self-Attention Q, K, V Projections
-        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-        set_tensor_name(gf, Qcur, "Qcur", il);
-        if (meta_.architecture == "qwen2") {
-            Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
-            set_tensor_name(gf, Qcur, "Qcur_biased", il);
-        }
-        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-        set_tensor_name(gf, Kcur, "Kcur", il);
-        if (meta_.architecture == "qwen2") {
-            Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
-            set_tensor_name(gf, Kcur, "Kcur_biased", il);
-        }
-        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-        set_tensor_name(gf, Vcur, "Vcur", il);
-        if (meta_.architecture == "qwen2") {
-            Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
-            set_tensor_name(gf, Vcur, "Vcur_biased", il);
-        }
-
-
-        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
-        set_tensor_name(gf, Qcur, "Qcur_3d", il);
-        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-        set_tensor_name(gf, Kcur, "Kcur_3d", il);
-        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
-        set_tensor_name(gf, Vcur, "Vcur_3d", il);
-
-        if (meta_.architecture == "qwen3") {
-            Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
-            set_tensor_name(gf, Qcur, "Qcur_normed", il);
-        }
-        // float freq_base = 10000.0f;
-        float freq_base = meta_.rope_freq_base;
-        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, 
-                              n_rot,                           // rotation dims
-                              GGML_ROPE_TYPE_NEOX,           // mode = 2
-                              meta_.context_length,        // n_ctx_orig = 40960
-                              freq_base,        // freq_base = 1000000
-                              1.0f,                           // freq_scale = 1
-                              0.0f,                           // ext_factor = 0
-                              1.0f,                           // attn_factor = 1
-                              32.0f,                          // beta_fast = 32
-                              1.0f);                          // beta_slow = 1
-
-
-        set_tensor_name(gf, Qcur, "Qcur_roped", il);
-        if (meta_.architecture == "qwen3") {
-            Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
-            set_tensor_name(gf, Kcur, "Kcur_normed", il);
-        }
-        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, 
-                              n_rot,                           // rotation dims
-                              GGML_ROPE_TYPE_NEOX,           // mode = 2
-                              meta_.context_length,        // n_ctx_orig = 40960
-                              freq_base,        // freq_base = 1000000
-                              1.0f,                           // freq_scale = 1
-                              0.0f,                           // ext_factor = 0
-                              1.0f,                           // attn_factor = 1
-                              32.0f,                          // beta_fast = 32
-                              1.0f);
-
-        set_tensor_name(gf, Kcur, "Kcur_roped", il);
-
-        // Build attention
-
-        // D. Grouped-Query Attention
-        float kq_scale = 1.0f/sqrtf(float(n_embd_head));
-        cur = build_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
-
-        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-        set_tensor_name(gf, cur, "attn_output", il);
-
-        // Only need logits for the last token
-        // if (il == n_layer - 1 && inp_out_ids) {
-        //     cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-        //     inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-        // }
-
-        
-
-        // E. Residual connection after attention
-        ggml_tensor * ffn_inp = ggml_add(ctx_, cur, inpSA);
-        set_tensor_name(gf, ffn_inp, "ffn_inp", il);
-
-        // F. RMS Normalization before FFN
-        cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        set_tensor_name(gf, cur, "ffn_norm", il);
-
-        // G. Feed-Forward Network (SwiGLU)
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
-        set_tensor_name(gf, cur, "ffn_output", il);
-
-        // H. Residual connection after FFN
-        cur = ggml_add(ctx_, cur, ffn_inp);
-        set_tensor_name(gf, cur, "cur_ffn_inp", il);
-
-        // cur = build_cvec(cur, il);
-        inpL = cur;
+        inpL = build_transformer_layer(ctx_, gf, kv_cache_.get(), inpL, inp_pos,
+                                       w, blk_hp, il, slot_idx,
+                                       static_cast<uint32_t>(n_tokens));
     }
 
     // 3. Final normalization and output projection
@@ -657,88 +575,6 @@ void Qwen3ForwardPass::_tq_compress_new(uint32_t layer, uint32_t slot_idx,
     tq_scratch_valid_pos_[layer][slot_idx] = pos + n_tokens;
 }
 
-ggml_cgraph* Qwen3ForwardPass::_build_single_layer_graph(
-    uint32_t il, const std::vector<int32_t>& tokens,
-    int pos, uint32_t slot_idx, uint32_t n_tokens,
-    uint32_t scratch_layer)
-{
-    reset_context();
-    ggml_cgraph* gf = new_graph();
-
-    int n_embd_head = (meta_.architecture == "qwen3")
-        ? meta_.attention_key_length
-        : meta_.embedding_length / meta_.attention_head_count;
-    int n_head = meta_.attention_head_count;
-    int n_head_kv = meta_.attention_head_count_kv;
-    int n_embd_k = n_head_kv * n_embd_head;
-    const int n_rot = n_embd_head;
-
-    auto& block = model_.get_block(il);
-
-    // Input hidden state — will be set via ggml_backend_tensor_set
-    ggml_tensor* inpL = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32,
-        meta_.embedding_length, n_tokens);
-    ggml_set_input(inpL);
-    ggml_set_name(inpL, "inpL");
-    ggml_build_forward_expand(gf, inpL);
-
-    // Position tensor
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp_pos);
-    ggml_set_name(inp_pos, "inp_pos");
-    ggml_build_forward_expand(gf, inp_pos);
-
-    ggml_tensor* inpSA = inpL;
-    ggml_tensor* cur;
-
-    // A. RMS Normalization before attention
-    cur = build_norm(gf, inpL, block.attn_norm_weight, il);
-
-    // B. Q, K, V projections
-    ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-    if (meta_.architecture == "qwen2") Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
-    ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-    if (meta_.architecture == "qwen2") Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
-    ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-    if (meta_.architecture == "qwen2") Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
-
-    Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head, n_tokens);
-    Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-    if (meta_.architecture == "qwen3") {
-        Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
-        Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
-    }
-
-    // RoPE
-    float freq_base = meta_.rope_freq_base;
-    Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-        meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-        meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-    // C. Attention
-    float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-    cur = build_attention(ctx_, gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
-        scratch_layer, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
-
-    // D. Output projection + residual
-    cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-    ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
-
-    // E. FFN
-    cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-    cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
-        block.ffn_down_weight, il);
-
-    // F. FFN residual
-    cur = ggml_add(ctx_, cur, ffn_inp);
-    ggml_set_name(cur, "layer_out");
-    ggml_build_forward_expand(gf, cur);
-
-    return gf;
-}
 
 ggml_cgraph* Qwen3ForwardPass::_build_output_head_graph() {
     reset_context();
@@ -780,55 +616,37 @@ ggml_cgraph* Qwen3ForwardPass::_build_layer_batch_graph(
     ggml_set_name(inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    TransformerBlockHparams blk_hp;
+    blk_hp.is_qwen2       = (meta_.architecture == "qwen2");
+    blk_hp.n_head         = n_head;
+    blk_hp.n_head_kv      = n_head_kv;
+    blk_hp.n_embd_head    = n_embd_head;
+    blk_hp.freq_base      = freq_base;
+    blk_hp.context_length = static_cast<int>(meta_.context_length);
+    blk_hp.rms_norm_eps   = meta_.rms_norm_eps;
+
     ggml_tensor* cur = inpL;
 
     for (uint32_t il = il_start; il < il_end; ++il) {
-        auto& block  = model_.get_block(il);
-        ggml_tensor* inpSA = cur;
+        auto& block = model_.get_block(il);
+        TransformerBlockWeights w;
+        w.attn_norm = block.attn_norm_weight;
+        w.q         = block.attn_q_weight;
+        w.k         = block.attn_k_weight;
+        w.v         = block.attn_v_weight;
+        w.q_bias    = block.attn_q_bias;
+        w.k_bias    = block.attn_k_bias;
+        w.v_bias    = block.attn_v_bias;
+        w.q_norm    = block.attn_q_norm_weight;
+        w.k_norm    = block.attn_k_norm_weight;
+        w.out       = block.attn_output_weight;
+        w.ffn_norm  = block.ffn_norm_weight;
+        w.ffn_gate  = block.ffn_gate_weight;
+        w.ffn_up    = block.ffn_up_weight;
+        w.ffn_down  = block.ffn_down_weight;
 
-        // Pre-attention norm
-        cur = build_norm(gf, cur, block.attn_norm_weight, il);
-
-        // Q, K, V projections
-        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-        if (meta_.architecture == "qwen2") {
-            Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
-            Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
-            Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
-        }
-
-        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-        if (meta_.architecture == "qwen3") {
-            Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
-            Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
-        }
-
-        // RoPE
-        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot,
-            GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
-            1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot,
-            GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
-            1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-        // Attention — each layer uses its persistent scratch cache slot (il)
-        const float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-        cur = build_attention(ctx_, gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
-            il, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
-
-        // Output projection + residuals
-        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-        ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
-
-        cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
-            block.ffn_down_weight, il);
-        cur = ggml_add(ctx_, cur, ffn_inp);
+        cur = build_transformer_layer(ctx_, gf, tq_scratch_cache_.get(), cur, inp_pos,
+                                      w, blk_hp, il, slot_idx, n_tokens);
     }
 
     ggml_set_name(cur, "layer_out");

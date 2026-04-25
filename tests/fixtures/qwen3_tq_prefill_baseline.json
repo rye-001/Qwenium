@@ -1,0 +1,42 @@
+{
+  "abs_tol": 0.05000000074505806,
+  "kv_quant_bits": 2,
+  "model_desc": "Qwen3ForwardPass",
+  "prompt": "The capital of France is",
+  "rel_tol": 0.009999999776482582,
+  "top8": [
+    {
+      "logit": 17.400592803955078,
+      "token_id": 12095
+    },
+    {
+      "logit": 14.201601028442383,
+      "token_id": 279
+    },
+    {
+      "logit": 14.196749687194824,
+      "token_id": 7407
+    },
+    {
+      "logit": 13.704010963439941,
+      "token_id": 1112
+    },
+    {
+      "logit": 13.504472732543945,
+      "token_id": 30743
+    },
+    {
+      "logit": 13.464624404907227,
+      "token_id": 32671
+    },
+    {
+      "logit": 13.447773933410645,
+      "token_id": 220
+    },
+    {
+      "logit": 13.292741775512695,
+      "token_id": 304
+    }
+  ],
+  "top_k": 8
+}

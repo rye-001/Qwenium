@@ -92,6 +92,9 @@ public:
     uint32_t n_slots_count()   const { return hp_.n_slots; }
     size_t   rec_slot_floats() const { return rec_slot_floats_; }
     size_t   conv_slot_floats() const { return conv_slot_floats_; }
+    uint32_t head_k_dim()      const { return hp_.head_k_dim; }
+    uint32_t num_v_heads()     const { return hp_.num_v_heads; }
+    uint32_t conv_kernel()     const { return hp_.conv_kernel; }
 
 private:
     Hparams  hp_;
