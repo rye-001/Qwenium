@@ -14,7 +14,7 @@
 //   - EOS is only unmasked when grammar is in accepting state
 //   - Vocab is normalized: Qwen3's Ġ (U+0120) → ' ', Ċ (U+010A) → '\n'
 
-#include "qwen3-core/qwen3-model.h"
+#include "core/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "models/qwen35.h"
@@ -386,7 +386,7 @@ struct SlotState {
     int32_t last_token_id;
 
     // Grammar state — nullptr when grammar is disabled
-    std::unique_ptr<qwen3::GrammarVocab> grammar;
+    std::unique_ptr<qwenium::GrammarVocab> grammar;
 };
 
 // ============================================================
@@ -419,7 +419,7 @@ static std::string normalize_token(const std::string& s) {
 // EOS is allowed only when the grammar is in accepting state.
 static void mask_grammar_logits(
     std::vector<float>&           logits,
-    qwen3::GrammarVocab*          grammar,
+    qwenium::GrammarVocab*          grammar,
     const std::vector<std::string>& vocab,
     int32_t                       eos_id)
 {
@@ -438,7 +438,7 @@ static void mask_grammar_logits(
 // ============================================================
 
 class ParallelModelRunner {
-    std::shared_ptr<Qwen3Model>   model_;
+    std::shared_ptr<Model>   model_;
     std::unique_ptr<ForwardPassBase> forward_pass_;
     std::unique_ptr<Tokenizer>    tokenizer_;
     std::string                   model_path_;
@@ -469,7 +469,7 @@ public:
 
     bool load() {
         try {
-            model_ = std::make_shared<Qwen3Model>();
+            model_ = std::make_shared<Model>();
             model_->load_metadata(model_path_);
             model_->load_tensors();
             tokenizer_ = std::make_unique<Tokenizer>(&model_->get_metadata());
@@ -531,7 +531,7 @@ public:
             std::cout << "  Grammar vocab built: " << vocab_size << " tokens\n";
         }
 
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
         ggml_backend_sched_t scheduler = model_->get_scheduler();
 
         // ── Phase 1: Clone system-prompt prefix to all slots ───────────────
@@ -563,7 +563,7 @@ public:
 
             // Initialize per-slot grammar (independent instance per slot)
             if (grammar_enabled)
-                slots[i].grammar = qwen3::GrammarVocab::parse_impl(gbnf_str);
+                slots[i].grammar = qwenium::GrammarVocab::parse_impl(gbnf_str);
 
             // Prefill user prompt
             ggml_backend_sched_reset(scheduler);

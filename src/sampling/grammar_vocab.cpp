@@ -25,7 +25,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qwen3 {
+namespace qwenium {
 
 // ============================================================================
 // Internal element types — identical to grammar.cpp
@@ -793,4 +793,4 @@ void GrammarVocab::dump_expected() const {
         }
     }
 }
-} // namespace qwen3
+} // namespace qwenium

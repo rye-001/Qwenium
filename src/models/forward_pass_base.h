@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "qwen3-model.h"
+#include "../core/model.h"
 #include "../state/kv_cache_simple.h"
 #include "ggml-backend.h"
 
@@ -27,7 +27,7 @@ constexpr size_t FP_GRAPH_SIZE = 16384;
  */
 class ForwardPassBase {
 public:
-    ForwardPassBase(const Qwen3Model& model, const Qwen3Metadata* metadata);
+    ForwardPassBase(const Model& model, const ModelMetadata* metadata);
     virtual ~ForwardPassBase();
 
     virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) = 0;
@@ -114,8 +114,8 @@ public:
     }
 
 protected:
-    const Qwen3Metadata& meta_;
-    const Qwen3Model& model_;
+    const ModelMetadata& meta_;
+    const Model& model_;
     struct ggml_context* ctx_;
     std::vector<uint8_t> ctx_buffer_;
 

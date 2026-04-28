@@ -7,7 +7,7 @@
 #include <vector>
 #include <iostream>
 
-namespace qwen3 {
+namespace qwenium {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     if (!pruned_vocab_) return;
@@ -193,4 +193,4 @@ int TemperatureSampler::sample(std::vector<float>& logits,
     return sorted[dist(gen_)].first;
 }
 
-} // namespace qwen3
+} // namespace qwenium

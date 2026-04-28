@@ -3,6 +3,7 @@
 #include "../layers/deltanet.h"
 #include "../layers/ffn.h"
 #include "../state/snapkv.h"
+#include "../qinf_error.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -10,6 +11,47 @@
 #include <cmath>
 #include <future>
 #include <thread>
+
+// ── Qwen35Config::from_metadata ──────────────────────────────────────────────
+
+Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
+    const uint32_t ssm_state_size          = meta.raw_kv.get_uint32("qwen35.ssm.state_size");
+    const uint32_t ssm_inner_size          = meta.raw_kv.get_uint32("qwen35.ssm.inner_size");
+    const uint32_t ssm_time_step_rank      = meta.raw_kv.get_uint32("qwen35.ssm.time_step_rank");
+    const uint32_t ssm_group_count         = meta.raw_kv.get_uint32("qwen35.ssm.group_count");
+    const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32("qwen35.ssm.conv_kernel");
+    const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32_opt("qwen35.rope.dimension_count").value_or(0u);
+
+    QINF_ASSERT(ssm_state_size > 0,
+        "Qwen35Config: field \"ssm_state_size\" expected > 0, got 0 "
+        "(GGUF key: qwen35.ssm.state_size)");
+    QINF_ASSERT(ssm_inner_size > 0,
+        "Qwen35Config: field \"ssm_inner_size\" expected > 0, got 0 "
+        "(GGUF key: qwen35.ssm.inner_size)");
+    QINF_ASSERT(ssm_time_step_rank > 0,
+        "Qwen35Config: field \"ssm_time_step_rank\" expected > 0, got 0 "
+        "(GGUF key: qwen35.ssm.time_step_rank)");
+    QINF_ASSERT(ssm_group_count > 0,
+        "Qwen35Config: field \"ssm_group_count\" expected > 0, got 0 "
+        "(GGUF key: qwen35.ssm.group_count)");
+    QINF_ASSERT(ssm_conv_kernel > 0,
+        "Qwen35Config: field \"ssm_conv_kernel\" expected > 0, got 0 "
+        "(GGUF key: qwen35.ssm.conv_kernel)");
+    QINF_ASSERT(full_attention_interval > 0,
+        "Qwen35Config: field \"full_attention_interval\" expected > 0, got 0 "
+        "(GGUF key: qwen35.full_attention_interval)");
+
+    return Qwen35Config{
+        ssm_conv_kernel,
+        ssm_state_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_inner_size,
+        rope_dimension_count,
+        full_attention_interval,
+    };
+}
 
 // Layers per fused graph_compute call (same value as forward-pass.cpp).
 // Each attention layer has its own persistent scratch slot for incremental decompression.
@@ -20,10 +62,13 @@ static constexpr uint32_t TQ_LAYER_BATCH = 4;
 // ============================================================
 
 Qwen35ForwardPass::Qwen35ForwardPass(
-    const Qwen3Model& model, const Qwen3Metadata* metadata,
+    const Model& model, const ModelMetadata* metadata,
     uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
     : ForwardPassBase(model, metadata)
 {
+    // Construct the typed config; validates qwen35-specific invariants.
+    cfg_ = Qwen35Config::from_metadata(*metadata);
+
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -36,7 +81,7 @@ Qwen35ForwardPass::Qwen35ForwardPass(
     ssm_layer_map_.resize(meta_.block_count, -1);
 
     for (uint32_t il = 0; il < meta_.block_count; ++il) {
-        if (meta_.is_full_attention_layer(il)) {
+        if (cfg_.is_full_attention_layer(il)) {
             kv_layer_map_[il] = static_cast<int32_t>(n_attn_layers++);
         } else {
             ssm_layer_map_[il] = static_cast<int32_t>(n_ssm_layers++);
@@ -63,21 +108,21 @@ Qwen35ForwardPass::Qwen35ForwardPass(
 
     // DeltaNet recurrent state — GatedDeltaNet layers only
     // conv_channels = d_inner + 2 * n_group * d_state = 2048 + 2*16*128 = 6144
-    const uint32_t d_inner_dn     = meta_.ssm_inner_size;
-    const uint32_t num_v_heads_dn = meta_.ssm_time_step_rank;
-    const uint32_t num_k_heads_dn = meta_.ssm_group_count;
+    const uint32_t d_inner_dn     = cfg_.ssm_inner_size;
+    const uint32_t num_v_heads_dn = cfg_.ssm_time_step_rank;
+    const uint32_t num_k_heads_dn = cfg_.ssm_group_count;
     const uint32_t head_v_dim_dn  = d_inner_dn / num_v_heads_dn;
     const uint32_t conv_channels_dn =
-        d_inner_dn + 2 * num_k_heads_dn * meta_.ssm_state_size;
+        d_inner_dn + 2 * num_k_heads_dn * cfg_.ssm_state_size;
 
     DeltaNetState::Hparams dn_hp{
         n_ssm_layers,
         max_batch_size,
         head_v_dim_dn,
-        meta_.ssm_state_size,  // head_k_dim
+        cfg_.ssm_state_size,  // head_k_dim
         num_v_heads_dn,
         conv_channels_dn,
-        meta_.ssm_conv_kernel,
+        cfg_.ssm_conv_kernel,
         cache_backend
     };
     dn_state_ = std::make_unique<DeltaNetState>(dn_hp);
@@ -151,7 +196,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         cur = build_norm(gf, inpL, block.attn_norm_weight, il);
         set_tensor_name(gf, cur, "attn_norm", il);
 
-        if (meta_.is_ssm_layer(il)) {
+        if (cfg_.is_ssm_layer(il)) {
             uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
             cur = build_deltanet_layer(
                 ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
@@ -160,13 +205,13 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
                 block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
                 block.ssm_norm_weight, block.ssm_out_weight,
                 static_cast<int>(meta_.embedding_length),
-                static_cast<int>(meta_.ssm_inner_size),
-                static_cast<int>(meta_.ssm_state_size),
-                static_cast<int>(meta_.ssm_group_count),
-                static_cast<int>(meta_.ssm_time_step_rank),
-                static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
-                static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
-                static_cast<int>(meta_.ssm_conv_kernel),
+                static_cast<int>(cfg_.ssm_inner_size),
+                static_cast<int>(cfg_.ssm_state_size),
+                static_cast<int>(cfg_.ssm_group_count),
+                static_cast<int>(cfg_.ssm_time_step_rank),
+                static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
+                static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
+                static_cast<int>(cfg_.ssm_conv_kernel),
                 meta_.rms_norm_eps,
                 il);
         } else {
@@ -177,8 +222,8 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
                                                              : kv_cache_.get();
             int32_t kv_idx = tq_scratch_cache_ ? 0 : kv_layer_map_[il];
             const int n_embd_head = meta_.attention_key_length;
-            const int n_rot = (meta_.rope_dimension_count > 0)
-                ? meta_.rope_dimension_count : n_embd_head;
+            const int n_rot = (cfg_.rope_dimension_count > 0)
+                ? cfg_.rope_dimension_count : n_embd_head;
             cur = ::build_gated_attention(
                 ctx_, gf, attn_cache, cur, inp_pos, kv_idx, n_tokens, slot_idx, il,
                 block.attn_q_weight, block.attn_q_norm_weight,
@@ -283,7 +328,7 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_layer_graph(
     ggml_tensor* inpSA = inpL;
     ggml_tensor* cur = build_norm(gf, inpL, block.attn_norm_weight, il);
 
-    if (meta_.is_ssm_layer(il)) {
+    if (cfg_.is_ssm_layer(il)) {
         uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
         cur = build_deltanet_layer(
             ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
@@ -292,13 +337,13 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_layer_graph(
             block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
             block.ssm_norm_weight, block.ssm_out_weight,
             static_cast<int>(meta_.embedding_length),
-            static_cast<int>(meta_.ssm_inner_size),
-            static_cast<int>(meta_.ssm_state_size),
-            static_cast<int>(meta_.ssm_group_count),
-            static_cast<int>(meta_.ssm_time_step_rank),
-            static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
-            static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
-            static_cast<int>(meta_.ssm_conv_kernel),
+            static_cast<int>(cfg_.ssm_inner_size),
+            static_cast<int>(cfg_.ssm_state_size),
+            static_cast<int>(cfg_.ssm_group_count),
+            static_cast<int>(cfg_.ssm_time_step_rank),
+            static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
+            static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
+            static_cast<int>(cfg_.ssm_conv_kernel),
             meta_.rms_norm_eps,
             il);
     } else {
@@ -309,8 +354,8 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_layer_graph(
 
         {
             const int n_embd_head = meta_.attention_key_length;
-            const int n_rot = (meta_.rope_dimension_count > 0)
-                ? meta_.rope_dimension_count : n_embd_head;
+            const int n_rot = (cfg_.rope_dimension_count > 0)
+                ? cfg_.rope_dimension_count : n_embd_head;
             cur = ::build_gated_attention(
                 ctx_, gf, tq_scratch_cache_.get(), cur, inp_pos,
                 scratch_layer, n_tokens, slot_idx, il,
@@ -368,7 +413,7 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_batch_graph(
 
         cur = build_norm(gf, cur, block.attn_norm_weight, il);
 
-        if (meta_.is_ssm_layer(il)) {
+        if (cfg_.is_ssm_layer(il)) {
             uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
             cur = build_deltanet_layer(
                 ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
@@ -377,21 +422,21 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_batch_graph(
                 block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
                 block.ssm_norm_weight, block.ssm_out_weight,
                 static_cast<int>(meta_.embedding_length),
-                static_cast<int>(meta_.ssm_inner_size),
-                static_cast<int>(meta_.ssm_state_size),
-                static_cast<int>(meta_.ssm_group_count),
-                static_cast<int>(meta_.ssm_time_step_rank),
-                static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
-                static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
-                static_cast<int>(meta_.ssm_conv_kernel),
+                static_cast<int>(cfg_.ssm_inner_size),
+                static_cast<int>(cfg_.ssm_state_size),
+                static_cast<int>(cfg_.ssm_group_count),
+                static_cast<int>(cfg_.ssm_time_step_rank),
+                static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
+                static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
+                static_cast<int>(cfg_.ssm_conv_kernel),
                 meta_.rms_norm_eps,
                 il);
         } else {
             // Each attention layer uses its persistent scratch slot (kv_layer_map_[il])
             {
                 const int n_embd_head = meta_.attention_key_length;
-                const int n_rot = (meta_.rope_dimension_count > 0)
-                    ? meta_.rope_dimension_count : n_embd_head;
+                const int n_rot = (cfg_.rope_dimension_count > 0)
+                    ? cfg_.rope_dimension_count : n_embd_head;
                 cur = ::build_gated_attention(
                     ctx_, gf, tq_scratch_cache_.get(), cur, inp_pos,
                     kv_layer_map_[il], n_tokens, slot_idx, il,
@@ -546,9 +591,11 @@ void Qwen35ForwardPass::_tq_compress_attn_layer(
 }
 
 // Find the last attention layer (for SnapKV scoring)
-static uint32_t _find_last_attn_layer(const Qwen3Metadata& meta) {
+static uint32_t _find_last_attn_layer(const ModelMetadata& meta) {
+    const uint32_t fai = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
     for (int32_t il = meta.block_count - 1; il >= 0; --il) {
-        if (meta.is_full_attention_layer(il)) return il;
+        const bool is_full = (fai > 0) && ((il % fai) == (fai - 1));
+        if (is_full) return il;
     }
     return meta.block_count - 1;  // fallback
 }
@@ -584,7 +631,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
             // n_kv_layers for compaction (only 6 attention layers have KV)
             uint32_t n_kv_layers = 0;
             for (uint32_t il = 0; il < meta_.block_count; ++il)
-                if (meta_.is_full_attention_layer(il)) ++n_kv_layers;
+                if (cfg_.is_full_attention_layer(il)) ++n_kv_layers;
             uint32_t original_seq_len = pos + tokens.size();
             apply_snapkv_from_graph(gf, scoring_layer, tokens.size(),
                 n_kv_layers, snapkv_budget_, snapkv_window_,
@@ -635,7 +682,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 
         // 1. Decompress KV delta for attention layers into their persistent scratch slots
         for (uint32_t il = il0; il < il1; ++il) {
-            if (!meta_.is_ssm_layer(il)) {
+            if (!cfg_.is_ssm_layer(il)) {
                 const uint32_t kv_idx = static_cast<uint32_t>(kv_layer_map_[il]);
                 _tq_decompress_attn_layer(kv_idx, slot_idx, kv_idx);
             }
@@ -666,7 +713,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 
         // Set causal mask for each attention layer in batch
         for (uint32_t il = il0; il < il1; ++il) {
-            if (meta_.is_ssm_layer(il)) continue;
+            if (cfg_.is_ssm_layer(il)) continue;
             char mask_name[32];
             snprintf(mask_name, sizeof(mask_name), "kq_mask.%d", il);
             ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, mask_name);
@@ -692,7 +739,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 
         // 6. Compress attention layers from their persistent scratch slots
         for (uint32_t il = il0; il < il1; ++il) {
-            if (!meta_.is_ssm_layer(il)) {
+            if (!cfg_.is_ssm_layer(il)) {
                 const uint32_t kv_idx = static_cast<uint32_t>(kv_layer_map_[il]);
                 _tq_compress_attn_layer(kv_idx, slot_idx,
                     tq_store_->get_pos(slot_idx), n_tokens, kv_idx);
@@ -706,7 +753,7 @@ std::vector<float> Qwen35ForwardPass::run_prefill(
 
             uint32_t n_kv_layers = 0;
             for (uint32_t il = 0; il < meta_.block_count; ++il)
-                if (meta_.is_full_attention_layer(il)) ++n_kv_layers;
+                if (cfg_.is_full_attention_layer(il)) ++n_kv_layers;
 
             apply_snapkv_from_graph(gf, scoring_layer, n_tokens,
                 n_kv_layers, snapkv_budget_, snapkv_window_,
@@ -796,7 +843,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
         // Pre-attention/SSM norm
         cur = build_norm(gf, inpL, block.attn_norm_weight, il);
 
-        if (meta_.is_ssm_layer(il)) {
+        if (cfg_.is_ssm_layer(il)) {
             uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
             DeltaNetLayer::PrefillArgs pa_unused{1, 0};
             DeltaNetLayer::DecodeArgs da{slots};
@@ -808,13 +855,13 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
                 dn_state_.get(),
                 DeltaNetLayer::Hparams{
                     static_cast<int>(meta_.embedding_length),
-                    static_cast<int>(meta_.ssm_inner_size),
-                    static_cast<int>(meta_.ssm_state_size),
-                    static_cast<int>(meta_.ssm_group_count),
-                    static_cast<int>(meta_.ssm_time_step_rank),
-                    static_cast<int>(meta_.ssm_inner_size / meta_.ssm_time_step_rank),
-                    static_cast<int>(meta_.ssm_inner_size + 2 * meta_.ssm_group_count * meta_.ssm_state_size),
-                    static_cast<int>(meta_.ssm_conv_kernel),
+                    static_cast<int>(cfg_.ssm_inner_size),
+                    static_cast<int>(cfg_.ssm_state_size),
+                    static_cast<int>(cfg_.ssm_group_count),
+                    static_cast<int>(cfg_.ssm_time_step_rank),
+                    static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
+                    static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
+                    static_cast<int>(cfg_.ssm_conv_kernel),
                     meta_.rms_norm_eps
                 });
             cur = dn_layer.build(ctx_, gf, cur, dn_idx, Phase::Decode, pa_unused, &da);
@@ -822,8 +869,8 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
             {
                 int32_t kv_idx = kv_layer_map_[il];
                 const int n_embd_head = meta_.attention_key_length;
-                const int n_rot = (meta_.rope_dimension_count > 0)
-                    ? meta_.rope_dimension_count : n_embd_head;
+                const int n_rot = (cfg_.rope_dimension_count > 0)
+                    ? cfg_.rope_dimension_count : n_embd_head;
                 cur = ::build_gated_batched_attention(
                     ctx_, gf, kv_cache_.get(), cur, inp_pos,
                     kq_mask, gather_indices, kv_idx, slots, positions, il,
@@ -920,5 +967,50 @@ void Qwen35ForwardPass::set_batched_inputs(
             }
         }
         ggml_backend_tensor_set(gather_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
+    }
+}
+
+// ── Inventory validator ──────────────────────────────────────────────────────
+
+void validate_qwen35_inventory(const ModelMetadata& meta)
+{
+    const auto& inv = meta.tensor_inventory;
+    auto require = [&](const std::string& name, const std::string& ctx) {
+        if (inv.find(name) == inv.end())
+            throw std::runtime_error(
+                "qwen35: missing tensor '" + name +
+                "': expected in " + ctx + ", got absent");
+    };
+    require("token_embd.weight", "model weights");
+    require("output_norm.weight", "model weights");
+
+    static const std::vector<std::string> shared = {
+        "attn_norm.weight", "post_attention_norm.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
+    };
+    static const std::vector<std::string> attn_tensors = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+    };
+    static const std::vector<std::string> ssm_tensors = {
+        "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
+        "ssm_alpha.weight", "ssm_beta.weight",
+        "attn_qkv.weight", "attn_gate.weight",
+        "ssm_norm.weight", "ssm_out.weight"
+    };
+    const uint32_t fai = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : shared) require(p + t, "block " + std::to_string(i));
+        const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+        const auto& chosen = is_full ? attn_tensors : ssm_tensors;
+        const std::string kind = is_full ? "attention" : "SSM";
+        for (const auto& t : chosen) {
+            if (inv.find(p + t) == inv.end())
+                throw std::runtime_error(
+                    "qwen35: missing tensor '" + p + t +
+                    "': expected in " + kind + " layer " + std::to_string(i) +
+                    ", got absent");
+        }
     }
 }

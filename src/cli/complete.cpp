@@ -6,10 +6,10 @@
 #include "../models/model_registry.h"
 
 int run_complete(
-    Qwen3Model& model,
+    Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::GrammarVocab>& grammar,
-    qwen3::SpeculativeDecoder* spec,
+    std::unique_ptr<qwenium::GrammarVocab>& grammar,
+    qwenium::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens
@@ -36,9 +36,9 @@ int run_complete(
         Tokenizer* tokenizer = model.get_tokenizer();
         const auto vocab = tokenizer->get_vocabulary();
 
-        std::unique_ptr<qwen3::Sampler> sampler;
+        std::unique_ptr<qwenium::Sampler> sampler;
         if (args.temperature > 0.0f) {
-            sampler = std::make_unique<qwen3::TemperatureSampler>(
+            sampler = std::make_unique<qwenium::TemperatureSampler>(
                 args.temperature, 
                 args.repetition_penalty, 
                 64, // lookback window
@@ -46,7 +46,7 @@ int run_complete(
                 args.top_p
             );
         } else {
-            sampler = std::make_unique<qwen3::GreedySampler>();
+            sampler = std::make_unique<qwenium::GreedySampler>();
         }
         if (grammar) {
             sampler->set_grammar(grammar.get());
@@ -55,7 +55,7 @@ int run_complete(
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
         if (!args.vocab_prune_list_path.empty()) {
-            pruned_vocab = qwen3::load_keep_list(args.vocab_prune_list_path);
+            pruned_vocab = qwenium::load_keep_list(args.vocab_prune_list_path);
             sampler->set_pruned_vocab(&pruned_vocab);
             if (args.verbose) {
                 std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";

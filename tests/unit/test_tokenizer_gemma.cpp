@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../../src/loader/tokenizer.h"
+#include "../../src/loader/tokenizer_config.h"
 
 namespace {
 
@@ -43,9 +44,17 @@ constexpr const char* SPM_UNDER = "\xE2\x96\x81";  // U+2581 ▁
 //   260 <start_of_turn>  USER_DEFINED
 //   261 <end_of_turn>    USER_DEFINED
 //   then NORMAL tokens listed below
-Qwen3Metadata make_minimal_gemma_vocab() {
-    Qwen3Metadata m;
-    m.tokenizer_type   = "llama";
+// TokenizerConfig matching Gemma's SentencePiece BPE with byte fallback.
+static TokenizerConfig gemma_test_config() {
+    TokenizerConfig cfg;
+    cfg.normalizer          = NormalizerKind::SpaceToUnderscore;
+    cfg.byte_fallback       = true;
+    cfg.extra_chat_specials = {"<start_of_turn>", "<end_of_turn>"};
+    return cfg;
+}
+
+ModelMetadata make_minimal_gemma_vocab() {
+    ModelMetadata m;
     m.bos_token_id     = 2;
     m.eos_token_id     = 1;
     m.padding_token_id = 0;
@@ -105,7 +114,7 @@ Qwen3Metadata make_minimal_gemma_vocab() {
     return m;
 }
 
-int find_id(const Qwen3Metadata& m, const std::string& s) {
+int find_id(const ModelMetadata& m, const std::string& s) {
     for (size_t i = 0; i < m.id_to_token.size(); ++i) {
         if (m.id_to_token[i] == s) return static_cast<int>(i);
     }
@@ -116,12 +125,12 @@ int find_id(const Qwen3Metadata& m, const std::string& s) {
 
 TEST(GemmaTokenizer, ConstructsFromLlamaMetadata) {
     auto m = make_minimal_gemma_vocab();
-    EXPECT_NO_THROW({ Tokenizer t(&m); });
+    EXPECT_NO_THROW({ Tokenizer t(&m, gemma_test_config()); });
 }
 
 TEST(GemmaTokenizer, EncodeWordViaBPEMergeReachesFullToken) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // No leading space. The BPE merge ladder he → hel → hell → hello must
     // collapse [h,e,l,l,o] into the single "hello" token. The toy vocab is
@@ -133,7 +142,7 @@ TEST(GemmaTokenizer, EncodeWordViaBPEMergeReachesFullToken) {
 
 TEST(GemmaTokenizer, EncodeAddsUnderscoreForSpaceSeparatedWords) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // "hello world" normalizes to "hello▁world". Without a dummy prefix, the
     // first word is plain "hello" and the second is "▁world".
@@ -145,7 +154,7 @@ TEST(GemmaTokenizer, EncodeAddsUnderscoreForSpaceSeparatedWords) {
 
 TEST(GemmaTokenizer, EncodeUsesByteFallbackForUnknownByte) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // '@' (0x40) is in no NORMAL token of the toy vocab — must byte-fallback.
     auto ids = t.encode("@");
@@ -155,7 +164,7 @@ TEST(GemmaTokenizer, EncodeUsesByteFallbackForUnknownByte) {
 
 TEST(GemmaTokenizer, EncodeSpecialTokenEmitsSingleId) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     auto ids = t.encode("<start_of_turn>");
     ASSERT_EQ(ids.size(), 1u);
@@ -164,7 +173,7 @@ TEST(GemmaTokenizer, EncodeSpecialTokenEmitsSingleId) {
 
 TEST(GemmaTokenizer, EncodeSpecialTokenSurroundedByText) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // "hello<start_of_turn>world" → ["hello", <start_of_turn>, "world"].
     auto ids = t.encode("hello<start_of_turn>world");
@@ -176,7 +185,7 @@ TEST(GemmaTokenizer, EncodeSpecialTokenSurroundedByText) {
 
 TEST(GemmaTokenizer, DecodeReplacesUnderscoreWithSpace) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     int32_t under_world = find_id(m, std::string(SPM_UNDER) + "world");
     ASSERT_GE(under_world, 0);
@@ -185,7 +194,7 @@ TEST(GemmaTokenizer, DecodeReplacesUnderscoreWithSpace) {
 
 TEST(GemmaTokenizer, DecodeByteFallbackEmitsRawByte) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // '?' → byte token at id 4 + 0x3F.
     EXPECT_EQ(t.decode(4 + 0x40), "@");
@@ -193,7 +202,7 @@ TEST(GemmaTokenizer, DecodeByteFallbackEmitsRawByte) {
 
 TEST(GemmaTokenizer, DecodeSpecialTokenReturnsLiteral) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     int32_t sot = find_id(m, "<start_of_turn>");
     ASSERT_GE(sot, 0);
@@ -202,7 +211,7 @@ TEST(GemmaTokenizer, DecodeSpecialTokenReturnsLiteral) {
 
 TEST(GemmaTokenizer, RoundTripASCII) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     const std::string text = "hello world";
     auto ids = t.encode(text);
@@ -211,7 +220,7 @@ TEST(GemmaTokenizer, RoundTripASCII) {
 
 TEST(GemmaTokenizer, RoundTripWithBytesAndSpecial) {
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     // 'h' and 'l' are NORMAL chars in the toy vocab; '@' falls back to its
     // byte token. Combined with a special token in the middle, this
@@ -226,7 +235,7 @@ TEST(GemmaTokenizer, BPEMergePicksHigherScoreWhenAvailable) {
     // ▁hello reaches the full token, which has the strongest score among
     // achievable merges.
     auto m = make_minimal_gemma_vocab();
-    Tokenizer t(&m);
+    Tokenizer t(&m, gemma_test_config());
 
     auto ids = t.encode(" hello");
     ASSERT_EQ(ids.size(), 1u);

@@ -1,4 +1,4 @@
-#include "qwen3-core/qwen3-model.h"
+#include "core/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "models/qwen35.h"
@@ -442,7 +442,7 @@ struct SlotState {
 // ============================================================
 
 class ParallelModelRunner {
-    std::shared_ptr<Qwen3Model> model_;
+    std::shared_ptr<Model> model_;
     std::unique_ptr<ForwardPassBase> forward_pass_;
     std::unique_ptr<Tokenizer> tokenizer_;
     std::string model_path_;
@@ -476,7 +476,7 @@ public:
 
     bool load() {
         try {
-            model_ = std::make_shared<Qwen3Model>();
+            model_ = std::make_shared<Model>();
             model_->load_metadata(model_path_);
             model_->load_tensors();
 
@@ -520,10 +520,10 @@ public:
             throw std::runtime_error("Too many tests for batch size");
         }
 
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
 
         // Load pruned vocabulary if specified
-        // std::unordered_set<int32_t> pruned_vocab = qwen3::load_keep_list("./output/vocab_artifacts/keep_list.bin");
+        // std::unordered_set<int32_t> pruned_vocab = qwenium::load_keep_list("./output/vocab_artifacts/keep_list.bin");
         // sampler.set_pruned_vocab(&pruned_vocab);
         // std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";
 

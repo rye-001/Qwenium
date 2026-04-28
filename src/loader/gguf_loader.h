@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../qwen3-core/qwen3-model.h"
+#include "../core/model.h"
 #include "ggml.h"
-#include "../qwen3-core/platform.h"
+#include "../core/platform.h"
 #include <string>
 #include <memory>
 #include <cstddef>
@@ -41,13 +41,13 @@ enum class GGUFValueType : uint32_t
     FLOAT64 = 12,
 };
 
-class QwenGGUFLoader {
+class GGUFLoader {
 public:
-    QwenGGUFLoader();
-    ~QwenGGUFLoader();
+    GGUFLoader();
+    ~GGUFLoader();
 
     void load_model(const std::string& path);
-    void extract_metadata(Qwen3Metadata& metadata) const;
+    void extract_metadata(ModelMetadata& metadata) const;
     
     size_t calculate_tensors_memory_size() const;
     
@@ -62,7 +62,7 @@ public:
 
     void validate_tensor_shape(struct ggml_tensor* tensor, const std::vector<int64_t>& expected_dims);
 
-    void validate_architecture(const Qwen3Metadata& meta) const;
+    void validate_architecture(const ModelMetadata& meta) const;
     void unload_model();
     
     bool is_loaded() const { return is_loaded_; }
@@ -74,7 +74,7 @@ private:
     std::unique_ptr<FileMapper> file_mapper_;
     bool is_loaded_;
     uint64_t tensor_data_offset_;
-    Qwen3Metadata metadata_;
+    ModelMetadata metadata_;
 
     void parse_and_validate_metadata(size_t& offset);
     void parse_tensor_inventory(size_t& offset, uint64_t tensor_count);
@@ -97,26 +97,16 @@ private:
     void validate_tensor_inventory() const;
     void is_valid_utf8(const std::string& str) const;
 
-    using MetadataHandler = std::function<void(QwenGGUFLoader*, size_t&, GGUFValueType)>;
+    using MetadataHandler = std::function<void(GGUFLoader*, size_t&, GGUFValueType)>;
     static const std::unordered_map<std::string_view, MetadataHandler>& get_metadata_handlers();
 
     void cleanup_resources();
 };
 
 // Factory function for creating a loader
-std::unique_ptr<QwenGGUFLoader> create_gguf_loader();
+std::unique_ptr<GGUFLoader> create_gguf_loader();
 
-// Validates the tensor inventory of a loaded qwen35moe model. Exposed as a
-// free function so unit tests can inject a crafted inventory to exercise the
-// fail-loud error contract without needing a real GGUF file.
-// Throws GGUFLoadError naming the missing tensor if any required key is absent.
-void validate_qwen35moe_inventory(const Qwen3Metadata& meta);
-
-// Validates a Gemma-1 tensor inventory. Same fail-loud contract:
-// names the architecture, the slot, the expected vs actual.
-void validate_gemma_inventory(const Qwen3Metadata& meta);
-
-// Dispatches inventory validation based on meta.architecture.
-// Throws GGUFLoadError for an unsupported architecture (with the same
-// fail-loud format as validate_architecture).
-void validate_inventory_for_architecture(const Qwen3Metadata& meta);
+// Dispatches inventory validation based on meta.architecture via the model
+// registry.  Throws GGUFLoadError for an unregistered architecture, or when
+// the registered validator rejects the inventory.
+void validate_inventory_for_architecture(const ModelMetadata& meta);

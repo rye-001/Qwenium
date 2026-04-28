@@ -12,7 +12,7 @@
 #include <string>
 #include <set>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/loader/gguf_loader.h"
 
 static std::string get_qwen35_model_path() {
@@ -33,7 +33,7 @@ protected:
     static void SetUpTestSuite() {
         if (get_qwen35_model_path().empty()) return;
 
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_qwen35_model_path());
         model_->load_tensors();
     }
@@ -42,10 +42,10 @@ protected:
         model_.reset();
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen35TensorLoadingTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen35TensorLoadingTest::model_ = nullptr;
 
 
 // ============================================================
@@ -94,7 +94,9 @@ TEST_F(Qwen35TensorLoadingTest, SSMLayerTensorsNonNull) {
     SKIP_IF_NO_MODEL();
 
     const auto& meta = model_->get_metadata();
-    ASSERT_TRUE(meta.is_ssm_layer(0));
+    const uint32_t fai = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    const bool is_full_0 = (fai > 0) && ((0 % fai) == (fai - 1));
+    ASSERT_FALSE(is_full_0);
 
     const auto& blk = model_->get_block(0);
 
@@ -132,7 +134,9 @@ TEST_F(Qwen35TensorLoadingTest, AttentionLayerTensorsNonNull) {
     SKIP_IF_NO_MODEL();
 
     const auto& meta = model_->get_metadata();
-    ASSERT_TRUE(meta.is_full_attention_layer(3));
+    const uint32_t fai2 = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    const bool is_full_3 = (fai2 > 0) && ((3 % fai2) == (fai2 - 1));
+    ASSERT_TRUE(is_full_3);
 
     const auto& blk = model_->get_block(3);
 

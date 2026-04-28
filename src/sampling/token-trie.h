@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace qwen3 {
+namespace qwenium {
 
 struct TrieNode {
     // Children indexed by byte value (0-255). nullptr = no child.
@@ -70,4 +70,4 @@ private:
     static void collect_subtree(const TrieNode* node, std::vector<int32_t>& out);
 };
 
-} // namespace qwen3
+} // namespace qwenium

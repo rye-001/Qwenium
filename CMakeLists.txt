@@ -37,7 +37,7 @@ find_package(Threads REQUIRED)
 if(QWEN3_ENABLE_OPENMP)
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(qwen3-core PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(core PRIVATE OpenMP::OpenMP_CXX)
         add_compile_definitions(QWEN3_USE_OPENMP)
     endif()
 endif()
@@ -75,7 +75,7 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
-add_subdirectory(src/qwen3-core)
+add_subdirectory(src/core)
 add_subdirectory(src/sampling)
 
 # Main CLI executable
@@ -102,13 +102,13 @@ if(QWEN3_BUILD_EXAMPLES)
 endif()
 
 # Installation
-install(TARGETS qwen3-cli
+install(TARGETS qwenium-cli
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
-install(DIRECTORY src/qwen3-core/ 
-    DESTINATION include/qwen3-core
+install(DIRECTORY src/core/ 
+    DESTINATION include/core
     FILES_MATCHING PATTERN "*.h"
 )

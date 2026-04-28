@@ -7,8 +7,9 @@
 #include <memory>
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "gguf_value.h"
 
-class QwenGGUFLoader;
+class GGUFLoader;
 class Tokenizer;
 
 struct TensorMetadata {
@@ -28,7 +29,7 @@ enum class TokenType : uint8_t {
     BYTE = 6
 };
 
-struct Qwen3Metadata {
+struct ModelMetadata {
     // Model metadata
     std::string model_name;
     std::string architecture;
@@ -44,21 +45,6 @@ struct Qwen3Metadata {
     float rope_freq_base = 0.0f;
     float rms_norm_eps   = 0.0f;
 
-    // SSM/hybrid fields (qwen35 and qwen35moe)
-    uint32_t ssm_conv_kernel = 0;        // *.ssm.conv_kernel
-    uint32_t ssm_state_size = 0;         // *.ssm.state_size
-    uint32_t ssm_group_count = 0;        // *.ssm.group_count
-    uint32_t ssm_time_step_rank = 0;     // *.ssm.time_step_rank
-    uint32_t ssm_inner_size = 0;         // *.ssm.inner_size
-    uint32_t full_attention_interval = 0; // *.full_attention_interval
-    uint32_t rope_dimension_count = 0;   // *.rope.dimension_count
-
-    // MoE fields (qwen35moe-specific)
-    uint32_t expert_count = 0;                      // qwen35moe.expert_count
-    uint32_t expert_used_count = 0;                 // qwen35moe.expert_used_count
-    uint32_t expert_feed_forward_length = 0;        // qwen35moe.expert_feed_forward_length
-    uint32_t expert_shared_feed_forward_length = 0; // qwen35moe.expert_shared_feed_forward_length
-    
     // Tokenizer metadata (from GGUF)
     std::string tokenizer_type;              // "gpt2" tokenizer.ggml.model
     std::string tokenizer_pre;               // "qwen2" tokenizer.ggml.pre
@@ -76,20 +62,8 @@ struct Qwen3Metadata {
     
     std::unordered_map<std::string, TensorMetadata> tensor_inventory;
 
-    // Helper: is layer i a full softmax attention layer?
-    bool is_full_attention_layer(uint32_t layer_idx) const {
-        const bool is_hybrid = (architecture == "qwen35" || architecture == "qwen35moe");
-        if (!is_hybrid || full_attention_interval == 0) {
-            return true; // Non-hybrid models: all layers are attention
-        }
-        // Pattern: layers (interval-1), 2*(interval-1)+1, ... i.e. layer_idx % interval == interval-1
-        return (layer_idx % full_attention_interval) == (full_attention_interval - 1);
-    }
-
-    bool is_ssm_layer(uint32_t layer_idx) const {
-        return !is_full_attention_layer(layer_idx);
-    }
-
+    // Raw GGUF KVs; family-specific fields read from here (typed members are universal-only).
+    GGUFKVBag raw_kv;
 };
 
 enum class Qwen3ModelSize {
@@ -144,10 +118,10 @@ struct TransformerBlock {
     struct ggml_tensor* moe_shexp_up_weight   = nullptr; // ffn_up_shexp.weight       [n_embd, d_ffn]
     struct ggml_tensor* moe_shexp_down_weight = nullptr; // ffn_down_shexp.weight     [d_ffn, n_embd]
 };
-class Qwen3Model {
+class Model {
 public:
-    Qwen3Model();
-    ~Qwen3Model();
+    Model();
+    ~Model();
 
     void load_metadata(const std::string& model_path);
     void load_tensors();
@@ -157,7 +131,7 @@ public:
     std::string get_model_size_string() const;
     void print_metadata() const;
     
-    const Qwen3Metadata& get_metadata() const { return metadata_; }
+    const ModelMetadata& get_metadata() const { return metadata_; }
     struct ggml_tensor* get_token_embedding_weight() const { return token_embd_weight_; }
     struct ggml_tensor* get_output_norm_weight() const { return output_norm_weight_; }
     struct ggml_tensor* get_output_weight() const { return output_weight_; }
@@ -171,9 +145,9 @@ public:
     bool has_metal_backend() const { return backend_metal_ != nullptr; }
 
 private:
-    Qwen3Metadata metadata_;
+    ModelMetadata metadata_;
     bool is_loaded_;
-    std::unique_ptr<QwenGGUFLoader> loader_;
+    std::unique_ptr<GGUFLoader> loader_;
     ggml_context* model_context_;
 
     // Phase 1: Backend infrastructure

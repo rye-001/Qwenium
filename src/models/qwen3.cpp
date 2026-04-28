@@ -11,7 +11,23 @@
 #include <cmath>
 #include <cinttypes>
 #include <future>
+#include <sstream>
 #include <thread>
+
+// ── Qwen tokenizer config ─────────────────────────────────────────────────────
+
+TokenizerConfig qwen_tokenizer_config()
+{
+    TokenizerConfig cfg;
+    cfg.normalizer    = NormalizerKind::None;
+    cfg.byte_fallback = false;
+    cfg.add_bos_token = false;
+    // <|im_start|> and <|im_end|> are CONTROL-typed in real Qwen GGUFs and
+    // are caught by the generic CONTROL scan.  List them explicitly so the
+    // intent is self-documenting and any GGUF that mislabels them still works.
+    cfg.extra_chat_specials = {"<|im_start|>", "<|im_end|>"};
+    return cfg;
+}
 
 constexpr size_t GRAPH_SIZE = 16384;
 
@@ -21,7 +37,7 @@ constexpr size_t GRAPH_SIZE = 16384;
 static constexpr uint32_t TQ_LAYER_BATCH = 4;
 
 Qwen3ForwardPass::Qwen3ForwardPass(
-    const Qwen3Model& model, const Qwen3Metadata* metadata,
+    const Model& model, const ModelMetadata* metadata,
     uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
     : ForwardPassBase(model, metadata) {
         kv_cache_ = nullptr;
@@ -836,5 +852,31 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
     ggml_backend_sched_graph_compute(scheduler, gf_out);
 
     return get_output_logits(gf_out);
+}
+
+// ── Inventory validator ──────────────────────────────────────────────────────
+
+void validate_qwen3_inventory(const ModelMetadata& meta)
+{
+    const auto& inv = meta.tensor_inventory;
+    auto require = [&](const std::string& name, const std::string& ctx) {
+        if (inv.find(name) == inv.end())
+            throw std::runtime_error(
+                meta.architecture + ": missing tensor '" + name +
+                "': expected in " + ctx + ", got absent");
+    };
+    require("token_embd.weight", "model weights");
+    require("output_norm.weight", "model weights");
+
+    static const std::vector<std::string> per_block = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+        "ffn_up.weight", "ffn_down.weight"
+    };
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block)
+            require(p + t, "block " + std::to_string(i));
+    }
 }
 

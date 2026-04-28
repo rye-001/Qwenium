@@ -10,40 +10,41 @@
 #include <functional>  // std::greater
 #include <vector>      // std::vector (likely already included)
 
-Tokenizer::Tokenizer(const Qwen3Metadata* metadata) : metadata_(metadata) {
+TokenizerConfig tokenizer_config_from_gguf(const ModelMetadata& meta)
+{
+    TokenizerConfig cfg;
+    cfg.add_bos_token = meta.add_bos_token;
+    // tokenizer.ggml.model = "llama" means SentencePiece BPE with ▁-normalization
+    // and byte-fallback.  This is a standard GGUF field value, not a family name.
+    if (meta.tokenizer_type == "llama") {
+        cfg.normalizer    = NormalizerKind::SpaceToUnderscore;
+        cfg.byte_fallback = true;
+        // Some GGUF exports mark chat-control tokens as NORMAL rather than
+        // USER_DEFINED; force-promote them so the encoder handles them atomically.
+        cfg.extra_chat_specials = {"<start_of_turn>", "<end_of_turn>"};
+    }
+    return cfg;
+}
+
+Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& config)
+    : metadata_(metadata), config_(config) {
     if (metadata_->id_to_token.empty()) {
         throw std::runtime_error("Invalid vocabulary: token list is empty.");
     }
 
-    is_llama_tokenizer_ = (metadata_->tokenizer_type == "llama");
+    is_llama_tokenizer_ = (config_.normalizer == NormalizerKind::SpaceToUnderscore);
 
     // Build token_to_id map
     token_to_id_.reserve(metadata_->id_to_token.size());
     for (size_t i = 0; i < metadata_->id_to_token.size(); ++i) {
         token_to_id_[metadata_->id_to_token[i]] = static_cast<int32_t>(i);
     }
-    
+
     if (is_llama_tokenizer_) {
-        // SentencePiece-derived BPE with byte fallback (Gemma, Llama).
+        // SentencePiece-derived BPE with byte fallback.
         // Uses score-based BPE merge for encode and ▁→space + byte-fallback decode.
         scores_ = metadata_->scores;
         initialize_special_tokens();
-
-        // Gemma chat-control tokens are stored with TokenType::NORMAL in some
-        // GGUF exports (e.g. gemma-2b-it-v1.1) instead of USER_DEFINED, so
-        // initialize_special_tokens above misses them. Promote them here so
-        // the encoder emits them atomically rather than letting BPE merge
-        // decompose them into [<, start, _, of, ...] pieces.
-        static const std::vector<std::string> llama_chat_specials = {
-            "<start_of_turn>", "<end_of_turn>",
-        };
-        for (const auto& s : llama_chat_specials) {
-            auto it = token_to_id_.find(s);
-            if (it != token_to_id_.end()) {
-                special_tokens_[s] = it->second;
-                special_token_ids_.insert(it->second);
-            }
-        }
 
         unk_token_id_ = (metadata_->unknown_token_id >= 0)
                             ? metadata_->unknown_token_id
@@ -130,38 +131,30 @@ Tokenizer::Tokenizer(const Qwen3Metadata* metadata) : metadata_(metadata) {
 
 
 void Tokenizer::initialize_special_tokens() {
-    // Add EOS from metadata
-    special_tokens_["<|endoftext|>"] = metadata_->eos_token_id;
+    // Register BOS / EOS / PAD by ID so is_special_token() works on them
+    // even if the caller never looks them up by name.
     special_token_ids_.insert(metadata_->eos_token_id);
-
-    // Insert bos/padding only if they were actually set in metadata
-    if (metadata_->bos_token_id >= 0) {
+    if (metadata_->bos_token_id >= 0)
         special_token_ids_.insert(metadata_->bos_token_id);
-    }
-    if (metadata_->padding_token_id >= 0) {
+    if (metadata_->padding_token_id >= 0)
         special_token_ids_.insert(metadata_->padding_token_id);
-    }
 
-    // Look up ChatML tokens from vocabulary instead of hardcoding IDs.
-    // This works for both qwen2/3 (where they're at 151644/151645)
-    // and qwen35 (where they're at different positions in the 248K vocab).
-    const std::vector<std::string> chatml_tokens = {
-        "<|im_start|>", "<|im_end|>"
-    };
-    for (const auto& tok_str : chatml_tokens) {
-        auto it = token_to_id_.find(tok_str);
-        if (it != token_to_id_.end()) {
-            special_tokens_[tok_str] = it->second;
-            special_token_ids_.insert(it->second);
-        }
-    }
-
-    // Find all special tokens in vocabulary (CONTROL or USER_DEFINED type)
+    // All CONTROL and USER_DEFINED vocab entries are special by type.
     for (size_t i = 0; i < metadata_->token_types.size(); ++i) {
         if (metadata_->token_types[i] == TokenType::CONTROL ||
             metadata_->token_types[i] == TokenType::USER_DEFINED) {
             special_token_ids_.insert(static_cast<int32_t>(i));
             special_tokens_[metadata_->id_to_token[i]] = static_cast<int32_t>(i);
+        }
+    }
+
+    // Force-promote extra tokens from config even if their TokenType is NORMAL.
+    // Needed for GGUF exports that mislabel chat-control tokens.
+    for (const auto& s : config_.extra_chat_specials) {
+        auto it = token_to_id_.find(s);
+        if (it != token_to_id_.end()) {
+            special_tokens_[s] = it->second;
+            special_token_ids_.insert(it->second);
         }
     }
 }

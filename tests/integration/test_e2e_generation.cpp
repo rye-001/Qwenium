@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "qwen3-core/qwen3-model.h"
+#include "core/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "loader/tokenizer.h"
@@ -21,7 +21,7 @@ struct GenerationTestParam {
 // Test fixture for end-to-end generation
 class E2EGenerationTest : public ::testing::TestWithParam<GenerationTestParam> {
 protected:
-    static std::map<std::string, std::shared_ptr<Qwen3Model>> model_cache_;
+    static std::map<std::string, std::shared_ptr<Model>> model_cache_;
     static std::string model_path_1_7b_;
     static std::string model_path_0_6b_;
     static std::string model_path_qwen2_14b_;
@@ -38,7 +38,7 @@ protected:
     static void load_model(const std::string& model_path) {
         if (model_cache_.find(model_path) == model_cache_.end()) {
             try {
-                auto model = std::make_shared<Qwen3Model>();
+                auto model = std::make_shared<Model>();
                 model->load_metadata(model_path);
                 model->load_tensors();
                 model_cache_[model_path] = model;
@@ -58,7 +58,7 @@ protected:
         auto model = model_it->second;
 
         Tokenizer tokenizer(&model->get_metadata());
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
         Qwen3ForwardPass forward_pass(*model, &model->get_metadata(), 4096);
         ggml_backend_sched_t scheduler = model->get_scheduler();
 
@@ -149,7 +149,7 @@ protected:
 };
 
 // Initialize static members
-std::map<std::string, std::shared_ptr<Qwen3Model>> E2EGenerationTest::model_cache_;
+std::map<std::string, std::shared_ptr<Model>> E2EGenerationTest::model_cache_;
 std::string E2EGenerationTest::model_path_1_7b_;
 std::string E2EGenerationTest::model_path_0_6b_;
 std::string E2EGenerationTest::model_path_qwen2_14b_;

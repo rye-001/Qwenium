@@ -48,7 +48,7 @@ target_link_libraries(http_server PRIVATE
     httplib::httplib
     nlohmann_json::nlohmann_json
     qinf-models
-    qwen3-core
+    core
     sampling
     Threads::Threads
 )

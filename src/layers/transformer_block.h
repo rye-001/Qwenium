@@ -20,7 +20,7 @@ struct ggml_cgraph;
 class simple_kv_cache;
 
 // Architecture hyperparameters for one transformer layer.
-// The caller (model recipe) extracts these from Qwen3Metadata before the loop.
+// The caller (model recipe) extracts these from ModelMetadata before the loop.
 struct TransformerBlockHparams {
     bool  is_qwen2;        // true → apply QKV biases and skip QK RMS norms (Qwen2)
     int   n_head;          // query head count

@@ -1,4 +1,4 @@
-#include "qwen3-model.h"
+#include "model.h"
 #include "../loader/gguf_loader.h"
 #include "../loader/tokenizer.h"
 #include "ggml-cpu.h"
@@ -13,7 +13,7 @@
 #define QWEN_DEFAULT_GRAPH_SIZE 16384
 #endif
 
-Qwen3Model::Qwen3Model()
+Model::Model()
     : is_loaded_(false),
       model_context_(nullptr),
       token_embd_weight_(nullptr),
@@ -24,7 +24,7 @@ Qwen3Model::Qwen3Model()
       sched_(nullptr),
       weights_buffer_(nullptr)
 {
-    loader_ = std::make_unique<QwenGGUFLoader>();
+    loader_ = std::make_unique<GGUFLoader>();
 
     // Phase 1: Initialize backend infrastructure
     std::cout << "[Phase 1] Initializing backends..." << std::endl;
@@ -65,7 +65,7 @@ Qwen3Model::Qwen3Model()
     }
 }
 
-Qwen3Model::~Qwen3Model()
+Model::~Model()
 {
     // Free resources in reverse order of creation
     if (model_context_) {
@@ -85,14 +85,14 @@ Qwen3Model::~Qwen3Model()
     }
 }
 
-void Qwen3Model::load_metadata(const std::string &model_path)
+void Model::load_metadata(const std::string &model_path)
 {
     loader_->load_model(model_path);
     loader_->extract_metadata(metadata_);
     is_loaded_ = true;
 }
 
-void Qwen3Model::load_tensors()
+void Model::load_tensors()
 {
     if (!is_loaded_) {
         throw GGUFLoadError("Metadata must be loaded before loading tensors.");
@@ -204,13 +204,15 @@ void Qwen3Model::load_tensors()
 
     std::cout << "All tensors loaded and assigned successfully." << std::endl;
 
-    // After tensors are loaded, initialize the tokenizer
+    // Derive tokenizer config from standard GGUF metadata fields (tokenizer_type,
+    // add_bos_token) so the tokenizer has no architecture string literals.
     std::cout << "Initializing tokenizer..." << std::endl;
-    tokenizer_ = std::make_unique<Tokenizer>(&metadata_);
+    TokenizerConfig tok_cfg = tokenizer_config_from_gguf(metadata_);
+    tokenizer_ = std::make_unique<Tokenizer>(&metadata_, tok_cfg);
     std::cout << "Tokenizer initialized." << std::endl;
 }
 
-void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors)
+void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors)
 {
     try {
         token_embd_weight_ = tensors.at("token_embd.weight");
@@ -251,7 +253,12 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
                 blocks_[i].moe_shexp_up_weight   = require(prefix + "ffn_up_shexp.weight");
                 blocks_[i].moe_shexp_down_weight = require(prefix + "ffn_down_shexp.weight");
 
-                if (metadata_.is_full_attention_layer(i)) {
+                // Inline arithmetic: tensor binding runs at load time, before any recipe exists.
+                // Typed configs (Qwen35MoEConfig) are constructed by recipes after this runs —
+                // chicken/egg. Use the same one-line formula the recipe and validators use.
+                const uint32_t fai = metadata_.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+                const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+                if (is_full) {
                     blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
                     blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
                     blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
@@ -281,7 +288,9 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
                 // qwen35: FFN norm is called "post_attention_norm"
                 blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
 
-                if (metadata_.is_full_attention_layer(i)) {
+                const uint32_t fai = metadata_.raw_kv.get_uint32("qwen35.full_attention_interval");
+                const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+                if (is_full) {
                     // Full softmax attention layer (layers 3,7,11,15,19,23)
                     blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
                     blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
@@ -336,7 +345,7 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
     }
 }
 
-bool Qwen3Model::validate_architecture() const
+bool Model::validate_architecture() const
 {
     if (!is_loaded_) {
         return false;
@@ -346,7 +355,7 @@ bool Qwen3Model::validate_architecture() const
            metadata_.architecture == "gemma";
 }
 
-Qwen3ModelSize Qwen3Model::detect_model_size() const
+Qwen3ModelSize Model::detect_model_size() const
 {
     if (!is_loaded_) {
         return Qwen3ModelSize::QWEN3_0_6B;
@@ -363,7 +372,7 @@ Qwen3ModelSize Qwen3Model::detect_model_size() const
     return Qwen3ModelSize::QWEN3_0_6B;
 }
 
-std::string Qwen3Model::get_model_size_string() const
+std::string Model::get_model_size_string() const
 {
     switch (detect_model_size()) {
         case Qwen3ModelSize::QWEN3_0_6B: return "0.6B";
@@ -373,7 +382,7 @@ std::string Qwen3Model::get_model_size_string() const
     }
 }
 
-void Qwen3Model::print_metadata() const
+void Model::print_metadata() const
 {
     if (!is_loaded_) {
         std::cout << "Model not loaded." << std::endl;

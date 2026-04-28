@@ -21,7 +21,7 @@
 #include "../../src/loader/tokenizer.h"
 #include "../../src/models/forward_pass_base.h"
 #include "../../src/models/model_registry.h"
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 
 namespace {
 
@@ -58,7 +58,7 @@ std::string Gemma1ModelFile::path_;
 TEST_F(Gemma1ModelFile, LoadMetadataAndArchitecture) {
     
 
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     EXPECT_EQ(model.get_metadata().architecture, "gemma");
     EXPECT_EQ(model.get_metadata().tokenizer_type, "llama");
@@ -74,7 +74,7 @@ TEST_F(Gemma1ModelFile, LoadMetadataAndArchitecture) {
 TEST_F(Gemma1ModelFile, TokenizerRoundTripsSimpleText) {
     
 
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     Tokenizer tok(&model.get_metadata());
 
@@ -91,7 +91,7 @@ TEST_F(Gemma1ModelFile, TokenizerRoundTripsSimpleText) {
 // can compare against the HF reference. Until we have ref fixtures from
 // PR G1.0, this is the cheapest way to spot tokenizer drift.
 TEST_F(Gemma1ModelFile, DiagnoseTokenizationOfChatSegment) {
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     Tokenizer tok(&model.get_metadata());
 
@@ -159,7 +159,7 @@ TEST_F(Gemma1ModelFile, DiagnoseTokenizationOfChatSegment) {
 // the HF reference (which gives norm=203.14, sample[:5]=[10.16,0.82,-3.67,
 // 0.44,0.23] for the last token 'is' (id 603) of "The capital of France is").
 TEST_F(Gemma1ModelFile, DumpInpLScaledForCompareWithHF) {
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     model.load_tensors();
 
@@ -275,7 +275,7 @@ TEST_F(Gemma1ModelFile, DumpInpLScaledForCompareWithHF) {
 // pointing at the right ballpark answer. If the forward pass is wired
 // correctly, Gemma 1 2B-it answers this trivially.
 TEST_F(Gemma1ModelFile, GreedyTop1OnTrivialPromptIsSensible) {
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     model.load_tensors();
 
@@ -317,7 +317,7 @@ TEST_F(Gemma1ModelFile, GreedyTop1OnTrivialPromptIsSensible) {
 TEST_F(Gemma1ModelFile, PrefillProducesFiniteLogits) {
     
 
-    Qwen3Model model;
+    Model model;
     model.load_metadata(path_);
     model.load_tensors();
 

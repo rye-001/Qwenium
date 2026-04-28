@@ -75,9 +75,9 @@ curl -s http://localhost:8080/v1/completions \
 ### Or use the CLI
 
 ```bash
-./bin/qwen3 model.gguf --chat                  # interactive
-./bin/qwen3 model.gguf --chat --speculative    # with speculative decoding
-./bin/qwen3 model.gguf -p "Hello, world!"      # single prompt
+./bin/qwenium model.gguf --chat                  # interactive
+./bin/qwenium model.gguf --chat --speculative    # with speculative decoding
+./bin/qwenium model.gguf -p "Hello, world!"      # single prompt
 ```
 
 ## Architecture
@@ -150,9 +150,9 @@ Measured on M1 MacBook Pro (32GB) with Qwen 2.5 Coder 14B Q4:
 cmake -DQWEN3_BUILD_TESTS=ON -DGGML_USE_METAL=ON -DCMAKE_BUILD_TYPE=Debug ..
 make -j8
 
-./bin/qwen3-unit-tests                     # per-module unit tests (no model needed)
-./bin/qwen3-integration-tests              # e2e generation (needs model files)
-./bin/qwen3-parallel-order-mngmt-test      # 10-concurrent DSL benchmark
+./bin/unit-tests                     # per-module unit tests (no model needed)
+./bin/integration-tests              # e2e generation (needs model files)
+./bin/parallel-order-mngmt-test      # 10-concurrent DSL benchmark
 ```
 
 Each module under `src/<dir>/<module>.cpp` has its unit test at `tests/unit/test_<module>.cpp`. Python benchmarks in `py/` for load testing and DSL validation.

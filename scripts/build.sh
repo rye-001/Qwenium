@@ -30,12 +30,12 @@ echo "Building..."
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 echo "Build completed successfully!"
-echo "Executable: $BUILD_DIR/qwen3"
+echo "Executable: $BUILD_DIR/qwenium"
 
 # Test basic functionality
 echo "Testing basic functionality..."
-if [ -x "./qwen3" ]; then
-    ./qwen3 --help
+if [ -x "./qwenium" ]; then
+    ./qwenium --help
     echo "Basic test passed!"
 else
     echo "ERROR: Executable not found or not executable"

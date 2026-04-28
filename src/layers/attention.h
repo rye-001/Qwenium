@@ -45,7 +45,7 @@ ggml_tensor* build_attn_mha(
 // Writes K/V to the cache at the current slot position, reads the full
 // cached sequence, builds a per-layer causal mask, then runs MHA.
 // n_embd_head and n_head_kv are the per-architecture dimension values
-// computed by the caller from Qwen3Metadata.
+// computed by the caller from ModelMetadata.
 // Extracted from Qwen3ForwardPass::_build_attention_layer — identical logic.
 ggml_tensor* build_attention(
     ggml_context*     ctx,

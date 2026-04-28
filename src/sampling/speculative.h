@@ -8,7 +8,7 @@
 
 #include "prompt_lookup.h"
 
-namespace qwen3 {
+namespace qwenium {
 
 // ============================================================================
 // SpeculativeResult: What the caller gets back
@@ -262,4 +262,4 @@ private:
     SpeculativeStats stats_;
 };
 
-} // namespace qwen3
+} // namespace qwenium

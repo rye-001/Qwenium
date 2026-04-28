@@ -13,7 +13,7 @@
 #include <vector>
 #include <algorithm>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/models/qwen36.h"
 
 static std::string get_model_path() {
@@ -31,17 +31,17 @@ class Qwen36ForwardTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         if (get_model_path().empty()) return;
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_model_path());
         model_->load_tensors();
     }
 
     static void TearDownTestSuite() { model_.reset(); }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen36ForwardTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen36ForwardTest::model_ = nullptr;
 
 // ── Test 1: graph builds and allocates without crashing ───────────────────────
 

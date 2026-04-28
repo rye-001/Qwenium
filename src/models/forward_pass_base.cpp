@@ -9,7 +9,7 @@
 #include <cmath>
 #include <stdexcept>
 
-ForwardPassBase::ForwardPassBase(const Qwen3Model& model, const Qwen3Metadata* metadata)
+ForwardPassBase::ForwardPassBase(const Model& model, const ModelMetadata* metadata)
     : meta_(*metadata), model_(model), ctx_(nullptr)
 {
         // Pre-allocate persistent buffer for graph metadata

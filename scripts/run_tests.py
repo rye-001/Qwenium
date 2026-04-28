@@ -47,7 +47,9 @@ def find_test_binaries(build_dir):
     for f in os.listdir(bin_dir):
         path = os.path.join(bin_dir, f)
         if os.path.isfile(path) and os.access(path, os.X_OK):
-            if f.startswith("qwen3-") or f.startswith("grammar-"):
+            if f == "qwenium":
+                continue  # CLI executable, not a test
+            if f.endswith("-tests") or f.endswith("-test"):
                 binaries.append((f, path))
     return sorted(binaries)
 
@@ -61,6 +63,14 @@ def main():
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     build_dir = os.path.join(project_root, args.build_dir)
+
+    print(f"{Colors.BOLD}Running lint checks...{Colors.ENDC}")
+    rc, out, err = run_command("./scripts/check_recipe_isolation.sh", cwd=project_root)
+    if rc != 0:
+        print(f"{Colors.FAIL}Lint failed: check_recipe_isolation{Colors.ENDC}")
+        print(out)
+        sys.exit(1)
+    print(f"{Colors.OKGREEN}  check_recipe_isolation: PASSED{Colors.ENDC}")
 
     if args.build:
         print(f"{Colors.BOLD}Building project...{Colors.ENDC}")

@@ -23,7 +23,7 @@
 
 #include "../../src/models/qwen3.h"
 #include "../../src/models/qwen35.h"
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/sampling/sampling.h"
 
@@ -51,7 +51,7 @@ class TurboQuantGenerationTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         if (get_model_path().empty()) return;
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_model_path());
         model_->load_tensors();
     }
@@ -74,7 +74,7 @@ protected:
         auto fp   = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, /*max_batch=*/1, kv_quant_bits);
         auto* sched = model_->get_scheduler();
         auto* tok   = model_->get_tokenizer();
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
 
         std::vector<int32_t> ctx_tokens = tok->encode(prompt);
         EXPECT_GT(ctx_tokens.size(), 0u) << "Tokeniser returned empty sequence";
@@ -118,10 +118,10 @@ protected:
         return out;
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> TurboQuantGenerationTest::model_ = nullptr;
+std::unique_ptr<Model> TurboQuantGenerationTest::model_ = nullptr;
 
 // ---------------------------------------------------------------------------
 // Tests

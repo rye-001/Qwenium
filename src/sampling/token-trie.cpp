@@ -3,7 +3,7 @@
 
 #include "token-trie.h"
 
-namespace qwen3 {
+namespace qwenium {
 
 void TokenTrie::build(const std::vector<std::string>& vocab) {
     root_ = std::make_unique<TrieNode>();
@@ -125,4 +125,4 @@ void TokenTrie::collect_subtree(const TrieNode* node, std::vector<int32_t>& out)
     }
 }
 
-} // namespace qwen3
+} // namespace qwenium

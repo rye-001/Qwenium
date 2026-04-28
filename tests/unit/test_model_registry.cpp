@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "../../src/loader/gguf_loader.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/forward_pass_base.h"
 
@@ -27,7 +28,7 @@ namespace {
 
 class FakeForwardPass : public ForwardPassBase {
 public:
-    FakeForwardPass(const Qwen3Model& m, const Qwen3Metadata* meta)
+    FakeForwardPass(const Model& m, const ModelMetadata* meta)
         : ForwardPassBase(m, meta) {}
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t) override { return nullptr; }
@@ -55,16 +56,17 @@ int FakeForwardPass::construction_count = 0;
 TEST(ModelRegistry, RegisterAndLookupFakeFactory) {
     FakeForwardPass::construction_count = 0;
 
-    register_model("fake_arch_test_only", [](const Qwen3Model& m, const Qwen3Metadata* meta,
-                                              uint32_t, uint32_t, int) {
-        ++FakeForwardPass::construction_count;
-        return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
-    });
+    register_model("fake_arch_test_only",
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+            ++FakeForwardPass::construction_count;
+            return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
+        },
+        [](const ModelMetadata&) {});
 
     EXPECT_TRUE(is_architecture_registered("fake_arch_test_only"));
 
-    Qwen3Model dummy;  // default-constructed; factory does not dereference it.
-    Qwen3Metadata meta;
+    Model dummy;  // default-constructed; factory does not dereference it.
+    ModelMetadata meta;
     meta.architecture = "fake_arch_test_only";
 
     auto fp = create_forward_pass(dummy, &meta, /*ctx=*/128, /*bs=*/1, /*kvb=*/0);
@@ -76,8 +78,8 @@ TEST(ModelRegistry, RegisterAndLookupFakeFactory) {
 }
 
 TEST(ModelRegistry, UnknownArchitectureFailsLoud) {
-    Qwen3Model dummy;
-    Qwen3Metadata meta;
+    Model dummy;
+    ModelMetadata meta;
     meta.architecture = "definitely_not_registered";
 
     try {
@@ -103,4 +105,58 @@ TEST(ModelRegistry, BuiltinModelsIsIdempotent) {
     register_builtin_models();
     register_builtin_models();
     EXPECT_TRUE(is_architecture_registered("qwen3"));
+}
+
+// ── InventoryValidator registration and dispatch ───────────────────────────────
+
+TEST(ModelRegistry, FakeValidatorIsCalledWithCorrectMetadata) {
+    const std::string arch = "fake_validator_arch_test";
+    int call_count = 0;
+    std::string captured_arch;
+
+    register_model(arch,
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+            return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
+        },
+        [&](const ModelMetadata& meta) {
+            ++call_count;
+            captured_arch = meta.architecture;
+        });
+
+    ModelMetadata meta;
+    meta.architecture = arch;
+    EXPECT_NO_THROW(validate_inventory_for_architecture(meta));
+    EXPECT_EQ(call_count, 1);
+    EXPECT_EQ(captured_arch, arch);
+
+    // Verify that a validator error propagates verbatim as GGUFLoadError.
+    register_model(arch,
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+            return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
+        },
+        [](const ModelMetadata&) {
+            throw std::runtime_error("fake_validator_arch_test: missing tensor 'sentinel': "
+                                     "expected in model weights, got absent");
+        });
+    try {
+        validate_inventory_for_architecture(meta);
+        FAIL() << "expected GGUFLoadError";
+    } catch (const GGUFLoadError& e) {
+        EXPECT_NE(std::string(e.what()).find("sentinel"), std::string::npos) << e.what();
+    }
+
+    unregister_model(arch);
+}
+
+TEST(ModelRegistry, ValidateInventoryUnknownArchFailsLoud) {
+    ModelMetadata meta;
+    meta.architecture = "not_a_real_arch_xyz";
+    try {
+        validate_inventory_for_architecture(meta);
+        FAIL() << "expected GGUFLoadError for unregistered architecture";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("validate_inventory_for_architecture"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("got 'not_a_real_arch_xyz'"), std::string::npos) << msg;
+    }
 }

@@ -1,6 +1,10 @@
 #pragma once
 // gemma1.h — Gemma 1 (2B / 7B) model recipe.
 //
+// Also defines gemma1_tokenizer_config() so the registry can wire it in
+// without architecture string literals in the CLI layer.
+// (GemmaChatTemplate lives in src/loader/chat_template.h.)
+//
 // Composes existing layer modules + Gemma-specific ops:
 //   - build_rms_norm_gemma:  (x / rms(x)) * (1 + w)
 //   - build_embed_scale:     embedding * sqrt(hidden_size)  (in fp32)
@@ -17,10 +21,18 @@
 
 #include "forward_pass_base.h"
 #include "../state/kv_cache_simple.h"
+#include "../loader/tokenizer_config.h"
+
+// Validates the tensor inventory for gemma architecture.
+// Throws std::runtime_error naming the missing tensor on failure.
+void validate_gemma1_inventory(const ModelMetadata& meta);
+
+// TokenizerConfig for Gemma 1 (SentencePiece BPE with byte fallback).
+TokenizerConfig gemma1_tokenizer_config();
 
 class Gemma1ForwardPass : public ForwardPassBase {
 public:
-    Gemma1ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata,
+    Gemma1ForwardPass(const Model& model, const ModelMetadata* metadata,
                       uint32_t context_len, uint32_t max_batch_size = 1,
                       int kv_quant_bits = 0);
     ~Gemma1ForwardPass() override = default;

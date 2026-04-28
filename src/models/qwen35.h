@@ -6,6 +6,48 @@
 #include "../state/kv_cache_simple.h"
 #include "../state/kv_cache_compressed.h"
 
+// Validates the tensor inventory for qwen35 architecture.
+// Throws std::runtime_error naming the missing tensor on failure.
+void validate_qwen35_inventory(const ModelMetadata& meta);
+
+// Typed config for the qwen35 recipe.  Holds only the fields that are
+// family-specific to qwen35 (SSM / DeltaNet, partial-RoPE dimension, and
+// the hybrid-attention interval that backs the layer-kind helpers).
+// Universal fields (block_count, embedding_length, head counts, RoPE base,
+// RMS eps) stay on ModelMetadata and are read directly by the recipe.
+//
+// The layer-kind methods (is_full_attention_layer / is_ssm_layer) live here
+// so the recipe calls cfg_.* rather than touching ModelMetadata.
+// ModelMetadata no longer carries these methods; all load-time call sites
+// (model.cpp, qwen35.cpp validators) use the inline arithmetic directly.
+struct Qwen35Config {
+    // SSM / DeltaNet block
+    uint32_t ssm_conv_kernel;
+    uint32_t ssm_state_size;
+    uint32_t ssm_group_count;
+    uint32_t ssm_time_step_rank;
+    uint32_t ssm_inner_size;
+
+    // Partial-RoPE dimension (0 → fall back to full head dimension at use sites)
+    uint32_t rope_dimension_count;
+
+    // Hybrid-attention scheduling
+    uint32_t full_attention_interval;
+
+    // Layer-kind helpers — identical semantics to ModelMetadata::is_*_layer
+    // but self-contained so the recipe does not need to touch the metadata.
+    bool is_full_attention_layer(uint32_t il) const {
+        if (full_attention_interval == 0) return true;
+        return (il % full_attention_interval) == (full_attention_interval - 1);
+    }
+    bool is_ssm_layer(uint32_t il) const { return !is_full_attention_layer(il); }
+
+    // Factory: copies family-specific fields from meta and validates
+    // qwen35-specific invariants.  Throws std::runtime_error on violation
+    // following the fail-loud contract: field name, expected, actual.
+    static Qwen35Config from_metadata(const ModelMetadata& meta);
+};
+
 /**
  * Forward pass for Qwen3.5 hybrid SSM/attention architecture.
  *
@@ -23,7 +65,7 @@
  */
 class Qwen35ForwardPass : public ForwardPassBase {
 public:
-    Qwen35ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata,
+    Qwen35ForwardPass(const Model& model, const ModelMetadata* metadata,
                       uint32_t context_len, uint32_t max_batch_size = 1,
                       int kv_quant_bits = 0);
     ~Qwen35ForwardPass() override = default;
@@ -108,6 +150,8 @@ public:
     }
 
 private:
+    Qwen35Config cfg_;  // family-specific config, derived from ModelMetadata at construction
+
     std::unique_ptr<simple_kv_cache> kv_cache_;       // attention layers (null when TQ enabled)
     std::unique_ptr<DeltaNetState>   dn_state_;       // DeltaNet recurrent state (always present)
     std::unique_ptr<CompressedKVStore> tq_store_;     // TurboQuant compressed store (optional)

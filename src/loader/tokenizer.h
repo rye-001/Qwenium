@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../qwen3-core/qwen3-model.h"
+#include "../core/model.h"
+#include "tokenizer_config.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,10 +20,17 @@ struct pair_hash {
     }
 };
 
+// Derive a TokenizerConfig from standard GGUF metadata fields.
+// Reads tokenizer_type ("llama" vs "gpt2") and add_bos_token.
+// Call sites that know the architecture can refine the returned config before
+// passing it to the Tokenizer constructor, but for all built-in models this
+// derivation is sufficient.
+TokenizerConfig tokenizer_config_from_gguf(const ModelMetadata& meta);
+
 class Tokenizer {
     friend class TokenizerTest_TestUnknownCharacters_Test;
 public:
-    Tokenizer(const Qwen3Metadata* metadata);
+    Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& config = {});
 
     std::vector<int32_t> encode(const std::string& text) const;
     std::string decode(int32_t token_id) const;
@@ -35,9 +43,12 @@ public:
 
 private:
     std::string _decode_original_token(int32_t original_id) const;
-    
+
+    // Configuration supplied at construction (arch-specific knobs).
+    TokenizerConfig config_;
+
     // Core BPE components
-    const Qwen3Metadata* metadata_;
+    const ModelMetadata* metadata_;
     std::unordered_map<std::string, int32_t> token_to_id_;
     std::unordered_map<std::pair<int32_t, int32_t>, std::pair<int, int32_t>, pair_hash> merges_;
     
@@ -70,12 +81,10 @@ private:
     std::unordered_map<std::string, int32_t> byte_decoder_;
     void initialize_byte_mapping();
 
-    // ── llama / SentencePiece-derived tokenizer (e.g. Gemma) ────────────────
-    // When metadata_->tokenizer_type == "llama", the existing GPT-2 byte-level
-    // BPE path is bypassed in favor of score-based Viterbi over normalized text
-    // with byte-fallback for unknown codepoints. The diff is the encode/decode
-    // algorithm — vocabulary, special-token table, and unk_token_id_ are
-    // populated by the same constructor.
+    // ── SentencePiece-derived tokenizer (NormalizerKind::SpaceToUnderscore) ──
+    // When config_.normalizer == SpaceToUnderscore, the GPT-2 byte-level BPE
+    // path is bypassed in favor of score-based merge over ▁-normalized text
+    // with byte-fallback for unknown codepoints.
     bool                    is_llama_tokenizer_ = false;
     std::vector<int32_t>    byte_fallback_ids_;     // 256 entries when llama
     std::vector<float>      scores_;                // alias of metadata_->scores

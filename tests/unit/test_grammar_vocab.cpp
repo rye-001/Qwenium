@@ -130,7 +130,7 @@ std::vector<std::string> build_vocab() {
 // Throws with detail on first rejection.
 // ============================================================================
 
-bool feed_sequence(qwen3::GrammarVocab& g,
+bool feed_sequence(qwenium::GrammarVocab& g,
                    const std::vector<int32_t>& tokens,
                    const std::vector<std::string>& vocab,
                    bool verbose = false)
@@ -159,7 +159,7 @@ bool feed_sequence(qwen3::GrammarVocab& g,
 }
 
 // Feed prefix only (no validation) for state-inspection tests
-void feed_prefix(qwen3::GrammarVocab& g,
+void feed_prefix(qwenium::GrammarVocab& g,
                  const std::vector<int32_t>& tokens,
                  const std::vector<std::string>& vocab)
 {
@@ -222,28 +222,28 @@ void suite1_parse(const std::string& gbnf, const std::vector<std::string>& vocab
     std::cout << "\n=== Suite 1: Parse & infrastructure ===" << std::endl;
 
     TEST("parse_impl succeeds on valid GBNF", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf);
         ASSERT_TRUE(g != nullptr);
     });
 
     TEST("parse_impl returns nullptr on empty string", {
-        auto g = qwen3::GrammarVocab::parse_impl("");
+        auto g = qwenium::GrammarVocab::parse_impl("");
         ASSERT_TRUE(g == nullptr);
     });
 
     TEST("parse_impl returns nullptr on missing root", {
-        auto g = qwen3::GrammarVocab::parse_impl("foo ::= \"bar\"");
+        auto g = qwenium::GrammarVocab::parse_impl("foo ::= \"bar\"");
         ASSERT_TRUE(g == nullptr);
     });
 
     TEST("initial state is not accepting", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf);
         ASSERT_TRUE(g != nullptr);
         ASSERT_FALSE(g->is_accepting_state());
     });
 
     TEST("initial valid tokens include statement starters", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf);
         ASSERT_TRUE(g != nullptr);
         auto valid = g->get_valid_tokens(vocab);
         ASSERT_IN(valid, T_CONST);
@@ -262,7 +262,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     std::cout << "\n=== Suite 2: Regression — fixed GBNF productions ===" << std::endl;
 
     TEST("let_decl: getAccounts() no args", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_RPAREN, T_SEMI
@@ -270,7 +270,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("let_decl: getAccounts({ tier: \"gold\" })", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_LBRACE, T_SPACE,
@@ -280,7 +280,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("for_of: simple loop with await body", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_FOR, T_SPACE, T_LPAREN, T_CONST, T_SPACE, T_ACCOUNT,
             T_SPACE, T_OF, T_SPACE, T_ACCOUNTS, T_RPAREN, T_SPACE,
@@ -293,7 +293,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("no double space: after '(' in empty call, space NOT valid", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN
@@ -304,7 +304,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("multi-statement: two let_decls", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_RPAREN, T_SEMI,
@@ -317,7 +317,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("numeric condition: orders.length > 5", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_IF, T_SPACE, T_LPAREN,
             T_ORDERS, T_DOT, T_LENGTH, T_GT, T_5,
@@ -331,7 +331,7 @@ void suite2_regression(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("full platinum example", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_LBRACE, T_SPACE,
@@ -371,7 +371,7 @@ void suite3_option_b_char_tracking(const std::string& gbnf, const std::vector<st
     TEST("'get' is valid at start of getAccounts literal (partial prefix)", {
         // Grammar expects "getAccounts". Vocab has T_GET="get" and T_ACCOUNTS_S="Accounts".
         // char_idx=0: "get" == "getAccounts".substr(0,3) → valid
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE  // now at function_name position
@@ -383,7 +383,7 @@ void suite3_option_b_char_tracking(const std::string& gbnf, const std::vector<st
 
     TEST("after accepting 'get', 'Accounts' is the only valid completion", {
         // char_idx advances to 3. Now only tokens matching "getAccounts".substr(3,...) = "Accounts..."
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GET  // partial: consumed "get", char_idx=3
@@ -396,7 +396,7 @@ void suite3_option_b_char_tracking(const std::string& gbnf, const std::vector<st
 
     TEST("full split-token sequence: 'get'+'Accounts'+'('+')'  accepts", {
         // Proves end-to-end: multi-token literal via char_idx works
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         ASSERT_TRUE(feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE,
@@ -406,7 +406,7 @@ void suite3_option_b_char_tracking(const std::string& gbnf, const std::vector<st
     });
 
     TEST("mid-literal state is NOT accepting", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GET  // mid-literal
@@ -427,7 +427,7 @@ void suite4_space_tokens(const std::string& gbnf, const std::vector<std::string>
         // After "await", grammar expects " " then function_name.
         // In BPE, " getAccounts" as one token = the space consumed by the " " literal.
         // char_idx tracks: " getAccounts"[0] == ' ' → matches " " literal.
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT  // grammar now at the " " literal before function_name
@@ -444,7 +444,7 @@ void suite4_space_tokens(const std::string& gbnf, const std::vector<std::string>
         // But " getAccounts" has 12 chars and only 1 was used — the remaining
         // "getAccounts" (11 chars) must continue matching function_name literal.
         // This tests cross-element token boundary handling.
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SP_GETACCOUNTS  // " getAccounts" spans " " + "getAccounts"
@@ -459,7 +459,7 @@ void suite4_space_tokens(const std::string& gbnf, const std::vector<std::string>
         // Option B key property: at a LITERAL(" ") state, the vocab-scan enforces
         // first-char matching without any pre-enumeration. Every accepted token
         // must begin with ' ' — no special-casing required.
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE, T_AWAIT
             // grammar now at " " literal before function_name
@@ -483,7 +483,7 @@ void suite5_char_class(const std::string& gbnf, const std::vector<std::string>& 
     std::cout << "\n=== Suite 5: CHAR_CLASS — number rule ===" << std::endl;
 
     TEST("after '>' comparator, digit tokens are valid", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT
         }, vocab);
@@ -494,7 +494,7 @@ void suite5_char_class(const std::string& gbnf, const std::vector<std::string>& 
     });
 
     TEST("multi-digit number: after '5', another digit or ')' is valid", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_prefix(*g, {
             T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT, T_5
         }, vocab);
@@ -513,7 +513,7 @@ void suite6_reset(const std::string& gbnf, const std::vector<std::string>& vocab
     std::cout << "\n=== Suite 6: reset() ===" << std::endl;
 
     TEST("reset after partial feed restores initial valid tokens", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         // Feed half a statement
         g->accept_token(T_CONST, vocab);
         g->accept_token(T_SPACE, vocab);
@@ -527,7 +527,7 @@ void suite6_reset(const std::string& gbnf, const std::vector<std::string>& vocab
     });
 
     TEST("reset after complete statement allows re-parsing", {
-        auto g = qwen3::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
+        auto g = qwenium::GrammarVocab::parse_impl(gbnf); ASSERT_TRUE(g);
         feed_sequence(*g, {
             T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
             T_AWAIT, T_SPACE, T_GETACCOUNTS, T_LPAREN, T_RPAREN, T_SEMI

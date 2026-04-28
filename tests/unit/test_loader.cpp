@@ -17,13 +17,14 @@
 
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/loader/tokenizer.h"
+#include "../../src/models/model_registry.h"
 
 // ── Fixture: minimal byte-level vocabulary ────────────────────────────────────
 //
 // Mirrors Tokenizer::initialize_byte_mapping() exactly so that
 // encode(x) → decode() round-trips any ASCII text without a real model file.
 // 256 byte tokens (indices 0–255) + one EOS control token at index 256.
-static Qwen3Metadata make_byte_level_metadata() {
+static ModelMetadata make_byte_level_metadata() {
     std::map<int, int> b2u;
     std::set<int> printable;
     for (int i = 33;  i <= 126; ++i) { printable.insert(i); b2u[i] = i; }
@@ -45,7 +46,7 @@ static Qwen3Metadata make_byte_level_metadata() {
         return s;
     };
 
-    Qwen3Metadata m;
+    ModelMetadata m;
     m.id_to_token.resize(257);
     m.token_types.resize(257, TokenType::NORMAL);
     for (int b = 0; b < 256; ++b) {
@@ -61,7 +62,7 @@ static Qwen3Metadata make_byte_level_metadata() {
 
 // ── Inventory schema tests (PR G1.2) ──────────────────────────────────────────
 
-// Build a minimal Qwen3Metadata with a synthetic tensor inventory for tests.
+// Build a minimal ModelMetadata with a synthetic tensor inventory for tests.
 // Tensor types and shapes are not exercised here — only required-key presence.
 static TensorMetadata fake_tensor(const std::string& name) {
     TensorMetadata t;
@@ -72,8 +73,8 @@ static TensorMetadata fake_tensor(const std::string& name) {
     return t;
 }
 
-static Qwen3Metadata make_complete_gemma_inventory(uint32_t blocks = 2) {
-    Qwen3Metadata m;
+static ModelMetadata make_complete_gemma_inventory(uint32_t blocks = 2) {
+    ModelMetadata m;
     m.architecture = "gemma";
     m.block_count = blocks;
     m.tensor_inventory["token_embd.weight"] = fake_tensor("token_embd.weight");
@@ -92,8 +93,8 @@ static Qwen3Metadata make_complete_gemma_inventory(uint32_t blocks = 2) {
     return m;
 }
 
-static Qwen3Metadata make_complete_qwen3_inventory(uint32_t blocks = 2) {
-    Qwen3Metadata m;
+static ModelMetadata make_complete_qwen3_inventory(uint32_t blocks = 2) {
+    ModelMetadata m;
     m.architecture = "qwen3";
     m.block_count = blocks;
     m.tensor_inventory["token_embd.weight"] = fake_tensor("token_embd.weight");
@@ -113,16 +114,17 @@ static Qwen3Metadata make_complete_qwen3_inventory(uint32_t blocks = 2) {
 }
 
 TEST(InventorySchema, GemmaCompleteInventoryPasses) {
+    register_builtin_models();
     auto m = make_complete_gemma_inventory();
-    EXPECT_NO_THROW(validate_gemma_inventory(m));
     EXPECT_NO_THROW(validate_inventory_for_architecture(m));
 }
 
 TEST(InventorySchema, GemmaMissingGlobalTensorFailsLoudly) {
+    register_builtin_models();
     auto m = make_complete_gemma_inventory();
     m.tensor_inventory.erase("output_norm.weight");
     try {
-        validate_gemma_inventory(m);
+        validate_inventory_for_architecture(m);
         FAIL() << "expected GGUFLoadError";
     } catch (const GGUFLoadError& e) {
         const std::string msg(e.what());
@@ -132,10 +134,11 @@ TEST(InventorySchema, GemmaMissingGlobalTensorFailsLoudly) {
 }
 
 TEST(InventorySchema, GemmaMissingPerBlockTensorFailsLoudly) {
+    register_builtin_models();
     auto m = make_complete_gemma_inventory(3);
     m.tensor_inventory.erase("blk.1.ffn_down.weight");
     try {
-        validate_gemma_inventory(m);
+        validate_inventory_for_architecture(m);
         FAIL() << "expected GGUFLoadError";
     } catch (const GGUFLoadError& e) {
         const std::string msg(e.what());
@@ -144,20 +147,22 @@ TEST(InventorySchema, GemmaMissingPerBlockTensorFailsLoudly) {
 }
 
 TEST(InventorySchema, GemmaTiedEmbeddingsAcceptedNoSeparateOutput) {
+    register_builtin_models();
     // Gemma reuses token_embd.weight for the LM head — no `output.weight`.
     // Validator must NOT require output.weight.
     auto m = make_complete_gemma_inventory();
     EXPECT_TRUE(m.tensor_inventory.find("output.weight") == m.tensor_inventory.end());
-    EXPECT_NO_THROW(validate_gemma_inventory(m));
+    EXPECT_NO_THROW(validate_inventory_for_architecture(m));
 }
 
 TEST(InventorySchema, Qwen3InventoryUnaffectedByDispatch) {
+    register_builtin_models();
     auto m = make_complete_qwen3_inventory();
     EXPECT_NO_THROW(validate_inventory_for_architecture(m));
 }
 
 TEST(InventorySchema, DispatchUnknownArchitectureFailsLoudly) {
-    Qwen3Metadata m;
+    ModelMetadata m;
     m.architecture = "totally_unknown";
     try {
         validate_inventory_for_architecture(m);
@@ -172,63 +177,68 @@ TEST(InventorySchema, DispatchUnknownArchitectureFailsLoudly) {
 // ── Architecture allow-list tests (PR G1.1) ───────────────────────────────────
 
 TEST(Loader, ArchitectureAllowListAcceptsQwen3) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "qwen3";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "qwen3";
     EXPECT_NO_THROW(loader.validate_architecture(m));
 }
 
 TEST(Loader, ArchitectureAllowListAcceptsQwen2) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "qwen2";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "qwen2";
     EXPECT_NO_THROW(loader.validate_architecture(m));
 }
 
 TEST(Loader, ArchitectureAllowListAcceptsQwen35) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "qwen35";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "qwen35";
     EXPECT_NO_THROW(loader.validate_architecture(m));
 }
 
 TEST(Loader, ArchitectureAllowListAcceptsQwen35Moe) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "qwen35moe";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "qwen35moe";
     EXPECT_NO_THROW(loader.validate_architecture(m));
 }
 
 TEST(Loader, ArchitectureAllowListAcceptsGemma) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "gemma";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "gemma";
     EXPECT_NO_THROW(loader.validate_architecture(m));
 }
 
 TEST(Loader, ArchitectureAllowListRejectsUnknownWithFailLoudFormat) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "unknown_arch_xyz";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "unknown_arch_xyz";
     try {
         loader.validate_architecture(m);
         FAIL() << "expected GGUFLoadError for unknown architecture";
     } catch (const GGUFLoadError& e) {
         const std::string msg(e.what());
-        // Fail-loud contract: name the parameter, expected value, then actual.
         EXPECT_NE(msg.find("validate_architecture"), std::string::npos) << msg;
         EXPECT_NE(msg.find("expected one of"), std::string::npos) << msg;
         EXPECT_NE(msg.find("got 'unknown_arch_xyz'"), std::string::npos) << msg;
-        // Allow-list members must appear in the message so users can self-correct.
         EXPECT_NE(msg.find("'gemma'"), std::string::npos) << msg;
         EXPECT_NE(msg.find("'qwen3'"), std::string::npos) << msg;
     }
 }
 
 TEST(Loader, ArchitectureAllowListRejectsEmpty) {
-    QwenGGUFLoader loader;
-    Qwen3Metadata m; m.architecture = "";
+    register_builtin_models();
+    GGUFLoader loader;
+    ModelMetadata m; m.architecture = "";
     EXPECT_THROW(loader.validate_architecture(m), GGUFLoadError);
 }
 
 // ── GGUFLoader build tests ────────────────────────────────────────────────────
 
 TEST(Loader, GGUFLoaderDefaultConstructs) {
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     EXPECT_FALSE(loader.is_loaded());
 }
 
@@ -239,7 +249,7 @@ TEST(Loader, CreateLoaderFactoryReturnsNonNull) {
 }
 
 TEST(Loader, LoadNonexistentPathThrows) {
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     EXPECT_THROW(
         loader.load_model("/tmp/qwen_inference_test_nonexistent_loader.gguf"),
         std::exception
@@ -249,19 +259,19 @@ TEST(Loader, LoadNonexistentPathThrows) {
 // ── Tokenizer build tests ─────────────────────────────────────────────────────
 
 TEST(Loader, TokenizerVocabSizeMatchesInput) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
     EXPECT_EQ(tok.get_vocabulary().size(), 257u);
 }
 
 TEST(Loader, TokenizerReportsEOSTokenId) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
     EXPECT_EQ(tok.get_eos_token_id(), 256);
 }
 
 TEST(Loader, TokenizerDecodeEOSReturnsControlString) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
     // EOS is CONTROL type; decode returns the token string verbatim.
     EXPECT_EQ(tok.decode(256), "<|endoftext|>");
@@ -273,7 +283,7 @@ TEST(Loader, TokenizerDecodeEOSReturnsControlString) {
 // byte token and decodes back via the GPT-2 byte mapping.
 
 TEST(Loader, TokenizerRoundTripSingleWord) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
 
     const std::string text = "Hello";
@@ -283,7 +293,7 @@ TEST(Loader, TokenizerRoundTripSingleWord) {
 }
 
 TEST(Loader, TokenizerRoundTripPhraseWithSpace) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
 
     const std::string text = "hello world";
@@ -291,9 +301,120 @@ TEST(Loader, TokenizerRoundTripPhraseWithSpace) {
 }
 
 TEST(Loader, TokenizerRoundTripDigitsAndPunctuation) {
-    Qwen3Metadata meta = make_byte_level_metadata();
+    ModelMetadata meta = make_byte_level_metadata();
     Tokenizer tok(&meta);
 
     const std::string text = "count 42!";
     EXPECT_EQ(tok.decode(tok.encode(text)), text);
+}
+
+// ── GGUFKVBag population tests (real model file) ──────────────────────────────
+//
+// These tests load the Qwen3.5-0.8B GGUF and verify that raw_kv contains a
+// representative sample of scalar keys with values that match the corresponding
+// typed fields on ModelMetadata.  Self-skip when QWEN35_MODEL_PATH is unset.
+
+static std::string get_qwen35_model_path_for_loader() {
+    const char* p = std::getenv("QWEN35_MODEL_PATH");
+    return p ? std::string(p) : "";
+}
+
+#define SKIP_IF_NO_QWEN35()                                                \
+    do {                                                                   \
+        if (get_qwen35_model_path_for_loader().empty()) {                  \
+            GTEST_SKIP() << "QWEN35_MODEL_PATH not set, skipping";        \
+        }                                                                  \
+    } while (0)
+
+// Fixture: loads the model once for all bag tests.
+class GGUFKVBagLoaderTest : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        if (get_qwen35_model_path_for_loader().empty()) return;
+        loader_ = std::make_unique<GGUFLoader>();
+        loader_->load_model(get_qwen35_model_path_for_loader());
+        loader_->extract_metadata(meta_);
+    }
+    static void TearDownTestSuite() {
+        loader_.reset();
+    }
+
+    static std::unique_ptr<GGUFLoader> loader_;
+    static ModelMetadata meta_;
+};
+std::unique_ptr<GGUFLoader> GGUFKVBagLoaderTest::loader_ = nullptr;
+ModelMetadata GGUFKVBagLoaderTest::meta_;
+
+// uint32 — block_count agrees between typed field and bag.
+TEST_F(GGUFKVBagLoaderTest, BlockCountInBagMatchesTypedField) {
+    SKIP_IF_NO_QWEN35();
+    const std::string key = meta_.architecture + ".block_count";
+    ASSERT_TRUE(meta_.raw_kv.contains(key)) << "bag missing " << key;
+    EXPECT_EQ(meta_.raw_kv.get_uint32(key), meta_.block_count);
+}
+
+// float — rope.freq_base agrees between typed field and bag.
+TEST_F(GGUFKVBagLoaderTest, RopeFreqBaseInBagMatchesTypedField) {
+    SKIP_IF_NO_QWEN35();
+    const std::string key = meta_.architecture + ".rope.freq_base";
+    ASSERT_TRUE(meta_.raw_kv.contains(key)) << "bag missing " << key;
+    EXPECT_FLOAT_EQ(meta_.raw_kv.get_float(key), meta_.rope_freq_base);
+}
+
+// string — tokenizer.ggml.model agrees between typed field and bag.
+TEST_F(GGUFKVBagLoaderTest, TokenizerModelInBagMatchesTypedField) {
+    SKIP_IF_NO_QWEN35();
+    ASSERT_TRUE(meta_.raw_kv.contains("tokenizer.ggml.model"))
+        << "bag missing tokenizer.ggml.model";
+    EXPECT_EQ(meta_.raw_kv.get_string("tokenizer.ggml.model"), meta_.tokenizer_type);
+}
+
+// string — tokenizer.ggml.pre agrees between typed field and bag.
+TEST_F(GGUFKVBagLoaderTest, TokenizerPreInBagMatchesTypedField) {
+    SKIP_IF_NO_QWEN35();
+    ASSERT_TRUE(meta_.raw_kv.contains("tokenizer.ggml.pre"))
+        << "bag missing tokenizer.ggml.pre";
+    EXPECT_EQ(meta_.raw_kv.get_string("tokenizer.ggml.pre"), meta_.tokenizer_pre);
+}
+
+// uint32 (family-specific) — full_attention_interval is present and non-zero in the bag.
+TEST_F(GGUFKVBagLoaderTest, FullAttentionIntervalInBag) {
+    SKIP_IF_NO_QWEN35();
+    const std::string key = meta_.architecture + ".full_attention_interval";
+    ASSERT_TRUE(meta_.raw_kv.contains(key)) << "bag missing " << key;
+    EXPECT_GT(meta_.raw_kv.get_uint32(key), 0u);
+}
+
+// bool (optional) — tokenizer.ggml.add_bos_token, if present, agrees.
+TEST_F(GGUFKVBagLoaderTest, AddBosTokenInBagMatchesTypedFieldWhenPresent) {
+    SKIP_IF_NO_QWEN35();
+    auto v = meta_.raw_kv.get_bool_opt("tokenizer.ggml.add_bos_token");
+    if (v.has_value()) {
+        EXPECT_EQ(*v, meta_.add_bos_token);
+    }
+    // Not present in every GGUF — test passes either way.
+}
+
+// Tokenizer array keys are NOT in the bag (arrays are excluded by design).
+TEST_F(GGUFKVBagLoaderTest, TokenizerArraysNotInBag) {
+    SKIP_IF_NO_QWEN35();
+    EXPECT_FALSE(meta_.raw_kv.contains("tokenizer.ggml.tokens"))
+        << "tokenizer.ggml.tokens is an array and must not be in raw_kv";
+    EXPECT_FALSE(meta_.raw_kv.contains("tokenizer.ggml.merges"))
+        << "tokenizer.ggml.merges is an array and must not be in raw_kv";
+}
+
+// Wrong-type access on a bag entry throws with the correct message shape.
+TEST_F(GGUFKVBagLoaderTest, WrongTypeAccessOnBagKeyThrows) {
+    SKIP_IF_NO_QWEN35();
+    const std::string key = meta_.architecture + ".block_count"; // uint32 in bag
+    ASSERT_TRUE(meta_.raw_kv.contains(key));
+    try {
+        meta_.raw_kv.get_string(key);   // asks for string from a uint32 entry
+        FAIL() << "expected std::runtime_error";
+    } catch (const std::runtime_error& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("string"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("uint32"), std::string::npos) << msg;
+    }
 }

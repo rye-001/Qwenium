@@ -53,7 +53,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/models/qwen3.h"
 #include "../../src/loader/tokenizer.h"
 
@@ -167,7 +167,7 @@ protected:
         }
         probe.close();
 
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(model_path);
         model_->load_tensors();
     }
@@ -214,10 +214,10 @@ protected:
             all_logits.begin() + static_cast<std::ptrdiff_t>(offset) + meta.vocab_size);
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen3TQPrefillTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen3TQPrefillTest::model_ = nullptr;
 
 #define SKIP_IF_NO_MODEL()                                                   \
     do {                                                                     \

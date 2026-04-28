@@ -11,10 +11,7 @@
 #include "cli-args.h"
 #include "speculative-bridge.h"
 
-#include "../qwen3-core/qwen3-model.h"
-#include "../models/qwen3.h"
-#include "../models/qwen35.h"
-#include "../models/qwen36.h"
+#include "../core/model.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
 #include "../sampling/grammar_vocab.h"
@@ -23,13 +20,13 @@
 
 
 
-class Qwen3Model;
-struct Qwen3Metadata;
+class Model;
+struct ModelMetadata;
 class ForwardPassBase;
 class Tokenizer;
 struct ChatMessage;
 
-namespace qwen3 {
+namespace qwenium {
     class Sampler;
     class SpeculativeDecoder;
 }
@@ -37,10 +34,10 @@ namespace qwen3 {
 /// Run the interactive multi-turn chat loop.
 /// Returns process exit code (0 on clean exit).
 int run_chat(
-    Qwen3Model& model,
+    Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::GrammarVocab>& grammar,        // nullable, may be reset per turn
-    qwen3::SpeculativeDecoder* spec,                  // nullable
+    std::unique_ptr<qwenium::GrammarVocab>& grammar,        // nullable, may be reset per turn
+    qwenium::SpeculativeDecoder* spec,                  // nullable
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens

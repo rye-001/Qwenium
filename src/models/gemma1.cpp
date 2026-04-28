@@ -8,12 +8,26 @@
 #include "ggml.h"
 
 #include <cmath>
+#include <sstream>
 #include <stdexcept>
+
+// ── Gemma tokenizer config ────────────────────────────────────────────────────
+
+TokenizerConfig gemma1_tokenizer_config()
+{
+    TokenizerConfig cfg;
+    cfg.normalizer    = NormalizerKind::SpaceToUnderscore;
+    cfg.byte_fallback = true;
+    cfg.add_bos_token = true;
+    // Some GGUF exports label these as NORMAL rather than USER_DEFINED.
+    cfg.extra_chat_specials = {"<start_of_turn>", "<end_of_turn>"};
+    return cfg;
+}
 
 constexpr size_t GEMMA1_GRAPH_SIZE = 16384;
 
 Gemma1ForwardPass::Gemma1ForwardPass(
-    const Qwen3Model& model, const Qwen3Metadata* metadata,
+    const Model& model, const ModelMetadata* metadata,
     uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
     : ForwardPassBase(model, metadata)
 {
@@ -212,4 +226,31 @@ void Gemma1ForwardPass::set_batched_inputs(
     throw std::runtime_error(
         "Gemma1ForwardPass::set_batched_inputs: batched decode not implemented "
         "in PR G1.5; expected: prefill-only path, got: batched call");
+}
+
+// ── Inventory validator ──────────────────────────────────────────────────────
+
+void validate_gemma1_inventory(const ModelMetadata& meta)
+{
+    const auto& inv = meta.tensor_inventory;
+    auto require = [&](const std::string& name) {
+        if (inv.find(name) == inv.end())
+            throw std::runtime_error(
+                "gemma: missing tensor '" + name +
+                "': expected in model weights, got absent");
+    };
+
+    // Tied embeddings: no separate output.weight.
+    require("token_embd.weight");
+    require("output_norm.weight");
+
+    static const std::vector<std::string> per_block = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+        "ffn_up.weight", "ffn_down.weight"
+    };
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block) require(p + t);
+    }
 }

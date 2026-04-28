@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/loader/tokenizer.h"
 
@@ -36,7 +36,7 @@ protected:
     static void SetUpTestSuite() {
         if (get_qwen35_model_path().empty()) return;
 
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_qwen35_model_path());
         model_->load_tensors();
     }
@@ -45,10 +45,10 @@ protected:
         model_.reset();
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen35ForwardAttnTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen35ForwardAttnTest::model_ = nullptr;
 
 // ============================================================
 // Test: Build prefill graph without crash
