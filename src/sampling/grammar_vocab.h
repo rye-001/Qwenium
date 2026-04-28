@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace qwen3 {
+namespace qwenium {
 
 class TokenTrie;  // forward declaration
 
@@ -46,4 +46,4 @@ private:
     const TokenTrie* trie_ = nullptr;
 };
 
-} // namespace qwen3
+} // namespace qwenium

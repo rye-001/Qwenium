@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-using namespace qwen3;
+using namespace qwenium;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -446,13 +446,13 @@ static void assert_equivalence_at(const std::string& gbnf,
                                    const std::vector<int32_t>& prefix_tokens,
                                    const std::string& description) {
     // Brute-force: no trie
-    auto g_brute = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g_brute = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g_brute, nullptr);
     for (int32_t t : prefix_tokens) g_brute->accept_token(t, vocab);
     auto brute_result = sorted(g_brute->get_valid_tokens(vocab));
 
     // Trie-accelerated
-    auto g_trie = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g_trie = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g_trie, nullptr);
     g_trie->set_token_trie(&trie);
     for (int32_t t : prefix_tokens) g_trie->accept_token(t, vocab);

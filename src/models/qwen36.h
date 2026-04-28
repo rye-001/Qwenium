@@ -1,6 +1,8 @@
 #pragma once
 // qwen36.h — Forward pass for the Qwen 3.6-35B-A3B hybrid architecture.
 //
+// validate_qwen36_inventory validates the tensor inventory for qwen35moe.
+//
 // Architecture: 40 layers, layer_idx % 4 == 3 → softmax attention (10 layers),
 //   else GatedDeltaNet (30 layers). Every layer uses a MoE FFN (256 experts,
 //   top-8, 1 shared expert). GGUF architecture string: "qwen35moe".
@@ -22,10 +24,53 @@
 #include <memory>
 #include <vector>
 
+// Validates the tensor inventory for qwen35moe architecture.
+// Throws std::runtime_error naming the missing tensor on failure.
+void validate_qwen36_inventory(const ModelMetadata& meta);
+
+// Typed config for the qwen35moe recipe.  Holds only the fields that are
+// family-specific to qwen35moe (SSM / DeltaNet, MoE, partial-RoPE dimension).
+// Universal fields (block_count, embedding_length, head counts, RoPE base,
+// RMS eps) stay on ModelMetadata and are read directly by the recipe.
+//
+// Construct once at recipe startup via from_metadata(); all subsequent
+// graph-building code reads cfg_.* for these fields.
+struct Qwen35MoEConfig {
+    // SSM / DeltaNet block
+    uint32_t ssm_conv_kernel;
+    uint32_t ssm_state_size;
+    uint32_t ssm_group_count;
+    uint32_t ssm_time_step_rank;
+    uint32_t ssm_inner_size;
+
+    // MoE block
+    uint32_t expert_count;
+    uint32_t expert_used_count;
+    uint32_t expert_feed_forward_length;
+
+    // Hybrid-attention
+    uint32_t rope_dimension_count;
+    uint32_t full_attention_interval;
+
+    // Layer-kind helpers — identical semantics to ModelMetadata::is_*_layer
+    // for the qwen35moe architecture, but self-contained on the config so the
+    // recipe does not read through ModelMetadata at graph-building time.
+    bool is_full_attention_layer(uint32_t il) const {
+        if (full_attention_interval == 0) return true;
+        return (il % full_attention_interval) == (full_attention_interval - 1);
+    }
+    bool is_ssm_layer(uint32_t il) const { return !is_full_attention_layer(il); }
+
+    // Factory: copies family-specific fields from meta and validates
+    // qwen35moe-specific invariants.  Throws std::runtime_error on violation
+    // following the fail-loud contract: field name, expected, actual.
+    static Qwen35MoEConfig from_metadata(const ModelMetadata& meta);
+};
+
 class Qwen36ForwardPass : public ForwardPassBase {
 public:
-    Qwen36ForwardPass(const Qwen3Model&     model,
-                      const Qwen3Metadata*  metadata,
+    Qwen36ForwardPass(const Model&     model,
+                      const ModelMetadata*  metadata,
                       uint32_t              context_len,
                       uint32_t              max_batch_size = 1,
                       int                   kv_quant_bits  = 0);
@@ -85,6 +130,8 @@ public:
     }
 
 private:
+    Qwen35MoEConfig cfg_;  // family-specific config, derived from ModelMetadata at construction
+
     std::unique_ptr<simple_kv_cache> kv_cache_;  // 10 attention layers
     std::unique_ptr<DeltaNetState>   dn_state_;   // 30 DeltaNet layers
 

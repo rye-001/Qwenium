@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/loader/tokenizer.h"
 
 static std::string get_qwen35_model_path() {
@@ -32,7 +32,7 @@ protected:
     static void SetUpTestSuite() {
         if (get_qwen35_model_path().empty()) return;
 
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_qwen35_model_path());
         model_->load_tensors();
 
@@ -44,11 +44,11 @@ protected:
         tokenizer_ = nullptr;
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
     static Tokenizer* tokenizer_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen35TokenizerTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen35TokenizerTest::model_ = nullptr;
 Tokenizer* Qwen35TokenizerTest::tokenizer_ = nullptr;
 
 // ============================================================

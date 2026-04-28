@@ -16,10 +16,8 @@
 #include "nlohmann/json.hpp"
 
 // Your existing headers
-#include "qwen3-core/qwen3-model.h"
-#include "models/qwen3.h"
-#include "models/qwen35.h"
-#include "models/qwen36.h"
+#include "core/model.h"
+#include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "state/kv_cache_simple.h"
@@ -87,19 +85,13 @@ public:
         model_.load_tensors();
         
         tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata());
-        sampler_ = std::make_unique<qwen3::GreedySampler>();
+        sampler_ = std::make_unique<qwenium::GreedySampler>();
         
         // Initialize forward pass with MAX_SLOTS slots
         const auto& srv_meta = model_.get_metadata();
-        if (srv_meta.architecture == "qwen35moe")
-            forward_pass_ = std::make_unique<Qwen36ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
-        else if (srv_meta.architecture == "qwen35")
-            forward_pass_ = std::make_unique<Qwen35ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
-        else
-            forward_pass_ = std::make_unique<Qwen3ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
+        register_builtin_models();
+        forward_pass_ = create_forward_pass(
+            model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS, /*kv_quant_bits=*/0);
         
         scheduler_ = model_.get_scheduler();
         
@@ -198,7 +190,7 @@ public:
         return system_prompt_cache_len_;
     }
 
-    void configure_server(qwen3::InferenceServer& server) {
+    void configure_server(qwenium::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
             // Apply Qwen chat template for user message only
             // System prompt handled separately via caching
@@ -316,10 +308,10 @@ private:
         return next_tokens;
     }
 
-    Qwen3Model model_;
+    Model model_;
     std::unique_ptr<ForwardPassBase> forward_pass_;
     std::unique_ptr<Tokenizer> tokenizer_;
-    std::unique_ptr<qwen3::GreedySampler> sampler_;
+    std::unique_ptr<qwenium::GreedySampler> sampler_;
     ggml_backend_sched_t scheduler_;
     std::mutex model_mutex_;  // Protects all model operations
     int max_ctx_per_slot_;
@@ -332,7 +324,7 @@ private:
 // =============================================================================
 // HTTP Routes
 // =============================================================================
-void setup_routes(httplib::Server& http, qwen3::InferenceServer& inference, QwenServerIntegration& integration) {
+void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, QwenServerIntegration& integration) {
     
     // Health check
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -365,7 +357,7 @@ void setup_routes(httplib::Server& http, qwen3::InferenceServer& inference, Qwen
             return;
         }
 
-        auto inf_req = std::make_shared<qwen3::InferenceRequest>();
+        auto inf_req = std::make_shared<qwenium::InferenceRequest>();
         inf_req->prompt = prompt;
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
@@ -399,7 +391,7 @@ void setup_routes(httplib::Server& http, qwen3::InferenceServer& inference, Qwen
                     while (true) {
                         int token_id = inf_req->token_queue->pop_blocking();
 
-                        if (token_id == qwen3::TokenQueue::QUEUE_END) {
+                        if (token_id == qwenium::TokenQueue::QUEUE_END) {
                             // Send final event
                             std::string done_event = "data: [DONE]\n\n";
                             sink.write(done_event.c_str(), done_event.size());
@@ -440,7 +432,7 @@ void setup_routes(httplib::Server& http, qwen3::InferenceServer& inference, Qwen
             
             while (true) {
                 int token_id = inf_req->token_queue->pop_blocking();
-                if (token_id == qwen3::TokenQueue::QUEUE_END) break;
+                if (token_id == qwenium::TokenQueue::QUEUE_END) break;
                 full_text += inference.decode_token(token_id);
                 token_count++;
             }
@@ -507,12 +499,12 @@ int main(int argc, char* argv[]) {
         QwenServerIntegration integration(model_path);
 
         // Create inference server
-        qwen3::InferenceServer::Config config;
+        qwenium::InferenceServer::Config config;
         config.max_slots = 10;
         config.max_queue_depth = 100;
         config.request_timeout = std::chrono::seconds(120);
 
-        qwen3::InferenceServer inference(config);
+        qwenium::InferenceServer inference(config);
         integration.configure_server(inference);
 
         // Start inference thread

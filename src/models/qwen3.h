@@ -3,6 +3,14 @@
 #include "forward_pass_base.h"
 #include "../state/kv_cache_simple.h"
 #include "../state/kv_cache_compressed.h"
+#include "../loader/tokenizer_config.h"
+
+// Validates the tensor inventory for qwen2/qwen3 architectures.
+// Throws std::runtime_error naming the missing tensor on failure.
+void validate_qwen3_inventory(const ModelMetadata& meta);
+
+// TokenizerConfig shared by all Qwen family architectures (qwen2/3/35/35moe).
+TokenizerConfig qwen_tokenizer_config();
 
 /**
  * Forward pass for Qwen2 and Qwen3 architectures.
@@ -19,7 +27,7 @@ class Qwen3ForwardPass : public ForwardPassBase {
     friend class RopeCorrectnessTest_ApplyRopeMatchesGoldenValues_Test;
     friend class GQAAttentionCorrectnessTest_GQAAttentionMatchesGoldenValues_Test;
 public:
-    explicit Qwen3ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata, uint32_t context_len, uint32_t max_batch_size = 1, int kv_quant_bits = 0);
+    explicit Qwen3ForwardPass(const Model& model, const ModelMetadata* metadata, uint32_t context_len, uint32_t max_batch_size = 1, int kv_quant_bits = 0);
     ~Qwen3ForwardPass() override = default;
 
     // --- Graph building ---

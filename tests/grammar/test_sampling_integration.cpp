@@ -1,5 +1,5 @@
 // test_sampling_integration.cpp
-// Grammar-constrained sampling integration tests for qwen3::GrammarVocab.
+// Grammar-constrained sampling integration tests for qwenium::GrammarVocab.
 //
 // CRITICAL FIX vs original test_grammar_sampling_integration.cpp:
 //   test_char_class_accept_with_vocab originally used "hello" (5 chars) as
@@ -70,7 +70,7 @@ static void test_get_valid_tokens_with_vocab()
     std::vector<std::string> vocab = {"[", "]", "let", "if", "for"};
     //                          id:    0    1     2      3     4
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     auto valid = g->get_valid_tokens(vocab);
@@ -83,7 +83,7 @@ static void test_accept_token_with_vocab()
     const std::string gbnf = R"(root ::= "[" "let" "]")";
     std::vector<std::string> vocab = {"[", "]", "let", "if", "for"};
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     g->accept_token(0, vocab);  // "["
@@ -114,7 +114,7 @@ static void test_char_class_with_vocab()
         "cherry",  // 6  starts with 'c' ✓
     };
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     auto valid = g->get_valid_tokens(vocab);
@@ -141,7 +141,7 @@ static void test_negated_char_class_with_vocab()
         "cherry",  // 6  starts with 'c' ✗
     };
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     auto valid = g->get_valid_tokens(vocab);
@@ -173,7 +173,7 @@ static void test_char_class_accept_with_vocab()
         "world", // 5  starts with 'w' — valid in get_valid_tokens, not for accept
     };
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     // get_valid_tokens: first-char scan includes tokens 0,2,4,5 (start a-z)
@@ -206,7 +206,7 @@ static void test_logits_masking()
     const std::string gbnf = R"(root ::= "[" "let" "]")";
     std::vector<std::string> vocab = {"[", "]", "let", "if", "for"};
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     std::vector<float> logits = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
@@ -226,7 +226,7 @@ static void test_logits_masking_with_alternatives()
     const std::string gbnf = R"(root ::= "a" | "b" | "c")";
     std::vector<std::string> vocab = {"a", "b", "c", "d", "e"};
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     std::vector<float> logits = {1.0f, 2.0f, 3.0f, 10.0f, 10.0f};
@@ -249,7 +249,7 @@ static void test_full_decode_loop_simple()
     const std::string gbnf = R"(root ::= "[" "let" "]")";
     std::vector<std::string> vocab = {"[", "]", "let", "if", "for"};
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     std::vector<int32_t> generated;
@@ -280,7 +280,7 @@ static void test_full_decode_loop_with_string()
         " ",     // 3
     };
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     // Guide to produce: "hello world"  tokens: 0,1,3,2,0
@@ -323,7 +323,7 @@ static void test_full_decode_loop_dsl_let_form()
         "hello", // 8
     };
 
-    auto g = qwen3::GrammarVocab::parse_impl(gbnf);
+    auto g = qwenium::GrammarVocab::parse_impl(gbnf);
     ASSERT_NE(g, nullptr);
 
     // Guide to: [let, x, "hello"]  = 0,2,3,4,3,7,8,7,1
@@ -447,7 +447,7 @@ static std::vector<std::string> build_dsl_vocab()
 }
 
 // Helper: accept and check
-static void dsl_accept(qwen3::GrammarVocab* g, const std::vector<std::string>& v,
+static void dsl_accept(qwenium::GrammarVocab* g, const std::vector<std::string>& v,
                        int32_t tok, const char* desc)
 {
     auto valid = g->get_valid_tokens(v);
@@ -460,13 +460,13 @@ static void dsl_accept(qwen3::GrammarVocab* g, const std::vector<std::string>& v
 
 static void test_parse_real_dsl_gbnf()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
 }
 
 static void test_real_dsl_simple_variable()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
     auto vocab = build_dsl_vocab();
 
@@ -487,7 +487,7 @@ static void test_real_dsl_simple_variable()
 
 static void test_real_dsl_simple_string()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
     auto vocab = build_dsl_vocab();
 
@@ -508,7 +508,7 @@ static void test_real_dsl_simple_string()
 
 static void test_real_dsl_let_form()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
     auto vocab = build_dsl_vocab();
     auto acc = [&](int32_t t, const char* d){ dsl_accept(g.get(), vocab, t, d); };
@@ -521,7 +521,7 @@ static void test_real_dsl_let_form()
 
 static void test_real_dsl_function_call_with_object()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
     auto vocab = build_dsl_vocab();
     auto acc = [&](int32_t t, const char* d){ dsl_accept(g.get(), vocab, t, d); };
@@ -535,7 +535,7 @@ static void test_real_dsl_function_call_with_object()
 
 static void test_real_dsl_full_complex_expression()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REAL_DSL_GBNF);
+    auto g = qwenium::GrammarVocab::parse_impl(REAL_DSL_GBNF);
     ASSERT_NE(g, nullptr);
     auto vocab = build_dsl_vocab();
     auto acc = [&](int32_t t, const char* d){ dsl_accept(g.get(), vocab, t, d); };

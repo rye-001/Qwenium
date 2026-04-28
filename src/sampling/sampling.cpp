@@ -1,6 +1,4 @@
 #include "sampling.h"
-// grammar_vocab.h is pulled in via sampling.h.
-// grammar.h and pretokenized_literals.h are no longer needed.
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -9,7 +7,7 @@
 #include <vector>
 #include <iostream>
 
-namespace qwen3 {
+namespace qwenium {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     if (!pruned_vocab_) return;
@@ -195,4 +193,4 @@ int TemperatureSampler::sample(std::vector<float>& logits,
     return sorted[dist(gen_)].first;
 }
 
-} // namespace qwen3
+} // namespace qwenium

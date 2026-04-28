@@ -1,6 +1,6 @@
 #include "gtest/gtest.h"
 #include "loader/tokenizer.h"
-#include "qwen3-core/qwen3-model.h"
+#include "core/model.h"
 #include "loader/gguf_loader.h"
 #include <memory>
 #include <vector>
@@ -8,8 +8,8 @@
 
 class TokenizerIntegrationTest : public ::testing::Test {
 protected:
-    std::unique_ptr<QwenGGUFLoader> loader_;
-    Qwen3Metadata metadata_;
+    std::unique_ptr<GGUFLoader> loader_;
+    ModelMetadata metadata_;
     std::unique_ptr<Tokenizer> tokenizer_;
     static std::string model_path_;
 
@@ -23,7 +23,7 @@ protected:
     }
 
     void SetUp() override {
-        loader_ = std::make_unique<QwenGGUFLoader>();
+        loader_ = std::make_unique<GGUFLoader>();
         try {
             loader_->load_model(model_path_);
             loader_->extract_metadata(metadata_);

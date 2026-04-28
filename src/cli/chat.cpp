@@ -2,12 +2,13 @@
 #include <fstream>
 
 #include "chat.h"
+#include "../models/model_registry.h"
 
 int run_chat(
-    Qwen3Model& model,
+    Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwen3::GrammarVocab>& grammar,
-    qwen3::SpeculativeDecoder* spec,
+    std::unique_ptr<qwenium::GrammarVocab>& grammar,
+    qwenium::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens
@@ -29,12 +30,12 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
     decoded_vocab.push_back(tokenizer->decode(static_cast<int32_t>(i)));
 }        
 
-        std::unique_ptr<qwen3::Sampler> sampler;
+        std::unique_ptr<qwenium::Sampler> sampler;
         if (args.temperature > 0.0f) {
-            sampler = std::make_unique<qwen3::TemperatureSampler>(
+            sampler = std::make_unique<qwenium::TemperatureSampler>(
                 args.temperature, args.repetition_penalty, 64, args.top_k, args.top_p);
         } else {
-            sampler = std::make_unique<qwen3::GreedySampler>();
+            sampler = std::make_unique<qwenium::GreedySampler>();
         }
         if (grammar) {
             sampler->set_grammar(grammar.get());
@@ -46,7 +47,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
         if (!args.vocab_prune_list_path.empty()) {
-            pruned_vocab = qwen3::load_keep_list(args.vocab_prune_list_path);
+            pruned_vocab = qwenium::load_keep_list(args.vocab_prune_list_path);
             sampler->set_pruned_vocab(&pruned_vocab);
             if (args.verbose) {
                 std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";
@@ -55,13 +56,8 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
         const auto& chat_meta = model.get_metadata();
-        std::unique_ptr<ForwardPassBase> forward_pass;
-        if (chat_meta.architecture == "qwen35moe")
-            forward_pass = std::make_unique<Qwen36ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
-        else if (chat_meta.architecture == "qwen35")
-            forward_pass = std::make_unique<Qwen35ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
-        else
-            forward_pass = std::make_unique<Qwen3ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
+        std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
+            model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
         forward_pass->set_snapkv_config(args.snapkv_budget, args.snapkv_window);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
@@ -85,7 +81,8 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         chat_history.push_back({"system", system_content});
         std::cout << "System Prompt: " << system_content << std::endl;
 
-        std::string system_turn = apply_chat_template({chat_history.back()}, false);
+        const ChatTemplate& tmpl = *lookup_chat_template(chat_meta.architecture);
+        std::string system_turn = tmpl.render({chat_history.back()}, false);
         std::vector<int32_t> system_tokens = tokenizer->encode(system_turn);
         log_tokens(system_tokens);
         all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
@@ -96,9 +93,6 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         // Clone System Prefix to Slot 1 for the user session
         forward_pass->clone_slot(0, 1, system_tokens.size());
         
-        const std::string im_end_str = "<|im_end|>";
-        const std::string eos_str = "<|endoftext|>";
-
         // Speculative bridge for chat mode (slot 1)
         SpeculativeBridge bridge{forward_pass.get(), scheduler};
 
@@ -128,7 +122,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             chat_history.push_back({"user", user_input});
 
             // Format only the new user turn for tokenization
-            std::string turn_prompt = apply_chat_template({{"user", user_input}});
+            std::string turn_prompt = tmpl.render({{"user", user_input}}, true);
             std::vector<int32_t> new_tokens = tokenizer->encode(turn_prompt);
             log_tokens(new_tokens);
             
@@ -199,9 +193,9 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             }
             end_chat_generation:
 
-            // After generation ends, we must add the <|im_end|>\n tokens to the cache
-            // so the next turn sees a properly terminated assistant message
-            std::string im_end_suffix = "<|im_end|>\n";
+            // After generation ends, append the turn-end marker so the next
+            // turn sees a properly terminated assistant message.
+            std::string im_end_suffix = tmpl.turn_end_suffix();
             std::vector<int32_t> im_end_tokens = tokenizer->encode(im_end_suffix);
             int end_pos = forward_pass->get_cache_pos(session_slot);
             

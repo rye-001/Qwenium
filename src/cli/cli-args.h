@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../loader/chat_template.h"
+
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -32,24 +34,6 @@ struct CliArgs {
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
 };
-
-struct ChatMessage {
-    std::string role;
-    std::string content;
-};
-
-// Format chat history into Qwen ChatML template
-inline std::string apply_chat_template(const std::vector<ChatMessage>& history, bool add_assistant_prompt = true) {
-    std::ostringstream prompt_stream;
-    for (const auto& message : history) {
-        prompt_stream << "<|im_start|>" << message.role << "\n"
-                      << message.content << "<|im_end|>\n";
-    }
-    if (add_assistant_prompt) {
-        prompt_stream << "<|im_start|>assistant\n";
-    }
-    return prompt_stream.str();
-}
 
 inline std::string make_readable(std::string str) {
         size_t pos = 0;

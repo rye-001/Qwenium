@@ -15,8 +15,9 @@
 #include <string>
 #include <set>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/loader/gguf_loader.h"
+#include "../../src/models/qwen35.h"
 
 // Helper to get model path from env
 static std::string get_qwen35_model_path() {
@@ -42,10 +43,10 @@ static std::string get_qwen35_model_path() {
 TEST(Qwen35Metadata, ArchitectureIsQwen35) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     EXPECT_EQ(meta.architecture, "qwen35");
@@ -57,10 +58,10 @@ TEST(Qwen35Metadata, ArchitectureIsQwen35) {
 TEST(Qwen35Metadata, CoreDimensionsMatchGGUF) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // Key[14]: qwen35.block_count = 24
@@ -100,32 +101,32 @@ TEST(Qwen35Metadata, CoreDimensionsMatchGGUF) {
 TEST(Qwen35Metadata, SSMMetadataParsed) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // Key[26]: qwen35.ssm.conv_kernel = 4
-    EXPECT_EQ(meta.ssm_conv_kernel, 4u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.ssm.conv_kernel"), 4u);
 
     // Key[27]: qwen35.ssm.state_size = 128
-    EXPECT_EQ(meta.ssm_state_size, 128u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.ssm.state_size"), 128u);
 
     // Key[28]: qwen35.ssm.group_count = 16
-    EXPECT_EQ(meta.ssm_group_count, 16u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.ssm.group_count"), 16u);
 
     // Key[29]: qwen35.ssm.time_step_rank = 16
-    EXPECT_EQ(meta.ssm_time_step_rank, 16u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.ssm.time_step_rank"), 16u);
 
     // Key[30]: qwen35.ssm.inner_size = 2048
-    EXPECT_EQ(meta.ssm_inner_size, 2048u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.ssm.inner_size"), 2048u);
 
     // Key[31]: qwen35.full_attention_interval = 4
-    EXPECT_EQ(meta.full_attention_interval, 4u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.full_attention_interval"), 4u);
 
     // Key[32]: qwen35.rope.dimension_count = 64
-    EXPECT_EQ(meta.rope_dimension_count, 64u);
+    EXPECT_EQ(meta.raw_kv.get_uint32("qwen35.rope.dimension_count"), 64u);
 }
 
 // ============================================================
@@ -134,10 +135,10 @@ TEST(Qwen35Metadata, SSMMetadataParsed) {
 TEST(Qwen35Metadata, TokenizerMetadata) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // Key[34]: tokenizer.ggml.model = 'gpt2'
@@ -166,10 +167,10 @@ TEST(Qwen35Metadata, TokenizerMetadata) {
 TEST(Qwen35Metadata, WeightTyingNoOutputWeight) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // Verify output.weight is NOT in tensor inventory
@@ -188,10 +189,10 @@ TEST(Qwen35Metadata, WeightTyingNoOutputWeight) {
 TEST(Qwen35Metadata, TensorCount) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     EXPECT_EQ(meta.tensor_inventory.size(), 320u);
@@ -205,20 +206,21 @@ TEST(Qwen35Metadata, TensorCount) {
 TEST(Qwen35Metadata, LayerTypeClassification) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // full_attention_interval = 4 means layers 3,7,11,15,19,23
     const std::set<uint32_t> expected_attn_layers = {3, 7, 11, 15, 19, 23};
+    const Qwen35Config cfg = Qwen35Config::from_metadata(meta);
 
     for (uint32_t i = 0; i < meta.block_count; ++i) {
         bool is_full_attn = expected_attn_layers.count(i) > 0;
 
-        // Classification check using the helper
-        EXPECT_EQ(meta.is_full_attention_layer(i), is_full_attn)
+        // Classification check via Qwen35Config — the canonical location after migration
+        EXPECT_EQ(cfg.is_full_attention_layer(i), is_full_attn)
             << "Layer " << i << " classification mismatch";
 
         // Cross-check against actual tensors in GGUF
@@ -290,10 +292,10 @@ TEST(Qwen35Metadata, LayerTypeClassification) {
 TEST(Qwen35Metadata, SSMTensorShapes) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     // Check layer 0 (SSM layer) tensor shapes from debug_gguf
@@ -330,10 +332,10 @@ TEST(Qwen35Metadata, SSMTensorShapes) {
 TEST(Qwen35Metadata, NormNamingConvention) {
     SKIP_IF_NO_MODEL();
 
-    QwenGGUFLoader loader;
+    GGUFLoader loader;
     loader.load_model(get_qwen35_model_path());
 
-    Qwen3Metadata meta;
+    ModelMetadata meta;
     loader.extract_metadata(meta);
 
     for (uint32_t i = 0; i < meta.block_count; ++i) {
@@ -353,7 +355,7 @@ TEST(Qwen35Metadata, NormNamingConvention) {
 TEST(Qwen35Metadata, ValidateArchitectureAcceptsQwen35) {
     SKIP_IF_NO_MODEL();
 
-    Qwen3Model model;
+    Model model;
     model.load_metadata(get_qwen35_model_path());
 
     EXPECT_TRUE(model.validate_architecture());

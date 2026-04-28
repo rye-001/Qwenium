@@ -1,4 +1,4 @@
-#include "qwen3-core/qwen3-model.h"
+#include "core/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "loader/tokenizer.h"
@@ -445,7 +445,7 @@ std::vector<TestCase> get_test_cases() {
 // ============================================================
 
 class ModelRunner {
-    std::shared_ptr<Qwen3Model> model_;
+    std::shared_ptr<Model> model_;
     std::unique_ptr<Qwen3ForwardPass> forward_pass_;
     std::unique_ptr<Tokenizer> tokenizer_;
     std::string model_path_;
@@ -479,7 +479,7 @@ public:
 
     bool load() {
         try {
-            model_ = std::make_shared<Qwen3Model>();
+            model_ = std::make_shared<Model>();
             model_->load_metadata(model_path_);
             model_->load_tensors();
 
@@ -516,7 +516,7 @@ public:
         // Rewind cache to after system prompt
         forward_pass_->set_cache_pos(system_prompt_cache_pos_, 0); // Slot 0
 
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
         ggml_backend_sched_t scheduler = model_->get_scheduler();
 
         // Format and tokenize user prompt only

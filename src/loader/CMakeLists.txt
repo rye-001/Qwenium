@@ -4,6 +4,7 @@ add_library(qinf-loader STATIC
     gguf_loader.cpp
     tokenizer.cpp
     weight_binding.cpp
+    chat_template.cpp
 )
 
 target_include_directories(qinf-loader PUBLIC

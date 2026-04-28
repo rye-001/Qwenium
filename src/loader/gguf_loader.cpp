@@ -1,4 +1,5 @@
 #include "gguf_loader.h"
+#include "../models/model_registry.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <algorithm>
@@ -28,6 +29,8 @@ static constexpr std::string_view KEY_TOKENIZER_EOS_TOKEN_ID = "tokenizer.ggml.e
 static constexpr std::string_view KEY_TOKENIZER_BOS_TOKEN_ID = "tokenizer.ggml.bos_token_id";
 static constexpr std::string_view KEY_TOKENIZER_PADDING_TOKEN_ID = "tokenizer.ggml.padding_token_id";
 static constexpr std::string_view KEY_TOKENIZER_ADD_BOS_TOKEN = "tokenizer.ggml.add_bos_token";
+static constexpr std::string_view KEY_TOKENIZER_UNK_TOKEN_ID = "tokenizer.ggml.unknown_token_id";
+static constexpr std::string_view KEY_TOKENIZER_SCORES = "tokenizer.ggml.scores";
 
 struct GGUFHeader
 {
@@ -37,11 +40,11 @@ struct GGUFHeader
     uint64_t metadata_kv_count;
 };
 
-QwenGGUFLoader::QwenGGUFLoader() : is_loaded_(false), tensor_data_offset_(0) {}
+GGUFLoader::GGUFLoader() : is_loaded_(false), tensor_data_offset_(0) {}
 
-QwenGGUFLoader::~QwenGGUFLoader() { cleanup_resources(); }
+GGUFLoader::~GGUFLoader() { cleanup_resources(); }
 
-void QwenGGUFLoader::load_model(const std::string &path)
+void GGUFLoader::load_model(const std::string &path)
 {
     model_path_ = path;
     std::cout << "Loading GGUF model: " << path << std::endl;
@@ -87,7 +90,7 @@ void QwenGGUFLoader::load_model(const std::string &path)
     is_loaded_ = true;
 }
 
-void QwenGGUFLoader::extract_metadata(Qwen3Metadata &metadata) const
+void GGUFLoader::extract_metadata(ModelMetadata &metadata) const
 {
     if (!is_loaded_)
     {
@@ -96,7 +99,7 @@ void QwenGGUFLoader::extract_metadata(Qwen3Metadata &metadata) const
     metadata = metadata_;
 }
 
-size_t QwenGGUFLoader::calculate_tensors_memory_size() const
+size_t GGUFLoader::calculate_tensors_memory_size() const
 {
     size_t total_bytes = 0;
 
@@ -127,7 +130,7 @@ size_t QwenGGUFLoader::calculate_tensors_memory_size() const
     return total_bytes;
 }
 
-void QwenGGUFLoader::load_all_tensors(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors)
+void GGUFLoader::load_all_tensors(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors)
 {
     if (!file_mapper_) {
         throw GGUFLoadError("Model not loaded or mapped.");
@@ -156,7 +159,7 @@ void QwenGGUFLoader::load_all_tensors(ggml_context *ctx, std::unordered_map<std:
     std::cout << "Successfully loaded " << tensors.size() << " tensors." << std::endl;
 }
 
-const TensorMetadata& QwenGGUFLoader::get_tensor_metadata(const std::string& name) const
+const TensorMetadata& GGUFLoader::get_tensor_metadata(const std::string& name) const
 {
     auto it = metadata_.tensor_inventory.find(name);
     if (it == metadata_.tensor_inventory.end()) {
@@ -168,7 +171,7 @@ const TensorMetadata& QwenGGUFLoader::get_tensor_metadata(const std::string& nam
 
 
 
-void QwenGGUFLoader::validate_tensor_shape(struct ggml_tensor *tensor,
+void GGUFLoader::validate_tensor_shape(struct ggml_tensor *tensor,
                                            const std::vector<int64_t> &expected)
 {
     if (!tensor) {
@@ -200,7 +203,7 @@ void QwenGGUFLoader::validate_tensor_shape(struct ggml_tensor *tensor,
     }
 }
 
-size_t QwenGGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
+size_t GGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
 {
     size_t elements = 1;
     for (uint64_t dim : meta.shape)
@@ -210,24 +213,29 @@ size_t QwenGGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
     return ggml_type_size(meta.type) * elements / ggml_blck_size(meta.type);
 }
 
-void QwenGGUFLoader::validate_architecture(const Qwen3Metadata &meta) const
+void GGUFLoader::validate_architecture(const ModelMetadata& meta) const
 {
-    if (meta.architecture != "qwen3" && meta.architecture != "qwen2" &&
-        meta.architecture != "qwen35" && meta.architecture != "qwen35moe")
-    {
-        throw GGUFLoadError("Invalid model architecture: '" + meta.architecture +
-                            "', expected one of: 'qwen3', 'qwen2', 'qwen35', 'qwen35moe'");
+    if (is_architecture_registered(meta.architecture)) {
+        std::cout << "Validated model architecture: " << meta.architecture << std::endl;
+        return;
     }
-    std::cout << "Validated model architecture: " << meta.architecture << std::endl;
+    std::string allow_list;
+    for (const auto& a : registered_architectures()) {
+        if (!allow_list.empty()) allow_list += ", ";
+        allow_list += "'" + a + "'";
+    }
+    throw GGUFLoadError(
+        "validate_architecture: expected one of: " + allow_list +
+        ", got '" + meta.architecture + "'");
 }
 
-void QwenGGUFLoader::unload_model()
+void GGUFLoader::unload_model()
 {
     cleanup_resources();
     is_loaded_ = false;
 }
 
-void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
+void GGUFLoader::parse_and_validate_metadata(size_t& offset)
 {
     const GGUFHeader* header = reinterpret_cast<const GGUFHeader*>(file_mapper_->data());
 
@@ -260,43 +268,57 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
         if (key == KEY_GENERAL_NAME) {
             if (type != GGUFValueType::STRING) throw GGUFLoadError("general.name has unexpected type.");
             metadata_.model_name = read_string_from_mem(offset);
+            metadata_.raw_kv.set(key, metadata_.model_name);
         } else if (key == prefix + "block_count") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.block_count = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.block_count);
         } else if (key == prefix + "embedding_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.embedding_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.embedding_length);
         } else if (key == prefix + "feed_forward_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.feed_forward_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.feed_forward_length);
         } else if (key == prefix + "context_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.context_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.context_length);
         } else if (key == prefix + "attention.head_count") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.attention_head_count = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.attention_head_count);
         } else if (key == prefix + "attention.head_count_kv") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.attention_head_count_kv = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.attention_head_count_kv);
         } else if (key == prefix + "attention.key_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.attention_key_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.attention_key_length);
         } else if (key == prefix + "attention.value_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.attention_value_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.attention_value_length);
         } else if (key == prefix + "rope.freq_base") {
             if (type != GGUFValueType::FLOAT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.rope_freq_base = read_value_from_mem<float>(offset);
+            metadata_.raw_kv.set(key, metadata_.rope_freq_base);
         } else if (key == prefix + "attention.layer_norm_rms_epsilon") {
             if (type != GGUFValueType::FLOAT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.rms_norm_eps = read_value_from_mem<float>(offset);
+            metadata_.raw_kv.set(key, metadata_.rms_norm_eps);
         } else if (key == KEY_TOKENIZER_MODEL) {
-             if (type != GGUFValueType::STRING) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_MODEL) + " has unexpected type.");
+            if (type != GGUFValueType::STRING) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_MODEL) + " has unexpected type.");
             metadata_.tokenizer_type = read_string_from_mem(offset);
+            metadata_.raw_kv.set(key, metadata_.tokenizer_type);
         } else if (key == KEY_TOKENIZER_PRE) {
             if (type != GGUFValueType::STRING) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_PRE) + " has unexpected type.");
             metadata_.tokenizer_pre = read_string_from_mem(offset);
+            metadata_.raw_kv.set(key, metadata_.tokenizer_pre);
         } else if (key == KEY_TOKENIZER_TOKENS) {
+            // Array — populates typed member only; arrays not stored in raw_kv.
             if (type != GGUFValueType::ARRAY) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_TOKENS) + " has unexpected type.");
             const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
             if (array_type != GGUFValueType::STRING) throw GGUFLoadError("Tokenizer tokens array has unexpected element type.");
@@ -309,6 +331,7 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
                 is_valid_utf8(metadata_.id_to_token[i]);
             }
         } else if (key == KEY_TOKENIZER_TOKEN_TYPE) {
+            // Array — populates typed member only; arrays not stored in raw_kv.
             if (type != GGUFValueType::ARRAY) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_TOKEN_TYPE) + " has unexpected type.");
             const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
             if (array_type != GGUFValueType::INT32) throw GGUFLoadError("Tokenizer token_type array has unexpected element type.");
@@ -319,6 +342,7 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
                 metadata_.token_types[i] = static_cast<TokenType>(read_value_from_mem<int32_t>(offset));
             }
         } else if (key == KEY_TOKENIZER_MERGES) {
+            // Array — populates typed member only; arrays not stored in raw_kv.
             if (type != GGUFValueType::ARRAY) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_MERGES) + " has unexpected type.");
             const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
             if (array_type != GGUFValueType::STRING) throw GGUFLoadError("Tokenizer merges array has unexpected element type.");
@@ -330,61 +354,74 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
             }
         } else if (key == KEY_TOKENIZER_EOS_TOKEN_ID) {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_EOS_TOKEN_ID) + " has unexpected type.");
-            metadata_.eos_token_id = read_value_from_mem<uint32_t>(offset);
+            const uint32_t v = read_value_from_mem<uint32_t>(offset);
+            metadata_.eos_token_id = static_cast<int32_t>(v);
+            metadata_.raw_kv.set(key, v);
         } else if (key == KEY_TOKENIZER_BOS_TOKEN_ID) {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_BOS_TOKEN_ID) + " has unexpected type.");
-            metadata_.bos_token_id = read_value_from_mem<uint32_t>(offset);
+            const uint32_t v = read_value_from_mem<uint32_t>(offset);
+            metadata_.bos_token_id = static_cast<int32_t>(v);
+            metadata_.raw_kv.set(key, v);
         } else if (key == KEY_TOKENIZER_PADDING_TOKEN_ID) {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_PADDING_TOKEN_ID) + " has unexpected type.");
-            metadata_.padding_token_id = read_value_from_mem<uint32_t>(offset);
+            const uint32_t v = read_value_from_mem<uint32_t>(offset);
+            metadata_.padding_token_id = static_cast<int32_t>(v);
+            metadata_.raw_kv.set(key, v);
         } else if (key == KEY_TOKENIZER_ADD_BOS_TOKEN) {
             if (type != GGUFValueType::BOOL) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_ADD_BOS_TOKEN) + " has unexpected type.");
             metadata_.add_bos_token = read_value_from_mem<bool>(offset);
-        } else if (key == prefix + "ssm.conv_kernel") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.ssm_conv_kernel = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "ssm.state_size") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.ssm_state_size = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "ssm.group_count") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.ssm_group_count = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "ssm.time_step_rank") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.ssm_time_step_rank = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "ssm.inner_size") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.ssm_inner_size = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "full_attention_interval") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.full_attention_interval = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "rope.dimension_count") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.rope_dimension_count = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "expert_count") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.expert_count = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "expert_used_count") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.expert_used_count = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "expert_feed_forward_length") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.expert_feed_forward_length = read_value_from_mem<uint32_t>(offset);
-        } else if (key == prefix + "expert_shared_feed_forward_length") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.expert_shared_feed_forward_length = read_value_from_mem<uint32_t>(offset);
+            metadata_.raw_kv.set(key, metadata_.add_bos_token);
+        } else if (key == KEY_TOKENIZER_UNK_TOKEN_ID) {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_UNK_TOKEN_ID) + " has unexpected type.");
+            const uint32_t v = read_value_from_mem<uint32_t>(offset);
+            metadata_.unknown_token_id = static_cast<int32_t>(v);
+            metadata_.raw_kv.set(key, v);
+        } else if (key == KEY_TOKENIZER_SCORES) {
+            // Array — populates typed member only; arrays not stored in raw_kv.
+            if (type != GGUFValueType::ARRAY) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_SCORES) + " has unexpected type.");
+            const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
+            if (array_type != GGUFValueType::FLOAT32) throw GGUFLoadError("Tokenizer scores array must be FLOAT32.");
+            const uint64_t n = read_value_from_mem<uint64_t>(offset);
+            metadata_.scores.resize(n);
+            for (uint64_t i = 0; i < n; ++i) {
+                metadata_.scores[i] = read_value_from_mem<float>(offset);
+            }
         } else {
-            skip_gguf_value_from_mem(offset, type);
+            // Unknown key: store supported scalar types in raw_kv so recipe
+            // from_metadata factories can read family-specific fields from there.
+            // Array types are deliberately skipped — they belong on typed members.
+            // Extend GGUFValue and add a branch here if a real consumer needs array support.
+            switch (type) {
+                case GGUFValueType::UINT32:
+                    metadata_.raw_kv.set(key, read_value_from_mem<uint32_t>(offset));
+                    break;
+                case GGUFValueType::INT32:
+                    metadata_.raw_kv.set(key, read_value_from_mem<int32_t>(offset));
+                    break;
+                case GGUFValueType::FLOAT32:
+                    metadata_.raw_kv.set(key, read_value_from_mem<float>(offset));
+                    break;
+                case GGUFValueType::BOOL:
+                    metadata_.raw_kv.set(key, read_value_from_mem<bool>(offset));
+                    break;
+                case GGUFValueType::STRING:
+                    metadata_.raw_kv.set(key, read_string_from_mem(offset));
+                    break;
+                default:
+                    // Narrower integer types, UINT64, INT64, FLOAT64, ARRAY — skip.
+                    skip_gguf_value_from_mem(offset, type);
+                    break;
+            }
         }
     }
 }
 
-void QwenGGUFLoader::cleanup_resources()
+void GGUFLoader::cleanup_resources()
 {
     file_mapper_.reset();
 }
 
-void QwenGGUFLoader::is_valid_utf8(const std::string &str) const
+void GGUFLoader::is_valid_utf8(const std::string &str) const
 {
     int i = 0;
     while (i < (int)str.length()) {
@@ -405,7 +442,7 @@ void QwenGGUFLoader::is_valid_utf8(const std::string &str) const
     }
 }
 
-void QwenGGUFLoader::parse_tensor_inventory(size_t& offset, uint64_t tensor_count)
+void GGUFLoader::parse_tensor_inventory(size_t& offset, uint64_t tensor_count)
 {
     std::cout << "Parsing tensor inventory..." << std::endl;
     for (uint64_t i = 0; i < tensor_count; ++i)
@@ -430,131 +467,36 @@ void QwenGGUFLoader::parse_tensor_inventory(size_t& offset, uint64_t tensor_coun
               << " tensor metadata entries." << std::endl;
 }
 
-void validate_qwen35moe_inventory(const Qwen3Metadata& meta)
+// Dispatch inventory validation via the model registry.
+// The validator for each architecture lives in its recipe file.
+// Re-wraps std::runtime_error as GGUFLoadError so callers see a consistent type.
+void validate_inventory_for_architecture(const ModelMetadata& meta)
 {
-    const auto& inventory = meta.tensor_inventory;
-
-    auto require = [&](const std::string& name) {
-        if (inventory.find(name) == inventory.end()) {
-            throw GGUFLoadError(
-                "qwen35moe: missing tensor '" + name +
-                "': expected in model weights, got absent");
+    if (!is_architecture_registered(meta.architecture)) {
+        std::string allow_list;
+        for (const auto& a : registered_architectures()) {
+            if (!allow_list.empty()) allow_list += ", ";
+            allow_list += "'" + a + "'";
         }
-    };
-
-    require("token_embd.weight");
-    require("output_norm.weight");
-
-    // MoE tensor names present in every block regardless of layer type
-    static const std::vector<std::string> moe_tensors = {
-        "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
-        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
-        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"
-    };
-    static const std::vector<std::string> attn_tensors = {
-        "attn_q.weight", "attn_k.weight", "attn_v.weight",
-        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
-    };
-    static const std::vector<std::string> dn_tensors = {
-        "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
-        "ssm_alpha.weight", "ssm_beta.weight",
-        "attn_qkv.weight", "attn_gate.weight",
-        "ssm_norm.weight", "ssm_out.weight"
-    };
-
-    for (uint32_t i = 0; i < meta.block_count; ++i) {
-        const std::string p = "blk." + std::to_string(i) + ".";
-        require(p + "attn_norm.weight");
-        require(p + "post_attention_norm.weight");
-        for (const auto& t : moe_tensors) require(p + t);
-
-        if (meta.is_full_attention_layer(i)) {
-            for (const auto& t : attn_tensors) require(p + t);
-        } else {
-            for (const auto& t : dn_tensors) require(p + t);
-        }
+        throw GGUFLoadError(
+            "validate_inventory_for_architecture: expected one of: " + allow_list +
+            ", got '" + meta.architecture + "'");
+    }
+    try {
+        lookup_inventory_validator(meta.architecture)(meta);
+    } catch (const std::runtime_error& e) {
+        throw GGUFLoadError(e.what());
     }
 }
 
-void QwenGGUFLoader::validate_tensor_inventory() const
+void GGUFLoader::validate_tensor_inventory() const
 {
     std::cout << "Validating tensor inventory..." << std::endl;
-    const auto &inventory = metadata_.tensor_inventory;
-
-    if (metadata_.architecture == "qwen35moe") {
-        validate_qwen35moe_inventory(metadata_);
-        std::cout << "Tensor inventory validation passed." << std::endl;
-        return;
-    }
-
-    // Global tensors
-    if (inventory.find("token_embd.weight") == inventory.end()) {
-        throw GGUFLoadError("Validation failed: Missing 'token_embd.weight'");
-    }
-    if (inventory.find("output_norm.weight") == inventory.end()) {
-        throw GGUFLoadError("Validation failed: Missing 'output_norm.weight'");
-    }
-
-    for (uint32_t i = 0; i < metadata_.block_count; ++i) {
-        const std::string prefix = "blk." + std::to_string(i) + ".";
-
-        if (metadata_.architecture == "qwen35") {
-            // Shared tensors (both layer types)
-            const std::vector<std::string> shared_tensors = {
-                "attn_norm.weight", "post_attention_norm.weight",
-                "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
-            };
-            for (const auto& t : shared_tensors) {
-                if (inventory.find(prefix + t) == inventory.end()) {
-                    throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "'");
-                }
-            }
-
-            if (metadata_.is_full_attention_layer(i)) {
-                // Full attention layer tensors
-                const std::vector<std::string> attn_tensors = {
-                    "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                    "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
-                };
-                for (const auto& t : attn_tensors) {
-                    if (inventory.find(prefix + t) == inventory.end()) {
-                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for attention layer " + std::to_string(i));
-                    }
-                }
-            } else {
-                // SSM (GatedDeltaNet) layer tensors
-                const std::vector<std::string> ssm_tensors = {
-                    "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
-                    "ssm_alpha.weight", "ssm_beta.weight",
-                    "attn_qkv.weight", "attn_gate.weight",
-                    "ssm_norm.weight", "ssm_out.weight"
-                };
-                for (const auto& t : ssm_tensors) {
-                    if (inventory.find(prefix + t) == inventory.end()) {
-                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for SSM layer " + std::to_string(i));
-                    }
-                }
-            }
-        } else {
-            // Original validation for qwen2/qwen3
-            const std::vector<std::string> required_tensors = {
-                "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
-                "ffn_up.weight", "ffn_down.weight"
-            };
-            for (const auto& t_name : required_tensors) {
-                const std::string full_name = prefix + t_name;
-                if (inventory.find(full_name) == inventory.end()) {
-                    throw GGUFLoadError("Validation failed: Missing tensor '" + full_name + "' for block " + std::to_string(i));
-                }
-            }
-        }
-    }
-
+    validate_inventory_for_architecture(metadata_);
     std::cout << "Tensor inventory validation passed." << std::endl;
 }
 
-std::string QwenGGUFLoader::read_string_from_mem(size_t& offset)
+std::string GGUFLoader::read_string_from_mem(size_t& offset)
 {
     const uint64_t len = read_value_from_mem<uint64_t>(offset);
     if (offset + len > file_mapper_->size()) {
@@ -565,7 +507,7 @@ std::string QwenGGUFLoader::read_string_from_mem(size_t& offset)
     return s;
 }
 
-void QwenGGUFLoader::skip_gguf_value_from_mem(size_t& offset, GGUFValueType type)
+void GGUFLoader::skip_gguf_value_from_mem(size_t& offset, GGUFValueType type)
 {
     switch (type)
     {
@@ -619,10 +561,10 @@ void QwenGGUFLoader::skip_gguf_value_from_mem(size_t& offset, GGUFValueType type
     }
 }
 
-std::unique_ptr<QwenGGUFLoader> create_gguf_loader() { return std::make_unique<QwenGGUFLoader>(); }
+std::unique_ptr<GGUFLoader> create_gguf_loader() { return std::make_unique<GGUFLoader>(); }
 
 // Load tensor metadata only (no data copying)
-void QwenGGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors)
+void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors)
 {
     if (!file_mapper_) {
         throw GGUFLoadError("Model not loaded or mapped.");
@@ -647,7 +589,7 @@ void QwenGGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<
 }
 
 // Get raw pointer to tensor data in mmap'd file
-const void* QwenGGUFLoader::get_tensor_data(const std::string& name) const
+const void* GGUFLoader::get_tensor_data(const std::string& name) const
 {
     if (!is_loaded_) {
         throw GGUFLoadError("Model not loaded");

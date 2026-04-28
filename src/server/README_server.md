@@ -144,7 +144,7 @@ curl http://localhost:8080/v1/models
 In `http_server.cpp` main():
 
 ```cpp
-qwen3::InferenceServer::Config config;
+qwenium::InferenceServer::Config config;
 config.max_slots = 10;           // Max concurrent generations
 config.max_queue_depth = 100;    // Reject requests if queue exceeds this
 config.request_timeout = 120s;   // Kill requests after this duration

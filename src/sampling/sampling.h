@@ -10,7 +10,7 @@
 #include <vector>
 #include <string>
 
-namespace qwen3 {
+namespace qwenium {
 
 class Sampler {
 public:
@@ -92,4 +92,4 @@ private:
     std::mt19937 gen_;
 };
 
-} // namespace qwen3
+} // namespace qwenium

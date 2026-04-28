@@ -3,6 +3,7 @@
 #include "../layers/attention.h"
 #include "../layers/deltanet.h"
 #include "../layers/ffn.h"
+#include "../qinf_error.h"
 
 #include "ggml.h"
 
@@ -11,11 +12,71 @@
 #include <iostream>
 #include <stdexcept>
 
+// ── Qwen35MoEConfig::from_metadata ───────────────────────────────────────────
+
+Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
+    const uint32_t ssm_state_size          = meta.raw_kv.get_uint32("qwen35moe.ssm.state_size");
+    const uint32_t ssm_inner_size          = meta.raw_kv.get_uint32("qwen35moe.ssm.inner_size");
+    const uint32_t ssm_time_step_rank      = meta.raw_kv.get_uint32("qwen35moe.ssm.time_step_rank");
+    const uint32_t ssm_group_count         = meta.raw_kv.get_uint32("qwen35moe.ssm.group_count");
+    const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32("qwen35moe.ssm.conv_kernel");
+    const uint32_t expert_count            = meta.raw_kv.get_uint32("qwen35moe.expert_count");
+    const uint32_t expert_used_count       = meta.raw_kv.get_uint32("qwen35moe.expert_used_count");
+    const uint32_t expert_feed_forward_length = meta.raw_kv.get_uint32("qwen35moe.expert_feed_forward_length");
+    const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32("qwen35moe.rope.dimension_count");
+    const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+
+    QINF_ASSERT(ssm_state_size > 0,
+        "Qwen35MoEConfig: field \"ssm_state_size\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.ssm.state_size)");
+    QINF_ASSERT(ssm_inner_size > 0,
+        "Qwen35MoEConfig: field \"ssm_inner_size\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.ssm.inner_size)");
+    QINF_ASSERT(ssm_time_step_rank > 0,
+        "Qwen35MoEConfig: field \"ssm_time_step_rank\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.ssm.time_step_rank)");
+    QINF_ASSERT(ssm_group_count > 0,
+        "Qwen35MoEConfig: field \"ssm_group_count\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.ssm.group_count)");
+    QINF_ASSERT(ssm_conv_kernel > 0,
+        "Qwen35MoEConfig: field \"ssm_conv_kernel\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.ssm.conv_kernel)");
+    QINF_ASSERT(expert_count > 0,
+        "Qwen35MoEConfig: field \"expert_count\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.expert_count)");
+    QINF_ASSERT(expert_feed_forward_length > 0,
+        "Qwen35MoEConfig: field \"expert_feed_forward_length\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.expert_feed_forward_length)");
+    QINF_ASSERT(expert_used_count <= expert_count,
+        "Qwen35MoEConfig: field \"expert_used_count\" expected <= expert_count (" +
+        std::to_string(expert_count) + "), got " +
+        std::to_string(expert_used_count));
+    QINF_ASSERT(rope_dimension_count > 0,
+        "Qwen35MoEConfig: field \"rope_dimension_count\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.rope.dimension_count)");
+    QINF_ASSERT(full_attention_interval > 0,
+        "Qwen35MoEConfig: field \"full_attention_interval\" expected > 0, got 0 "
+        "(GGUF key: qwen35moe.full_attention_interval)");
+
+    return Qwen35MoEConfig{
+        ssm_conv_kernel,
+        ssm_state_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_inner_size,
+        expert_count,
+        expert_used_count,
+        expert_feed_forward_length,
+        rope_dimension_count,
+        full_attention_interval,
+    };
+}
+
 // ── Constructor ──────────────────────────────────────────────────────────────
 
 Qwen36ForwardPass::Qwen36ForwardPass(
-    const Qwen3Model&    model,
-    const Qwen3Metadata* metadata,
+    const Model&    model,
+    const ModelMetadata* metadata,
     uint32_t             context_len,
     uint32_t             max_batch_size,
     int                  /*kv_quant_bits*/)
@@ -23,18 +84,21 @@ Qwen36ForwardPass::Qwen36ForwardPass(
 {
     const auto& m = *metadata;
 
+    // Construct the typed config; validates qwen35moe-specific invariants.
+    cfg_ = Qwen35MoEConfig::from_metadata(m);
+
     // Cache attention hparams — these never change per token.
     n_embd_head_ = static_cast<int>(m.attention_key_length);   // 256
     n_head_       = static_cast<int>(m.attention_head_count);   // 16
     n_head_kv_    = static_cast<int>(m.attention_head_count_kv);// 2
-    n_rot_        = static_cast<int>(m.rope_dimension_count);   // 64 (partial)
+    n_rot_        = static_cast<int>(cfg_.rope_dimension_count); // 64 (partial)
 
     // MoE hparams — same for every layer.
     moe_hp_ = MoELayer::Hparams{
-        static_cast<int>(m.expert_count),                    // 256
-        static_cast<int>(m.expert_used_count),               // 8
-        static_cast<int>(m.expert_feed_forward_length),      // 512
-        true                                                 // has_shared_expert
+        static_cast<int>(cfg_.expert_count),             // 256
+        static_cast<int>(cfg_.expert_used_count),        // 8
+        static_cast<int>(cfg_.expert_feed_forward_length), // 512
+        true                                             // has_shared_expert
     };
 
     // Build physical→logical layer index maps.
@@ -42,7 +106,7 @@ Qwen36ForwardPass::Qwen36ForwardPass(
     dn_layer_map_.assign(m.block_count, -1);
     int kv_idx = 0, dn_idx = 0;
     for (uint32_t il = 0; il < m.block_count; ++il) {
-        if (m.is_full_attention_layer(il))
+        if (cfg_.is_full_attention_layer(il))
             kv_layer_map_[il] = kv_idx++;
         else
             dn_layer_map_[il] = dn_idx++;
@@ -71,20 +135,20 @@ Qwen36ForwardPass::Qwen36ForwardPass(
         cache_backend);
 
     // DeltaNet state — 30 DeltaNet layers, backend-backed.
-    const uint32_t d_inner       = m.ssm_inner_size;     // 4096
-    const uint32_t num_v_heads   = m.ssm_time_step_rank; // 32
-    const uint32_t num_k_heads   = m.ssm_group_count;    // 16
+    const uint32_t d_inner       = cfg_.ssm_inner_size;     // 4096
+    const uint32_t num_v_heads   = cfg_.ssm_time_step_rank; // 32
+    const uint32_t num_k_heads   = cfg_.ssm_group_count;    // 16
     const uint32_t head_v_dim    = d_inner / num_v_heads; // 128
-    const uint32_t conv_channels = d_inner + 2 * num_k_heads * m.ssm_state_size; // 8192
+    const uint32_t conv_channels = d_inner + 2 * num_k_heads * cfg_.ssm_state_size; // 8192
 
     DeltaNetState::Hparams dn_state_hp{
         static_cast<uint32_t>(n_dn_layers),
         max_batch_size,
         head_v_dim,
-        m.ssm_state_size,  // head_k_dim = 128
+        cfg_.ssm_state_size,  // head_k_dim = 128
         num_v_heads,
         conv_channels,
-        m.ssm_conv_kernel, // 4
+        cfg_.ssm_conv_kernel, // 4
         cache_backend
     };
     dn_state_ = std::make_unique<DeltaNetState>(dn_state_hp);
@@ -168,19 +232,19 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     const auto& m        = meta_;
     const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
 
-    // Derive DeltaNet state hparams from metadata for the helper.
-    const uint32_t d_inner       = m.ssm_inner_size;
-    const uint32_t num_v_heads   = m.ssm_time_step_rank;
-    const uint32_t num_k_heads   = m.ssm_group_count;
+    // Derive DeltaNet state hparams from the typed config for the helper.
+    const uint32_t d_inner       = cfg_.ssm_inner_size;
+    const uint32_t num_v_heads   = cfg_.ssm_time_step_rank;
+    const uint32_t num_k_heads   = cfg_.ssm_group_count;
     const uint32_t head_v_dim    = d_inner / num_v_heads;
-    const uint32_t conv_channels = d_inner + 2 * num_k_heads * m.ssm_state_size;
+    const uint32_t conv_channels = d_inner + 2 * num_k_heads * cfg_.ssm_state_size;
     DeltaNetState::Hparams dn_hp{
         0, 0,             // n_dn_layers / n_slots not used in helper
         head_v_dim,
-        m.ssm_state_size,
+        cfg_.ssm_state_size,
         num_v_heads,
         conv_channels,
-        m.ssm_conv_kernel,
+        cfg_.ssm_conv_kernel,
         nullptr
     };
 
@@ -203,7 +267,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
         ggml_tensor* cur = build_norm(gf, inpL, blk.attn_norm_weight, il);
 
         // ── Attention or DeltaNet ───────────────────────────────────────────
-        if (m.is_full_attention_layer(il)) {
+        if (cfg_.is_full_attention_layer(il)) {
             int kv_idx = kv_layer_map_[il];
             // Gated attention: joint Q+Gate projection, Q weight outputs
             // [(n_embd_head*2)*n_head, n_tokens]. build_gated_attention
@@ -262,15 +326,15 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     const auto&    m      = meta_;
     const uint32_t n_batch = static_cast<uint32_t>(tokens.size());
 
-    // Derive DeltaNet state hparams from metadata for the helper.
-    const uint32_t d_inner       = m.ssm_inner_size;
-    const uint32_t num_v_heads   = m.ssm_time_step_rank;
-    const uint32_t num_k_heads   = m.ssm_group_count;
+    // Derive DeltaNet state hparams from the typed config for the helper.
+    const uint32_t d_inner       = cfg_.ssm_inner_size;
+    const uint32_t num_v_heads   = cfg_.ssm_time_step_rank;
+    const uint32_t num_k_heads   = cfg_.ssm_group_count;
     const uint32_t head_v_dim    = d_inner / num_v_heads;
-    const uint32_t conv_channels = d_inner + 2 * num_k_heads * m.ssm_state_size;
+    const uint32_t conv_channels = d_inner + 2 * num_k_heads * cfg_.ssm_state_size;
     DeltaNetState::Hparams dn_hp{
-        0, 0, head_v_dim, m.ssm_state_size,
-        num_v_heads, conv_channels, m.ssm_conv_kernel, nullptr
+        0, 0, head_v_dim, cfg_.ssm_state_size,
+        num_v_heads, conv_channels, cfg_.ssm_conv_kernel, nullptr
     };
 
     // 1. Token embedding
@@ -310,7 +374,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
         // Pre-attention norm
         ggml_tensor* cur = build_norm(gf, inpL, blk.attn_norm_weight, il);
 
-        if (m.is_full_attention_layer(il)) {
+        if (cfg_.is_full_attention_layer(il)) {
             int kv_idx = kv_layer_map_[il];
             cur = build_gated_batched_attention(
                 ctx_, gf, kv_cache_.get(), cur, inp_pos,
@@ -396,7 +460,7 @@ void Qwen36ForwardPass::set_inputs(ggml_cgraph* gf,
     // Causal masks — only for attention layers.
     // build_attention() names each layer's mask "kq_mask.{physical_il}".
     for (uint32_t il = 0; il < meta_.block_count; ++il) {
-        if (!meta_.is_full_attention_layer(il)) continue;
+        if (!cfg_.is_full_attention_layer(il)) continue;
 
         char name[32];
         std::snprintf(name, sizeof(name), "kq_mask.%u", il);
@@ -458,5 +522,51 @@ void Qwen36ForwardPass::set_batched_inputs(
                 idx[b * n_kv + j] = static_cast<int32_t>(slot * n_kv + j);
         }
         ggml_backend_tensor_set(gi, idx.data(), 0, idx.size() * sizeof(int32_t));
+    }
+}
+
+// ── Inventory validator ──────────────────────────────────────────────────────
+
+void validate_qwen36_inventory(const ModelMetadata& meta)
+{
+    const auto& inv = meta.tensor_inventory;
+    auto require = [&](const std::string& name) {
+        if (inv.find(name) == inv.end())
+            throw std::runtime_error(
+                "qwen35moe: missing tensor '" + name +
+                "': expected in model weights, got absent");
+    };
+
+    require("token_embd.weight");
+    require("output_norm.weight");
+
+    static const std::vector<std::string> moe_tensors = {
+        "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"
+    };
+    static const std::vector<std::string> attn_tensors = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+    };
+    static const std::vector<std::string> dn_tensors = {
+        "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
+        "ssm_alpha.weight", "ssm_beta.weight",
+        "attn_qkv.weight", "attn_gate.weight",
+        "ssm_norm.weight", "ssm_out.weight"
+    };
+
+    const uint32_t fai = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        require(p + "attn_norm.weight");
+        require(p + "post_attention_norm.weight");
+        for (const auto& t : moe_tensors) require(p + t);
+        // Inline arithmetic: validator runs at load time, before Qwen35MoEConfig is constructed.
+        const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+        if (is_full)
+            for (const auto& t : attn_tensors) require(p + t);
+        else
+            for (const auto& t : dn_tensors)   require(p + t);
     }
 }

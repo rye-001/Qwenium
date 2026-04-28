@@ -1,7 +1,6 @@
 # Sampling Library
 add_library(sampling STATIC
     sampling.cpp
-    grammar.cpp
     grammar_vocab.cpp
     token-trie.cpp
 )

@@ -1,5 +1,5 @@
 // test_multitoken.cpp
-// Multi-token literal tests adapted for qwen3::GrammarVocab.
+// Multi-token literal tests adapted for qwenium::GrammarVocab.
 //
 // In grammar_vocab.cpp, multi-token literal handling is inherent:
 //   "Promise.all" is one grammar literal; if the tokenizer splits it as
@@ -37,7 +37,7 @@ static void run_test(const char* name, void(*func)())
 // ---------------------------------------------------------------------------
 class TokenAcceptor {
 public:
-    TokenAcceptor(qwen3::GrammarVocab* g, const std::vector<std::string>& v)
+    TokenAcceptor(qwenium::GrammarVocab* g, const std::vector<std::string>& v)
         : grammar(g), vocab(v) {}
 
     void accept(int32_t token, const char* desc)
@@ -65,7 +65,7 @@ public:
     std::vector<int32_t> get_valid() { return grammar->get_valid_tokens(vocab); }
 
 private:
-    qwen3::GrammarVocab* grammar;
+    qwenium::GrammarVocab* grammar;
     const std::vector<std::string>& vocab;
 };
 
@@ -103,13 +103,13 @@ static std::vector<std::string> build_multitoken_vocab()
 // ============================================================================
 static void test_grammar_parses()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
 }
 
 static void test_single_token_still_works()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -128,7 +128,7 @@ static void test_single_token_still_works()
 // ============================================================================
 static void test_first_token_valid()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -145,7 +145,7 @@ static void test_first_token_valid()
 
 static void test_middle_token_valid()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -163,7 +163,7 @@ static void test_middle_token_valid()
 
 static void test_last_token_valid()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -181,7 +181,7 @@ static void test_last_token_valid()
 
 static void test_full_statement()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -199,7 +199,7 @@ static void test_full_statement()
 
 static void test_grammar_advances_after_completion()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(MULTITOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_multitoken_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -232,7 +232,7 @@ static std::vector<std::string> build_two_token_vocab()
 
 static void test_two_token_literal()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(TWO_TOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(TWO_TOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_two_token_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -246,7 +246,7 @@ static void test_two_token_literal()
 
 static void test_two_token_intermediate_state()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(TWO_TOKEN_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(TWO_TOKEN_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_two_token_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -279,7 +279,7 @@ static std::vector<std::string> build_alternatives_vocab()
 
 static void test_alternatives_initial_tokens()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_alternatives_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -292,7 +292,7 @@ static void test_alternatives_initial_tokens()
 
 static void test_alternatives_shared_prefix()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_alternatives_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -309,7 +309,7 @@ static void test_alternatives_shared_prefix()
 
 static void test_alternatives_complete_promise_all()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_alternatives_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -322,7 +322,7 @@ static void test_alternatives_complete_promise_all()
 
 static void test_alternatives_complete_promise_race()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(ALTERNATIVES_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_alternatives_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -355,7 +355,7 @@ static std::vector<std::string> build_sequence_vocab()
 
 static void test_multitoken_in_sequence()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(SEQUENCE_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(SEQUENCE_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_sequence_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -372,7 +372,7 @@ static void test_multitoken_in_sequence()
 
 static void test_sequence_after_multitoken_first_token()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(SEQUENCE_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(SEQUENCE_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_sequence_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -406,7 +406,7 @@ static std::vector<std::string> build_repeat_vocab()
 
 static void test_multitoken_with_star_zero()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_repeat_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -417,7 +417,7 @@ static void test_multitoken_with_star_zero()
 
 static void test_multitoken_with_star_one()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_repeat_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -432,7 +432,7 @@ static void test_multitoken_with_star_one()
 
 static void test_multitoken_with_star_two()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REPEAT_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_repeat_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -492,7 +492,7 @@ static std::vector<std::string> build_realistic_vocab()
 
 static void test_realistic_const_accounts_getAccounts()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -513,7 +513,7 @@ static void test_realistic_const_accounts_getAccounts()
 
 static void test_realistic_identifier_choice()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -532,7 +532,7 @@ static void test_realistic_identifier_choice()
 
 static void test_realistic_three_token_function()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -554,7 +554,7 @@ static void test_realistic_three_token_function()
 
 static void test_realistic_getOpenOrders()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -576,7 +576,7 @@ static void test_realistic_getOpenOrders()
 
 static void test_realistic_function_shared_prefix()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);
@@ -598,7 +598,7 @@ static void test_realistic_function_shared_prefix()
 
 static void test_realistic_mid_multitoken_constraint()
 {
-    auto g = qwen3::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
+    auto g = qwenium::GrammarVocab::parse_impl(REALISTIC_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_realistic_vocab();
     TokenAcceptor ta(g.get(), vocab);

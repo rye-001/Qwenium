@@ -11,10 +11,10 @@
 #include <string>
 #include <functional>
 
-namespace qwen3 {
+namespace qwenium {
 
 // Forward declarations - these come from your existing codebase
-class Qwen3Model;
+class Model;
 class Qwen3ForwardPass;
 class SimpleKVCache;
 class Tokenizer;
@@ -379,4 +379,4 @@ private:
     GetEosTokenFunc get_eos_token_;
 };
 
-}  // namespace qwen3
+}  // namespace qwenium

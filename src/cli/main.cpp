@@ -14,20 +14,21 @@
 #include "complete.h"
 #include "chat.h"
 
-#include "../qwen3-core/qwen3-model.h"
+#include "../core/model.h"
 #include "../loader/gguf_loader.h"
-#include "../models/qwen3.h"
-#include "../models/qwen35.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
 #include "../sampling/speculative.h"
 #include "../sampling/vocab_utils.h"
 #include "../sampling/grammar_vocab.h"
 
+#include "../models/model_registry.h"
+
+
 // #include "./tensor_tracer.h"
 
 void debug_computed_tensor(ggml_tensor* tensor, const char* name);
-size_t calculate_scratch_size(const Qwen3Metadata& metadata,
+size_t calculate_scratch_size(const ModelMetadata& metadata,
                                size_t max_context_length = 2048,
                                size_t batch_size = 512);
 
@@ -192,8 +193,9 @@ int main(int argc, char** argv) {
     ggml_backend_load_all();
     
     // Initialize and load model
-    Qwen3Model model;
+    Model model;
     try {
+        register_builtin_models();
         model.load_metadata(args.model_path);
         model.print_metadata();
         model.load_tensors();
@@ -206,7 +208,7 @@ int main(int argc, char** argv) {
     }
 
     // --- Grammar Setup ---
-    std::unique_ptr<qwen3::GrammarVocab> grammar;
+    std::unique_ptr<qwenium::GrammarVocab> grammar;
     if (!args.grammar_file.empty()) {
         std::ifstream file(args.grammar_file);
         if (!file) {
@@ -215,7 +217,7 @@ int main(int argc, char** argv) {
         }
         std::string grammar_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        grammar = qwen3::GrammarVocab::parse_impl(grammar_str);
+        grammar = qwenium::GrammarVocab::parse_impl(grammar_str);
         if (!grammar) {
             std::cerr << "Error: Failed to parse grammar file." << std::endl;
             return 1;
@@ -250,12 +252,12 @@ int main(int argc, char** argv) {
     // --- Speculative Decoder Setup (shared by both modes) ---
     // PLD is disabled when grammar is active (grammar needs per-token validation)
     bool use_speculative = args.speculative && !grammar;
-    std::unique_ptr<qwen3::SpeculativeDecoder> spec;
+    std::unique_ptr<qwenium::SpeculativeDecoder> spec;
     if (use_speculative) {
-        qwen3::PromptLookupConfig pld_config;
+        qwenium::PromptLookupConfig pld_config;
         pld_config.ngram_size = args.pld_ngram_size;
         pld_config.max_draft = args.pld_max_draft;
-        spec = std::make_unique<qwen3::SpeculativeDecoder>(
+        spec = std::make_unique<qwenium::SpeculativeDecoder>(
             pld_config, (int)model.get_metadata().vocab_size);
         std::cout << "Prompt Lookup Decoding enabled (ngram=" << pld_config.ngram_size
                   << ", max_draft=" << pld_config.max_draft << ")" << std::endl;
@@ -283,7 +285,7 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
 
 
 // Calculate scratch buffer size based on model architecture
-size_t calculate_scratch_size(const Qwen3Metadata& metadata, 
+size_t calculate_scratch_size(const ModelMetadata& metadata, 
                                size_t max_context_length,
                                size_t batch_size) {
     // Base calculation: scales with layers, hidden dimensions, and batch

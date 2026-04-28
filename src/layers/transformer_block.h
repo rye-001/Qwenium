@@ -20,7 +20,7 @@ struct ggml_cgraph;
 class simple_kv_cache;
 
 // Architecture hyperparameters for one transformer layer.
-// The caller (model recipe) extracts these from Qwen3Metadata before the loop.
+// The caller (model recipe) extracts these from ModelMetadata before the loop.
 struct TransformerBlockHparams {
     bool  is_qwen2;        // true → apply QKV biases and skip QK RMS norms (Qwen2)
     int   n_head;          // query head count
@@ -29,6 +29,13 @@ struct TransformerBlockHparams {
     float freq_base;       // RoPE frequency base
     int   context_length;  // original context length for RoPE ext
     float rms_norm_eps;    // epsilon for RMS norm
+
+    // ── Gemma-1 knobs (PR G1.5) ─────────────────────────────────────────
+    // Defaults preserve bit-identical Qwen behavior. Flipping either flag
+    // selects a Gemma-shaped op at the same call site — no parallel
+    // module hierarchy.
+    bool  gemma_rms_norm = false;  // true → (x / rms(x)) * (1 + w) instead of x * w
+    bool  gemma_geglu    = false;  // true → GeGLU-tanh FFN instead of SwiGLU
 };
 
 // Weight tensors for one transformer block.

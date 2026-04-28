@@ -10,7 +10,7 @@
 #include <vector>
 #include <iostream>
 
-#include "../../src/qwen3-core/qwen3-model.h"
+#include "../../src/core/model.h"
 #include "../../src/models/qwen3.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/loader/tokenizer.h"
@@ -28,7 +28,7 @@ class Qwen35GenerationTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         if (get_qwen35_model_path().empty()) return;
-        model_ = std::make_unique<Qwen3Model>();
+        model_ = std::make_unique<Model>();
         model_->load_metadata(get_qwen35_model_path());
         model_->load_tensors();
     }
@@ -39,7 +39,7 @@ protected:
         auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
         ggml_backend_sched_t sched = model_->get_scheduler();
         Tokenizer* tok = model_->get_tokenizer();
-        qwen3::GreedySampler sampler;
+        qwenium::GreedySampler sampler;
 
         std::vector<int32_t> tokens = tok->encode(prompt);
         EXPECT_GT(tokens.size(), 0u);
@@ -84,10 +84,10 @@ protected:
         return generated;
     }
 
-    static std::unique_ptr<Qwen3Model> model_;
+    static std::unique_ptr<Model> model_;
 };
 
-std::unique_ptr<Qwen3Model> Qwen35GenerationTest::model_ = nullptr;
+std::unique_ptr<Model> Qwen35GenerationTest::model_ = nullptr;
 
 TEST_F(Qwen35GenerationTest, GeneratesNonEmpty) {
     SKIP_IF_NO_MODEL();
@@ -132,7 +132,7 @@ TEST_F(Qwen35GenerationTest, LogitsStayFinite) {
     auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
     ggml_backend_sched_t sched = model_->get_scheduler();
     Tokenizer* tok = model_->get_tokenizer();
-    qwen3::GreedySampler sampler;
+    qwenium::GreedySampler sampler;
 
     std::vector<int32_t> tokens = tok->encode("Hello world");
 

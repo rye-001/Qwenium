@@ -1,0 +1,10 @@
+# Gemma canary prompt set (PR G1.0 / G1.5 logit-agreement gate).
+# One prompt per line. Lines starting with '#' are comments.
+# Add multi-byte UTF-8, leading-space cases, and grammar-shaped prompts as
+# they're needed for individual phase gates; for now we keep the set tiny
+# and grow it deliberately so reference-fixture regeneration is cheap.
+
+Hello, world.
+The capital of France is
+import numpy as np
+def fibonacci(n):

@@ -186,14 +186,14 @@ void test_equivalence_initial_position()
     auto vocab = build_resolve_once_vocab();
 
     // Get valid tokens WITHOUT trie (brute-force)
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     ASSERT_NE(grammar_bf, nullptr);
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
     // Get valid tokens WITH trie
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     ASSERT_NE(grammar_trie, nullptr);
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
     grammar_trie->set_token_trie(&trie);
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
@@ -209,11 +209,11 @@ void test_equivalence_initial_position()
 void test_equivalence_after_space_literal()
 {
     auto vocab = build_resolve_once_vocab();
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     grammar_trie->set_token_trie(&trie);
 
     // Accept "const" then " " → grammar now at identifier position
@@ -237,10 +237,10 @@ void test_equivalence_after_space_literal()
 void test_space_literal_many_candidates()
 {
     auto vocab = build_resolve_once_vocab();
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
-    auto grammar = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     grammar->set_token_trie(&trie);
 
     // "const" → now at " " literal
@@ -270,10 +270,10 @@ void test_space_literal_many_candidates()
 void test_exact_literal_match()
 {
     auto vocab = build_resolve_once_vocab();
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
-    auto grammar = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     grammar->set_token_trie(&trie);
 
     // Feed "const" → grammar expects " "
@@ -316,16 +316,16 @@ root ::= "await" " " "getAccounts" "(" ")" ";"
     vocab[6] = " getAccounts(";  // spans 3 elements: " " + "getAccounts" + "("
     vocab[7] = " getAccounts";   // spans 2 elements: " " + "getAccounts"
 
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
     // Without trie
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_bf->accept_token(0, vocab); // "await"
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
     // With trie
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_trie->set_token_trie(&trie);
     grammar_trie->accept_token(0, vocab); // "await"
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
@@ -359,15 +359,15 @@ root ::= "prefix" [a-z]+
     vocab[5] = "xyz";
     vocab[6] = "PREFIX";     // wrong case
 
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
     // Without trie
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(grammar_str);
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
     // With trie
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_trie->set_token_trie(&trie);
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
 
@@ -397,11 +397,11 @@ root ::= "prefix" [a-z]+
 void test_equivalence_full_decode()
 {
     auto vocab = build_resolve_once_vocab();
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(RESOLVE_ONCE_GRAMMAR);
     grammar_trie->set_token_trie(&trie);
 
     // Decode: const accounts = await getAccounts();
@@ -457,15 +457,15 @@ root ::= "a" ("b" "c")* "d"
     vocab[8] = "bc";   // full iteration
     vocab[9] = "bcd";  // full iteration + "d"
 
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
     // Without trie
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(grammar_str);
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
     // With trie
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_trie->set_token_trie(&trie);
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
 
@@ -491,15 +491,15 @@ root ::= "\"" [^"]* "\""
     vocab[5] = "123";
     vocab[6] = "a";
 
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
     // After opening quote, both paths should agree
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_bf->accept_token(0, vocab); // "\""
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_trie->set_token_trie(&trie);
     grammar_trie->accept_token(0, vocab); // "\""
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
@@ -528,13 +528,13 @@ root ::= "getAccounts" "(" ")"
     vocab[6] = "getAccounts("; // full match + overshoot into next element
     vocab[7] = "getAccounts()"; // full match + 2 elements
 
-    qwen3::TokenTrie trie;
+    qwenium::TokenTrie trie;
     trie.build(vocab);
 
-    auto grammar_bf = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_bf = qwenium::GrammarVocab::parse_impl(grammar_str);
     auto valid_bf = grammar_bf->get_valid_tokens(vocab);
 
-    auto grammar_trie = qwen3::GrammarVocab::parse_impl(grammar_str);
+    auto grammar_trie = qwenium::GrammarVocab::parse_impl(grammar_str);
     grammar_trie->set_token_trie(&trie);
     auto valid_trie = grammar_trie->get_valid_tokens(vocab);
 

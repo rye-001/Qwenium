@@ -10,17 +10,57 @@
 #include <functional>  // std::greater
 #include <vector>      // std::vector (likely already included)
 
-Tokenizer::Tokenizer(const Qwen3Metadata* metadata) : metadata_(metadata) {
+TokenizerConfig tokenizer_config_from_gguf(const ModelMetadata& meta)
+{
+    TokenizerConfig cfg;
+    cfg.add_bos_token = meta.add_bos_token;
+    // tokenizer.ggml.model = "llama" means SentencePiece BPE with ▁-normalization
+    // and byte-fallback.  This is a standard GGUF field value, not a family name.
+    if (meta.tokenizer_type == "llama") {
+        cfg.normalizer    = NormalizerKind::SpaceToUnderscore;
+        cfg.byte_fallback = true;
+        // Some GGUF exports mark chat-control tokens as NORMAL rather than
+        // USER_DEFINED; force-promote them so the encoder handles them atomically.
+        cfg.extra_chat_specials = {"<start_of_turn>", "<end_of_turn>"};
+    }
+    return cfg;
+}
+
+Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& config)
+    : metadata_(metadata), config_(config) {
     if (metadata_->id_to_token.empty()) {
         throw std::runtime_error("Invalid vocabulary: token list is empty.");
     }
-    
+
+    is_llama_tokenizer_ = (config_.normalizer == NormalizerKind::SpaceToUnderscore);
+
     // Build token_to_id map
     token_to_id_.reserve(metadata_->id_to_token.size());
     for (size_t i = 0; i < metadata_->id_to_token.size(); ++i) {
         token_to_id_[metadata_->id_to_token[i]] = static_cast<int32_t>(i);
     }
-    
+
+    if (is_llama_tokenizer_) {
+        // SentencePiece-derived BPE with byte fallback.
+        // Uses score-based BPE merge for encode and ▁→space + byte-fallback decode.
+        scores_ = metadata_->scores;
+        initialize_special_tokens();
+
+        unk_token_id_ = (metadata_->unknown_token_id >= 0)
+                            ? metadata_->unknown_token_id
+                            : -1;
+        if (unk_token_id_ < 0) {
+            for (size_t i = 0; i < metadata_->token_types.size(); ++i) {
+                if (metadata_->token_types[i] == TokenType::UNKNOWN) {
+                    unk_token_id_ = static_cast<int32_t>(i);
+                    break;
+                }
+            }
+        }
+        initialize_llama_byte_fallback();
+        return;
+    }
+
     // Parse merge rules and populate the optimized map
     merges_.reserve(metadata_->merges.size());
     for (int i = 0; i < metadata_->merges.size(); ++i) {
@@ -91,38 +131,30 @@ Tokenizer::Tokenizer(const Qwen3Metadata* metadata) : metadata_(metadata) {
 
 
 void Tokenizer::initialize_special_tokens() {
-    // Add EOS from metadata
-    special_tokens_["<|endoftext|>"] = metadata_->eos_token_id;
+    // Register BOS / EOS / PAD by ID so is_special_token() works on them
+    // even if the caller never looks them up by name.
     special_token_ids_.insert(metadata_->eos_token_id);
-
-    // Insert bos/padding only if they were actually set in metadata
-    if (metadata_->bos_token_id >= 0) {
+    if (metadata_->bos_token_id >= 0)
         special_token_ids_.insert(metadata_->bos_token_id);
-    }
-    if (metadata_->padding_token_id >= 0) {
+    if (metadata_->padding_token_id >= 0)
         special_token_ids_.insert(metadata_->padding_token_id);
-    }
 
-    // Look up ChatML tokens from vocabulary instead of hardcoding IDs.
-    // This works for both qwen2/3 (where they're at 151644/151645)
-    // and qwen35 (where they're at different positions in the 248K vocab).
-    const std::vector<std::string> chatml_tokens = {
-        "<|im_start|>", "<|im_end|>"
-    };
-    for (const auto& tok_str : chatml_tokens) {
-        auto it = token_to_id_.find(tok_str);
-        if (it != token_to_id_.end()) {
-            special_tokens_[tok_str] = it->second;
-            special_token_ids_.insert(it->second);
-        }
-    }
-
-    // Find all special tokens in vocabulary (CONTROL or USER_DEFINED type)
+    // All CONTROL and USER_DEFINED vocab entries are special by type.
     for (size_t i = 0; i < metadata_->token_types.size(); ++i) {
         if (metadata_->token_types[i] == TokenType::CONTROL ||
             metadata_->token_types[i] == TokenType::USER_DEFINED) {
             special_token_ids_.insert(static_cast<int32_t>(i));
             special_tokens_[metadata_->id_to_token[i]] = static_cast<int32_t>(i);
+        }
+    }
+
+    // Force-promote extra tokens from config even if their TokenType is NORMAL.
+    // Needed for GGUF exports that mislabel chat-control tokens.
+    for (const auto& s : config_.extra_chat_specials) {
+        auto it = token_to_id_.find(s);
+        if (it != token_to_id_.end()) {
+            special_tokens_[s] = it->second;
+            special_token_ids_.insert(it->second);
         }
     }
 }
@@ -331,18 +363,300 @@ std::vector<int32_t> Tokenizer::encode_single_token(const std::string& text) con
 
 std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
     if (text.empty()) return {};
-    
+
+    if (is_llama_tokenizer_) {
+        return encode_llama(text);
+    }
+
     // Step 1: Pre-tokenization (handles special tokens and regex splitting)
     std::vector<std::string> pretokens = pretokenize(text);
-    
+
     // Step 2: Apply BPE to each pre-token
     std::vector<int32_t> result;
     for (const std::string& pretoken : pretokens) {
         std::vector<int32_t> encoded = encode_with_special_tokens(pretoken);
         result.insert(result.end(), encoded.begin(), encoded.end());
     }
-    
+
     return result;
+}
+
+// ── llama / SentencePiece-derived tokenizer (Gemma) ───────────────────────────
+//
+// Byte-fallback table: for each byte 0..255, the vocab is expected to contain
+// a token of the form "<0xNN>" (TokenType::BYTE). We index those here so the
+// Viterbi encoder has a guaranteed fall-through for any input byte.
+//
+// Fail-loud: if a byte token is missing, encoding any text containing that
+// byte would silently produce UNK and lose information. We accept partial
+// tables only when the GGUF lacks BYTE-typed tokens (e.g. test fixtures);
+// the encode path then falls back to the unknown_token_id for unmappable
+// bytes, which the unit tests explicitly cover.
+void Tokenizer::initialize_llama_byte_fallback() {
+    byte_fallback_ids_.assign(256, -1);
+    for (size_t i = 0; i < metadata_->token_types.size(); ++i) {
+        if (metadata_->token_types[i] != TokenType::BYTE) continue;
+        const std::string& s = metadata_->id_to_token[i];
+        // Expected form: "<0xNN>".
+        if (s.size() == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                return -1;
+            };
+            int hi = hex(s[3]);
+            int lo = hex(s[4]);
+            if (hi >= 0 && lo >= 0) {
+                byte_fallback_ids_[(hi << 4) | lo] = static_cast<int32_t>(i);
+            }
+        }
+    }
+}
+
+// Best-effort score lookup for fallthrough scoring.
+// Tokens absent from `scores` are treated as having score 0.
+static inline float score_or_zero(const std::vector<float>& scores, int32_t id) {
+    if (id < 0 || static_cast<size_t>(id) >= scores.size()) return 0.0f;
+    return scores[id];
+}
+
+// Length in bytes of a UTF-8 character starting at byte b. Returns 0 for
+// invalid leading bytes (caller falls back to single-byte handling).
+static inline int utf8_char_len(unsigned char b) {
+    if ((b & 0x80) == 0x00) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+// SentencePiece-style BPE merge by score (used by Gemma / Llama family).
+// This matches what HF transformers does for `tokenizer.ggml.model = "llama"`:
+//
+//   1. Split the (already ▁-normalized) input into UTF-8 *characters*
+//      and look each up in the vocab. Unknown chars decompose into
+//      byte-fallback tokens (`<0xNN>`).
+//   2. Repeatedly pick the highest-score adjacent (left, right) pair whose
+//      *concatenation* is itself a vocab token, and merge it. Ties are
+//      resolved by leftmost position (matching SentencePiece behavior).
+//   3. Stop when no adjacent pair is a vocab token.
+//
+// This is *not* Viterbi over substring scores — that algorithm prefers
+// shorter tokens with cheap byte-fallback whenever the longer tokens have
+// large negative scores, which is exactly the failure mode that produced
+// "user" → ['us','er'] and "Who" → ['▁W','ho'] before this rewrite.
+std::vector<int32_t> Tokenizer::encode_llama(const std::string& text) const {
+    // 1. Special-token splitting: walk the input, emitting any special-token
+    //    match verbatim and Viterbi-encoding the gaps in between. Special
+    //    tokens like <start_of_turn> must appear as a single id, not be
+    //    decomposed into pieces.
+    auto encode_segment = [&](const std::string& seg) -> std::vector<int32_t> {
+        if (seg.empty()) return {};
+
+        // 2. Normalize: replace each space with U+2581 (▁) per SentencePiece.
+        static const std::string spm_under = "\xE2\x96\x81";
+        std::string norm;
+        norm.reserve(seg.size());
+        for (char c : seg) {
+            if (c == ' ') norm += spm_under;
+            else norm += c;
+        }
+
+        // 3. Initial split: walk the normalized string as UTF-8 characters
+        //    and emit one token per char. If the char isn't in the vocab,
+        //    decompose into byte-fallback tokens (`<0xNN>`) so every byte
+        //    has a starting token id.
+        struct Node {
+            int32_t id;       // -1 if deleted
+            std::string text; // the raw (normalized) bytes this token covers
+        };
+        std::vector<Node> nodes;
+        nodes.reserve(norm.size());
+
+        for (size_t i = 0; i < norm.size();) {
+            const unsigned char b = static_cast<unsigned char>(norm[i]);
+            int len = utf8_char_len(b);
+            if (len == 0 || i + len > norm.size()) {
+                // Invalid leading byte → single-byte fallback path.
+                int32_t bid = byte_fallback_ids_[b];
+                nodes.push_back({bid >= 0 ? bid : unk_token_id_,
+                                 std::string(1, norm[i])});
+                i += 1;
+                continue;
+            }
+            std::string ch = norm.substr(i, len);
+            auto it = token_to_id_.find(ch);
+            if (it != token_to_id_.end()) {
+                nodes.push_back({it->second, ch});
+            } else {
+                // Char absent → emit each underlying byte as a byte-fallback.
+                for (int k = 0; k < len; ++k) {
+                    unsigned char bb = static_cast<unsigned char>(norm[i + k]);
+                    int32_t bid = byte_fallback_ids_[bb];
+                    nodes.push_back({bid >= 0 ? bid : unk_token_id_,
+                                     std::string(1, norm[i + k])});
+                }
+            }
+            i += len;
+        }
+
+        // 4. Iterative BPE merge by score. We use a doubly-linked list over
+        //    `nodes` and a max-heap on score keyed by (score, position).
+        //    Stale entries are filtered at pop time.
+        const int N = static_cast<int>(nodes.size());
+        if (N == 0) return {};
+
+        std::vector<int> prev(N, -1), next(N, -1);
+        for (int i = 0; i < N; ++i) {
+            prev[i] = (i > 0)     ? i - 1 : -1;
+            next[i] = (i + 1 < N) ? i + 1 : -1;
+        }
+
+        struct PQEntry {
+            float       score;     // higher = better (max-heap)
+            int         pos;       // left node index
+            int         right_pos; // right node index — used to validate staleness
+            int32_t     merged_id;
+            std::string merged_text;
+            bool operator<(const PQEntry& o) const { return score < o.score; }
+        };
+        std::priority_queue<PQEntry> pq;
+
+        auto try_enqueue = [&](int left) {
+            if (left < 0) return;
+            int right = next[left];
+            if (right < 0) return;
+            std::string s = nodes[left].text + nodes[right].text;
+            auto it = token_to_id_.find(s);
+            if (it == token_to_id_.end()) return;
+            // Skip special tokens — they're emitted by the outer loop only.
+            if (special_token_ids_.count(it->second)) return;
+            pq.push({score_or_zero(scores_, it->second),
+                     left, right, it->second, std::move(s)});
+        };
+
+        for (int i = 0; i < N; ++i) try_enqueue(i);
+
+        while (!pq.empty()) {
+            PQEntry e = pq.top();
+            pq.pop();
+            // Staleness checks: either node deleted, or the right neighbor
+            // changed since enqueue (which would mean the merged_text no
+            // longer matches the live concatenation).
+            if (nodes[e.pos].id < 0) continue;
+            if (e.right_pos < 0 || next[e.pos] != e.right_pos) continue;
+            if (nodes[e.right_pos].id < 0) continue;
+            if (nodes[e.pos].text + nodes[e.right_pos].text != e.merged_text) continue;
+
+            // Merge: absorb right into left.
+            nodes[e.pos].id   = e.merged_id;
+            nodes[e.pos].text = e.merged_text;
+            int absorbed = e.right_pos;
+            int new_next = next[absorbed];
+            next[e.pos] = new_next;
+            if (new_next >= 0) prev[new_next] = e.pos;
+            nodes[absorbed].id = -1;
+
+            // Enqueue new neighboring pairs.
+            try_enqueue(prev[e.pos]);
+            try_enqueue(e.pos);
+        }
+
+        // 5. Collect the surviving tokens left-to-right.
+        std::vector<int32_t> out;
+        out.reserve(N);
+        for (int i = 0; i < N; i = next[i] < 0 ? -1 : next[i]) {
+            if (i < 0) break;
+            if (nodes[i].id < 0) continue;
+            out.push_back(nodes[i].id);
+            if (next[i] < 0) break;
+        }
+        return out;
+    };
+
+    // Build a list of special tokens sorted by length (longest first) so that
+    // overlapping prefixes resolve to the longer match.
+    std::vector<std::pair<std::string, int32_t>> specials(
+        special_tokens_.begin(), special_tokens_.end());
+    std::sort(specials.begin(), specials.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first.size() > b.first.size();
+              });
+
+    std::vector<int32_t> result;
+    size_t pos = 0;
+    for (; pos < text.size(); ++pos) {
+        for (const auto& [tok, id] : specials) {
+            if (tok.empty()) continue;
+            if (text.compare(pos, tok.size(), tok) == 0) {
+                if (pos > 0) {
+                    auto seg = encode_segment(text.substr(0, pos));
+                    result.insert(result.end(), seg.begin(), seg.end());
+                }
+                result.push_back(id);
+                // Recurse on the remainder so any further specials there are
+                // emitted atomically as well.
+                std::string rest = text.substr(pos + tok.size());
+                std::vector<int32_t> tail = encode(rest);
+                result.insert(result.end(), tail.begin(), tail.end());
+                return result;
+            }
+        }
+    }
+    // No special token in `text` — encode the whole input as a single segment.
+    auto seg = encode_segment(text);
+    result.insert(result.end(), seg.begin(), seg.end());
+    return result;
+}
+
+std::string Tokenizer::decode_llama(int32_t token_id) const {
+    if (token_id < 0 ||
+        token_id >= static_cast<int32_t>(metadata_->id_to_token.size())) {
+        return "<ID_OOB>";
+    }
+
+    if (is_special_token(token_id)) {
+        return metadata_->id_to_token[token_id];
+    }
+
+    const TokenType tt = (static_cast<size_t>(token_id) < metadata_->token_types.size())
+                             ? metadata_->token_types[token_id]
+                             : TokenType::NORMAL;
+
+    if (tt == TokenType::BYTE) {
+        const std::string& s = metadata_->id_to_token[token_id];
+        if (s.size() == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                return -1;
+            };
+            int hi = hex(s[3]), lo = hex(s[4]);
+            if (hi >= 0 && lo >= 0) {
+                return std::string(1, static_cast<char>((hi << 4) | lo));
+            }
+        }
+        return s;
+    }
+
+    // Replace U+2581 (▁, "\xE2\x96\x81") with space.
+    std::string out;
+    const std::string& tok = metadata_->id_to_token[token_id];
+    out.reserve(tok.size());
+    for (size_t i = 0; i < tok.size();) {
+        if (i + 2 < tok.size() &&
+            static_cast<unsigned char>(tok[i])     == 0xE2 &&
+            static_cast<unsigned char>(tok[i + 1]) == 0x96 &&
+            static_cast<unsigned char>(tok[i + 2]) == 0x81) {
+            out += ' ';
+            i += 3;
+        } else {
+            out += tok[i++];
+        }
+    }
+    return out;
 }
 
 std::string Tokenizer::_decode_original_token(int32_t original_id) const {
@@ -389,6 +703,9 @@ std::string Tokenizer::_decode_original_token(int32_t original_id) const {
 }
 
 std::string Tokenizer::decode(int32_t token_id) const {
+    if (is_llama_tokenizer_) {
+        return decode_llama(token_id);
+    }
     return _decode_original_token(token_id);
 }
 

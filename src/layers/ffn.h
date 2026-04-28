@@ -28,3 +28,16 @@ ggml_tensor* build_ffn_swiglu(
     ggml_tensor*  down,
     int           il,
     Phase         phase = Phase::Prefill);
+
+// Gemma-style GeGLU FFN: down(geglu_tanh(gate(cur), up(cur))).
+// Uses the tanh-approximation of GELU (`gelu_pytorch_tanh`), not the exact
+// erf-based GELU. Wrong variant produces drift that compounds across layers.
+ggml_tensor* build_ffn_geglu_tanh(
+    ggml_context* ctx,
+    ggml_cgraph*  gf,
+    ggml_tensor*  cur,
+    ggml_tensor*  gate,
+    ggml_tensor*  up,
+    ggml_tensor*  down,
+    int           il,
+    Phase         phase = Phase::Prefill);

@@ -28,8 +28,17 @@ ggml_tensor* build_transformer_layer(
 {
     ggml_tensor* inpSA = cur;
 
+    // Pick the norm builder once. Gemma's (1+w) form is the same shape but
+    // a different scaling — selecting it here keeps the rest of the block
+    // identical between families.
+    auto rms = [&](ggml_tensor* t, ggml_tensor* weight, int idx) {
+        return hp.gemma_rms_norm
+                   ? build_rms_norm_gemma(ctx, t, weight, hp.rms_norm_eps, idx)
+                   : build_rms_norm(ctx, t, weight, hp.rms_norm_eps, idx);
+    };
+
     // A. Pre-attention RMS norm
-    cur = build_rms_norm(ctx, cur, w.attn_norm, hp.rms_norm_eps, static_cast<int>(il));
+    cur = rms(cur, w.attn_norm, static_cast<int>(il));
     tblk_name(cur, "cur_normed", il);
 
     // B. QKV projections
@@ -62,7 +71,8 @@ ggml_tensor* build_transformer_layer(
     tblk_name(Vcur, "Vcur_3d", il);
 
     // C. Optional QK RMS norms (qwen3 only)
-    if (!hp.is_qwen2) {
+    if (!hp.is_qwen2 && w.q_norm != nullptr) {
+        // Gemma 1 has no QK norm (q_norm is null); Qwen 3 has it.
         Qcur = build_rms_norm(ctx, Qcur, w.q_norm, hp.rms_norm_eps, static_cast<int>(il));
         tblk_name(Qcur, "Qcur_normed", il);
     }
@@ -74,7 +84,7 @@ ggml_tensor* build_transformer_layer(
                           hp.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     tblk_name(Qcur, "Qcur_roped", il);
 
-    if (!hp.is_qwen2) {
+    if (!hp.is_qwen2 && w.k_norm != nullptr) {
         Kcur = build_rms_norm(ctx, Kcur, w.k_norm, hp.rms_norm_eps, static_cast<int>(il));
         tblk_name(Kcur, "Kcur_normed", il);
     }
@@ -98,12 +108,17 @@ ggml_tensor* build_transformer_layer(
     tblk_name(ffn_inp, "ffn_inp", il);
 
     // H. Pre-FFN RMS norm
-    cur = build_rms_norm(ctx, ffn_inp, w.ffn_norm, hp.rms_norm_eps, static_cast<int>(il));
+    cur = rms(ffn_inp, w.ffn_norm, static_cast<int>(il));
     tblk_name(cur, "ffn_norm", il);
 
-    // I. SwiGLU FFN
-    cur = build_ffn_swiglu(ctx, gf, cur, w.ffn_gate, w.ffn_up, w.ffn_down,
-                            static_cast<int>(il));
+    // I. FFN: SwiGLU (default) or GeGLU-tanh (Gemma)
+    if (hp.gemma_geglu) {
+        cur = build_ffn_geglu_tanh(ctx, gf, cur, w.ffn_gate, w.ffn_up, w.ffn_down,
+                                    static_cast<int>(il));
+    } else {
+        cur = build_ffn_swiglu(ctx, gf, cur, w.ffn_gate, w.ffn_up, w.ffn_down,
+                                static_cast<int>(il));
+    }
     tblk_name(cur, "ffn_output", il);
 
     // J. Post-FFN residual

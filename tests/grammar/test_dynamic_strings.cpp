@@ -97,7 +97,7 @@ std::vector<std::string> build_dynamic_string_vocab()
 class TokenAcceptor
 {
 public:
-    TokenAcceptor(qwen3::GrammarVocab *g, const std::vector<std::string> &v)
+    TokenAcceptor(qwenium::GrammarVocab *g, const std::vector<std::string> &v)
         : grammar(g), vocab(v) {}
 
     void accept(int32_t token, const char *desc)
@@ -133,7 +133,7 @@ public:
     }
 
 private:
-    qwen3::GrammarVocab *grammar;
+    qwenium::GrammarVocab *grammar;
     const std::vector<std::string> &vocab;
 };
 
@@ -143,7 +143,7 @@ private:
 
 void test_dynamic_grammar_parses()
 {
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 }
 
@@ -154,7 +154,7 @@ void test_dynamic_grammar_parses()
 
 void test_reach_string_content()
 {
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 
     auto vocab = build_dynamic_string_vocab();
@@ -186,7 +186,7 @@ void test_reach_string_content()
 
 void test_dynamic_string_content_valid()
 {
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 
     auto vocab = build_dynamic_string_vocab();
@@ -217,7 +217,7 @@ void test_dynamic_string_content_valid()
 
 void test_full_dynamic_string_statement()
 {
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 
     auto vocab = build_dynamic_string_vocab();
@@ -250,7 +250,7 @@ void test_full_dynamic_string_statement()
 
 void test_closing_quote_valid_after_content()
 {
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 
     auto vocab = build_dynamic_string_vocab();
@@ -297,7 +297,7 @@ void test_multi_token_dynamic_content()
     vocab[102] = "hello";
     vocab[104] = " world";
 
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
     ASSERT_NE(grammar, nullptr);
 
     TokenAcceptor accept(grammar.get(), vocab);
@@ -346,7 +346,7 @@ void test_star_allows_continuation()
     vocab[102] = "hello";
     vocab[105] = "world";
 
-    auto grammar = qwen3::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
+    auto grammar = qwenium::GrammarVocab::parse_impl(DYNAMIC_STRING_GRAMMAR);
 
     TokenAcceptor accept(grammar.get(), vocab);
 

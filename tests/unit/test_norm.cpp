@@ -179,3 +179,115 @@ TEST_F(NormTest, OutputIsFinite) {
     for (float v : out)
         EXPECT_TRUE(std::isfinite(v)) << "non-finite output: " << v;
 }
+
+// ── Gemma-style RMSNorm: (x / rms(x)) * (1 + w) (PR G1.4) ─────────────────────
+
+// Hand-computed reference for build_rms_norm_gemma([3, 4], weight=[2, 0.5], eps=0):
+//   rms      = sqrt(12.5) ≈ 3.535534
+//   normed   = [0.848528, 1.131371]
+//   (1 + w)  = [3.0, 1.5]
+//   scaled   = [0.848528*3.0, 1.131371*1.5] = [2.545585, 1.697056]
+TEST_F(NormTest, GemmaRMSNormKnownAnswer) {
+    const size_t ctx_bytes = 256 * 1024;
+    ggml_init_params p{ctx_bytes, nullptr, true};
+    ggml_context* ctx = ggml_init(p);
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+    ggml_set_input(input);
+
+    ggml_tensor* out = build_rms_norm_gemma(ctx, input, w_, /*eps=*/0.0f, /*il=*/0);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend_));
+    ggml_gallocr_alloc_graph(alloc, gf);
+
+    float indata[2] = {3.0f, 4.0f};
+    ggml_backend_tensor_set(input, indata, 0, sizeof(indata));
+    ggml_backend_graph_compute(backend_, gf);
+
+    float result[2];
+    ggml_backend_tensor_get(out, result, 0, sizeof(result));
+
+    EXPECT_NEAR(result[0], 0.848528f * 3.0f, 1e-4f);
+    EXPECT_NEAR(result[1], 1.131371f * 1.5f, 1e-4f);
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+}
+
+// Sanity: with weight = [0, 0], (1+w) = 1 → output equals plain rms(x).
+TEST_F(NormTest, GemmaRMSNormZeroWeightEqualsRmsNormalized) {
+    float zeros[2] = {0.0f, 0.0f};
+    memcpy(w_->data, zeros, sizeof(zeros));
+
+    const size_t ctx_bytes = 256 * 1024;
+    ggml_init_params p{ctx_bytes, nullptr, true};
+    ggml_context* ctx = ggml_init(p);
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+    ggml_set_input(input);
+
+    ggml_tensor* out = build_rms_norm_gemma(ctx, input, w_, 0.0f, 0);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend_));
+    ggml_gallocr_alloc_graph(alloc, gf);
+
+    float indata[2] = {3.0f, 4.0f};
+    ggml_backend_tensor_set(input, indata, 0, sizeof(indata));
+    ggml_backend_graph_compute(backend_, gf);
+
+    float result[2];
+    ggml_backend_tensor_get(out, result, 0, sizeof(result));
+
+    EXPECT_NEAR(result[0], 3.0f / std::sqrt(12.5f), 1e-4f);
+    EXPECT_NEAR(result[1], 4.0f / std::sqrt(12.5f), 1e-4f);
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+
+    // Restore weight for subsequent tests.
+    float wdata[2] = {2.0f, 0.5f};
+    memcpy(w_->data, wdata, sizeof(wdata));
+}
+
+// ── Embedding scale: cur * scale (PR G1.4) ────────────────────────────────────
+
+TEST_F(NormTest, EmbedScaleMultipliesBySqrtD) {
+    const size_t ctx_bytes = 256 * 1024;
+    ggml_init_params p{ctx_bytes, nullptr, true};
+    ggml_context* ctx = ggml_init(p);
+
+    const int d = 16;
+    const float scale = std::sqrt(static_cast<float>(d));
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+    ggml_set_input(input);
+
+    ggml_tensor* out = build_embed_scale(ctx, input, scale);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend_));
+    ggml_gallocr_alloc_graph(alloc, gf);
+
+    std::vector<float> indata(d);
+    for (int i = 0; i < d; ++i) indata[i] = static_cast<float>(i) - 7.5f;
+    ggml_backend_tensor_set(input, indata.data(), 0, indata.size() * sizeof(float));
+    ggml_backend_graph_compute(backend_, gf);
+
+    std::vector<float> result(d);
+    ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
+
+    for (int i = 0; i < d; ++i) {
+        EXPECT_NEAR(result[i], indata[i] * scale, 1e-4f);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+}

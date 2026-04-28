@@ -6,7 +6,7 @@
 #include <fstream>
 #include <stdexcept>
 
-namespace qwen3 {
+namespace qwenium {
 
 // Load keep_list.bin: [count(uint32)] [id(uint32), id, ...]
 inline std::unordered_set<int32_t> load_keep_list(const std::string& path) {
@@ -36,4 +36,4 @@ inline std::unordered_set<int32_t> load_keep_list(const std::string& path) {
     return result;
 }
 
-} // namespace qwen3
+} // namespace qwenium
