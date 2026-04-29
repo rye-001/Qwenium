@@ -35,8 +35,6 @@ Thumbs.db
 # Logs and temporary files
 *.log
 *.tmp
-core
-core.*
 
 # Model files (typically large)
 *.gguf

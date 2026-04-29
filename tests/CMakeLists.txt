@@ -496,6 +496,47 @@ target_link_libraries(transformer-block-tests PRIVATE
 target_compile_features(transformer-block-tests PRIVATE cxx_std_17)
 gtest_discover_tests(transformer-block-tests)
 
+# ── Gemma 2 unit tests (Phase G2) ────────────────────────────────────────────
+
+# Softcap op: build_softcap(x, cap) = cap * tanh(x/cap) — no model file needed.
+add_executable(gemma2-softcap-tests
+    unit/test_gemma2_softcap.cpp
+)
+target_link_libraries(gemma2-softcap-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+target_compile_features(gemma2-softcap-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma2-softcap-tests)
+
+# Sandwich norm: post_attn_norm / post_ffn_norm hooks in build_transformer_layer.
+# No model file needed.
+add_executable(gemma2-sandwich-norm-tests
+    unit/test_gemma2_sandwich_norm.cpp
+)
+target_link_libraries(gemma2-sandwich-norm-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    qinf-state
+    ggml
+)
+target_compile_features(gemma2-sandwich-norm-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma2-sandwich-norm-tests)
+
+# Sliding-window: Gemma2Config::from_metadata layer_window pattern +
+# mask logic — no model file needed.
+add_executable(gemma2-sliding-window-tests
+    unit/test_gemma2_sliding_window.cpp
+)
+target_link_libraries(gemma2-sliding-window-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+)
+target_compile_features(gemma2-sliding-window-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma2-sliding-window-tests)
+
 # ── TQ prefill canary tests ───────────────────────────────────────────────────
 # Regression gate for the TurboQuant prefill path (_build_layer_batch_graph).
 # Prerequisite for the build_transformer_layer extraction PR.

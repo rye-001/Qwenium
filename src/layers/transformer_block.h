@@ -36,6 +36,12 @@ struct TransformerBlockHparams {
     // module hierarchy.
     bool  gemma_rms_norm = false;  // true → (x / rms(x)) * (1 + w) instead of x * w
     bool  gemma_geglu    = false;  // true → GeGLU-tanh FFN instead of SwiGLU
+
+    // ── Gemma-2 knobs (PR G2) ────────────────────────────────────────────
+    // attn_softcap: attention logit soft-capping value (cap * tanh(x/cap)).
+    //   0.0 = off (Qwen/Gemma-1 path — behavior is bit-identical).
+    //   50.0 for Gemma 2.
+    float attn_softcap = 0.0f;
 };
 
 // Weight tensors for one transformer block.
@@ -55,6 +61,13 @@ struct TransformerBlockWeights {
     ggml_tensor* ffn_gate;   // ffn_gate_weight
     ggml_tensor* ffn_up;     // ffn_up_weight
     ggml_tensor* ffn_down;   // ffn_down_weight
+
+    // ── Gemma-2 sandwich norm weights (PR G2.1) ──────────────────────────
+    // nullptr → standard pre-norm only (Qwen/Gemma-1 path unchanged).
+    // Non-null → sandwich norm: post-norm applied after attn/FFN output,
+    //   before the residual add.  x + post_norm(op(pre_norm(x))).
+    ggml_tensor* post_attn_norm = nullptr;  // blk.N.post_attention_norm.weight
+    ggml_tensor* post_ffn_norm  = nullptr;  // blk.N.post_ffw_norm.weight
 };
 
 // Build one transformer layer's ggml nodes into an existing graph.

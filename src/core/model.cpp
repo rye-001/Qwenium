@@ -337,6 +337,16 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
                 blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
                 blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+            } else if (metadata_.architecture == "gemma2") {
+                // Gemma 2: same QKV / FFN tensor names as Gemma 1.
+                // post_attention_norm / post_ffw_norm are fetched by the recipe
+                // directly via ggml_get_tensor — they are G2-specific and not in
+                // the generic TransformerBlock struct.
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
             }
         }
     }
@@ -352,7 +362,7 @@ bool Model::validate_architecture() const
     }
     return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" ||
            metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe" ||
-           metadata_.architecture == "gemma";
+           metadata_.architecture == "gemma"  || metadata_.architecture == "gemma2";
 }
 
 Qwen3ModelSize Model::detect_model_size() const
@@ -389,14 +399,25 @@ void Model::print_metadata() const
         return;
     }
 
-    std::cout << "Qwen Model Metadata:" << std::endl;
+    std::cout << "Model Metadata:" << std::endl;
     std::cout << "  Architecture: " << metadata_.architecture << std::endl;
     std::cout << "  Model Name: " << metadata_.model_name << std::endl;
+
+    // general.basename / general.finetune identify base vs instruct variants.
+    if (auto v = metadata_.raw_kv.get_string_opt("general.basename"); v)
+        std::cout << "  Basename: " << *v << std::endl;
+    if (auto v = metadata_.raw_kv.get_string_opt("general.finetune"); v)
+        std::cout << "  Finetune: " << *v << std::endl;
+
     std::cout << "  Block Count: " << metadata_.block_count << std::endl;
     std::cout << "  Embedding Length: " << metadata_.embedding_length << std::endl;
     std::cout << "  Attention Heads: " << metadata_.attention_head_count << std::endl;
     std::cout << "  KV Heads: " << metadata_.attention_head_count_kv << std::endl;
+    std::cout << "  Attn Key Length (n_embd_head): " << metadata_.attention_key_length << std::endl;
     std::cout << "  Rope Freq Base: " << metadata_.rope_freq_base << std::endl;
     std::cout << "  RMS Norm Epsilon: " << metadata_.rms_norm_eps << std::endl;
+    std::cout << "  BOS token id: " << metadata_.bos_token_id
+              << "  add_bos_token: " << (metadata_.add_bos_token ? "true" : "false") << std::endl;
+    std::cout << "  EOS token id: " << metadata_.eos_token_id << std::endl;
     std::cout << "  Detected Model Size: " << get_model_size_string() << std::endl;
 }

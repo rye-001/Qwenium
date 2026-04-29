@@ -36,6 +36,7 @@ std::string GemmaChatTemplate::render(const std::vector<ChatMessage>& history,
 {
     std::ostringstream out;
     for (const auto& m : history) {
+        // if (m.content.empty()) continue;  // empty system/user turn = structural noise for Gemma
         out << "<start_of_turn>" << gemma_role_for(m.role) << "\n"
             << m.content << "<end_of_turn>\n";
     }
