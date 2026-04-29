@@ -505,6 +505,38 @@ target_link_libraries(gemma2-sliding-window-tests PRIVATE
 target_compile_features(gemma2-sliding-window-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma2-sliding-window-tests)
 
+# ── Gemma 3 unit tests (Phase G3) ────────────────────────────────────────────
+
+# Gemma3Config: 5:1 window pattern, per-layer RoPE base, QK-norm semantics.
+# No model file required.
+add_executable(gemma3-config-tests
+    unit/test_gemma3_config.cpp
+)
+target_link_libraries(gemma3-config-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-layers
+    core
+    ggml
+)
+target_compile_features(gemma3-config-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma3-config-tests)
+
+# Gemma 3 forward pass integration test (PR G3.4).
+# Self-skips when GEMMA3_MODEL_PATH is unset and default file is absent.
+add_executable(forward-tests-gemma3
+    unit/test_gemma3_forward.cpp
+)
+target_link_libraries(forward-tests-gemma3 PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(forward-tests-gemma3 PRIVATE cxx_std_17)
+gtest_discover_tests(forward-tests-gemma3)
+
 # ── TQ prefill canary tests ───────────────────────────────────────────────────
 # Regression gate for the TurboQuant prefill path (_build_layer_batch_graph).
 # Prerequisite for the build_transformer_layer extraction PR.
