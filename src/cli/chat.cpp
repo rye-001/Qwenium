@@ -84,14 +84,17 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         const ChatTemplate& tmpl = *lookup_chat_template(chat_meta.architecture);
         std::string system_turn = tmpl.render({chat_history.back()}, false);
         std::vector<int32_t> system_tokens = tokenizer->encode(system_turn);
-        log_tokens(system_tokens);
-        all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
 
-        // Prefill System Prompt into Slot 0
-        forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
-
-        // Clone System Prefix to Slot 1 for the user session
-        forward_pass->clone_slot(0, 1, system_tokens.size());
+        // Only prefill and clone when there is actual system content.
+        // An empty render (e.g. Gemma with no system prompt) must not inject
+        // a spurious turn into the KV cache — slot 1 stays at pos=0 and the
+        // first user-turn encode will own the BOS.
+        if (!system_tokens.empty()) {
+            log_tokens(system_tokens);
+            all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
+            forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
+            forward_pass->clone_slot(0, 1, system_tokens.size());
+        }
         
         // Speculative bridge for chat mode (slot 1)
         SpeculativeBridge bridge{forward_pass.get(), scheduler};

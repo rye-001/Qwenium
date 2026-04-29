@@ -4,6 +4,7 @@
 #include "qwen35.h"
 #include "qwen36.h"
 #include "gemma1.h"
+#include "gemma2.h"
 
 #include <map>
 #include <mutex>
@@ -174,5 +175,12 @@ void register_builtin_models()
             return std::make_unique<Gemma1ForwardPass>(m, meta, ctx, bs, kvb);
         },
         validate_gemma1_inventory,
+        gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
+
+    register_model("gemma2",
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
+            return std::make_unique<Gemma2ForwardPass>(m, meta, ctx, bs, kvb);
+        },
+        validate_gemma2_inventory,
         gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
 }

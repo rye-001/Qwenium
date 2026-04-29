@@ -9,6 +9,7 @@ add_library(qinf-models STATIC
     qwen35.cpp
     qwen36.cpp
     gemma1.cpp
+    gemma2.cpp
     model_registry.cpp
 )
 

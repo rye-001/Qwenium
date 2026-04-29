@@ -23,9 +23,22 @@ static void set_name(ggml_tensor* t, const char* base, int il = -1) {
     }
 }
 
+// ── build_softcap ────────────────────────────────────────────────────────────
+// Gemma 2 logit soft-capping: cap * tanh(x / cap).
+// Applied on raw attention QK scores (before scaled softmax) and on final
+// logits.  cap must be > 0; callers gate the call on that condition.
+ggml_tensor* build_softcap(ggml_context* ctx, ggml_tensor* x, float cap)
+{
+    x = ggml_scale(ctx, x, 1.0f / cap);
+    x = ggml_tanh(ctx, x);
+    x = ggml_scale(ctx, x, cap);
+    return x;
+}
+
 // ── build_attn_mha ───────────────────────────────────────────────────────────
 // Extracted from ForwardPassBase::build_attn_mha (src/models/forward_pass_base.cpp).
 // Logic is identical — only ctx_ → ctx parameter.
+// softcap: when > 0, applies cap * tanh(kq / cap) before the scaled softmax.
 ggml_tensor* build_attn_mha(
     ggml_context* ctx,
     ggml_cgraph*  gf,
@@ -36,7 +49,8 @@ ggml_tensor* build_attn_mha(
     ggml_tensor*  sinks,
     float         kq_scale,
     uint32_t      pos,
-    int           il)
+    int           il,
+    float         softcap)
 {
     (void)gf; (void)pos; // gf/pos unused directly; kept for API symmetry with callers
 
@@ -64,7 +78,21 @@ ggml_tensor* build_attn_mha(
 
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
-        kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0);
+        // Gemma 2 attention logit soft-capping (softcap == 0 → off).
+        // The scale (1/√d) must be applied BEFORE the tanh clamp:
+        //   cap · tanh( QKᵀ/√d  /  cap )
+        // Passing kq_scale to soft_max_ext instead would multiply after the
+        // tanh, compressing the logits into ±(cap·kq_scale) and making
+        // attention near-uniform.
+        if (softcap > 0.0f) {
+            kq = ggml_scale(ctx, kq, kq_scale);
+            set_name(kq, "kq_scaled", il);
+            kq = build_softcap(ctx, kq, softcap);
+            set_name(kq, "kq_softcapped", il);
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f, 0);
+        } else {
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0);
+        }
         set_name(kq, "kq_soft", il);
 
         ggml_soft_max_add_sinks(kq, sinks);
@@ -98,7 +126,8 @@ ggml_tensor* build_attention(
     uint32_t         slot_idx,
     int              il,
     int              n_embd_head,
-    int              n_head_kv)
+    int              n_head_kv,
+    float            softcap)
 {
     const uint32_t pos  = kv_cache->get_pos(slot_idx);
     const uint32_t n_kv = pos + n_tokens;
@@ -145,7 +174,7 @@ ggml_tensor* build_attention(
     ggml_build_forward_expand(gf, kq_mask);
 
     // 5. Run MHA
-    return build_attn_mha(ctx, gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
+    return build_attn_mha(ctx, gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il, softcap);
 }
 
 // ── build_batched_attention ──────────────────────────────────────────────────

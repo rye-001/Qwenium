@@ -97,11 +97,19 @@ ggml_tensor* build_transformer_layer(
     const float kq_scale = 1.0f / sqrtf(static_cast<float>(hp.n_embd_head));
     cur = build_attention(ctx, gf, kv_cache, Qcur, Kcur, Vcur,
                           static_cast<int>(il), kq_scale, n_tokens, slot_idx,
-                          static_cast<int>(il), hp.n_embd_head, hp.n_head_kv);
+                          static_cast<int>(il), hp.n_embd_head, hp.n_head_kv,
+                          hp.attn_softcap);
 
     // F. Output projection
     cur = ggml_mul_mat(ctx, w.out, cur);
     tblk_name(cur, "attn_output", il);
+
+    // F2. Post-attention norm (sandwich norm — Gemma 2).
+    // nullptr = Qwen / Gemma-1 path; behavior is bit-identical when absent.
+    if (w.post_attn_norm != nullptr) {
+        cur = rms(cur, w.post_attn_norm, static_cast<int>(il));
+        tblk_name(cur, "post_attn_normed", il);
+    }
 
     // G. Post-attention residual
     ggml_tensor* ffn_inp = ggml_add(ctx, cur, inpSA);
@@ -120,6 +128,12 @@ ggml_tensor* build_transformer_layer(
                                 static_cast<int>(il));
     }
     tblk_name(cur, "ffn_output", il);
+
+    // I2. Post-FFN norm (sandwich norm — Gemma 2).
+    if (w.post_ffn_norm != nullptr) {
+        cur = rms(cur, w.post_ffn_norm, static_cast<int>(il));
+        tblk_name(cur, "post_ffn_normed", il);
+    }
 
     // J. Post-FFN residual
     cur = ggml_add(ctx, cur, ffn_inp);

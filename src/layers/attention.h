@@ -26,8 +26,20 @@ class simple_kv_cache;
 struct ggml_context;
 struct ggml_cgraph;
 
-// Core MHA kernel: Q@K^T → softmax(scale, mask) → @V.
+// Logit soft-capping op (Gemma 2): cap * tanh(x / cap).
+// When cap == 0 the caller should skip the call; this function never returns
+// the input unchanged — it always applies the op regardless of cap value.
+// Used on raw attention scores (before scaled softmax) and on final logits.
+ggml_tensor* build_softcap(
+    ggml_context* ctx,
+    ggml_tensor*  x,
+    float         cap);
+
+// Core MHA kernel: Q@K^T → [optional softcap] → softmax(scale, mask) → @V.
 // Handles GQA, head permutation, stream splitting, and contiguous recombination.
+// softcap: attention logit soft-capping value (0.0 = off — Qwen/Gemma-1 path
+//   produces bit-identical output). When > 0: cap * tanh(x/cap) is applied to
+//   the raw QK product before the scaled softmax.
 // Extracted from ForwardPassBase::build_attn_mha — identical logic.
 ggml_tensor* build_attn_mha(
     ggml_context* ctx,
@@ -39,13 +51,15 @@ ggml_tensor* build_attn_mha(
     ggml_tensor* sinks,
     float        kq_scale,
     uint32_t     pos,
-    int          il);
+    int          il,
+    float        softcap = 0.0f);
 
 // Prefill / single-slot attention.
 // Writes K/V to the cache at the current slot position, reads the full
 // cached sequence, builds a per-layer causal mask, then runs MHA.
 // n_embd_head and n_head_kv are the per-architecture dimension values
 // computed by the caller from ModelMetadata.
+// softcap: forwarded to build_attn_mha (0.0 = off; Qwen/Gemma-1 unchanged).
 // Extracted from Qwen3ForwardPass::_build_attention_layer — identical logic.
 ggml_tensor* build_attention(
     ggml_context*     ctx,
@@ -60,7 +74,8 @@ ggml_tensor* build_attention(
     uint32_t          slot_idx,
     int               il,
     int               n_embd_head,
-    int               n_head_kv);
+    int               n_head_kv,
+    float             softcap = 0.0f);
 
 // Decode / batched multi-slot attention.
 // Scatters K/V into each slot, gathers the full KV history via indices,
