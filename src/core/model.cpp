@@ -347,6 +347,16 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
                 blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
                 blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+            } else if (metadata_.architecture == "gemma3") {
+                // Gemma 3: same QKV / FFN names as Gemma 2, plus QK-norm weights.
+                // post_attention_norm / post_ffw_norm / attn_q_norm / attn_k_norm
+                // are fetched by the recipe via ggml_get_tensor (G3-specific, not
+                // in the generic TransformerBlock struct).
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
             }
         }
     }
@@ -362,7 +372,8 @@ bool Model::validate_architecture() const
     }
     return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" ||
            metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe" ||
-           metadata_.architecture == "gemma"  || metadata_.architecture == "gemma2";
+           metadata_.architecture == "gemma"  || metadata_.architecture == "gemma2" ||
+           metadata_.architecture == "gemma3";
 }
 
 Qwen3ModelSize Model::detect_model_size() const
