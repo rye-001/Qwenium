@@ -11,6 +11,7 @@ add_library(qinf-models STATIC
     gemma1.cpp
     gemma2.cpp
     gemma3.cpp
+    gemma4.cpp           # tokenizer/chat surface + G4.8 stub
     model_registry.cpp
 )
 

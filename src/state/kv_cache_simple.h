@@ -19,7 +19,38 @@ public:
         ggml_type type_v = GGML_TYPE_F16,
         ggml_backend_t backend = nullptr);  // Optional backend parameter
 
+    // Reference-mode constructor.  Same shape as the primary
+    // constructor, plus a per-layer sharing vector.  When sharing[il] is
+    // a reference, layer `il` allocates no K/V storage; its slots point at
+    // sharing[il].source_layer's tensors.  Pre-conditions enforced
+    // fail-loud at construction time:
+    //   - sharing.size() == n_layers
+    //   - for every reference layer `il`: source_layer is in [0, il) and
+    //     is itself a non-reference (owning) layer.
+    // When `sharing` is empty the behavior is identical to the primary
+    // constructor.
+    simple_kv_cache(
+        uint32_t n_layers,
+        uint32_t n_ctx_max,
+        uint32_t n_batch_max,
+        uint32_t n_embd_k,
+        uint32_t n_embd_v,
+        ggml_type type_k,
+        ggml_type type_v,
+        ggml_backend_t backend,
+        const std::vector<KvSharingSpec>& sharing);
+
     ~simple_kv_cache() = default;
+
+    // True iff layer `il` aliases another layer's K/V storage.  Recipes that
+    // route Q-only attention computations through the shared slot use this
+    // to skip the (illegal) cpy_k / cpy_v call for reference layers.
+    bool is_reference_layer(uint32_t il) const {
+        return il < sharing_.size() && sharing_[il].is_reference;
+    }
+    int  reference_source(uint32_t il) const {
+        return is_reference_layer(il) ? sharing_[il].source_layer : -1;
+    }
 
     // Get a full view of cached K for layer il and slot_idx: [n_embd_k, n_kv]
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t slot_idx = 0);
@@ -90,6 +121,11 @@ private:
     // Persistent cache tensors (allocated in buf)
     std::vector<ggml_tensor*> k_cache;  // One per layer
     std::vector<ggml_tensor*> v_cache;  // One per layer
+
+    // per-layer sharing spec.  Empty when no layer references any
+    // other (the standard path).  init_cache() honors this vector when
+    // populated.
+    std::vector<KvSharingSpec> sharing_;
 
     void init_cache();
 };

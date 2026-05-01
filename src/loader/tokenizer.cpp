@@ -32,7 +32,7 @@ Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& confi
         throw std::runtime_error("Invalid vocabulary: token list is empty.");
     }
 
-    is_llama_tokenizer_ = (config_.normalizer == NormalizerKind::SpaceToUnderscore);
+    is_llama_tokenizer_ = (config_.normalizer == NormalizerKind::SpaceToUnderscore || metadata_->tokenizer_type == "gemma4");
 
     // Build token_to_id map
     token_to_id_.reserve(metadata_->id_to_token.size());

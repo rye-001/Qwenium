@@ -12,6 +12,7 @@
 // Tensor naming: verbose (matches build_prefill_graph convention).
 // Build-time only — negligible cost on the TQ hot path.
 
+#include "layer.h"
 #include "ggml.h"
 #include <cstdint>
 
@@ -25,7 +26,7 @@ struct TransformerBlockHparams {
     bool  is_qwen2;        // true → apply QKV biases and skip QK RMS norms (Qwen2)
     int   n_head;          // query head count
     int   n_head_kv;       // KV head count (GQA)
-    int   n_embd_head;     // per-head embedding dimension
+    int   n_embd_head;     // Q per-head dimension (= hidden_dim / n_head for Qwen/Gemma 1-3)
     float freq_base;       // RoPE frequency base
     int   context_length;  // original context length for RoPE ext
     float rms_norm_eps;    // epsilon for RMS norm
@@ -42,6 +43,22 @@ struct TransformerBlockHparams {
     //   0.0 = off (Qwen/Gemma-1 path — behavior is bit-identical).
     //   50.0 for Gemma 2.
     float attn_softcap = 0.0f;
+
+    // ── G4.1: per-layer attention shape overrides ────────────────────────
+    // When non-zero, override n_embd_head for K and V head dimensions
+    // independently.  All existing recipes leave these at 0 (degenerate
+    // case: head_dim_k = head_dim_v = n_embd_head — behavior unchanged).
+    // Gemma 4 sets these per-layer from LayerSpec: SWA layers have
+    // head_dim_k = head_dim_v = 256 while n_embd_head = 256 (also 256);
+    // global layers have head_dim_k = head_dim_v = 512 while n_embd_head = 256.
+    int      head_dim_k  = 0;   // K head dim; 0 → n_embd_head
+    int      head_dim_v  = 0;   // V head dim; 0 → n_embd_head
+
+    // rope_dim: number of head dimensions that receive RoPE rotation.
+    //   0 → n_embd_head (full-head RoPE — all existing recipes).
+    //   Gemma 4 global layers use 512 (= head_dim_k); SWA layers use 256.
+    //   p-RoPE (G4.5) further prunes within rope_dim — handled in G4.5.
+    int      rope_dim    = 0;
 };
 
 // Weight tensors for one transformer block.
@@ -72,9 +89,19 @@ struct TransformerBlockWeights {
 
 // Build one transformer layer's ggml nodes into an existing graph.
 //
-// cur:      hidden state entering this layer [n_embd, n_tokens]
-// inp_pos:  token position indices [n_tokens]
-// il:       physical layer index (used for KV cache slot selection and tensor naming)
+// cur:           hidden state entering this layer [n_embd, n_tokens]
+// inp_pos:       token position indices [n_tokens]
+// il:            physical layer index (used for KV cache slot selection and tensor naming)
+// ple_residual:  optional secondary residual contribution added to the
+//                residual stream at the block-entry injection point — i.e.
+//                inpSA = cur + ple_residual is what subsequent norms/attn/FFN
+//                see and what the final residual adds back into.  Shape must
+//                match cur ([n_embd, n_tokens]).  Pass nullptr for the
+//                Qwen / Gemma 1/2/3 path (behavior bit-identical when null).
+//                When the input is all-zeros the non-null path is also
+//                bit-identical to the null path, by construction
+//                (ggml_add of zeros is the identity).
+//                Used by Gemma 4 PLE (G4.3); inactive in 26B-A4B.
 //
 // Returns the updated hidden state tensor after the full layer.
 ggml_tensor* build_transformer_layer(
@@ -87,4 +114,5 @@ ggml_tensor* build_transformer_layer(
     const TransformerBlockHparams& hp,
     uint32_t                       il,
     uint32_t                       slot_idx,
-    uint32_t                       n_tokens);
+    uint32_t                       n_tokens,
+    ggml_tensor*                   ple_residual = nullptr);

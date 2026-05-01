@@ -84,8 +84,14 @@ def main():
               f"non-pinned version.", file=sys.stderr)
 
     hf_id = args.hf_id or {
-        ("g1", "2b"): "google/gemma-2b",
-        ("g1", "7b"): "google/gemma-7b",
+        ("g1", "2b"):     "google/gemma-2b",
+        ("g1", "7b"):     "google/gemma-7b",
+        # G4.0: 26B-A4B-It is the canary target for Phase G4. The dense
+        # 31B variant has no public checkpoint at the time of writing; once
+        # available, add ("g4", "31b") -> "google/gemma-4-31B-it" so the
+        # PLE / shared-KV gates have a real backing run. See
+        # docs/plan-gemma-impl.md → "Deferred — Gemma 4 dense 31B follow-up".
+        ("g4", "26b-a4b"): "google/gemma-4-26B-A4B-it",
     }.get((args.gen, args.model))
     if not hf_id:
         print(f"error: no HF id mapped for gen={args.gen} model={args.model}; pass --hf-id",

@@ -35,6 +35,30 @@ ggml_tensor* build_softcap(ggml_context* ctx, ggml_tensor* x, float cap)
     return x;
 }
 
+// ── build_rope_pruned ────────────────────────────────────────────────────────
+// p-RoPE (Gemma 4 global layers): rotate only the first n_rot dimensions of
+// each head; the remaining (head_dim - n_rot) dimensions pass through unchanged.
+//
+// ggml_rope_ext with `n_dims = n_rot` already implements this exact behavior:
+// the kernel rotates dims [0, n_rot) and copies dims [n_rot, head_dim) verbatim.
+// We expose it as a named function so recipes that select RopeKind::Pruned can
+// document the intent explicitly at the call site, and so the unit test has a
+// stable surface to oracle-check against.
+ggml_tensor* build_rope_pruned(
+    ggml_context* ctx,
+    ggml_tensor*  x,
+    ggml_tensor*  inp_pos,
+    int           n_rot,
+    int           context_len,
+    float         freq_base)
+{
+    // Argument order matches the existing call in transformer_block.cpp:
+    //   freq_base, freq_scale=1, ext_factor=0, attn_factor=1, beta_fast=32, beta_slow=1
+    return ggml_rope_ext(ctx, x, inp_pos, /*freq_factors=*/nullptr,
+                         n_rot, GGML_ROPE_TYPE_NEOX, context_len,
+                         freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+}
+
 // ── build_attn_mha ───────────────────────────────────────────────────────────
 // Extracted from ForwardPassBase::build_attn_mha (src/models/forward_pass_base.cpp).
 // Logic is identical — only ctx_ → ctx parameter.
@@ -112,7 +136,9 @@ ggml_tensor* build_attn_mha(
 
 // ── build_attention ──────────────────────────────────────────────────────────
 // Extracted from Qwen3ForwardPass::_build_attention_layer (forward-pass.cpp).
-// Logic is identical — ctx_ → ctx, meta_ fields → n_embd_head/n_head_kv params.
+// G4.1: n_embd_head split into head_dim_k + head_dim_v so Gemma 4 can use
+// different K/V head dims than Q head dim.  All existing callers pass the
+// same value for head_dim_k and head_dim_v — behavior is bit-identical.
 ggml_tensor* build_attention(
     ggml_context*    ctx,
     ggml_cgraph*     gf,
@@ -125,7 +151,8 @@ ggml_tensor* build_attention(
     uint32_t         n_tokens,
     uint32_t         slot_idx,
     int              il,
-    int              n_embd_head,
+    int              head_dim_k,
+    int              head_dim_v,
     int              n_head_kv,
     float            softcap)
 {
@@ -146,22 +173,22 @@ ggml_tensor* build_attention(
     ggml_tensor* v_full = kv_cache->get_v(ctx, layer_idx, n_kv, slot_idx);
 
     // 3. Create views for the attention calculation
-    const int n_embd_k = n_head_kv * n_embd_head;
-    const int n_embd_v = n_head_kv * n_embd_head;
+    const int n_embd_k = n_head_kv * head_dim_k;
+    const int n_embd_v = n_head_kv * head_dim_v;
 
     k = ggml_view_3d(ctx, k_full,
-        n_embd_head,
+        head_dim_k,
         n_head_kv,
         n_kv,
-        n_embd_head * sizeof(float),
+        head_dim_k * sizeof(float),
         n_embd_k   * sizeof(float),
         0);
 
     v = ggml_view_3d(ctx, v_full,
-        n_embd_head,
+        head_dim_v,
         n_head_kv,
         n_kv,
-        n_embd_head * sizeof(float),
+        head_dim_v * sizeof(float),
         n_embd_v   * sizeof(float),
         0);
 
@@ -579,7 +606,9 @@ ggml_tensor* AttentionLayer::build_prefill(
         qkv.q, qkv.k, qkv.v,
         layer_idx, hp_.kq_scale,
         args.n_tokens, args.slot_idx,
-        layer_idx, hp_.n_embd_head, hp_.n_head_kv);
+        layer_idx,
+        hp_.n_embd_head, hp_.n_embd_head,  // head_dim_k = head_dim_v = n_embd_head
+        hp_.n_head_kv);
     set_name(attn_out, "attn_out", layer_idx);
 
     ggml_tensor* out = ggml_mul_mat(ctx, w_out_, attn_out);

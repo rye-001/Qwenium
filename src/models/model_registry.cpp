@@ -6,6 +6,7 @@
 #include "gemma1.h"
 #include "gemma2.h"
 #include "gemma3.h"
+#include "gemma4.h"
 
 #include <map>
 #include <mutex>
@@ -191,4 +192,24 @@ void register_builtin_models()
         },
         validate_gemma3_inventory,
         gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
+
+    // Gemma 4 (26B-A4B-It text-only).
+    // Tokenizer config and chat template are wired now so loader-side
+    // metadata dispatch can resolve "gemma4".  The forward-pass factory
+    // produces a stub that throws on construction; PR G4.8 replaces it.
+    // Reuses GemmaChatTemplate (basic <start_of_turn>/<end_of_turn>
+    // rendering — the IT model's tool-calling Jinja is out of scope; see
+    // docs/plan-gemma-impl.md → Phase G4 → "Out of scope for G4").
+    register_model("gemma4",
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
+            return std::make_unique<Gemma4ForwardPass>(m, meta, ctx, bs, kvb);
+        },
+        validate_gemma4_inventory,
+        gemma4_tokenizer_config(),
+        // Gemma 4 IT uses native <|turn>...<turn|> markers — not the
+        // <start_of_turn>/<end_of_turn> shape G1/2/3 share.  Using
+        // GemmaChatTemplate here makes the IT model hallucinate
+        // <tool_call|> because the prompt structure doesn't match its
+        // training distribution.
+        std::make_unique<Gemma4ChatTemplate>());
 }

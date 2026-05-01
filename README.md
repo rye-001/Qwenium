@@ -1,8 +1,10 @@
 # Qwenium
 
-A from-scratch LLM inference engine in C++ for the Qwen family, using [ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml). Serve 10 concurrent users from a single 32GB Mac.
+A from-scratch LLM inference engine in C++ for the Qwen and Gemma families, using [ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml). Serve 10 concurrent users from a single 32GB Mac.
 
-**Small codebase, modular architecture, clear boundaries.** Pure transformers, hybrid SSM+attention, and MoE, all in a codebase you can read in an afternoon.
+**Small codebase, modular architecture, clear boundaries.** Pure transformers, hybrid SSM+attention, MoE, and Gemma's per-layer-embedding variants, all in a codebase you can read in an afternoon.
+
+Qwenium is built so you can read it, change it, and trust it. One directory per layer type. One file per model recipe. Adding a new model is a recipe, not a refactor.
 
 ## Why not just use llama.cpp?
 
@@ -16,7 +18,8 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 
 ## What it does
 
-- **Hybrid architectures** — Pure transformer (Qwen3), attention + SSM/GatedDeltaNet (Qwen3.5), and DeltaNet + attention + MoE (Qwen3.6).
+- **Multi-family support** — Qwen 2/2.5/3/3.5/3.6 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
+- **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
 - **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
 - **Prefix caching** — System prompt KV state cloned per slot. 2.25× faster wall time, 5.3× faster time-to-first-token.
 - **TurboQuant KV** — Compressed KV cache backed by Walsh–Hadamard rotation + Lloyd–Max quantization for long contexts.
@@ -34,6 +37,10 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 | Qwen 3 1.7B / 0.6B | Transformer | BF16 / Q8_0 | ~3.4 GB / ~0.6 GB | ✅ Tested |
 | Qwen 3.5 27B | Attention + SSM | Q4 / Q8 | ~16 GB | ✅ |
 | Qwen 3.6 35B-A3B | DeltaNet + Attention + MoE | Q4 / Q8 | ~20 GB | ✅ |
+| Gemma 1 (2B / 7B) | Transformer | Q4 / Q8 | ~1.5 GB / ~5 GB | ✅ |
+| Gemma 2 (2B / 9B) | Transformer + logit soft-cap | Q4 / Q8 | ~1.5 GB / ~6 GB | ✅ |
+| Gemma 3 (4B text) | Transformer + sliding-window | Q4 / Q8 | ~3 GB | ✅ |
+| Gemma 4 (4B) | Transformer + PLE + pruned RoPE | Q4 / Q8 | ~3 GB | ✅ |
 
 ## Quick Start
 
@@ -102,7 +109,8 @@ src/
 ├── models/                      # Model recipes (compose layer modules)
 │   ├── qwen3.*                  #   Qwen2/2.5/3 (pure transformer)
 │   ├── qwen35.*                 #   Qwen3.5 (attention + SSM)
-│   └── qwen36.*                 #   Qwen3.6 (DeltaNet + attention + MoE)
+│   ├── qwen36.*                 #   Qwen3.6 (DeltaNet + attention + MoE)
+│   └── gemma1-4.*               #   Gemma family (logit soft-cap, sliding-window, PLE, pruned RoPE)
 ├── loader/                      # GGUF parsing, mmap tensor loading, tokenizer
 ├── sampling/                    # Sampling, grammar, token-trie, speculative decoding
 ├── server/                      # Inference server + OpenAI-compatible HTTP API

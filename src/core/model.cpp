@@ -357,6 +357,31 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
                 blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
                 blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+            } else if (metadata_.architecture == "gemma4") {
+                // Gemma 4 (G4.8):
+                //   - QK-norm weights ARE bound to the block (q_norm/k_norm slots)
+                //     because every layer uses them — unlike G2/G3 which fetch
+                //     them via ggml_get_tensor.
+                //   - attn_v.weight is CONDITIONAL: present only on sliding
+                //     layers; global layers reuse K as V (no attn_v in GGUF).
+                //     Bind nullptr on global layers; the recipe checks
+                //     `w.attn_v == nullptr` and aliases V == K accordingly.
+                //   - Dual-FFN, MoE expert weights, sandwich norms, and
+                //     layer_output_scale live outside the generic
+                //     TransformerBlock struct and are resolved by the recipe
+                //     via ggml_get_tensor (Gemma4ForwardPass::require_tensor).
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
+                blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+                {
+                    // attn_v conditional — sliding-only.
+                    auto v_it = tensors.find(prefix + "attn_v.weight");
+                    blocks_[i].attn_v_weight =
+                        (v_it != tensors.end()) ? v_it->second : nullptr;
+                }
             }
         }
     }

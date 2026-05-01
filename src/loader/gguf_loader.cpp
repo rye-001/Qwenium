@@ -290,9 +290,38 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
             metadata_.attention_head_count = read_value_from_mem<uint32_t>(offset);
             metadata_.raw_kv.set(key, metadata_.attention_head_count);
         } else if (key == prefix + "attention.head_count_kv") {
-            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
-            metadata_.attention_head_count_kv = read_value_from_mem<uint32_t>(offset);
-            metadata_.raw_kv.set(key, metadata_.attention_head_count_kv);
+            // Gemma 4 stores this as a per-layer ARRAY of UINT32 (one entry
+            // per block) because global vs sliding layers have different KV
+            // head counts.  Existing architectures (Qwen, Gemma 1/2/3) keep
+            // it as a scalar UINT32 — accept both.
+            //
+            // Array form: skip the bytes; leave the typed scalar member at
+            // its default (0) and don't populate raw_kv.  The recipe is
+            // responsible for deriving per-layer values (Gemma4Config does
+            // this from blk.<il>.attn_k.weight shapes — no GGUFKVBag array
+            // support required).  Storing only the first element here would
+            // be a foot-gun: any consumer treating it as the uniform value
+            // would silently get wrong results.
+            if (type == GGUFValueType::UINT32) {
+                metadata_.attention_head_count_kv = read_value_from_mem<uint32_t>(offset);
+                metadata_.raw_kv.set(key, metadata_.attention_head_count_kv);
+            } else if (type == GGUFValueType::ARRAY) {
+                const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
+                if (array_type != GGUFValueType::UINT32 && array_type != GGUFValueType::INT32) {
+                    throw GGUFLoadError(
+                        key + ": expected ARRAY<UINT32> or UINT32, "
+                              "got ARRAY of element-type " +
+                        std::to_string(static_cast<int>(array_type)));
+                }
+                const uint64_t n = read_value_from_mem<uint64_t>(offset);
+                for (uint64_t i = 0; i < n; ++i) {
+                    (void)read_value_from_mem<uint32_t>(offset);
+                }
+            } else {
+                throw GGUFLoadError(
+                    key + ": expected UINT32 or ARRAY<UINT32>, got type " +
+                    std::to_string(static_cast<int>(type)));
+            }
         } else if (key == prefix + "attention.key_length") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.attention_key_length = read_value_from_mem<uint32_t>(offset);

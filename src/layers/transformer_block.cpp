@@ -24,9 +24,31 @@ ggml_tensor* build_transformer_layer(
     const TransformerBlockHparams& hp,
     uint32_t                       il,
     uint32_t                       slot_idx,
-    uint32_t                       n_tokens)
+    uint32_t                       n_tokens,
+    ggml_tensor*                   ple_residual)
 {
+    // G4.2: PLE second-residual injection.
+    // Injection point: block entry, before the pre-attention norm.  The
+    // injected tensor becomes part of the residual stream — subsequent
+    // norms, attention, and FFN all see the post-injection value, and the
+    // final residual reuses it via inpSA below.
+    // ple_residual == nullptr → degenerate to the Qwen / Gemma 1/2/3 path
+    //   (no ggml_add node emitted; bit-identical to before this PR).
+    // ple_residual all-zeros  → identity (ggml_add of zeros): the path is
+    //   bit-identical at the value level, by ggml's add semantics.
+    if (ple_residual != nullptr) {
+        cur = ggml_add(ctx, cur, ple_residual);
+        tblk_name(cur, "cur_with_ple", il);
+    }
+
     ggml_tensor* inpSA = cur;
+
+    // Resolve per-layer shape overrides (G4.1).
+    // Zero-defaults degrade to the existing uniform-shape behavior for all
+    // recipes that do not set these fields (Qwen, Gemma 1/2/3).
+    const int head_dim_k = hp.head_dim_k ? hp.head_dim_k : hp.n_embd_head;
+    const int head_dim_v = hp.head_dim_v ? hp.head_dim_v : hp.n_embd_head;
+    const int n_rot      = hp.rope_dim   ? hp.rope_dim   : hp.n_embd_head;
 
     // Pick the norm builder once. Gemma's (1+w) form is the same shape but
     // a different scaling — selecting it here keeps the rest of the block
@@ -63,11 +85,14 @@ ggml_tensor* build_transformer_layer(
         tblk_name(Vcur, "Vcur_biased", il);
     }
 
+    // Q is always shaped by n_embd_head (Q head dim).
+    // K and V use head_dim_k/v which may differ from n_embd_head when
+    // head_dim_k/v are explicitly set (e.g. Gemma 4 global layers).
     Qcur = ggml_reshape_3d(ctx, Qcur, hp.n_embd_head, hp.n_head,    n_tokens);
     tblk_name(Qcur, "Qcur_3d", il);
-    Kcur = ggml_reshape_3d(ctx, Kcur, hp.n_embd_head, hp.n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx, Kcur, head_dim_k, hp.n_head_kv, n_tokens);
     tblk_name(Kcur, "Kcur_3d", il);
-    Vcur = ggml_reshape_3d(ctx, Vcur, hp.n_embd_head, hp.n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx, Vcur, head_dim_v, hp.n_head_kv, n_tokens);
     tblk_name(Vcur, "Vcur_3d", il);
 
     // C. Optional QK RMS norms (qwen3 only)
@@ -77,8 +102,7 @@ ggml_tensor* build_transformer_layer(
         tblk_name(Qcur, "Qcur_normed", il);
     }
 
-    // D. RoPE
-    const int n_rot = hp.n_embd_head;
+    // D. RoPE — n_rot may be < head_dim_k (p-RoPE lands in G4.5).
     Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
                           n_rot, GGML_ROPE_TYPE_NEOX, hp.context_length,
                           hp.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
@@ -94,10 +118,12 @@ ggml_tensor* build_transformer_layer(
     tblk_name(Kcur, "Kcur_roped", il);
 
     // E. Grouped-Query Attention
+    // kq_scale uses Q head dim (hp.n_embd_head) — correct regardless of K/V head dims.
     const float kq_scale = 1.0f / sqrtf(static_cast<float>(hp.n_embd_head));
     cur = build_attention(ctx, gf, kv_cache, Qcur, Kcur, Vcur,
                           static_cast<int>(il), kq_scale, n_tokens, slot_idx,
-                          static_cast<int>(il), hp.n_embd_head, hp.n_head_kv,
+                          static_cast<int>(il),
+                          head_dim_k, head_dim_v, hp.n_head_kv,
                           hp.attn_softcap);
 
     // F. Output projection

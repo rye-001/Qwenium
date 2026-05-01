@@ -1,5 +1,8 @@
 #include "kv_cache_simple.h"
 
+#include <stdexcept>
+#include <string>
+
 simple_kv_cache::simple_kv_cache(
         uint32_t n_layers,
         uint32_t n_ctx_max,
@@ -8,7 +11,7 @@ simple_kv_cache::simple_kv_cache(
         uint32_t n_embd_v,
         ggml_type type_k,
         ggml_type type_v,
-        ggml_backend_t backend) : 
+        ggml_backend_t backend) :
     n_layers(n_layers),
     n_ctx_max(n_ctx_max),
     n_batch_max(n_batch_max),
@@ -16,10 +19,65 @@ simple_kv_cache::simple_kv_cache(
     n_embd_v(n_embd_v),
     type_k(type_k),
     type_v(type_v),
-    backend(backend), 
+    backend(backend),
     buf(nullptr, ggml_backend_buffer_free),
     ctx(nullptr, ggml_free) {
-    
+
+    positions.resize(n_batch_max, 0);
+    init_cache();
+}
+
+// reference-mode constructor ─────────────────────────────────────────
+simple_kv_cache::simple_kv_cache(
+        uint32_t n_layers,
+        uint32_t n_ctx_max,
+        uint32_t n_batch_max,
+        uint32_t n_embd_k,
+        uint32_t n_embd_v,
+        ggml_type type_k,
+        ggml_type type_v,
+        ggml_backend_t backend,
+        const std::vector<KvSharingSpec>& sharing) :
+    n_layers(n_layers),
+    n_ctx_max(n_ctx_max),
+    n_batch_max(n_batch_max),
+    n_embd_k(n_embd_k),
+    n_embd_v(n_embd_v),
+    type_k(type_k),
+    type_v(type_v),
+    backend(backend),
+    buf(nullptr, ggml_backend_buffer_free),
+    ctx(nullptr, ggml_free),
+    sharing_(sharing) {
+
+    if (!sharing_.empty() && sharing_.size() != n_layers) {
+        throw std::runtime_error(
+            "simple_kv_cache: field \"sharing.size\" expected " +
+            std::to_string(n_layers) + ", got " +
+            std::to_string(sharing_.size()));
+    }
+
+    // Fail-loud: every reference must point to an in-range, owning layer.
+    // Catching the malformed spec at construction beats discovering it at
+    // graph-build time when k_cache[il] would silently be nullptr.
+    for (size_t il = 0; il < sharing_.size(); ++il) {
+        if (!sharing_[il].is_reference) continue;
+        const int src = sharing_[il].source_layer;
+        if (src < 0 || src >= static_cast<int>(il)) {
+            throw std::runtime_error(
+                "simple_kv_cache: layer " + std::to_string(il) +
+                " field \"source_layer\" expected in [0, " +
+                std::to_string(il) + "), got " + std::to_string(src));
+        }
+        if (sharing_[src].is_reference) {
+            throw std::runtime_error(
+                "simple_kv_cache: layer " + std::to_string(il) +
+                " references layer " + std::to_string(src) +
+                " which is itself a reference; expected an owning layer "
+                "(transitive aliasing not supported)");
+        }
+    }
+
     positions.resize(n_batch_max, 0);
     init_cache();
 }
@@ -36,11 +94,17 @@ void simple_kv_cache::init_cache() {
     };
     ctx.reset(ggml_init(params));
 
-    // Create tensors (metadata only, no data allocated yet)
+    // Create tensors (metadata only, no data allocated yet).
+    // reference layers do NOT allocate their own tensors — their
+    // k_cache[il] / v_cache[il] are bound to the source layer's tensors
+    // after the buffer is allocated below.  Skipping allocation here is
+    // what makes reference mode "free" memory-wise.
     k_cache.resize(n_layers);
     v_cache.resize(n_layers);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        const bool is_ref = !sharing_.empty() && sharing_[il].is_reference;
+        if (is_ref) continue;  // bind below
         k_cache[il] = ggml_new_tensor_3d(ctx.get(), type_k, n_embd_k, n_ctx_max, n_batch_max);
         v_cache[il] = ggml_new_tensor_3d(ctx.get(), type_v, n_embd_v, n_ctx_max, n_batch_max);
     }
@@ -53,9 +117,20 @@ void simple_kv_cache::init_cache() {
     } else {
         buffer_type = ggml_backend_cpu_buffer_type();
     }
-    
+
     // Allocate buffer and assign all tensors to it
     buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buffer_type));
+
+    // now that the source layers' tensors are backed by real storage,
+    // alias every reference layer's slot to its source.  Reads through
+    // get_k / get_v on the reference layer hit the same backing memory the
+    // source's writes go to, so cross-layer KV sharing is "free" at runtime.
+    for (uint32_t il = 0; il < sharing_.size(); ++il) {
+        if (!sharing_[il].is_reference) continue;
+        const int src = sharing_[il].source_layer;
+        k_cache[il] = k_cache[src];
+        v_cache[il] = v_cache[src];
+    }
 
 
 

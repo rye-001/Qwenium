@@ -9,6 +9,7 @@ add_library(qinf-layers STATIC
     moe.cpp
     moe_residency.cpp
     norm.cpp
+    ple.cpp           # Per-Layer Embedding lookup + projection
     transformer_block.cpp
 )
 

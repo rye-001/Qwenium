@@ -160,12 +160,19 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
 
             // Decode phase
             for (int i = 0; i < args.max_tokens; ++i) {
+                // We decode the token
                 std::string decoded_token = tokenizer->decode(next_token_id);
+                std::string im_end_str = tmpl.turn_end_suffix();
 
-                if (next_token_id == eos_token_id) {
-                    break;
+                // If the turn_end_suffix has a newline, strip it for comparison if the token is just the marker
+                std::string marker_only = im_end_str;
+                if (!marker_only.empty() && marker_only.back() == '\n') {
+                    marker_only.pop_back();
                 }
 
+                if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == marker_only) {
+                    break;
+                }
                 log_token(next_token_id);
                 print_token(decoded_token);
                 assistant_response += decoded_token;

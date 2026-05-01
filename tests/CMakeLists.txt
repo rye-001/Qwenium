@@ -399,6 +399,51 @@ target_link_libraries(gemma-tokenizer-tests PRIVATE
 target_compile_features(gemma-tokenizer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma-tokenizer-tests)
 
+# ── G4.7: Gemma 4 tokenizer + chat template tests ────────────────────────────
+# Covers gemma4_tokenizer_config() shape, encode/decode round-trip with
+# BOS=2 / EOS=106, and registry dispatch ("gemma4" → GemmaChatTemplate +
+# gemma4_tokenizer_config()).  No model file required.
+add_executable(gemma4-tokenizer-tests
+    unit/test_tokenizer_gemma4.cpp
+)
+target_link_libraries(gemma4-tokenizer-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+    qinf-models
+)
+target_compile_features(gemma4-tokenizer-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma4-tokenizer-tests)
+
+add_executable(gemma4-chat-template-tests
+    unit/test_chat_template_gemma4.cpp
+)
+target_link_libraries(gemma4-chat-template-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(gemma4-chat-template-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma4-chat-template-tests)
+
+# Gemma4Config + inventory validator unit tests ──────────────────────
+# Pure-unit (no model file). Synthesizes A4B-shaped metadata + tensor
+# inventory in memory and exercises Gemma4Config::from_metadata + the
+# widened validate_gemma4_inventory.
+add_executable(gemma4-recipe-tests
+    unit/test_gemma4_recipe.cpp
+)
+target_link_libraries(gemma4-recipe-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(gemma4-recipe-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma4-recipe-tests)
+
 # GGUFKVBag unit tests — no model file needed.
 # Covers: round-trip set/get for each scalar type; missing-key / wrong-type
 # fail-loud; optional accessor (nullopt / value / wrong-type throw); contains().
@@ -432,7 +477,7 @@ target_link_libraries(loader-tests PRIVATE
 target_compile_features(loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(loader-tests)
 
-# Model registry tests (PR G1.6) — no model file needed.
+# Model registry tests — no model file needed.
 add_executable(model-registry-tests
     unit/test_model_registry.cpp
 )
@@ -464,7 +509,89 @@ target_link_libraries(transformer-block-tests PRIVATE
 target_compile_features(transformer-block-tests PRIVATE cxx_std_17)
 gtest_discover_tests(transformer-block-tests)
 
-# ── Gemma 2 unit tests (Phase G2) ────────────────────────────────────────────
+# LayerSpec and per-layer attention shape tests ──────────────────────
+# Covers: LayerSpec vector construction from synthetic per-layer arrays;
+#   degenerate case bit-identical to zero-default path; asymmetric head_dim
+#   build-and-compute succeeds (finite output).  No model file required.
+add_executable(layer-spec-tests
+    unit/test_layer_spec.cpp
+    unit/test_transformer_block_ple.cpp   # G4.2 second-residual slot
+)
+
+target_link_libraries(layer-spec-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    qinf-state
+    ggml
+)
+
+target_compile_features(layer-spec-tests PRIVATE cxx_std_17)
+gtest_discover_tests(layer-spec-tests)
+
+# Pruned RoPE op tests ───────────────────────────────────────────────
+# Covers: zero-position identity; tail dims pass through; full rotation matches
+# direct ggml_rope_ext; non-trivial rotation under pos>0; NEOX-pair oracle.
+# No model file required.
+add_executable(rope-pruned-tests
+    unit/test_rope_pruned.cpp
+)
+target_link_libraries(rope-pruned-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+target_compile_features(rope-pruned-tests PRIVATE cxx_std_17)
+gtest_discover_tests(rope-pruned-tests)
+
+# Final logit soft-cap tests ─────────────────────────────────────────
+# Covers: build_softcap on an LM-head-shaped tensor with
+# cap=30.  Hand-rolled oracle: 30 * tanh(x/30) over a curated value range.
+# No model file required.
+add_executable(gemma4-final-softcap-tests
+    unit/test_gemma4_final_softcap.cpp
+)
+target_link_libraries(gemma4-final-softcap-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+target_compile_features(gemma4-final-softcap-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma4-final-softcap-tests)
+
+# PLE (per-layer embedding) op tests ─────────────────────────────────
+# Covers: build_ple lookup + projection against a synthetic oracle.  PLE is
+# inactive in the 26B-A4B checkpoint (embedding_length_per_layer_input=0);
+# this is the synthetic-config gate the dense 31B follow-up will promote.
+# No model file required.
+add_executable(ple-tests
+    unit/test_ple.cpp
+)
+target_link_libraries(ple-tests PRIVATE
+    GTest::gtest_main
+    qinf-layers
+    ggml
+)
+target_compile_features(ple-tests PRIVATE cxx_std_17)
+gtest_discover_tests(ple-tests)
+
+# KV cache reference-mode tests ──────────────────────────────────────
+# Covers: synthetic state-isolation — the last N layers are configured as
+# references to a producing layer; verifies (a) reference layers' K/V tensors
+# alias the source layer, (b) writes to the source are visible at the reference
+# without an explicit copy.  Inactive in 26B-A4B (shared_kv_layers=0).  No
+# model file required.
+add_executable(kv-reference-mode-tests
+    unit/test_kv_reference_mode.cpp
+)
+target_link_libraries(kv-reference-mode-tests PRIVATE
+    GTest::gtest_main
+    qinf-state
+    ggml
+)
+target_compile_features(kv-reference-mode-tests PRIVATE cxx_std_17)
+gtest_discover_tests(kv-reference-mode-tests)
+
+# ── Gemma 2 unit tests ────────────────────────────────────────────
 
 # Softcap op: build_softcap(x, cap) = cap * tanh(x/cap) — no model file needed.
 add_executable(gemma2-softcap-tests
@@ -505,7 +632,7 @@ target_link_libraries(gemma2-sliding-window-tests PRIVATE
 target_compile_features(gemma2-sliding-window-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma2-sliding-window-tests)
 
-# ── Gemma 3 unit tests (Phase G3) ────────────────────────────────────────────
+# ── Gemma 3 unit tests ────────────────────────────────────────────
 
 # Gemma3Config: 5:1 window pattern, per-layer RoPE base, QK-norm semantics.
 # No model file required.
@@ -522,7 +649,7 @@ target_link_libraries(gemma3-config-tests PRIVATE
 target_compile_features(gemma3-config-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma3-config-tests)
 
-# Gemma 3 forward pass integration test (PR G3.4).
+# Gemma 3 forward pass integration test.
 # Self-skips when GEMMA3_MODEL_PATH is unset and default file is absent.
 add_executable(forward-tests-gemma3
     unit/test_gemma3_forward.cpp

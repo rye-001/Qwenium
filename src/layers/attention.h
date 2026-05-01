@@ -35,6 +35,28 @@ ggml_tensor* build_softcap(
     ggml_tensor*  x,
     float         cap);
 
+// Pruned RoPE (p-RoPE — Gemma 4 global layers).
+//
+// Applies NEOX-style RoPE rotation to only the first n_rot dimensions of each
+// head; the remaining (head_dim - n_rot) dimensions pass through unchanged.
+// When n_rot == head_dim this is bit-identical to standard full-head RoPE.
+//
+// x:           [head_dim, n_head, n_tokens] (or [head_dim, n_kv, n_tokens])
+// inp_pos:     [n_tokens] I32 token-position indices.
+// n_rot:       number of leading head dimensions to rotate (1 ≤ n_rot ≤ head_dim).
+// context_len: original training context length (RoPE extension parameter).
+// freq_base:   RoPE frequency base.
+//
+// The implementation delegates to ggml_rope_ext with NEOX type; the trailing
+// (head_dim - n_rot) elements are left untouched by the kernel.
+ggml_tensor* build_rope_pruned(
+    ggml_context* ctx,
+    ggml_tensor*  x,
+    ggml_tensor*  inp_pos,
+    int           n_rot,
+    int           context_len,
+    float         freq_base);
+
 // Core MHA kernel: Q@K^T → [optional softcap] → softmax(scale, mask) → @V.
 // Handles GQA, head permutation, stream splitting, and contiguous recombination.
 // softcap: attention logit soft-capping value (0.0 = off — Qwen/Gemma-1 path
@@ -57,9 +79,13 @@ ggml_tensor* build_attn_mha(
 // Prefill / single-slot attention.
 // Writes K/V to the cache at the current slot position, reads the full
 // cached sequence, builds a per-layer causal mask, then runs MHA.
-// n_embd_head and n_head_kv are the per-architecture dimension values
-// computed by the caller from ModelMetadata.
+//
+// head_dim_k: K per-head dimension (used for both K-cache view dimensions).
+// head_dim_v: V per-head dimension.  For almost all models head_dim_k ==
+//   head_dim_v; they are kept separate to support future asymmetric cases.
+// n_head_kv: number of KV heads (GQA).
 // softcap: forwarded to build_attn_mha (0.0 = off; Qwen/Gemma-1 unchanged).
+//
 // Extracted from Qwen3ForwardPass::_build_attention_layer — identical logic.
 ggml_tensor* build_attention(
     ggml_context*     ctx,
@@ -73,7 +99,8 @@ ggml_tensor* build_attention(
     uint32_t          n_tokens,
     uint32_t          slot_idx,
     int               il,
-    int               n_embd_head,
+    int               head_dim_k,
+    int               head_dim_v,
     int               n_head_kv,
     float             softcap = 0.0f);
 
