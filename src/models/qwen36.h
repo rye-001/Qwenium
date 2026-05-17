@@ -86,15 +86,8 @@ public:
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>&  positions) override;
 
-    // ── Input setting ────────────────────────────────────────────────────────
-    void set_inputs(ggml_cgraph* gf,
-                    const std::vector<int32_t>& tokens,
-                    int pos) override;
-
-    void set_batched_inputs(ggml_cgraph* gf,
-                            const std::vector<int32_t>& tokens,
-                            const std::vector<uint32_t>& slots,
-                            const std::vector<int32_t>&  positions) override;
+    // Inputs are populated via the typed graph_inputs_ set built in
+    // build_prefill_graph / build_decoding_graph (no set_inputs override).
 
     // ── Cache management ─────────────────────────────────────────────────────
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {

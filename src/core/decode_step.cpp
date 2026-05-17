@@ -31,18 +31,20 @@ int32_t decode_step(
     uint32_t               vocab_size,
     bool                   force_dense
 ) {
-    // 0. BRIDGE (Option 1 pending): build_decoding_graph has no TurboQuant
-    //    support — under TQ the recipe's full kv_cache_ is intentionally null,
-    //    so the decode graph would pass a null cache into attention and
-    //    segfault. Refuse the TQ-unaware decode graph here and route through
-    //    the legacy per-recipe single-token run_prefill path, which IS
-    //    TQ-aware (decompress-before / compress-after, scratch-cache select).
+    // 0. BRIDGE: route to the legacy single-token run_prefill path when the
+    //    unified decode graph can't be used. Two reasons, same destination:
+    //      (a) tq_active()       — build_decoding_graph has no TurboQuant
+    //          support (kv_cache_ is null under TQ → would segfault); the
+    //          legacy run_prefill IS TQ-aware. (Option 1 pending.)
+    //      (b) !has_decode_graph() — recipe's build_decoding_graph is
+    //          unimplemented and throws (Gemma 1–4); single-token run_prefill
+    //          is that recipe's only decode mechanism.
     //    This is exactly how decode worked before decode_step existed.
     //    NOTE: no sparse LM head on this path — run_prefill builds the full
-    //    output. Grammar masking still applies via sampler->sample(). When TQ
-    //    ownership moves into the cache (Option 1), this branch is deleted and
-    //    the unified graph path handles TQ transparently.
-    if (fp->tq_active()) {
+    //    output. Grammar masking still applies via sampler->sample(). Deferred:
+    //    collapse the two predicates into one intent-named query so a third
+    //    reason doesn't spawn a third boolean.
+    if (fp->tq_active() || !fp->has_decode_graph()) {
         const int32_t pos = static_cast<int32_t>(fp->get_cache_pos(slot));
         std::vector<float> logits =
             fp->run_prefill({token}, pos, slot, scheduler);
@@ -74,8 +76,7 @@ int32_t decode_step(
     ggml_backend_sched_reset(scheduler);
     ggml_cgraph* gf = fp->build_decoding_graph(tokens, slots, positions);
     ggml_backend_sched_alloc_graph(scheduler, gf);
-    fp->upload_sparse_indices();
-    fp->set_batched_inputs(gf, tokens, slots, positions);
+    fp->set_decode_inputs(gf, tokens, slots, positions);
     ggml_backend_sched_graph_compute(scheduler, gf);
     fp->advance_cache(1, slot);
 

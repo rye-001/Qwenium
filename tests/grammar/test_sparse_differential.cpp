@@ -37,7 +37,37 @@
 
 #include "ggml-backend.h"
 
+#include "ggml.h"
+#include <cstdint>
+#include <cstdio>
+
+// Tree-portable decode-input application. This one source file is compiled in
+// BOTH pre-refactor `main` (@7fac6f7) and the typed-graph-inputs branch so the
+// sparse dump is byte-comparable. The branch folded the sparse one-off
+// (set_sparse_decode_ids / upload_sparse_indices / consume-on-use clear) into
+// SparseHeadInput, applied via set_decode_inputs; `main` uses the legacy
+// upload_sparse_indices + set_batched_inputs. Select by header presence so the
+// SAME file compiles and produces identical bytes on each tree.
+#if defined(__has_include)
+#  if __has_include("../../src/graph_inputs/graph_input.h")
+#    define QINF_HAVE_TYPED_INPUTS 1
+#  endif
+#endif
+
 namespace {
+
+void apply_decode_inputs(ForwardPassBase* fp, ggml_cgraph* gf,
+                         const std::vector<int32_t>& toks,
+                         const std::vector<uint32_t>& slts,
+                         const std::vector<int32_t>& poss) {
+#ifdef QINF_HAVE_TYPED_INPUTS
+    fp->set_decode_inputs(gf, toks, slts, poss);
+#else
+    fp->upload_sparse_indices();
+    fp->set_batched_inputs(gf, toks, slts, poss);
+#endif
+}
+
 
 std::string slurp(const std::string& path) {
     std::ifstream f(path);
@@ -118,8 +148,7 @@ RunResult run_n(
                 ggml_backend_sched_reset(scheduler);
                 ggml_cgraph* gf = fp->build_decoding_graph(toks, slts, poss);
                 ggml_backend_sched_alloc_graph(scheduler, gf);
-                fp->upload_sparse_indices();
-                fp->set_batched_inputs(gf, toks, slts, poss);
+                apply_decode_inputs(fp, gf, toks, slts, poss);
                 ggml_backend_sched_graph_compute(scheduler, gf);
                 fp->advance_cache(1, slot);
                 std::vector<float> logits = fp->get_output_logits(gf);
@@ -168,8 +197,7 @@ RunResult run_n(
             ggml_backend_sched_reset(scheduler);
             ggml_cgraph* gf = fp->build_decoding_graph(tokens, slots, positions);
             ggml_backend_sched_alloc_graph(scheduler, gf);
-            fp->upload_sparse_indices();
-            fp->set_batched_inputs(gf, tokens, slots, positions);
+            apply_decode_inputs(fp, gf, tokens, slots, positions);
             ggml_backend_sched_graph_compute(scheduler, gf);
             fp->advance_cache(1, slot);
 
@@ -204,6 +232,72 @@ RunResult run_n(
     }
 
     return res;
+}
+
+// ── Sparse byte-identical dump (Phase 1 gate, 7th row) ────────────────────
+// Replicates decode_step's sparse branch EXACTLY (force_dense=false), but
+// captures the sparse path's actual internal state to a deterministic binary:
+// the peek_valid_set ids, the `valid_indices` graph-node readback (the direct
+// tripwire for the SparseHeadInput set/clear ORDERING bug — uninitialized or
+// prematurely-cleared indices show up here, invisible in post-mapped vocab
+// logits), the pre-mapping sparse [k] logits, and the chosen token. Same
+// format on both trees via apply_decode_inputs.
+
+void fwr_u64(FILE* f, uint64_t v) { std::fwrite(&v, sizeof(v), 1, f); }
+
+int32_t capture_sparse_step(FILE* f, ForwardPassBase* fp,
+                            ggml_backend_sched_t scheduler,
+                            qwenium::Sampler* sampler,
+                            const std::vector<std::string>& vocab,
+                            uint32_t vocab_size, int32_t token, uint32_t slot) {
+    // decode_step sparse decision (SPARSE_HEAD_FRACTION_DENOM = 8),
+    // force_dense=false, QWENIUM_FORCE_DENSE assumed unset (deterministic).
+    std::vector<int32_t> valid_ids = sampler->peek_valid_set();
+    const bool use_sparse = !valid_ids.empty() &&
+                            valid_ids.size() < vocab_size / 8;
+    fp->set_sparse_decode_ids(use_sparse ? valid_ids
+                                          : std::vector<int32_t>{});
+
+    const int32_t pos = static_cast<int32_t>(fp->get_cache_pos(slot));
+    const std::vector<int32_t>  toks = {token};
+    const std::vector<uint32_t> slts = {slot};
+    const std::vector<int32_t>  poss = {pos};
+
+    ggml_backend_sched_reset(scheduler);
+    ggml_cgraph* gf = fp->build_decoding_graph(toks, slts, poss);
+    ggml_backend_sched_alloc_graph(scheduler, gf);
+    apply_decode_inputs(fp, gf, toks, slts, poss);
+    ggml_backend_sched_graph_compute(scheduler, gf);
+    fp->advance_cache(1, slot);
+
+    std::vector<float> logits = fp->get_output_logits(gf);
+
+    // Read back the actual `valid_indices` graph node (post-compute, before
+    // the next reset). This is the ordering-bug tripwire.
+    std::vector<int32_t> node;
+    ggml_tensor* vi = ggml_graph_get_tensor(gf, "valid_indices");
+    if (vi) {
+        node.resize(static_cast<size_t>(vi->ne[0]));
+        ggml_backend_tensor_get(vi, node.data(), 0,
+                                node.size() * sizeof(int32_t));
+    }
+
+    std::vector<int32_t> history;
+    int32_t next = use_sparse
+        ? sampler->sample_sparse(logits, valid_ids, history)
+        : static_cast<int32_t>(sampler->sample(logits, history, vocab));
+    sampler->accept_token(next);
+
+    uint8_t us = use_sparse ? 1 : 0;
+    std::fwrite(&us, 1, 1, f);
+    fwr_u64(f, valid_ids.size());
+    std::fwrite(valid_ids.data(), sizeof(int32_t), valid_ids.size(), f);
+    fwr_u64(f, node.size());
+    std::fwrite(node.data(), sizeof(int32_t), node.size(), f);
+    fwr_u64(f, logits.size());
+    std::fwrite(logits.data(), sizeof(float), logits.size(), f);
+    std::fwrite(&next, sizeof(int32_t), 1, f);
+    return next;
 }
 
 } // namespace
@@ -316,6 +410,53 @@ int main(int argc, char** argv) {
         for (int32_t id : stop_ids) s->add_eos_token_id(id);
         return s;
     };
+
+    // ── Sparse byte-identical dump mode (Phase 1 gate, 7th row) ───────────
+    // QWENIUM_SPARSE_DUMP=<path>: run ONLY the sparse config (Run A: real
+    // grammar, force_dense=false) deterministically and write a binary the
+    // same way logits_dump.cpp does, so `cmp`/sha256 works branch-vs-main.
+    if (const char* dump_path = std::getenv("QWENIUM_SPARSE_DUMP")) {
+        auto s = make_sampler();
+        grammar->reset();
+        std::vector<float> prefill = forward_pass->run_prefill(
+            user_tokens, static_cast<int32_t>(system_tokens.size()),
+            slot_A, scheduler);
+        std::vector<float> last(prefill.end() - vocab_size, prefill.end());
+        std::vector<int32_t> hist0;
+        int32_t first = static_cast<int32_t>(
+            s->sample(last, hist0, decoded_vocab));
+        grammar->accept_token(first, decoded_vocab);
+
+        FILE* f = std::fopen(dump_path, "wb");
+        if (!f) { std::perror("fopen"); return 1; }
+        // 1. Full dense prefill logits (sanity; same path as existing gate).
+        fwr_u64(f, prefill.size());
+        std::fwrite(prefill.data(), sizeof(float), prefill.size(), f);
+        // 2. First token (chosen at prefill under grammar).
+        std::fwrite(&first, sizeof(int32_t), 1, f);
+        // 3. Eight grammar-constrained sparse decode steps, full internal
+        //    state per step (valid ids, valid_indices node, [k] logits, tok).
+        int32_t tok = first;
+        uint8_t n_steps = 0;
+        long count_pos = std::ftell(f);
+        std::fwrite(&n_steps, 1, 1, f);  // placeholder, rewritten below
+        for (int i = 0; i < 8; ++i) {
+            tok = capture_sparse_step(f, forward_pass.get(), scheduler,
+                                      s.get(), decoded_vocab, vocab_size,
+                                      tok, slot_A);
+            ++n_steps;
+            bool eos = false;
+            for (int32_t sid : stop_ids) if (tok == sid) { eos = true; break; }
+            if (eos) break;
+        }
+        std::fseek(f, count_pos, SEEK_SET);
+        std::fwrite(&n_steps, 1, 1, f);
+        std::fclose(f);
+        std::fprintf(stderr,
+            "[sparse-dump] wrote %s: %zu prefill floats, first=%d, %u steps\n",
+            dump_path, prefill.size(), first, (unsigned)n_steps);
+        return 0;
+    }
 
     const char* probe_env = std::getenv("QWENIUM_DIFF_PROBE");
     const bool do_probe = probe_env && std::string(probe_env) == "1";

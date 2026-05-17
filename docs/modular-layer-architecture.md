@@ -719,8 +719,8 @@ variants of the same concept exist, grep-uniqueness dies and both
 humans and agents rank false positives.
 
 **No dumping grounds.** `src/` contains only directories that name a
-concept from this spec (`layers/`, `state/`, `models/`, `metal/`,
-`sampling/`, `quant/`, `loader/`, `cli/`, `server/`). Do not add
+concept from this spec (`layers/`, `state/`, `graph_inputs/`, `models/`,
+`metal/`, `sampling/`, `quant/`, `loader/`, `cli/`, `server/`). Do not add
 `util/`, `common/`, `misc/`, `helpers/`. If a piece of code doesn't
 fit in one of the named directories, either (a) it belongs in a new
 concept-named directory whose purpose is stated in this spec, or

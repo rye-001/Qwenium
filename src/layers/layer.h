@@ -24,7 +24,7 @@ enum class Phase {
 // Attention mask topology for one layer.
 // Global  — full causal attention over the entire KV cache.
 // Sliding — causal attention limited to the last `window` tokens.
-// Used by LayerSpec and by the recipe's set_inputs() to fill the KQ mask.
+// Used by LayerSpec and by the recipe's AttnMaskInput window to fill the KQ mask.
 enum class AttentionKind {
     Global,   // full causal mask (window == 0)
     Sliding,  // sliding-window mask (window > 0)

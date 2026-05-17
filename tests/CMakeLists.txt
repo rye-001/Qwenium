@@ -19,12 +19,19 @@ add_executable(unit-tests
     unit/test_qwen35_generation.cpp
     unit/test_grammar_vocab.cpp
     unit/test_turboquant_generation.cpp
+    unit/test_graph_input.cpp
+    unit/test_tokens_input.cpp
+    unit/test_positions_input.cpp
+    unit/test_attn_mask_input.cpp
+    unit/test_gather_indices_input.cpp
+    unit/test_sparse_head_input.cpp
 )
 
 # Link libraries for unit tests
 target_link_libraries(unit-tests PRIVATE
     GTest::gtest_main
     qinf-models
+    qinf-graph-inputs
     core
     sampling
     ggml
@@ -50,6 +57,18 @@ target_link_libraries(integration-tests PRIVATE
 
 # Discover and add integration tests to CTest
 gtest_discover_tests(integration-tests)
+
+# Byte-identical differential harness (compile-identical on main + branch).
+add_executable(logits-dump
+    diff/logits_dump.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+)
+target_link_libraries(logits-dump PRIVATE
+    qinf-models
+    core
+    sampling
+    ggml
+)
 
 # Define the standalone order management test (Non-GTest)
 add_executable(order-mngmt-test

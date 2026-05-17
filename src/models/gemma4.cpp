@@ -4,6 +4,9 @@
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
 #include "../layers/norm.h"
+#include "../graph_inputs/tokens_input.h"
+#include "../graph_inputs/positions_input.h"
+#include "../graph_inputs/attn_mask_input.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -13,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -610,6 +614,16 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    // Typed inputs (replaces set_inputs). Per-layer sliding window is a
+    // parameter on AttnMaskInput: global layers => 0, sliding => window.
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    for (uint32_t il = 0; il < config_.n_layers; ++il)
+        graph_inputs_.add(std::make_unique<AttnMaskInput>(
+            "kq_mask." + std::to_string(il),
+            config_.is_global[il] ? 0u : config_.sliding_window));
+
     // 3. Transformer stack (manual composition; build_transformer_layer
     //    can't host this — see the gemma4.h scope comment).
     for (uint32_t il = 0; il < config_.n_layers; ++il) {
@@ -646,73 +660,6 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     return gf;
 }
 
-// ── set_inputs ───────────────────────────────────────────────────────────────
-
-void Gemma4ForwardPass::set_inputs(ggml_cgraph* gf,
-                                    const std::vector<int32_t>& tokens,
-                                    int pos)
-{
-    const uint32_t n_tokens = static_cast<uint32_t>(tokens.size());
-
-    // ── DEBUG: dump first ~16 tokens & positions of first prefill call ──────
-    static int dbg_call = 0;
-    if (dbg_call < 3) {
-        std::fprintf(stderr, "[G4DBG] set_inputs call #%d: n_tokens=%u  pos=%d\n",
-                     dbg_call, n_tokens, pos);
-        const size_t lim = std::min<size_t>(tokens.size(), 16);
-        std::fprintf(stderr, "[G4DBG]   tokens[0..%zu]:", lim);
-        for (size_t i = 0; i < lim; ++i) std::fprintf(stderr, " %d", tokens[i]);
-        std::fprintf(stderr, "%s\n", tokens.size() > lim ? " …" : "");
-        dbg_call++;
-    }
-
-    ggml_tensor* tokens_t = ggml_graph_get_tensor(gf, "tokens");
-    if (!tokens_t) {
-        throw std::runtime_error(
-            "Gemma4ForwardPass::set_inputs: 'tokens' tensor not found in graph");
-    }
-    ggml_backend_tensor_set(tokens_t, tokens.data(), 0,
-                            tokens.size() * sizeof(int32_t));
-
-    ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!inp_pos) {
-        throw std::runtime_error(
-            "Gemma4ForwardPass::set_inputs: 'inp_pos' tensor not found");
-    }
-    std::vector<int32_t> positions(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        positions[i] = pos + static_cast<int32_t>(i);
-    }
-    ggml_backend_tensor_set(inp_pos, positions.data(), 0,
-                            positions.size() * sizeof(int32_t));
-
-    // Per-layer KQ mask: causal for global; causal + window cutoff for sliding.
-    for (uint32_t il = 0; il < config_.n_layers; ++il) {
-        char name[32];
-        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
-        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
-        if (!kq_mask) {
-            throw std::runtime_error(
-                "Gemma4ForwardPass::set_inputs: kq_mask tensor not found "
-                "for layer " + std::to_string(il));
-        }
-        const uint32_t n_kv = kq_mask->ne[0];
-        const uint32_t window = config_.is_global[il] ? 0u : config_.sliding_window;
-
-        std::vector<float> mask(n_kv * n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const uint32_t q_pos = static_cast<uint32_t>(pos) + i;
-            for (uint32_t j = 0; j < n_kv; ++j) {
-                const bool causal = (j <= q_pos);
-                const bool in_win = (window == 0) || (q_pos - j < window);
-                mask[i * n_kv + j] = (causal && in_win) ? 0.0f : -INFINITY;
-            }
-        }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0,
-                                n_kv * n_tokens * sizeof(float));
-    }
-}
-
 // ── DEBUG run_prefill: read back intermediates after compute ─────────────────
 std::vector<float> Gemma4ForwardPass::run_prefill(
     const std::vector<int32_t>& tokens,
@@ -723,7 +670,7 @@ std::vector<float> Gemma4ForwardPass::run_prefill(
     ggml_backend_sched_reset(scheduler);
     ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
     ggml_backend_sched_alloc_graph(scheduler, gf);
-    set_inputs(gf, tokens, pos);
+    set_prefill_inputs(gf, tokens, pos);
     ggml_backend_sched_graph_compute(scheduler, gf);
 
     if (dbg_call < 2) {
@@ -786,18 +733,6 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     // (the class of bug fixed in qwen3.cpp / qwen35.cpp).
     throw std::runtime_error(
         "Gemma4ForwardPass::build_decoding_graph: batched decode not "
-        "implemented in PR G4.8 (architecture='gemma4'); expected: "
-        "prefill-only path, got: batched call");
-}
-
-void Gemma4ForwardPass::set_batched_inputs(
-    ggml_cgraph* /*gf*/,
-    const std::vector<int32_t>& /*tokens*/,
-    const std::vector<uint32_t>& /*slots*/,
-    const std::vector<int32_t>& /*positions*/)
-{
-    throw std::runtime_error(
-        "Gemma4ForwardPass::set_batched_inputs: batched decode not "
         "implemented in PR G4.8 (architecture='gemma4'); expected: "
         "prefill-only path, got: batched call");
 }

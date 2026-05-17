@@ -32,7 +32,6 @@ public:
         : ForwardPassBase(m, meta) {}
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t) override { return nullptr; }
-    void set_inputs(ggml_cgraph*, const std::vector<int32_t>&, int) override {}
     void advance_cache(uint32_t, uint32_t) override {}
     void clear_slot(uint32_t) override {}
     void set_cache_pos(uint32_t, uint32_t) override {}
@@ -42,10 +41,6 @@ public:
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>&,
                                       const std::vector<uint32_t>&,
                                       const std::vector<int32_t>&) override { return nullptr; }
-    void set_batched_inputs(ggml_cgraph*,
-                            const std::vector<int32_t>&,
-                            const std::vector<uint32_t>&,
-                            const std::vector<int32_t>&) override {}
 
     static int construction_count;
 };

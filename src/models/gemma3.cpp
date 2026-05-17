@@ -4,11 +4,15 @@
 #include "../layers/ffn.h"
 #include "../layers/norm.h"
 #include "../layers/transformer_block.h"
+#include "../graph_inputs/tokens_input.h"
+#include "../graph_inputs/positions_input.h"
+#include "../graph_inputs/attn_mask_input.h"
 
 #include "ggml.h"
 
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 
@@ -172,6 +176,17 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    // Typed inputs (replaces set_inputs). Gemma 3 uses a 5:1 local:global
+    // pattern; the per-layer sliding window is a parameter on AttnMaskInput
+    // (config_.layer_window[il]; 0 = global). Per-layer RoPE base is a graph
+    // op, not an input — out of scope (plan scope fence).
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    for (uint32_t il = 0; il < config_.n_layers; ++il)
+        graph_inputs_.add(std::make_unique<AttnMaskInput>(
+            "kq_mask." + std::to_string(il), config_.layer_window[il]));
+
     // 2. Base block hyperparameters (per-layer freq_base is overwritten in the loop).
     TransformerBlockHparams blk_hp;
     blk_hp.is_qwen2       = false;
@@ -267,72 +282,3 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
         "implemented in PR G3.4; expected: prefill-only path, got: batched call");
 }
 
-// ── set_inputs ────────────────────────────────────────────────────────────────
-
-void Gemma3ForwardPass::set_inputs(ggml_cgraph* gf,
-                                    const std::vector<int32_t>& tokens,
-                                    int pos)
-{
-    const uint32_t n_tokens = static_cast<uint32_t>(tokens.size());
-
-    ggml_tensor* tokens_t = ggml_graph_get_tensor(gf, "tokens");
-    if (!tokens_t) {
-        throw std::runtime_error(
-            "Gemma3ForwardPass::set_inputs: 'tokens' tensor not found in graph");
-    }
-    ggml_backend_tensor_set(tokens_t, tokens.data(), 0,
-                            tokens.size() * sizeof(int32_t));
-
-    ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!inp_pos) {
-        throw std::runtime_error(
-            "Gemma3ForwardPass::set_inputs: 'inp_pos' tensor not found in graph");
-    }
-    std::vector<int32_t> positions(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        positions[i] = pos + static_cast<int32_t>(i);
-    }
-    ggml_backend_tensor_set(inp_pos, positions.data(), 0,
-                            positions.size() * sizeof(int32_t));
-
-    // Per-layer causal / sliding-window KQ mask.
-    // Global layers (layer_window == 0): standard causal mask.
-    // Local layers (layer_window > 0): additional window cutoff.
-    for (uint32_t il = 0; il < config_.n_layers; ++il) {
-        char name[32];
-        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
-        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
-        if (!kq_mask) {
-            throw std::runtime_error(
-                "Gemma3ForwardPass::set_inputs: kq_mask tensor not found "
-                "for layer " + std::to_string(il));
-        }
-        const uint32_t n_kv   = kq_mask->ne[0];
-        const uint32_t window = config_.layer_window[il];  // 0 = global
-
-        std::vector<float> mask(n_kv * n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const uint32_t q_pos = static_cast<uint32_t>(pos) + i;
-            for (uint32_t j = 0; j < n_kv; ++j) {
-                bool causal = (j <= q_pos);
-                bool in_win = (window == 0) || (q_pos - j < window);
-                mask[i * n_kv + j] = (causal && in_win) ? 0.0f : -INFINITY;
-            }
-        }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0,
-                                n_kv * n_tokens * sizeof(float));
-    }
-}
-
-// ── set_batched_inputs ────────────────────────────────────────────────────────
-
-void Gemma3ForwardPass::set_batched_inputs(
-    ggml_cgraph* /*gf*/,
-    const std::vector<int32_t>& /*tokens*/,
-    const std::vector<uint32_t>& /*slots*/,
-    const std::vector<int32_t>& /*positions*/)
-{
-    throw std::runtime_error(
-        "Gemma3ForwardPass::set_batched_inputs: batched decode not implemented "
-        "in PR G3.4; expected: prefill-only path, got: batched call");
-}

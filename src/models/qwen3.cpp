@@ -4,12 +4,17 @@
 #include "../layers/transformer_block.h"
 #include "../state/turboquant.h"
 #include "../state/snapkv.h"
+#include "../graph_inputs/tokens_input.h"
+#include "../graph_inputs/positions_input.h"
+#include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/gather_indices_input.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <iostream>
 #include <cmath>
 #include <cinttypes>
+#include <memory>
 #include <future>
 #include <sstream>
 #include <thread>
@@ -140,6 +145,16 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    // Typed inputs for this graph (replaces set_inputs). Cleared here so
+    // build_output_head can append SparseHeadInput on the sparse path; one
+    // uniform causal mask per (all-attention) layer, no sliding window.
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    for (uint32_t il = 0; il < static_cast<uint32_t>(n_layers); ++il)
+        graph_inputs_.add(std::make_unique<AttnMaskInput>(
+            "kq_mask." + std::to_string(il), 0u));
+
     // memset(inp_pos->data, 0, ggml_nbytes(inp_pos));
     // for (int i = 0; i < n_tokens; ++i) {
     //     ggml_set_i32_1d(inp_pos, i, pos + i);
@@ -254,6 +269,14 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
+    // Typed inputs for the decode graph (replaces set_batched_inputs).
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
+    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
+        kv_cache_->get_n_ctx_max()));
+
     // 2. Transformer Blocks
     ggml_tensor * cur;
     for (uint32_t il = 0; il < n_layers; ++il) {
@@ -325,136 +348,9 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 // build_batched_attention(). Call sites updated to use the free functions.
 
 
-// Set input data AFTER allocation
-void Qwen3ForwardPass::set_inputs(ggml_cgraph* gf, 
-                                   const std::vector<int32_t>& tokens, 
-                                   int pos) {
-    const size_t n_tokens = tokens.size();
-    
-    // 1. Set token IDs
-    ggml_tensor* tokens_tensor = ggml_graph_get_tensor(gf, "tokens");
-    if (!tokens_tensor) {
-        throw std::runtime_error("tokens tensor not found in graph");
-    }
-    ggml_backend_tensor_set(tokens_tensor, tokens.data(), 0, n_tokens * sizeof(int32_t));
-
-    // DEBUG: Verify token data transfer
-    std::vector<int32_t> tokens_readback(n_tokens);
-    ggml_backend_tensor_get(tokens_tensor, tokens_readback.data(), 0, n_tokens * sizeof(int32_t));
-    if (tokens != tokens_readback) {
-        fprintf(stderr, "FATAL: Token data mismatch after transfer to GPU!\n");
-        for(size_t i = 0; i < n_tokens; ++i) {
-            if (tokens[i] != tokens_readback[i]) {
-                fprintf(stderr, "Mismatch at index %zu: Original=%d, Readback=%d\n", i, tokens[i], tokens_readback[i]);
-            }
-        }
-        exit(1); // Abort on critical error
-    }
-    
-    // 2. Set position IDs
-    ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!inp_pos) {
-        throw std::runtime_error("inp_pos tensor not found in graph");
-    }
-    std::vector<int32_t> pos_data(n_tokens);
-    for (size_t i = 0; i < n_tokens; i++) {
-        pos_data[i] = pos + i;
-    }
-    ggml_backend_tensor_set(inp_pos, pos_data.data(), 0, n_tokens * sizeof(int32_t));
-
-    // DEBUG: Verify position data transfer
-    std::vector<int32_t> pos_readback(n_tokens);
-    ggml_backend_tensor_get(inp_pos, pos_readback.data(), 0, n_tokens * sizeof(int32_t));
-    if (pos_data != pos_readback) {
-        fprintf(stderr, "FATAL: Position data mismatch after transfer to GPU!\n");
-        exit(1); // Abort on critical error
-    }
-
-    // 3. Set causal attention mask for each layer
-    for (uint32_t il = 0; il < meta_.block_count; ++il) {
-        char mask_name[32];
-        snprintf(mask_name, sizeof(mask_name), "kq_mask.%d", il);
-        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, mask_name);
-        if (!kq_mask) {
-            throw std::runtime_error("kq_mask tensor not found in graph for layer " + std::to_string(il));
-        }
-
-        const uint32_t n_kv = kq_mask->ne[0];
-        std::vector<float> mask_data(n_kv * n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const uint32_t q_pos = pos + i;
-            for (uint32_t j = 0; j < n_kv; ++j) {
-                mask_data[i * n_kv + j] = (j <= q_pos) ? 0.0f : -INFINITY;
-            }
-        }
-        ggml_backend_tensor_set(kq_mask, mask_data.data(), 0, n_kv * n_tokens * sizeof(float));
-    }
-    
-}
-
-
-// Set input data for batched graph
-void Qwen3ForwardPass::set_batched_inputs(ggml_cgraph* gf, 
-                                   const std::vector<int32_t>& tokens, 
-                                   const std::vector<uint32_t>& slots,
-                                   const std::vector<int32_t>& positions) {
-    const size_t n_tokens = tokens.size();
-    if (slots.size() != n_tokens || positions.size() != n_tokens) {
-        throw std::runtime_error("Input vector size mismatch in set_batched_inputs");
-    }
-    
-    // 1. Set token IDs
-    ggml_tensor* tokens_tensor = ggml_graph_get_tensor(gf, "tokens");
-    if (!tokens_tensor) {
-        throw std::runtime_error("tokens tensor not found in graph");
-    }
-    ggml_backend_tensor_set(tokens_tensor, tokens.data(), 0, n_tokens * sizeof(int32_t));
-    
-    // 2. Set position IDs
-    ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!inp_pos) {
-        throw std::runtime_error("inp_pos tensor not found in graph");
-    }
-    ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
-
-    // 3. Set shared causal attention mask
-    ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, "kq_mask_b");
-    if (!kq_mask) {
-        throw std::runtime_error("kq_mask_b tensor not found in graph");
-    }
-
-    const uint32_t n_kv_dim = kq_mask->ne[0]; 
-
-std::vector<float> mask_data(n_kv_dim * n_tokens);
-for (uint32_t b = 0; b < n_tokens; ++b) {
-    const int32_t current_pos = positions[b];
-    for (uint32_t j = 0; j < n_kv_dim; ++j) {
-        // Layout: [n_kv, 1, 1, n_batch] — batch is slowest dimension
-        mask_data[b * n_kv_dim + j] = ((int32_t)j <= current_pos) ? 0.0f : -INFINITY;
-    }
-}
-
-
-    ggml_backend_tensor_set(kq_mask, mask_data.data(), 0, n_kv_dim * n_tokens * sizeof(float));
-
-    // 4. Set KV Gather Indices (shared across layers)
-    ggml_tensor* gather_indices = ggml_graph_get_tensor(gf, "gather_indices");
-    if (gather_indices) {
-        // gather_indices->ne[0] is n_tokens * n_kv_len
-        uint32_t n_total_indices = gather_indices->ne[0];
-        uint32_t n_kv_len = n_total_indices / n_tokens;
-        std::vector<int32_t> indices(n_total_indices);
-        
-        for (uint32_t b = 0; b < n_tokens; ++b) {
-            uint32_t slot_idx = slots[b];
-            for (uint32_t t = 0; t < n_kv_len; ++t) {
-                // Flat index = slot_idx * n_ctx_max + t
-                indices[b * n_kv_len + t] = slot_idx * kv_cache_->get_n_ctx_max() + t;
-            }
-        }
-        ggml_backend_tensor_set(gather_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
-    }
-}
+// set_inputs / set_batched_inputs removed: inputs are now populated by the
+// typed GraphInputSet (graph_inputs_) built in build_prefill_graph and
+// build_decoding_graph. See docs/plan-typed-graph-inputs.md.
 
 // ============================================================================
 // TurboQuant Phase 2: Per-layer compute with compressed KV
@@ -692,7 +588,7 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         }
 
         ggml_backend_sched_alloc_graph(scheduler, gf);
-        set_inputs(gf, tokens, pos);
+        set_prefill_inputs(gf, tokens, pos);
         ggml_backend_sched_graph_compute(scheduler, gf);
 
         advance_cache(tokens.size(), slot_idx);
@@ -732,8 +628,12 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         ggml_backend_sched_reset(scheduler);
         ggml_backend_sched_alloc_graph(scheduler, gf_emb);
 
-        ggml_tensor* tok_tensor = ggml_graph_get_tensor(gf_emb, "tokens");
-        ggml_backend_tensor_set(tok_tensor, tokens.data(), 0, n_tokens * sizeof(int32_t));
+        {
+            StepContext step;
+            step.gf = gf_emb;
+            step.tokens = &tokens;
+            TokensInput().set_input(step);
+        }
 
         ggml_backend_sched_graph_compute(scheduler, gf_emb);
 
@@ -745,9 +645,6 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
     // Sync scratch cache position with TQ store's position tracker
     tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
 
-    // Pre-compute position IDs (same for every batch)
-    std::vector<int32_t> pos_data(n_tokens);
-    for (uint32_t i = 0; i < n_tokens; ++i) pos_data[i] = pos + i;
 
     // ── Batched layer compute ────────────────────────────────────────────
     // TQ_LAYER_BATCH layers share one graph_compute call → cuts scheduler
@@ -777,27 +674,23 @@ std::vector<float> Qwen3ForwardPass::run_prefill(
         ggml_backend_sched_reset(scheduler);
         ggml_backend_sched_alloc_graph(scheduler, gf);
 
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inp_pos"),
-            pos_data.data(), 0, n_tokens * sizeof(int32_t));
+        // inpL is a hidden-state carrier, not a typed input — direct set
+        // (plan scope fence).
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inpL"),
             hidden.data(), 0,
             static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
 
-        // Set one causal mask per layer in the batch
-        for (uint32_t il = il0; il < il1; ++il) {
-            char mask_name[32];
-            snprintf(mask_name, sizeof(mask_name), "kq_mask.%d", il);
-            ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, mask_name);
-            if (!kq_mask) continue;
-            const uint32_t n_kv = kq_mask->ne[0];
-            std::vector<float> mask_data(n_kv * n_tokens);
-            for (uint32_t i = 0; i < n_tokens; ++i) {
-                const uint32_t q_pos = pos + i;
-                for (uint32_t j = 0; j < n_kv; ++j)
-                    mask_data[i * n_kv + j] = (j <= q_pos) ? 0.0f : -INFINITY;
-            }
-            ggml_backend_tensor_set(kq_mask, mask_data.data(), 0,
-                n_kv * n_tokens * sizeof(float));
+        // Positions + per-layer causal masks: same typed inputs as the
+        // non-TQ path. Collapses the 4th duplicated poke copy.
+        {
+            StepContext step;
+            step.gf = gf;
+            step.tokens = &tokens;
+            step.pos = pos;
+            PositionsInput().set_input(step);
+            for (uint32_t il = il0; il < il1; ++il)
+                AttnMaskInput("kq_mask." + std::to_string(il), 0u)
+                    .set_input(step);
         }
 
         // 4. One compute call for all layers in batch

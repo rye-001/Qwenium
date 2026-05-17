@@ -67,7 +67,7 @@ protected:
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf_prefill = forward_pass.build_prefill_graph(tokens, 0);
         ggml_backend_sched_alloc_graph(scheduler, gf_prefill);
-        forward_pass.set_inputs(gf_prefill, tokens, 0);
+        forward_pass.set_prefill_inputs(gf_prefill, tokens, 0);
         ggml_backend_sched_graph_compute(scheduler, gf_prefill);
         forward_pass.advance_cache(tokens.size(), 0);
 
@@ -90,7 +90,7 @@ protected:
             ggml_backend_sched_reset(scheduler);
             ggml_cgraph* gf_decode = forward_pass.build_prefill_graph(current_token_vec, current_pos);
             ggml_backend_sched_alloc_graph(scheduler, gf_decode);
-            forward_pass.set_inputs(gf_decode, current_token_vec, current_pos);
+            forward_pass.set_prefill_inputs(gf_decode, current_token_vec, current_pos);
             ggml_backend_sched_graph_compute(scheduler, gf_decode);
             forward_pass.advance_cache(1, 0);
 

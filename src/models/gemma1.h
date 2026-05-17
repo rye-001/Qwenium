@@ -44,13 +44,11 @@ public:
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
 
-    void set_inputs(ggml_cgraph* gf, const std::vector<int32_t>& tokens,
-                    int pos) override;
+    // build_decoding_graph throws; decode_step routes via run_prefill bridge.
+    bool has_decode_graph() const override { return false; }
 
-    void set_batched_inputs(ggml_cgraph* gf,
-                            const std::vector<int32_t>& tokens,
-                            const std::vector<uint32_t>& slots,
-                            const std::vector<int32_t>& positions) override;
+    // Inputs are populated via the typed graph_inputs_ set built in
+    // build_prefill_graph (no set_inputs override).
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);

@@ -146,8 +146,11 @@ public:
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
 
-    void set_inputs(ggml_cgraph* gf, const std::vector<int32_t>& tokens,
-                    int pos) override;
+    // build_decoding_graph throws; decode_step routes via run_prefill bridge.
+    bool has_decode_graph() const override { return false; }
+
+    // Inputs are populated via the typed graph_inputs_ set built in
+    // build_prefill_graph (no set_inputs override).
 
     // DEBUG: instrumented prefill — same as base, but reads back named
     // intermediate tensors after compute and prints stats (G4 hallucination).
@@ -155,11 +158,6 @@ public:
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx,
         ggml_backend_sched_t scheduler) override;
-
-    void set_batched_inputs(ggml_cgraph* gf,
-                            const std::vector<int32_t>& tokens,
-                            const std::vector<uint32_t>& slots,
-                            const std::vector<int32_t>& positions) override;
 
     // Cache routing: every per-slot position-management op fans out to BOTH
     // the sliding and global caches so the per-layer logical positions stay

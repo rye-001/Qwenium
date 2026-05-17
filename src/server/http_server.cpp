@@ -176,7 +176,7 @@ public:
         ggml_backend_sched_reset(scheduler_);
         ggml_cgraph* gf = forward_pass_->build_prefill_graph(tokens, 0, TEMPLATE_SLOT);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
-        forward_pass_->set_inputs(gf, tokens, 0);
+        forward_pass_->set_prefill_inputs(gf, tokens, 0);
         ggml_backend_sched_graph_compute(scheduler_, gf);
         forward_pass_->advance_cache(tokens.size(), TEMPLATE_SLOT);
         
@@ -259,7 +259,7 @@ private:
         // Use build_prefill_graph with slot_id
         ggml_cgraph* gf = forward_pass_->build_prefill_graph(tokens, start_pos, slot_id);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
-        forward_pass_->set_inputs(gf, tokens, start_pos);
+        forward_pass_->set_prefill_inputs(gf, tokens, start_pos);
         ggml_backend_sched_graph_compute(scheduler_, gf);
         forward_pass_->advance_cache(tokens.size(), slot_id);
 
@@ -296,7 +296,7 @@ private:
 
         ggml_cgraph* gf = forward_pass_->build_decoding_graph(tokens, slot_ids_u32, positions);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
-        forward_pass_->set_batched_inputs(gf, tokens, slot_ids_u32, positions);
+        forward_pass_->set_decode_inputs(gf, tokens, slot_ids_u32, positions);
         ggml_backend_sched_graph_compute(scheduler_, gf);
 
         std::vector<int> next_tokens;
