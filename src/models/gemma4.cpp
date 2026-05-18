@@ -592,7 +592,8 @@ ggml_tensor* Gemma4ForwardPass::build_block(
 // ── build_prefill_graph ──────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -635,28 +636,39 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, inpL);
     }
 
-    // 4. Final norm + LM head + final logit soft-cap (G4.6).
-    ggml_tensor* cur = build_rms_norm(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        config_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // 4. Output head. THE single per-recipe head-presence guard site for
+    // gemma4 (docs/plan-feed-tokens.md → Head-presence locality constraint:
+    // exactly one site, not scattered want_logits conditionals).
+    // want_logits=false (feed_tokens) prunes final norm → LM head → softcap.
+    // Head-less anchor is the per-layer ggml_set_output(inpL) from the layer
+    // loop above (same invariant as the qwen35/qwen36 else-anchor, different
+    // mechanism). KV cpy_k/v state-write roots are independently expanded in
+    // build_block; attention-only (dense + MoE FFN, no recurrent state),
+    // still owes its own KV-append mid-stream differential.
+    if (want_logits) {
+        // Final norm + LM head + final logit soft-cap (G4.6).
+        ggml_tensor* cur = build_rms_norm(
+            ctx_, inpL, model_.get_output_norm_weight(),
+            config_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    // Tied embeddings: prefer output.weight if explicitly present, else
-    // reuse token_embd.weight (the Gemma 1/2/3/4 path).
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        // Tied embeddings: prefer output.weight if explicitly present, else
+        // reuse token_embd.weight (the Gemma 1/2/3/4 path).
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+
+        if (config_.final_softcap > 0.0f) {
+            cur = build_softcap(ctx_, cur, config_.final_softcap);
+        }
+
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-
-    if (config_.final_softcap > 0.0f) {
-        cur = build_softcap(ctx_, cur, config_.final_softcap);
-    }
-
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
     return gf;
 }
 

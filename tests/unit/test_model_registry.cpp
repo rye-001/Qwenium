@@ -31,7 +31,7 @@ public:
     FakeForwardPass(const Model& m, const ModelMetadata* meta)
         : ForwardPassBase(m, meta) {}
 
-    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t) override { return nullptr; }
+    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t, bool) override { return nullptr; }
     void advance_cache(uint32_t, uint32_t) override {}
     void clear_slot(uint32_t) override {}
     void set_cache_pos(uint32_t, uint32_t) override {}

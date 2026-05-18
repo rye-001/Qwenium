@@ -150,7 +150,8 @@ ggml_tensor* Gemma3ForwardPass::require_tensor(uint32_t il, const char* suffix) 
 // ── build_prefill_graph ───────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -241,25 +242,36 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, inpL);
     }
 
-    // 4. Final norm.
-    ggml_tensor* cur = build_rms_norm(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        config_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // 4. Output head. THE single per-recipe head-presence guard site for
+    // gemma3 (docs/plan-feed-tokens.md → Head-presence locality constraint:
+    // exactly one site, not scattered want_logits conditionals).
+    // want_logits=false (feed_tokens) prunes final norm → LM head. Head-less
+    // anchor is the per-layer ggml_set_output(inpL) from the layer loop
+    // (same invariant as the qwen35/qwen36 else-anchor, different mechanism).
+    // KV cpy_k/v state-write roots are independently expanded in
+    // build_transformer_layer; attention-only, still owes its KV-append
+    // mid-stream differential ("attention-only" is not a skip).
+    if (want_logits) {
+        // Final norm.
+        ggml_tensor* cur = build_rms_norm(
+            ctx_, inpL, model_.get_output_norm_weight(),
+            config_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    // 5. LM head (tied embeddings — no separate output.weight in Gemma 3).
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        // LM head (tied embeddings — no separate output.weight in Gemma 3).
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+
+        // No final soft-cap for Gemma 3 (removed in G3 vs. G2).
+
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-
-    // No final soft-cap for Gemma 3 (removed in G3 vs. G2).
-
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
 
     return gf;
 }

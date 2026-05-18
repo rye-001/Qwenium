@@ -173,7 +173,8 @@ Qwen35ForwardPass::Qwen35ForwardPass(
 // ============================================================
 
 struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -279,8 +280,27 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         inpL = cur;
     }
 
-    // 3. Output head
-    build_output_head(gf, inpL);
+    // 3. Output head.
+    // THE single per-recipe head-presence guard site for qwen35
+    // (docs/plan-feed-tokens.md → Head-presence locality constraint: exactly
+    // one site, identical in shape across recipes — not scattered want_logits
+    // conditionals). want_logits=false (feed_tokens) prunes the head; KV
+    // cpy_k/v and DeltaNet conv + recurrent ggml_cpy state-write roots are
+    // independently ggml_build_forward_expand'd in the layer builders, so the
+    // head-less graph still advances both state types. The else-branch
+    // anchors the residual tip as a graph output: the scheduler propagates
+    // backend assignment from outputs, and the pruned logits node used to be
+    // that anchor (without it ggml_gallocr aborts on buffer_id < 0). This
+    // anchor is numerically inert — it forces compute, not different state.
+    // The TQ run_prefill path builds its head in a separate gf_out graph and
+    // is unreachable from feed_tokens (scoped out, fails loud via
+    // tq_active()) — so this remains exactly one reachable guard site.
+    if (want_logits) {
+        build_output_head(gf, inpL);
+    } else {
+        ggml_build_forward_expand(gf, inpL);
+        ggml_set_output(inpL);
+    }
     return gf;
 }
 

@@ -31,7 +31,7 @@ public:
     ~Qwen3ForwardPass() override = default;
 
     // --- Graph building ---
-    struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) override;
+    struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0, bool want_logits = true) override;
 
     struct ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,

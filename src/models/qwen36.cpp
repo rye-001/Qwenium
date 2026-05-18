@@ -229,7 +229,7 @@ static ggml_tensor* build_dn_layer(
 
 ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     const std::vector<int32_t>& tokens,
-    int pos, uint32_t slot_idx)
+    int pos, uint32_t slot_idx, bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -323,8 +323,24 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
         inpL = cur;
     }
 
-    // 4. Final norm + LM head
-    build_output_head(gf, inpL);
+    // 4. Final norm + LM head.
+    // THE single per-recipe head-presence guard site (docs/plan-feed-tokens.md
+    // → Head-presence locality constraint: exactly one site, identical in
+    // shape across recipes — not scattered want_logits conditionals). When
+    // want_logits=false (feed_tokens), the head is pruned: state-write roots
+    // — KV cpy_k/v and DeltaNet conv + recurrent ggml_cpy — are independently
+    // ggml_build_forward_expand'd inside the layer builders, so the head-less
+    // graph still advances both state types. KV-append vs recurrent-overwrite
+    // stays at the cache-object level; the recurrence kernel is not forked.
+    // The else-branch anchors the residual tip as a graph output (the pruned
+    // logits node used to be the scheduler's backend-propagation anchor;
+    // without it ggml_gallocr aborts on buffer_id < 0). Numerically inert.
+    if (want_logits) {
+        build_output_head(gf, inpL);
+    } else {
+        ggml_build_forward_expand(gf, inpL);
+        ggml_set_output(inpL);
+    }
 
     return gf;
 }

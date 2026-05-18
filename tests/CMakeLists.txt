@@ -316,6 +316,55 @@ target_link_libraries(forward-tests-qwen36 PRIVATE
 target_compile_features(forward-tests-qwen36 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-qwen36)
 
+# feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
+# differential (docs/plan-feed-tokens.md). Self-skips when model absent.
+add_executable(feed-tokens-tests-qwen36
+    unit/test_qwen36_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-qwen36 PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-qwen36 PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-qwen36)
+
+# feed_tokens Phase 2 — qwen35 head-less state-advance + mid-decode
+# differential (docs/plan-feed-tokens.md). Self-skips when model absent.
+add_executable(feed-tokens-tests-qwen35
+    unit/test_qwen35_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-qwen35 PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-qwen35 PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-qwen35)
+
+# feed_tokens Phase 3 — gemma1–4 head-less state-advance + per-recipe
+# KV-append mid-decode differential (docs/plan-feed-tokens.md). One
+# parameterized harness; each recipe self-skips when its model is absent.
+add_executable(feed-tokens-tests-gemma
+    unit/test_gemma_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-gemma PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-gemma PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-gemma)
+
 # Qwen 3.6 hparam + inventory validation tests (PR 3.I.1).
 # Pure-unit tests (no model file) run unconditionally.
 # Model-file integration tests self-skip when QWEN_MODEL_PATH is unset.

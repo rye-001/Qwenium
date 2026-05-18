@@ -74,12 +74,18 @@ public:
     // Inputs are populated via graph_inputs_ (typed GraphInputSet), built in
     // build_prefill_graph / build_decoding_graph. No set_inputs /
     // set_batched_inputs override — those are gone for this recipe.
-    struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) override;
+    struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0, bool want_logits = true) override;
 
     ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) override;
+
+    // Phase 2 of docs/plan-feed-tokens.md: qwen35 honors want_logits=false
+    // with one head-guard site in build_prefill_graph. feed_tokens scopes TQ
+    // out (base fails loud via tq_active()), so the TQ run_prefill head path
+    // is unreachable — exactly one reachable guard site.
+    bool feed_tokens_supported() const override { return true; }
 
         // --- Cache management (delegates to KV, SSM, and TQ caches) ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {

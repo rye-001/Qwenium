@@ -32,7 +32,11 @@ public:
     ForwardPassBase(const Model& model, const ModelMetadata* metadata);
     virtual ~ForwardPassBase();
 
-    virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) = 0;
+    // want_logits=false prunes the LM head (the single per-recipe head-guard
+    // site) so the graph advances state only — see feed_tokens and
+    // docs/plan-feed-tokens.md. State-write roots are independent graph roots;
+    // pruning the head leaves them intact.
+    virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0, bool want_logits = true) = 0;
     virtual void advance_cache(uint32_t n_tokens, uint32_t slot_idx) = 0;
     virtual void clear_slot(uint32_t slot_idx) = 0;
     virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
@@ -80,6 +84,57 @@ public:
         advance_cache(tokens.size(), slot_idx);
         return get_output_logits(gf);
     }
+
+    // ── feed_tokens ──────────────────────────────────────────────
+    // Advance this slot's model state — attention KV-append AND recurrent
+    // overwrite — over a span of already-known tokens WITHOUT building the
+    // LM head or producing logits. The inverse of run_prefill-with-logits:
+    // consume tokens to condition future predictions; predict nothing.
+    // State mutation, no return value. See docs/plan-feed-tokens.md.
+    //
+    // Standalone at the API; thin parameterization underneath: the internal
+    // impl is the existing prefill builder with want_logits=false (exactly
+    // one head-guard site per recipe). NOT a forked KV/recurrent write.
+    //
+    // TurboQuant is scoped OUT:
+    // feed_tokens onto a non-empty mid-decode cache under TQ is a
+    // compressed-store write path that is deliberately NOT folded into this
+    // primitive. It fails loud rather than silently corrupting compressed
+    // state, mirroring the existing decode bridge in decode_step.cpp.
+    void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
+                     ggml_backend_sched_t scheduler) {
+        if (tq_active())
+            throw std::runtime_error(
+                "feed_tokens: tq_active expected=false actual=true — "
+                "TurboQuant is scoped out (docs/plan-feed-tokens.md TQ "
+                "clause, option 2). feed_tokens onto a non-empty mid-decode "
+                "cache under TQ is a compressed-store write path not folded "
+                "into this primitive; refusing rather than corrupting state.");
+        if (!feed_tokens_supported())
+            throw std::runtime_error(
+                "feed_tokens: feed_tokens_supported expected=true "
+                "actual=false — this recipe has no want_logits=false head "
+                "guard yet. docs/plan-feed-tokens.md is phased (qwen36 "
+                "first); refusing rather than silently building the head.");
+
+        const int pos = static_cast<int>(get_cache_pos(slot));
+
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf =
+            build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_prefill_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+        advance_cache(static_cast<uint32_t>(tokens.size()), slot);
+        // No get_output_logits: head-less by contract.
+    }
+
+    // True only for recipes whose build_prefill_graph honors want_logits=false
+    // with exactly one head-guard site. Phased per docs/plan-feed-tokens.md
+    // (qwen36 first). Default false so feed_tokens fails loud for recipes
+    // that have not implemented the guard, rather than silently building the
+    // head (wasteful) or shipping an unverified state-advance path.
+    virtual bool feed_tokens_supported() const { return false; }
 
     // Typed inputs the most-recently-built graph owns. Populated by the
     // recipe's build_*_graph; consumed by run_prefill / decode_step via

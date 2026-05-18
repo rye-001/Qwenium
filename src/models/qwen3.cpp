@@ -117,7 +117,7 @@ Qwen3ForwardPass::Qwen3ForwardPass(
             }
         }
 
-struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx) {
+struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx, [[maybe_unused]] bool want_logits) {
     reset_context();
     ggml_cgraph* gf = new_graph();
     int n_layers = meta_.block_count;        // Layers 0-27
