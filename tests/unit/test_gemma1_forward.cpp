@@ -178,7 +178,7 @@ TEST_F(Gemma1ModelFile, DumpInpLScaledForCompareWithHF) {
     ggml_backend_sched_reset(sched);
     ggml_cgraph* gf = fp->build_prefill_graph(tokens, 0, 0);
     ggml_backend_sched_alloc_graph(sched, gf);
-    fp->set_inputs(gf, tokens, 0);
+    fp->set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     auto dump_last_token = [&](const char* name) {

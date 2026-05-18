@@ -4,6 +4,10 @@
 #include "../layers/deltanet.h"
 #include "../layers/ffn.h"
 #include "../qinf_error.h"
+#include "../graph_inputs/tokens_input.h"
+#include "../graph_inputs/positions_input.h"
+#include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/gather_indices_input.h"
 
 #include "ggml.h"
 
@@ -11,6 +15,7 @@
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
+#include <memory>
 
 // ── Qwen35MoEConfig::from_metadata ───────────────────────────────────────────
 
@@ -258,6 +263,17 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    // Typed inputs (replaces set_inputs). One uniform causal mask per
+    // attention layer; DeltaNet layers have none. build_output_head appends
+    // SparseHeadInput on the sparse path.
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    for (uint32_t il = 0; il < m.block_count; ++il)
+        if (cfg_.is_full_attention_layer(il))
+            graph_inputs_.add(std::make_unique<AttnMaskInput>(
+                "kq_mask." + std::to_string(il), 0u));
+
     // 3. Transformer loop
     for (uint32_t il = 0; il < m.block_count; ++il) {
         const auto& blk = model_.get_block(il);
@@ -366,6 +382,15 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
+    // Typed inputs (replaces set_batched_inputs). qwen36 KV gather uses an
+    // n_kv_len per-slot stride (not n_ctx_max).
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
+    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
+        GatherIndicesInput::Stride::NKvLen));
+
     // 4. Transformer loop
     for (uint32_t il = 0; il < m.block_count; ++il) {
         const auto& blk = model_.get_block(il);
@@ -437,93 +462,9 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     return gf;
 }
 
-// ── set_inputs ────────────────────────────────────────────────────────────────
-
-void Qwen36ForwardPass::set_inputs(ggml_cgraph* gf,
-                                   const std::vector<int32_t>& tokens,
-                                   int pos)
-{
-    const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
-
-    // Tokens
-    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
-    if (!tok_t) throw std::runtime_error("qwen36: 'tokens' tensor missing from graph");
-    ggml_backend_tensor_set(tok_t, tokens.data(), 0, n_tok * sizeof(int32_t));
-
-    // Position IDs
-    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!pos_t) throw std::runtime_error("qwen36: 'inp_pos' tensor missing from graph");
-    std::vector<int32_t> pos_data(n_tok);
-    for (uint32_t i = 0; i < n_tok; ++i) pos_data[i] = pos + static_cast<int>(i);
-    ggml_backend_tensor_set(pos_t, pos_data.data(), 0, n_tok * sizeof(int32_t));
-
-    // Causal masks — only for attention layers.
-    // build_attention() names each layer's mask "kq_mask.{physical_il}".
-    for (uint32_t il = 0; il < meta_.block_count; ++il) {
-        if (!cfg_.is_full_attention_layer(il)) continue;
-
-        char name[32];
-        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
-        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
-        if (!kq_mask) continue;  // mask may not exist if kv_cache was empty
-
-        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
-        std::vector<float> mask(n_kv * n_tok);
-        for (uint32_t t = 0; t < n_tok; ++t) {
-            const uint32_t q_pos = static_cast<uint32_t>(pos) + t;
-            for (uint32_t j = 0; j < n_kv; ++j)
-                mask[t * n_kv + j] = (j <= q_pos) ? 0.0f : -INFINITY;
-        }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
-    }
-}
-
-// ── set_batched_inputs ────────────────────────────────────────────────────────
-
-void Qwen36ForwardPass::set_batched_inputs(
-    ggml_cgraph* gf,
-    const std::vector<int32_t>& tokens,
-    const std::vector<uint32_t>& slots,
-    const std::vector<int32_t>&  positions)
-{
-    const uint32_t n_batch = static_cast<uint32_t>(tokens.size());
-
-    // Tokens
-    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
-    if (!tok_t) throw std::runtime_error("qwen36: 'tokens' tensor missing from graph");
-    ggml_backend_tensor_set(tok_t, tokens.data(), 0, n_batch * sizeof(int32_t));
-
-    // Position IDs (one per batch slot)
-    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos");
-    if (!pos_t) throw std::runtime_error("qwen36: 'inp_pos' tensor missing from graph");
-    ggml_backend_tensor_set(pos_t, positions.data(), 0, n_batch * sizeof(int32_t));
-
-    // Shared KV mask [n_kv_len, 1, 1, n_batch]
-    ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, "kq_mask_b");
-    if (kq_mask) {
-        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
-        std::vector<float> mask(n_kv * n_batch, -INFINITY);
-        for (uint32_t b = 0; b < n_batch; ++b) {
-            const uint32_t q_pos = static_cast<uint32_t>(positions[b]);
-            for (uint32_t j = 0; j <= q_pos && j < n_kv; ++j)
-                mask[b * n_kv + j] = 0.0f;
-        }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
-    }
-
-    // Gather indices [n_batch * n_kv_len]
-    ggml_tensor* gi = ggml_graph_get_tensor(gf, "gather_indices");
-    if (gi) {
-        const uint32_t n_kv   = static_cast<uint32_t>(gi->ne[0]) / n_batch;
-        std::vector<int32_t> idx(n_batch * n_kv);
-        for (uint32_t b = 0; b < n_batch; ++b) {
-            const uint32_t slot = slots[b];
-            for (uint32_t j = 0; j < n_kv; ++j)
-                idx[b * n_kv + j] = static_cast<int32_t>(slot * n_kv + j);
-        }
-        ggml_backend_tensor_set(gi, idx.data(), 0, idx.size() * sizeof(int32_t));
-    }
-}
+// set_inputs / set_batched_inputs removed: inputs are now populated by the
+// typed GraphInputSet (graph_inputs_) built in build_prefill_graph and
+// build_decoding_graph. See docs/plan-typed-graph-inputs.md.
 
 // ── Inventory validator ──────────────────────────────────────────────────────
 

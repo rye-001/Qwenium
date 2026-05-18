@@ -79,7 +79,7 @@ TEST_F(Qwen36ForwardTest, PrefillProducesFiniteLogits) {
     ASSERT_NE(gf, nullptr);
 
     ASSERT_TRUE(ggml_backend_sched_alloc_graph(sched, gf)) << "Allocation failed";
-    fp.set_inputs(gf, tokens, 0);
+    fp.set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     std::vector<float> logits = fp.get_output_logits(gf);
@@ -117,7 +117,7 @@ TEST_F(Qwen36ForwardTest, TopTokenIndexInRange) {
     ASSERT_NE(gf, nullptr);
 
     ASSERT_TRUE(ggml_backend_sched_alloc_graph(sched, gf));
-    fp.set_inputs(gf, tokens, 0);
+    fp.set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     std::vector<float> logits = fp.get_output_logits(gf);

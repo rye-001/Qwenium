@@ -26,6 +26,7 @@ target_link_libraries(qinf-models PUBLIC
     core
     qinf-layers
     qinf-state
+    qinf-graph-inputs
 )
 
 set_target_properties(qinf-models PROPERTIES

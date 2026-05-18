@@ -93,7 +93,7 @@ TEST_F(Qwen35ForwardAttnTest, PrefillProducesFiniteLogits) {
     ASSERT_TRUE(alloc_ok) << "Graph allocation failed";
 
     // Set inputs
-    fp.set_inputs(gf, tokens, 0);
+    fp.set_prefill_inputs(gf, tokens, 0);
 
     // Compute
     ggml_backend_sched_graph_compute(sched, gf);
@@ -138,7 +138,7 @@ TEST_F(Qwen35ForwardAttnTest, LogitsNotAllZero) {
     ggml_backend_sched_reset(sched);
     ggml_cgraph* gf = fp.build_prefill_graph(tokens, 0, 0);
     ggml_backend_sched_alloc_graph(sched, gf);
-    fp.set_inputs(gf, tokens, 0);
+    fp.set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     std::vector<float> logits = fp.get_output_logits(gf);
@@ -176,7 +176,7 @@ TEST_F(Qwen35ForwardAttnTest, CacheAdvanceAfterPrefill) {
     ggml_backend_sched_reset(sched);
     ggml_cgraph* gf = fp.build_prefill_graph(tokens, 0, 0);
     ggml_backend_sched_alloc_graph(sched, gf);
-    fp.set_inputs(gf, tokens, 0);
+    fp.set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     // Advance cache — should not crash

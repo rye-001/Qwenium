@@ -31,10 +31,26 @@ Key principles:
 
 ## Target Models
 
+Qwen family:
 - Qwen2/2.5
 - Qwen3-32B (pure transformer — attention + dense FFN)
 - Qwen3.5 (attention + SSM)
 - Qwen 3.6-35B-A3B (hybrid — DeltaNet + attention + MoE, arch: `qwen35moe` in GGUF)
+
+Gemma family (text-only) — the designated **cross-family forcing function**;
+see `docs/plan-gemma-impl.md`:
+- Gemma 1 (pure transformer)
+- Gemma 2 (interleaved local/global attention — even=local, odd=global)
+- Gemma 3 (5:1 local:global, per-layer RoPE base)
+- Gemma 4 (parallel dual-FFN — dense FFN **and** MoE FFN summed per layer;
+  structurally distinct from Qwen 3.6 A3B's pure per-layer MoE)
+
+**Cross-family rule (load-bearing).** Any plan, interface, or refactor that
+touches the forward pass MUST be designed and grounded against at least one
+Qwen recipe AND at least one Gemma recipe before it is considered complete.
+An interface validated only on Qwen is presumed Qwen-shaped until a Gemma
+recipe proves otherwise — Gemma is the falsifier, not an afterthought. The
+byte-identical gate for any extraction includes a Gemma model, not just Qwen.
 
 ## ggml Constraints
 
@@ -67,8 +83,9 @@ engineering wins and the rule is revised. Full list in
 - **Test co-location.** `src/<path>/<module>.cpp` has its unit test at
   `tests/unit/test_<module>.cpp`. Always. No nesting variants.
 - **No dumping grounds.** `src/` contains only concept-named directories
-  (`layers/`, `state/`, `models/`, `metal/`, `sampling/`, `quant/`,
-  `loader/`, `cli/`, `server/`). No `util/`, `common/`, `misc/`, `helpers/`.
+  (`layers/`, `state/`, `graph_inputs/`, `models/`, `metal/`, `sampling/`,
+  `quant/`, `loader/`, `cli/`, `server/`). No `util/`, `common/`, `misc/`,
+  `helpers/`.
 - **Fail-loud error contract.** Errors at module boundaries name the slot
   or parameter, the expected value, and the actual value, in that order.
   Silent fallbacks and best-effort recovery are forbidden at module

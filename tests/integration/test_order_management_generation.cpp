@@ -463,7 +463,7 @@ class ModelRunner {
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf_prefill = forward_pass_->build_prefill_graph(system_prompt_tokens_, 0, 0); // Slot 0
         ggml_backend_sched_alloc_graph(scheduler, gf_prefill);
-        forward_pass_->set_inputs(gf_prefill, system_prompt_tokens_, 0);
+        forward_pass_->set_prefill_inputs(gf_prefill, system_prompt_tokens_, 0);
         ggml_backend_sched_graph_compute(scheduler, gf_prefill);
         forward_pass_->advance_cache(system_prompt_tokens_.size(), 0); // Slot 0
 
@@ -531,7 +531,7 @@ public:
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf_prefill = forward_pass_->build_prefill_graph(user_tokens, system_prompt_cache_pos_, 0); // Slot 0
         ggml_backend_sched_alloc_graph(scheduler, gf_prefill);
-        forward_pass_->set_inputs(gf_prefill, user_tokens, system_prompt_cache_pos_);
+        forward_pass_->set_prefill_inputs(gf_prefill, user_tokens, system_prompt_cache_pos_);
         ggml_backend_sched_graph_compute(scheduler, gf_prefill);
         forward_pass_->advance_cache(user_tokens.size(), 0); // Slot 0
 
@@ -556,7 +556,7 @@ public:
             std::vector<int32_t> d_positions = {current_pos};
             ggml_cgraph* gf_decode = forward_pass_->build_decoding_graph(current_token_vec, d_slots, d_positions);
             ggml_backend_sched_alloc_graph(scheduler, gf_decode);
-            forward_pass_->set_batched_inputs(gf_decode, current_token_vec, d_slots, d_positions);
+            forward_pass_->set_decode_inputs(gf_decode, current_token_vec, d_slots, d_positions);
             ggml_backend_sched_graph_compute(scheduler, gf_decode);
             forward_pass_->advance_cache(1, 0); // Slot 0
 

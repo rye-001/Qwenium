@@ -71,19 +71,12 @@ public:
     ~Qwen35ForwardPass() override = default;
 
     // --- Graph building ---
+    // Inputs are populated via graph_inputs_ (typed GraphInputSet), built in
+    // build_prefill_graph / build_decoding_graph. No set_inputs /
+    // set_batched_inputs override — those are gone for this recipe.
     struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) override;
 
-    // --- Input setting ---
-    void set_inputs(ggml_cgraph* gf,
-                    const std::vector<int32_t>& tokens,
-                    int pos) override;
-
     ggml_cgraph* build_decoding_graph(
-        const std::vector<int32_t>& tokens,
-        const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions) override;
-
-    void set_batched_inputs(ggml_cgraph* gf,
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) override;

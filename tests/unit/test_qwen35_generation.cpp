@@ -48,7 +48,7 @@ protected:
         ggml_backend_sched_reset(sched);
         ggml_cgraph* gf = fp->build_prefill_graph(tokens, 0, 0);
         EXPECT_TRUE(ggml_backend_sched_alloc_graph(sched, gf));
-        fp->set_inputs(gf, tokens, 0);
+        fp->set_prefill_inputs(gf, tokens, 0);
         ggml_backend_sched_graph_compute(sched, gf);
 
         std::vector<float> all_logits = fp->get_output_logits(gf);
@@ -73,7 +73,7 @@ protected:
             ggml_backend_sched_reset(sched);
             gf = fp->build_prefill_graph(next_vec, pos, 0);
             EXPECT_TRUE(ggml_backend_sched_alloc_graph(sched, gf));
-            fp->set_inputs(gf, next_vec, pos);
+            fp->set_prefill_inputs(gf, next_vec, pos);
             ggml_backend_sched_graph_compute(sched, gf);
 
             logits = fp->get_output_logits(gf);
@@ -139,7 +139,7 @@ TEST_F(Qwen35GenerationTest, LogitsStayFinite) {
     ggml_backend_sched_reset(sched);
     ggml_cgraph* gf = fp->build_prefill_graph(tokens, 0, 0);
     ggml_backend_sched_alloc_graph(sched, gf);
-    fp->set_inputs(gf, tokens, 0);
+    fp->set_prefill_inputs(gf, tokens, 0);
     ggml_backend_sched_graph_compute(sched, gf);
 
     std::vector<float> all_logits = fp->get_output_logits(gf);
@@ -166,7 +166,7 @@ TEST_F(Qwen35GenerationTest, LogitsStayFinite) {
         ggml_backend_sched_reset(sched);
         gf = fp->build_prefill_graph(next_vec, pos, 0);
         ggml_backend_sched_alloc_graph(sched, gf);
-        fp->set_inputs(gf, next_vec, pos);
+        fp->set_prefill_inputs(gf, next_vec, pos);
         ggml_backend_sched_graph_compute(sched, gf);
 
         logits = fp->get_output_logits(gf);

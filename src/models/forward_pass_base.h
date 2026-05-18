@@ -3,9 +3,11 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 #include "../core/model.h"
 #include "../state/kv_cache_simple.h"
+#include "../graph_inputs/graph_input.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
@@ -31,7 +33,6 @@ public:
     virtual ~ForwardPassBase();
 
     virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) = 0;
-    virtual void set_inputs(ggml_cgraph* gf, const std::vector<int32_t>& tokens, int pos) = 0;
     virtual void advance_cache(uint32_t n_tokens, uint32_t slot_idx) = 0;
     virtual void clear_slot(uint32_t slot_idx) = 0;
     virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
@@ -55,6 +56,12 @@ public:
     // Default false; recipes that allocate a compressed store override it.
     virtual bool tq_active() const { return false; }
 
+    // False ⇒ this recipe has no build_decoding_graph (it throws); decode_step
+    // must route through the legacy single-token run_prefill bridge instead.
+    // Default true; recipes whose build_decoding_graph is unimplemented
+    // (Gemma 1–4) override to false.
+    virtual bool has_decode_graph() const { return true; }
+
     // ── TurboQuant per-layer compute ────────────────────────────
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
     // When TQ is enabled, processes one layer at a time with compressed KV.
@@ -68,17 +75,48 @@ public:
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
-        set_inputs(gf, tokens, pos);
+        set_prefill_inputs(gf, tokens, pos);
         ggml_backend_sched_graph_compute(scheduler, gf);
         advance_cache(tokens.size(), slot_idx);
         return get_output_logits(gf);
     }
 
-    virtual void set_batched_inputs(ggml_cgraph* gf,
+    // Typed inputs the most-recently-built graph owns. Populated by the
+    // recipe's build_*_graph; consumed by run_prefill / decode_step via
+    // StepContext.
+    GraphInputSet& graph_inputs() { return graph_inputs_; }
+
+    // Populate the current prefill graph's typed inputs (contiguous
+    // positions: row r -> pos + r). sparse_decode_ids_ is consumed on use
+    // (clear mirrors the former upload_sparse_indices semantics).
+    void set_prefill_inputs(ggml_cgraph* gf,
+        const std::vector<int32_t>& tokens, int pos) {
+        StepContext step;
+        step.gf         = gf;
+        step.tokens     = &tokens;
+        step.pos        = pos;
+        step.sparse_ids = sparse_decode_ids_.empty()
+            ? nullptr : &sparse_decode_ids_;
+        graph_inputs_.set_input(step);
+        sparse_decode_ids_.clear();
+    }
+
+    // Populate the current decode graph's typed inputs for a batched step.
+    void set_decode_inputs(ggml_cgraph* gf,
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions) = 0;
-    
+        const std::vector<int32_t>& positions) {
+        StepContext step;
+        step.gf         = gf;
+        step.tokens     = &tokens;
+        step.positions  = &positions;
+        step.slots      = &slots;
+        step.sparse_ids = sparse_decode_ids_.empty()
+            ? nullptr : &sparse_decode_ids_;
+        graph_inputs_.set_input(step);
+        sparse_decode_ids_.clear();
+    }
+
     // --- Output extraction (shared by all architectures) ---
     std::vector<float> get_output_logits(ggml_cgraph* gf);
     std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
@@ -127,10 +165,15 @@ protected:
     struct ggml_context* ctx_;
     std::vector<uint8_t> ctx_buffer_;
 
-    // Sparse decode: host-side indices set before graph build; ggml handle
-    // valid between build_output_head and the next reset_context call.
+    // Typed inputs for the current graph. Each recipe rebuilds this in its
+    // build_*_graph; run_prefill / decode_step fan set_input over it.
+    GraphInputSet graph_inputs_;
+
+    // Sparse decode: host-side valid token ids armed before graph build.
+    // build_output_head registers a SparseHeadInput when this is non-empty;
+    // set_prefill_inputs / set_decode_inputs upload it via StepContext and
+    // clear it (consume-on-use).
     std::vector<int32_t> sparse_decode_ids_;
-    ggml_tensor*         valid_indices_input_ = nullptr;
 
     // SnapKV: post-prefill KV eviction (0 = disabled)
     uint32_t snapkv_budget_ = 0;
@@ -188,9 +231,4 @@ public:
     void set_sparse_decode_ids(std::vector<int32_t> ids) {
         sparse_decode_ids_ = std::move(ids);
     }
-
-    // Copy sparse_decode_ids_ into the ggml input tensor created during
-    // build_output_head. Call after ggml_backend_sched_alloc_graph and
-    // before ggml_backend_sched_graph_compute.
-    void upload_sparse_indices();
 };

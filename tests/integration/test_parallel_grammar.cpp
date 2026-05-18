@@ -454,7 +454,7 @@ class ParallelModelRunner {
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = forward_pass_->build_prefill_graph(system_prompt_tokens_, 0);
         ggml_backend_sched_alloc_graph(scheduler, gf);
-        forward_pass_->set_inputs(gf, system_prompt_tokens_, 0);
+        forward_pass_->set_prefill_inputs(gf, system_prompt_tokens_, 0);
         ggml_backend_sched_graph_compute(scheduler, gf);
         forward_pass_->advance_cache(system_prompt_tokens_.size(), 0);
         system_prompt_cache_pos_ = forward_pass_->get_cache_pos(0);
@@ -570,7 +570,7 @@ public:
             ggml_cgraph* gf = forward_pass_->build_prefill_graph(
                 user_tokens, system_prompt_cache_pos_, i);
             ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass_->set_inputs(gf, user_tokens, system_prompt_cache_pos_);
+            forward_pass_->set_prefill_inputs(gf, user_tokens, system_prompt_cache_pos_);
             ggml_backend_sched_graph_compute(scheduler, gf);
             forward_pass_->advance_cache(user_tokens.size(), i);
 
@@ -629,7 +629,7 @@ public:
             ggml_cgraph* gf = forward_pass_->build_decoding_graph(
                 batch_tokens, batch_slots, batch_positions);
             ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass_->set_batched_inputs(gf, batch_tokens, batch_slots, batch_positions);
+            forward_pass_->set_decode_inputs(gf, batch_tokens, batch_slots, batch_positions);
             ggml_backend_sched_graph_compute(scheduler, gf);
 
             // Sample for each active slot
