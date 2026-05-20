@@ -336,7 +336,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // logits node used to be the scheduler's backend-propagation anchor;
     // without it ggml_gallocr aborts on buffer_id < 0). Numerically inert.
     if (want_logits) {
-        build_output_head(gf, inpL);
+        build_output_head(gf, build_out_ids_slice(gf, inpL));
     } else {
         ggml_build_forward_expand(gf, inpL);
         ggml_set_output(inpL);

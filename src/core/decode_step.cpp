@@ -1,5 +1,6 @@
 #include "decode_step.h"
 #include "ggml-backend.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -29,8 +30,71 @@ int32_t decode_step(
     const std::vector<int32_t>&    history,
     const std::vector<std::string>& vocab,
     uint32_t               vocab_size,
-    bool                   force_dense
+    bool                   force_dense,
+    std::vector<int32_t>*  forced_run
 ) {
+    if (forced_run) forced_run->clear();
+
+    // Phase B — forced-token elision. If the grammar leaves exactly one valid
+    // token, the next token is determined; we do NOT need a forward pass to
+    // know it. Roll the deterministic run, then advance model state over it
+    // in ONE feed_tokens dispatch (KV append + recurrent overwrite, no LM
+    // head — docs/plan-feed-tokens.md). Skips r forwards, r heads, r samples.
+    //
+    // feed_tokens throws under TurboQuant by contract, and is per-recipe
+    // gated; guard on both. Independent of has_decode_graph(): the forced
+    // path never builds the decode graph (gemma's bridge recipes can still
+    // elide). The single returned token is ingested by the NEXT normal
+    // decode_step (the caller re-enters with token = run.back() at the
+    // branch), exactly as in the non-elided path.
+    // Reused by step 1 when the forced block already peeked — peek_valid_set
+    // recomputes get_valid_tokens (the measured decode bottleneck) every
+    // call, so the branching path must not pay for it twice.
+    std::vector<int32_t> valid_ids;
+    bool have_valid = false;
+
+    if (forced_run && fp->feed_tokens_supported() && !fp->tq_active()) {
+        std::vector<int32_t> v = sampler->peek_valid_set();
+        if (v.size() == 1) {
+            const auto& stop = sampler->eos_token_ids();
+            auto is_stop = [&](int32_t t) {
+                return std::find(stop.begin(), stop.end(), t) != stop.end();
+            };
+            // Bound a single feed batch; an over-long forced run just spans
+            // multiple decode_step calls (still no per-token forward).
+            constexpr size_t kForcedRunCap = 64;
+
+            std::vector<int32_t> run;
+            int32_t t = v[0];
+            while (true) {
+                run.push_back(t);
+                sampler->accept_token(t);          // advance grammar
+                if (is_stop(t) || run.size() >= kForcedRunCap) break;
+                v = sampler->peek_valid_set();
+                if (v.size() != 1) break;          // reached a branch
+                t = v[0];
+            }
+
+            // Ingest the input `token` plus every forced token except the
+            // last. The last (run.back()) is returned and ingested by the
+            // next normal decode_step — identical to how a normal step
+            // ingests its input `token` and predicts the successor.
+            std::vector<int32_t> feed;
+            feed.reserve(run.size());
+            feed.push_back(token);
+            feed.insert(feed.end(), run.begin(), run.end() - 1);
+            fp->feed_tokens(feed, slot, scheduler);
+
+            forced_run->assign(run.begin(), run.end() - 1);
+            return run.back();
+        }
+        // Not forced (branching / unconstrained): fall through. peek did not
+        // mutate grammar state; reuse v for step 1 instead of re-peeking
+        // (and the version-stamped cache still feeds sample()'s apply path).
+        valid_ids = std::move(v);
+        have_valid = true;
+    }
+
     // 0. BRIDGE: route to the legacy single-token run_prefill path when the
     //    unified decode graph can't be used. Two reasons, same destination:
     //      (a) tq_active()       — build_decoding_graph has no TurboQuant
@@ -57,8 +121,9 @@ int32_t decode_step(
         return next_token;
     }
 
-    // 1. Query grammar constraints before the forward pass.
-    std::vector<int32_t> valid_ids = sampler->peek_valid_set();
+    // 1. Query grammar constraints before the forward pass (reuse the forced
+    //    block's peek when present — never call get_valid_tokens twice).
+    if (!have_valid) valid_ids = sampler->peek_valid_set();
     const bool use_sparse = !force_dense &&
                             !env_force_dense() &&
                             !valid_ids.empty() &&

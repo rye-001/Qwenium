@@ -239,7 +239,7 @@ ggml_cgraph* Gemma2ForwardPass::build_prefill_graph(
     if (want_logits) {
         // Final norm (Gemma GGUF pre-shifts weights → standard build_rms_norm).
         ggml_tensor* cur = build_rms_norm(
-            ctx_, inpL, model_.get_output_norm_weight(),
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
             config_.rms_norm_eps, /*il=*/-1);
         set_tensor_name(gf, cur, "final_norm");
         ggml_set_output(cur);

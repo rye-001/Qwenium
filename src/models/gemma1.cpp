@@ -166,7 +166,7 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     // KV-append mid-stream differential ("attention-only" is not a skip).
     if (want_logits) {
         ggml_tensor* cur = build_rms_norm_gemma(
-            ctx_, inpL, model_.get_output_norm_weight(),
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
             meta_.rms_norm_eps, /*il=*/-1);
         set_tensor_name(gf, cur, "final_norm");
         ggml_set_output(cur);

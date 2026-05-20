@@ -296,7 +296,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // is unreachable from feed_tokens (scoped out, fails loud via
     // tq_active()) — so this remains exactly one reachable guard site.
     if (want_logits) {
-        build_output_head(gf, inpL);
+        build_output_head(gf, build_out_ids_slice(gf, inpL));
     } else {
         ggml_build_forward_expand(gf, inpL);
         ggml_set_output(inpL);

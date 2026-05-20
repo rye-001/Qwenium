@@ -1,0 +1,1 @@
+root ::= "await config.initialize(); await db.connect(); const result = await query.run();"

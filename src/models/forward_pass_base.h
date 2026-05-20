@@ -276,6 +276,20 @@ protected:
     // created automatically from sparse_decode_ids_ (set by set_sparse_decode_ids).
     void build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx = nullptr);
 
+    // Prefill-only token-position slice. Inserts a ggml_get_rows on the hidden
+    // state immediately before the LM head so the ~150k-wide head runs only on
+    // the position(s) that produce logits (default: last token). Registers an
+    // OutputIdsInput owning the "out_ids" slot. Returns `cur` unchanged when
+    // the slice is disabled (the differential dense-reference seam) — this is
+    // an explicit, caller-selected path, NOT a silent fallback on error.
+    //
+    // Orthogonal to the vocab-axis sparse slice in build_output_head: this
+    // gathers the hidden state, that gathers the head weight. Both compose
+    // order-independently in one graph. Called at the single per-recipe
+    // prefill head site only — never from build_decoding_graph (decode with
+    // n_tokens=1 is already trivially sliced).
+    ggml_tensor* build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* cur);
+
     void set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il = -1) const;
 
 public:
@@ -286,4 +300,15 @@ public:
     void set_sparse_decode_ids(std::vector<int32_t> ids) {
         sparse_decode_ids_ = std::move(ids);
     }
+
+    // Differential seam for the prefill output-position slice. Default true:
+    // prefill builds the LM head only on the last token (the optimization).
+    // Set false to build the dense head over all N positions — the bit-for-bit
+    // reference the slice differential compares against. Explicit and
+    // caller-selected; not an error fallback (CLAUDE.md fail-loud contract).
+    void set_slice_prefill_head(bool on) { slice_prefill_head_ = on; }
+    bool slice_prefill_head() const { return slice_prefill_head_; }
+
+protected:
+    bool slice_prefill_head_ = true;
 };

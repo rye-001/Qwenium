@@ -365,6 +365,24 @@ target_link_libraries(feed-tokens-tests-gemma PRIVATE
 target_compile_features(feed-tokens-tests-gemma PRIVATE cxx_std_17)
 gtest_discover_tests(feed-tokens-tests-gemma)
 
+# Prefill output-ID slice (last-token LM-head elision). No-model fail-loud
+# unit tests run unconditionally; the qwen35 + gemma1 bit-identical /
+# composition differentials self-skip when their model is absent.
+add_executable(out-ids-slice-tests
+    unit/test_out_ids_slice.cpp
+)
+
+target_link_libraries(out-ids-slice-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-graph-inputs
+    core
+    ggml
+)
+
+target_compile_features(out-ids-slice-tests PRIVATE cxx_std_17)
+gtest_discover_tests(out-ids-slice-tests)
+
 # Qwen 3.6 hparam + inventory validation tests (PR 3.I.1).
 # Pure-unit tests (no model file) run unconditionally.
 # Model-file integration tests self-skip when QWEN_MODEL_PATH is unset.

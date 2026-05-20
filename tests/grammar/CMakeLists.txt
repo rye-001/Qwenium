@@ -40,3 +40,23 @@ endif()
 if(APPLE)
     target_link_libraries(grammar-test-sparse-differential PRIVATE "-framework Accelerate")
 endif()
+
+# Phase B forced-token elision differential (token-stable vs non-elided).
+# Heavy — loads a real model; self-skips when QWENIUM_MODEL_PATH is absent.
+add_executable(grammar-test-forced-elision
+    test_forced_elision.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+)
+target_link_libraries(grammar-test-forced-elision PRIVATE
+    qinf-models
+    core
+    sampling
+    ggml
+    Threads::Threads
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(grammar-test-forced-elision PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(APPLE)
+    target_link_libraries(grammar-test-forced-elision PRIVATE "-framework Accelerate")
+endif()

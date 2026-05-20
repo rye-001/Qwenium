@@ -187,10 +187,9 @@ This phase is genuinely architectural — it's the stress test for whether the s
 
 ### Done criteria (Phase B)
 
-1. On the order-mgmt prompt: total tok/s on Qwen 3.6-A3B reaches ~1.5–2× baseline (combined with Phase A).
-2. Forced-token elision verified bit-for-bit against a non-elided run (same output sequence, just produced faster).
-3. No `if (grammar)` branches inside any layer module.
-4. `state/` exposes its prefill entry points cleanly; KV append vs recurrent overwrite stay distinct.
+1. Forced-token elision verified bit-for-bit against a non-elided run (same output sequence, just produced faster).
+2. No `if (grammar)` branches inside any layer module.
+3. `state/` exposes its prefill entry points cleanly; KV append vs recurrent overwrite stay distinct.
 
 ---
 

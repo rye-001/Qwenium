@@ -167,6 +167,12 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             using Clock = std::chrono::steady_clock;
             auto t_decode_start = Clock::now();
 
+            // Phase B: tokens decode_step emitted via forced-token elision
+            // (grammar-determined, no forward pass). Drained below in the
+            // same order, with the same stop/print/history handling the
+            // returned token gets. Grammar state is already advanced inside.
+            std::vector<int32_t> forced_run;
+
             for (int i = 0; i < args.max_tokens; ++i) {
                 std::string decoded_token = tokenizer->decode(next_token_id);
                 if (std::find(stop_ids.begin(), stop_ids.end(), next_token_id) != stop_ids.end()) {
@@ -186,7 +192,22 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 next_token_id = decode_step(
                     forward_pass.get(), scheduler, sampler.get(),
                     next_token_id, session_slot,
-                    all_tokens, decoded_vocab, vocab_size);
+                    all_tokens, decoded_vocab, vocab_size,
+                    /*force_dense=*/false, &forced_run);
+
+                // Drain forced-elided tokens (chronologically before the
+                // returned one), same handling as the loop-top emission.
+                for (int32_t ft : forced_run) {
+                    if (std::find(stop_ids.begin(), stop_ids.end(), ft) != stop_ids.end()) {
+                        goto end_chat_generation;
+                    }
+                    std::string ft_str = tokenizer->decode(ft);
+                    log_token(ft);
+                    print_token(ft_str);
+                    assistant_response += ft_str;
+                    all_tokens.push_back(ft);
+                    generated_tokens.push_back(ft);
+                }
 
                 if (std::find(stop_ids.begin(), stop_ids.end(), next_token_id) != stop_ids.end()) {
                     break;
