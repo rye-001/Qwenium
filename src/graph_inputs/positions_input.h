@@ -2,8 +2,7 @@
 
 #include "graph_input.h"
 
-// Owns the "inp_pos" slot. Contiguous prefill (pos + r) and batched decode
-// (explicit per-row positions) fold into one body via StepContext::row_pos.
+// Owns the "inp_pos" slot.
 class PositionsInput : public GraphInput {
 public:
     explicit PositionsInput(const char* slot = "inp_pos") : slot_(slot) {}

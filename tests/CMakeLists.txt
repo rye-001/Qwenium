@@ -62,6 +62,7 @@ gtest_discover_tests(integration-tests)
 add_executable(logits-dump
     diff/logits_dump.cpp
     ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
 )
 target_link_libraries(logits-dump PRIVATE
     qinf-models
@@ -169,6 +170,23 @@ target_link_libraries(token-trie-tests PRIVATE
 )
 
 gtest_discover_tests(token-trie-tests)
+
+# DecodePlan truth-table tests (GTest, no model needed). Enumerates the
+# resolver's input combinations and asserts the resolved plan — the
+# "first-class" half of the consolidation. Drops the self-tautology
+# rejections from the resolver and re-asserts them here on resolved values.
+add_executable(decode-plan-tests
+    unit/test_decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+)
+
+target_link_libraries(decode-plan-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+)
+
+target_compile_features(decode-plan-tests PRIVATE cxx_std_17)
+gtest_discover_tests(decode-plan-tests)
 
 # Parallel grammar test (Non-GTest)
 add_executable(parallel-grammar-test

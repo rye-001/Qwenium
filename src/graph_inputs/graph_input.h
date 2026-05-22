@@ -8,13 +8,9 @@
 struct ggml_cgraph;
 struct ggml_tensor;
 
-// One step's worth of host-side data that typed inputs read to populate their
-// graph tensors. Replaces the four overlapping parameter lists (set_inputs,
-// set_batched_inputs, the TQ per-layer loop, the prefill sub-graphs) with one.
-//
+// One step's data that typed inputs read to populate their graph tensors.
 // Position model: prefill is contiguous (row r -> pos + r). Batched decode
-// passes an explicit per-row vector. row_pos() folds both so a single
-// PositionsInput / AttnMaskInput body serves every recipe.
+// passes an explicit per-row vector.
 struct StepContext {
     ggml_cgraph* gf = nullptr;
 
@@ -34,40 +30,29 @@ struct StepContext {
 
 // A self-describing input over one (or, via composition, several) graph
 // slot(s). It knows how to populate its tensor and whether that tensor is
-// still valid versus the previous step. Verbose and explicit on purpose: no
-// CRTP, no template metaprogramming (CLAUDE.md cleverness rule). Flat — five
-// concrete classes, no base-of-base.
+// still valid versus the previous step.
 class GraphInput {
 public:
     virtual ~GraphInput() = default;
 
-    // Populate this input's tensor(s) for the given step. Called after
-    // ggml_backend_sched_alloc_graph, before compute.
+    // Populate this input's tensor(s) for the given step.
     virtual void set_input(const StepContext& step) = 0;
 
-    // True iff nothing this input depends on changed since the last
-    // set_input. Conservative: default false. Only an input that can
-    // *prove* invariance returns true. (Phase 2 implements honest answers;
-    // Phase 1 leaves every input at the safe default.)
+    // True iff nothing in this input depends on changed since the last
+    // set_input. Conservative: default false.
     virtual bool can_reuse(const StepContext& step) const { return false; }
 
     // Name of the tensor slot this input owns, for fail-loud diagnostics.
     virtual const char* slot_name() const = 0;
 
 protected:
-    // Fail-loud tensor lookup. Throws naming the slot, the expected
-    // dtype/shape, and the actual ("absent"), in that order. Strictly
-    // stronger than ggml_graph_get_tensor returning null and segfaulting
-    // downstream.
+    // Fail-loud tensor lookup
     static ggml_tensor* require_tensor(const StepContext& step,
                                        const char* slot,
                                        int expected_type);
 };
 
-// An ordered collection of typed inputs for one graph. set_input fans out to
-// every member; can_reuse ANDs them (llama.cpp llm_graph_result::can_reuse
-// shape). A future HybridMemoryInput is just another GraphInput added here —
-// composition, not a unified base (CLAUDE.md KV != RS invariant).
+// An ordered collection of typed inputs for one graph.
 class GraphInputSet {
 public:
     void add(std::unique_ptr<GraphInput> input) {
@@ -81,7 +66,7 @@ public:
         for (const auto& in : inputs_) in->set_input(step);
     }
 
-    // Conservative AND. Phase 1: always false (every member defaults false).
+    // Conservative AND
     bool can_reuse(const StepContext& step) const {
         for (const auto& in : inputs_)
             if (!in->can_reuse(step)) return false;

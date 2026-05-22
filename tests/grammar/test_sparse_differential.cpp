@@ -251,7 +251,7 @@ int32_t capture_sparse_step(FILE* f, ForwardPassBase* fp,
                             const std::vector<std::string>& vocab,
                             uint32_t vocab_size, int32_t token, uint32_t slot) {
     // decode_step sparse decision (SPARSE_HEAD_FRACTION_DENOM = 8),
-    // force_dense=false, QWENIUM_FORCE_DENSE assumed unset (deterministic).
+    // force_dense=false (force_dense_param is the sole diagnostic seam).
     std::vector<int32_t> valid_ids = sampler->peek_valid_set();
     const bool use_sparse = !valid_ids.empty() &&
                             valid_ids.size() < vocab_size / 8;
@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
     const char* env_model = std::getenv("QWENIUM_MODEL_PATH");
     std::string model_path = env_model ? env_model
                                        : "./Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf";
-    std::string grammar_path = "py/order-management.gbnf";
+    std::string grammar_path = "grammar/order-management.gbnf";
     std::string system_prompt_path = "tests/system_prompt_order_mngmt.txt";
     std::string user_query = "get all platinum customers";
     int n_tokens = 30;

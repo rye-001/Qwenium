@@ -26,6 +26,7 @@ target_link_libraries(grammar-test-corpus-parse PRIVATE sampling)
 add_executable(grammar-test-sparse-differential
     test_sparse_differential.cpp
     ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
 )
 target_link_libraries(grammar-test-sparse-differential PRIVATE
     qinf-models
@@ -46,6 +47,7 @@ endif()
 add_executable(grammar-test-forced-elision
     test_forced_elision.cpp
     ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
 )
 target_link_libraries(grammar-test-forced-elision PRIVATE
     qinf-models

@@ -17,10 +17,6 @@ TokenizerConfig qwen_tokenizer_config();
  * 
  * All layers are uniform transformer blocks with standard softmax attention.
  * KV cache spans all layers with identity index mapping.
- * 
- * This class preserves the exact same public API as the original
- * Qwen3ForwardPass — existing call sites (CLI, server, tests) need
- * no changes.
  */
 class Qwen3ForwardPass : public ForwardPassBase {
     // Grant the unit test access to private members for validation.
@@ -38,9 +34,6 @@ public:
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions
     ) override;
-
-    // Inputs are populated via the typed graph_inputs_ set built in
-    // build_prefill_graph / build_decoding_graph (no set_inputs override).
 
     // --- Cache management ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
@@ -88,7 +81,7 @@ public:
 
     // TurboQuant active iff the compressed store was allocated (kv_quant_bits>=2).
     // build_decoding_graph has no TQ path; decode_step uses this to route TQ
-    // decode through the TQ-aware run_prefill (bridge until Option 1 lands).
+    // decode through the TQ-aware run_prefill
     bool tq_active() const override { return tq_store_ != nullptr; }
 
     std::vector<float> run_prefill(

@@ -1,9 +1,7 @@
 #pragma once
 // qwen36.h — Forward pass for the Qwen 3.6-35B-A3B hybrid architecture.
 //
-// validate_qwen36_inventory validates the tensor inventory for qwen35moe.
-//
-// Architecture: 40 layers, layer_idx % 4 == 3 → softmax attention (10 layers),
+// Architecture: 40 layers, layer_idx % 4 == 3: softmax attention (10 layers),
 //   else GatedDeltaNet (30 layers). Every layer uses a MoE FFN (256 experts,
 //   top-8, 1 shared expert). GGUF architecture string: "qwen35moe".
 //
@@ -12,8 +10,7 @@
 //   DeltaNetState    — 30 layers, backend-backed recurrent + conv state
 //
 // Graph shape: one monolithic ggml_cgraph per prefill call (≈2400 nodes,
-//   well within the 16 384-node budget). Sub-graph batching (à la Qwen3.5 TQ)
-//   is deferred to Phase 4 if the node budget is ever approached.
+//   well within the 16 384-node budget).
 
 #include "forward_pass_base.h"
 #include "../state/kv_cache_simple.h"
@@ -63,7 +60,6 @@ struct Qwen35MoEConfig {
 
     // Factory: copies family-specific fields from meta and validates
     // qwen35moe-specific invariants.  Throws std::runtime_error on violation
-    // following the fail-loud contract: field name, expected, actual.
     static Qwen35MoEConfig from_metadata(const ModelMetadata& meta);
 };
 
@@ -81,17 +77,12 @@ public:
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx = 0, bool want_logits = true) override;
 
-    // qwen36 is the first recipe to honor want_logits=false (one head-guard
-    // site in build_prefill_graph). docs/plan-feed-tokens.md phase 1.
     bool feed_tokens_supported() const override { return true; }
 
     ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>&  positions) override;
-
-    // Inputs are populated via the typed graph_inputs_ set built in
-    // build_prefill_graph / build_decoding_graph (no set_inputs override).
 
     // ── Cache management ─────────────────────────────────────────────────────
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {

@@ -15,11 +15,6 @@ void validate_qwen35_inventory(const ModelMetadata& meta);
 // the hybrid-attention interval that backs the layer-kind helpers).
 // Universal fields (block_count, embedding_length, head counts, RoPE base,
 // RMS eps) stay on ModelMetadata and are read directly by the recipe.
-//
-// The layer-kind methods (is_full_attention_layer / is_ssm_layer) live here
-// so the recipe calls cfg_.* rather than touching ModelMetadata.
-// ModelMetadata no longer carries these methods; all load-time call sites
-// (model.cpp, qwen35.cpp validators) use the inline arithmetic directly.
 struct Qwen35Config {
     // SSM / DeltaNet block
     uint32_t ssm_conv_kernel;
@@ -28,14 +23,12 @@ struct Qwen35Config {
     uint32_t ssm_time_step_rank;
     uint32_t ssm_inner_size;
 
-    // Partial-RoPE dimension (0 → fall back to full head dimension at use sites)
+    // Partial-RoPE dimension (0 -> fall back to full head dimension at use sites)
     uint32_t rope_dimension_count;
 
     // Hybrid-attention scheduling
     uint32_t full_attention_interval;
 
-    // Layer-kind helpers — identical semantics to ModelMetadata::is_*_layer
-    // but self-contained so the recipe does not need to touch the metadata.
     bool is_full_attention_layer(uint32_t il) const {
         if (full_attention_interval == 0) return true;
         return (il % full_attention_interval) == (full_attention_interval - 1);
@@ -44,7 +37,6 @@ struct Qwen35Config {
 
     // Factory: copies family-specific fields from meta and validates
     // qwen35-specific invariants.  Throws std::runtime_error on violation
-    // following the fail-loud contract: field name, expected, actual.
     static Qwen35Config from_metadata(const ModelMetadata& meta);
 };
 
@@ -71,9 +63,6 @@ public:
     ~Qwen35ForwardPass() override = default;
 
     // --- Graph building ---
-    // Inputs are populated via graph_inputs_ (typed GraphInputSet), built in
-    // build_prefill_graph / build_decoding_graph. No set_inputs /
-    // set_batched_inputs override — those are gone for this recipe.
     struct ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0, bool want_logits = true) override;
 
     ggml_cgraph* build_decoding_graph(
@@ -81,7 +70,7 @@ public:
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) override;
 
-    // Phase 2 of docs/plan-feed-tokens.md: qwen35 honors want_logits=false
+    // qwen35 honors want_logits=false
     // with one head-guard site in build_prefill_graph. feed_tokens scopes TQ
     // out (base fails loud via tq_active()), so the TQ run_prefill head path
     // is unreachable — exactly one reachable guard site.
@@ -190,7 +179,5 @@ private:
     // Compress newly written KV tokens from scratch slot scratch_layer → tq_store_.
     void _tq_compress_attn_layer(uint32_t kv_idx, uint32_t slot_idx, uint32_t pos,
                                   uint32_t n_tokens, uint32_t scratch_layer = 0);
-
-    // --- Batched decode builders (multi-slot, 1 token per slot) ---
 
 };

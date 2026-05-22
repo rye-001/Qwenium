@@ -3,8 +3,7 @@
 #include "graph_input.h"
 
 // Owns the "tokens" slot (the I32 input feeding ggml_get_rows for the
-// embedding lookup). Body moved verbatim from the recipes'
-// set_inputs/set_batched_inputs token-copy.
+// embedding lookup).
 class TokensInput : public GraphInput {
 public:
     explicit TokensInput(const char* slot = "tokens") : slot_(slot) {}

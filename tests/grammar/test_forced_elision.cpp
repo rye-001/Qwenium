@@ -15,9 +15,12 @@
 // only divergence Metal can inject is in branching-position logits, asserted
 // token-stable). Strict bytewise is not claimed (unattainable by construction).
 //
-// Same harness shape as test_sparse_differential.cpp: real model + real
-// grammar, two session slots cloned from one prefill, greedy. Self-skips when
-// the model is absent.
+// Combinatorial: iterates over resolved DecodePlan values (not raw flag
+// products) — {diagnostic} × {forced elision} for a Unified non-TQ recipe.
+// Every legal plan must be token-stable vs the canonical baseline; illegal
+// combinations never reach here (resolve_decode_plan throws). Same harness
+// shape as test_sparse_differential.cpp: real model + grammar, per-case slot
+// cloned from one prefill, greedy. Self-skips when the model is absent.
 
 #include <algorithm>
 #include <cstdint>
@@ -31,6 +34,7 @@
 #include <vector>
 
 #include "../../src/core/decode_step.h"
+#include "../../src/core/decode_plan.h"
 #include "../../src/core/model.h"
 #include "../../src/loader/chat_template.h"
 #include "../../src/loader/tokenizer.h"
@@ -56,7 +60,8 @@ std::vector<int32_t> run_decode(
     ForwardPassBase* fp, ggml_backend_sched_t sched,
     qwenium::Sampler* sampler, const std::vector<std::string>& vocab,
     uint32_t vocab_size, int32_t first_token, uint32_t slot, int n_tokens,
-    const std::vector<int32_t>& stop_ids, bool forced, size_t* elided = nullptr) {
+    const std::vector<int32_t>& stop_ids, bool forced, bool force_dense,
+    size_t* elided = nullptr) {
 
     std::vector<int32_t> out;
     auto is_stop = [&](int32_t t) {
@@ -68,7 +73,7 @@ std::vector<int32_t> run_decode(
 
     for (int i = 0; i < n_tokens && !is_stop(next); ) {
         next = decode_step(fp, sched, sampler, next, slot, history, vocab,
-                           vocab_size, /*force_dense=*/false,
+                           vocab_size, force_dense,
                            forced ? &forced_run : nullptr);
         bool stop_hit = false;
         if (forced) {
@@ -95,7 +100,7 @@ int main(int argc, char** argv) {
     const char* env_model = std::getenv("QWENIUM_MODEL_PATH");
     std::string model_path = env_model ? env_model
                                        : "./Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf";
-    std::string grammar_path = "py/order-management.gbnf";
+    std::string grammar_path = "grammar/order-management.gbnf";
     std::string system_prompt_path = "tests/system_prompt_order_mngmt.txt";
     std::string user_query = "get all platinum customers";
     int n_tokens = 40;
@@ -139,15 +144,32 @@ int main(int argc, char** argv) {
     auto sys_tokens  = tok->encode(sys_turn);
     auto user_tokens = tok->encode(user_turn);
 
-    auto fp = create_forward_pass(model, &meta, 4096, 3, 0);
+    // Combinatorial differential over resolved DecodePlan values (NOT raw
+    // flag products): for a Unified, non-TQ recipe the legal plans are the
+    // {diagnostic} × {forced elision} grid. Every legal plan must produce a
+    // token-stable-identical stream to the canonical baseline (Optimized, no
+    // forced elision). Plans that route through feed_tokens are token-stable,
+    // not bytewise, by the documented Metal fork — that is the asserted
+    // contract here (Phase B done-criterion #1, fork-rewritten).
+    struct Case {
+        const char* name;
+        bool        forced;       // pass a forced_run sink to decode_step
+        bool        force_dense;  // decode_step force_dense + slice_prefill off
+    };
+    const Case cases[] = {
+        {"Optimized/forced=off", false, false},  // [0] = baseline
+        {"Optimized/forced=on ", true,  false},
+        {"ForceDense/forced=off", false, true },
+        {"ForceDense/forced=on ", true,  true },
+    };
+    constexpr int kNCases = sizeof(cases) / sizeof(cases[0]);
+
+    auto fp = create_forward_pass(model, &meta, 4096, kNCases + 1, 0);
     ggml_backend_sched_t sched = model.get_scheduler();
-    const uint32_t prefill_slot = 0, slot_off = 1, slot_on = 2;
+    const uint32_t prefill_slot = 0;
     fp->run_prefill(sys_tokens, 0, prefill_slot, sched);
-    fp->clone_slot(prefill_slot, slot_off, sys_tokens.size());
-    fp->clone_slot(prefill_slot, slot_on,  sys_tokens.size());
 
     const std::vector<int32_t> stop_ids = meta.stop_token_ids;
-
     auto make_sampler = [&]() {
         auto s = std::make_unique<qwenium::GreedySampler>();
         s->set_grammar(grammar.get());
@@ -165,52 +187,76 @@ int main(int argc, char** argv) {
         grammar->accept_token(t, vocab);
         return t;
     };
-
-    auto sOff = make_sampler();
-    int32_t f0 = fresh_start(sOff.get(), slot_off);
-    auto off = run_decode(fp.get(), sched, sOff.get(), vocab, vocab_size,
-                          f0, slot_off, n_tokens, stop_ids, /*forced=*/false);
-
-    auto sOn = make_sampler();
-    int32_t f1 = fresh_start(sOn.get(), slot_on);
-    size_t elided = 0;
-    auto on = run_decode(fp.get(), sched, sOn.get(), vocab, vocab_size,
-                         f1, slot_on, n_tokens, stop_ids, /*forced=*/true,
-                         &elided);
-    std::cerr << "[info] forced-elided tokens (no forward pass): " << elided
-              << " / " << on.size() << " generated\n";
-    if (elided == 0)
-        std::cerr << "[warn] forced elision never fired for this "
-                     "model/grammar — differential is correct but vacuous; "
-                     "use the order-management grammar on a DSL-following "
-                     "model to exercise it.\n";
-
-    auto dump = [&](const char* tag, int32_t first, const std::vector<int32_t>& v) {
-        std::cerr << "[" << tag << "] " << first;
-        for (int32_t t : v) std::cerr << "," << t;
-        std::cerr << "\n";
+    auto route_str = [](DecodeRoute r) {
+        return r == DecodeRoute::Unified ? "Unified" : "Bridge";
     };
-    dump("OFF", f0, off);
-    dump("ON ", f1, on);
+    auto diag_str = [](DecodeDiagnostic d) {
+        return d == DecodeDiagnostic::Optimized ? "Optimized" : "ForceDense";
+    };
 
-    bool ok = (f0 == f1) && (off.size() == on.size());
-    for (size_t i = 0; ok && i < off.size(); ++i) ok = (off[i] == on[i]);
+    std::vector<int32_t> base_stream;
+    int32_t base_first = 0;
+    bool all_ok = true;
 
-    if (!ok) {
-        std::cerr << "[FAIL] forced-elision token stream diverged from the "
-                     "non-elided baseline. Phase B must be token-stable "
-                     "(see header: bytewise is unattainable on Metal).\n";
-        size_t n = std::min(off.size(), on.size());
-        for (size_t i = 0; i < n; ++i)
-            if (off[i] != on[i]) {
-                std::cerr << "  first divergence @" << i << " off=" << off[i]
-                          << " ('" << vocab[off[i]] << "') on=" << on[i]
-                          << " ('" << vocab[on[i]] << "')\n";
-                break;
-            }
+    for (int c = 0; c < kNCases; ++c) {
+        const Case& cs = cases[c];
+        const uint32_t slot = static_cast<uint32_t>(c + 1);
+        fp->clone_slot(prefill_slot, slot, sys_tokens.size());
+        // The collapsed diagnostic seam: ForceDense drives BOTH inputs
+        // (decode force_dense + the prefill out_ids slice toggle) together.
+        fp->set_slice_prefill_head(!cs.force_dense);
+
+        // Resolve once and show the plan this case actually spans (illegal
+        // combinations would have thrown in resolve — none here, all legal).
+        DecodePlan plan = resolve_decode_plan(fp.get(), cs.forced,
+                                              cs.force_dense);
+        std::cerr << "[plan " << cs.name << "] route=" << route_str(plan.route)
+                  << " diagnostic=" << diag_str(plan.diagnostic)
+                  << " allow_forced_elision=" << plan.allow_forced_elision
+                  << " sparse_head_allowed=" << plan.sparse_head_allowed
+                  << " has_decode_graph=" << plan.has_decode_graph << "\n";
+
+        auto s = make_sampler();
+        int32_t first = fresh_start(s.get(), slot);
+        size_t elided = 0;
+        auto stream = run_decode(fp.get(), sched, s.get(), vocab, vocab_size,
+                                 first, slot, n_tokens, stop_ids, cs.forced,
+                                 cs.force_dense, &elided);
+
+        std::cerr << "[" << cs.name << "] elided=" << elided << " first="
+                  << first << " n=" << stream.size() << "\n";
+
+        if (c == 0) { base_stream = stream; base_first = first; continue; }
+
+        bool ok = (first == base_first) && (stream.size() == base_stream.size());
+        for (size_t i = 0; ok && i < stream.size(); ++i)
+            ok = (stream[i] == base_stream[i]);
+        if (!ok) {
+            all_ok = false;
+            std::cerr << "[FAIL] plan '" << cs.name << "' diverged from the "
+                         "Optimized/forced=off baseline (token-stable "
+                         "required).\n";
+            size_t n = std::min(stream.size(), base_stream.size());
+            for (size_t i = 0; i < n; ++i)
+                if (stream[i] != base_stream[i]) {
+                    std::cerr << "  first divergence @" << i << " base="
+                              << base_stream[i] << " ('" << vocab[base_stream[i]]
+                              << "') case=" << stream[i] << " ('"
+                              << vocab[stream[i]] << "')\n";
+                    break;
+                }
+        } else {
+            std::cerr << "[ok] plan '" << cs.name << "' token-stable vs "
+                         "baseline (" << (1 + stream.size()) << " tokens)\n";
+        }
+    }
+
+    if (!all_ok) {
+        std::cerr << "[FAIL] DecodePlan combinatorial differential: at least "
+                     "one legal plan changed the token stream.\n";
         return 1;
     }
-    std::cerr << "[PASS] forced elision token-stable: " << (1 + on.size())
-              << " tokens identical to the non-elided baseline.\n";
+    std::cerr << "[PASS] DecodePlan combinatorial differential: all "
+              << kNCases << " legal plans token-stable vs baseline.\n";
     return 0;
 }
