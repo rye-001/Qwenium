@@ -91,7 +91,7 @@ public:
         const auto& srv_meta = model_.get_metadata();
         register_builtin_models();
         forward_pass_ = create_forward_pass(
-            model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS, /*kv_quant_bits=*/0);
+            model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
         
         scheduler_ = model_.get_scheduler();
         

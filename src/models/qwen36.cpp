@@ -83,8 +83,7 @@ Qwen36ForwardPass::Qwen36ForwardPass(
     const Model&    model,
     const ModelMetadata* metadata,
     uint32_t             context_len,
-    uint32_t             max_batch_size,
-    int                  /*kv_quant_bits*/)
+    uint32_t             max_batch_size)
     : ForwardPassBase(model, metadata)
 {
     const auto& m = *metadata;
@@ -380,12 +379,12 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     ggml_build_forward_expand(gf, inp_pos);
 
     // 3. KV gather mask — shared across all attention layers.
-    uint32_t max_physical = 0;
+    uint32_t max_pos = 0;
     for (uint32_t s : slots) {
-        uint32_t phys = get_physical_cache_pos(s);
-        if (phys > max_physical) max_physical = phys;
+        uint32_t p = get_cache_pos(s);
+        if (p > max_pos) max_pos = p;
     }
-    const uint32_t n_kv_len = max_physical + 1;  // +1 for token being written
+    const uint32_t n_kv_len = max_pos + 1;
 
     ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
                                                n_kv_len, 1, 1, n_batch);

@@ -83,17 +83,10 @@ constexpr size_t GEMMA2_GRAPH_SIZE = 16384;
 
 Gemma2ForwardPass::Gemma2ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata),
       config_(Gemma2Config::from_metadata(*metadata))
 {
-    if (kv_quant_bits != 0) {
-        throw std::runtime_error(
-            "Gemma2ForwardPass: kv_quant_bits != 0 not supported "
-            "(architecture='gemma2'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();

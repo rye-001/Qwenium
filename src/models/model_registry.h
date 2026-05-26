@@ -23,8 +23,7 @@ using ForwardPassFactory = std::function<std::unique_ptr<ForwardPassBase>(
     const Model&        model,
     const ModelMetadata*     metadata,
     uint32_t                 context_len,
-    uint32_t                 max_batch_size,
-    int                      kv_quant_bits)>;
+    uint32_t                 max_batch_size)>;
 
 // Per-architecture tensor-inventory validator.
 // Throws std::runtime_error (naming slot, expected, actual) on failure.
@@ -70,8 +69,7 @@ std::unique_ptr<ForwardPassBase> create_forward_pass(
     const Model&    model,
     const ModelMetadata* metadata,
     uint32_t             context_len,
-    uint32_t             max_batch_size,
-    int                  kv_quant_bits);
+    uint32_t             max_batch_size);
 
 // Register all built-in model recipes (qwen2/3, qwen35, qwen35moe, gemma).
 // Idempotent — safe to call multiple times. Call once from CLI startup.

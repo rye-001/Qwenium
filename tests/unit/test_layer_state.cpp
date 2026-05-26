@@ -1,7 +1,7 @@
 // test_layer_state.cpp — PR 2.1 / PR 2.2
 //
 // Tests the LayerState abstract interface via a mock implementation,
-// and verifies that simple_kv_cache and CompressedKVStore conform to it.
+// and verifies that simple_kv_cache conforms to it.
 //
 // Run: ./qwen3-layer-tests --gtest_filter="LayerState*"
 
@@ -11,7 +11,6 @@
 
 #include "../../src/state/layer_state.h"
 #include "../../src/state/kv_cache_simple.h"
-#include "../../src/state/kv_cache_compressed.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -101,24 +100,3 @@ TEST_F(KVCacheLayerStateTest, TruncateToPosition) {
     EXPECT_EQ(cache_->get_pos(0), 5u);
 }
 
-// ── PR 2.2: CompressedKVStore conforms ───────────────────────────────────────
-
-TEST(CompressedKVStoreLayerState, InheritsLayerState) {
-    // n_embd_k=128, head_dim=64 (power of 2), block_size=32 → 128/32=4 blocks per head.
-    CompressedKVStore store(/*n_layers=*/2, /*n_slots=*/2, /*n_ctx_max=*/16,
-                            /*n_embd_k=*/128, /*n_embd_v=*/128,
-                            /*head_dim=*/64, /*bits=*/2);
-    LayerState* ls = &store;
-    ASSERT_NE(ls, nullptr);
-    EXPECT_GT(ls->memory_bytes(), 0u);
-}
-
-TEST(CompressedKVStoreLayerState, ResetSequenceResetsPosition) {
-    CompressedKVStore store(2, 2, 16, 128, 128, 64, 2);
-    store.advance(/*slot=*/0, /*n_tokens=*/6);
-    EXPECT_EQ(store.get_pos(0), 6u);
-
-    LayerState* ls = &store;
-    ls->reset_sequence(0);
-    EXPECT_EQ(store.get_pos(0), 0u);
-}

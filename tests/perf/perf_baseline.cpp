@@ -124,7 +124,7 @@ static json benchmark_model(
     model.load_tensors();
     const auto& meta = model.get_metadata();
     const uint32_t ctx_len = 2048;   // cap KV cache for baseline — full context_length OOMs on 32GB
-    auto fp = create_forward_pass(model, &meta, ctx_len, 1, 0);
+    auto fp = create_forward_pass(model, &meta, ctx_len, 1);
     ggml_backend_sched_t sched = model.get_scheduler();
     Tokenizer* tok = model.get_tokenizer();
 

@@ -100,25 +100,9 @@ single-token decode steps from the same starting state.
   That reasoning has burned this project before. Each recipe owes its own
   passing differential, Gemma included.
 
-### TurboQuant clause (do not omit)
+### TurboQuant clause — resolved
 
-Under TurboQuant, the decode path that *defines* this contract is the
-`run_prefill` compress/decompress bridge — `decode_step.cpp` already routes TQ
-decode there because the unified graph has no TQ path. `feed_tokens` onto a
-non-empty mid-decode cache under TQ is a **compressed-store write path**.
-
-The doc-as-implemented must do **one** of:
-
-1. **Fold TQ into the contract:** `feed_tokens` reuses the TQ bridge (or proves
-   equivalence to it), and the per-recipe differential is run **with TQ
-   active** as well as without.
-2. **Scope TQ out explicitly:** `feed_tokens` fails loud — asserts / refuses —
-   when `tq_active()`, mirroring the existing TQ decode bridge, with the reason
-   stated in code and here.
-
-Silent omission is **forbidden**. This is the project's known segfault-class
-gap (uninitialized state under TQ); it must be a stated decision, not an
-oversight.
+TurboQuant was deleted (outside the workload envelope). No interaction remains.
 
 ---
 

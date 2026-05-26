@@ -56,8 +56,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --speculative           Enable Prompt Lookup Decoding (speculative)\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
-    std::cout << "  --snapkv-budget N       SnapKV: keep top-N KV positions per head after prefill (0 = disabled)\n";
-    std::cout << "  --snapkv-window W       SnapKV: observation window size (default: 32)\n\n";
+    std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";
     std::cout << "  " << program_name << " model.gguf --chat\n";
@@ -117,9 +116,6 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--ctx-size") {
             if (i + 1 >= argc) return false;
             args.context_length = std::stoi(argv[++i]);
-        } else if (arg == "--kv-quant-bits") {
-            if (i + 1 >= argc) return false;
-            args.kv_quant_bits = std::stoi(argv[++i]);
         } else if (arg == "--speculative") {
             args.speculative = true;
         } else if (arg == "--pld-ngram") {
@@ -128,12 +124,6 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--pld-max-draft") {
             if (i + 1 >= argc) return false;
             args.pld_max_draft = std::stoi(argv[++i]);
-        } else if (arg == "--snapkv-budget") {
-            if (i + 1 >= argc) return false;
-            args.snapkv_budget = std::stoi(argv[++i]);
-        } else if (arg == "--snapkv-window") {
-            if (i + 1 >= argc) return false;
-            args.snapkv_window = std::stoi(argv[++i]);
         } else if (args.model_path.empty()) {
             args.model_path = arg;
         }

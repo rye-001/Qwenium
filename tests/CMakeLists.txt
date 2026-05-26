@@ -18,7 +18,6 @@ add_executable(unit-tests
     unit/test_qwen35_forward_attn.cpp
     unit/test_qwen35_generation.cpp
     unit/test_grammar_vocab.cpp
-    unit/test_turboquant_generation.cpp
     unit/test_graph_input.cpp
     unit/test_tokens_input.cpp
     unit/test_positions_input.cpp
@@ -96,68 +95,6 @@ target_link_libraries(parallel-order-mngmt-test PRIVATE
     sampling
     ggml
 )
-
-# TurboQuant unit tests (GTest, no model needed)
-add_executable(turboquant-tests
-    unit/test_turboquant.cpp
-)
-
-target_link_libraries(turboquant-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-)
-
-gtest_discover_tests(turboquant-tests)
-
-# Compressed KV store unit tests (GTest, no model needed)
-add_executable(compressed-kv-tests
-    unit/test_compressed_kv_store.cpp
-)
-
-target_link_libraries(compressed-kv-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-)
-
-gtest_discover_tests(compressed-kv-tests)
-
-# SnapKV CLI config tests (GTest, no model needed)
-add_executable(snapkv-cli-tests
-    unit/test_snapkv_cli.cpp
-)
-
-target_link_libraries(snapkv-cli-tests PRIVATE
-    GTest::gtest_main
-)
-
-gtest_discover_tests(snapkv-cli-tests)
-
-# SnapKV eviction + compaction unit tests (GTest, no model needed)
-add_executable(snapkv-eviction-tests
-    unit/test_snapkv_eviction.cpp
-)
-
-target_link_libraries(snapkv-eviction-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-    ggml
-)
-
-gtest_discover_tests(snapkv-eviction-tests)
-
-# SnapKV position tracking tests (GTest)
-add_executable(snapkv-position-tests
-    unit/test_snapkv_position.cpp
-)
-
-target_link_libraries(snapkv-position-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-    core
-    ggml
-)
-
-gtest_discover_tests(snapkv-position-tests)
 
 # TokenTrie unit tests (GTest, no model needed)
 add_executable(token-trie-tests
@@ -807,32 +744,6 @@ target_link_libraries(forward-tests-gemma3 PRIVATE
 )
 target_compile_features(forward-tests-gemma3 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-gemma3)
-
-# ── TQ prefill canary tests ───────────────────────────────────────────────────
-# Regression gate for the TurboQuant prefill path (_build_layer_batch_graph).
-# Prerequisite for the build_transformer_layer extraction PR.
-# Self-skips when QWEN3_MODEL_PATH is unset or the model file is absent.
-# See: docs/kv-cache-unification.md open question #3.
-add_executable(tq-prefill-tests
-    unit/test_qwen3_tq_prefill.cpp
-)
-
-# Bake the source-tree fixture path into the binary so it resolves correctly
-# regardless of the working directory from which tests are invoked.
-target_compile_definitions(tq-prefill-tests PRIVATE
-    QWEN3_TQ_BASELINE_DEFAULT="${CMAKE_SOURCE_DIR}/tests/fixtures/qwen3_tq_prefill_baseline.json"
-)
-
-target_link_libraries(tq-prefill-tests PRIVATE
-    GTest::gtest_main
-    qinf-models
-    core
-    nlohmann_json::nlohmann_json
-    ggml
-)
-
-target_compile_features(tq-prefill-tests PRIVATE cxx_std_17)
-gtest_discover_tests(tq-prefill-tests)
 
 # ── Phase 4 tools ─────────────────────────────────────────────────────────────
 

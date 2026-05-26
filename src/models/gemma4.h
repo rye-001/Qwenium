@@ -135,8 +135,7 @@ TokenizerConfig gemma4_tokenizer_config();
 class Gemma4ForwardPass : public ForwardPassBase {
 public:
     Gemma4ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1,
-                      int kv_quant_bits = 0);
+                      uint32_t context_len, uint32_t max_batch_size = 1);
     ~Gemma4ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,
@@ -173,7 +172,6 @@ public:
     void clear_slot(uint32_t slot_idx) override;
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override;
     uint32_t get_cache_pos(uint32_t slot_idx) const override;
-    uint32_t get_physical_cache_pos(uint32_t slot_idx) const override;
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override;
 
 private:

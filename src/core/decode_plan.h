@@ -4,8 +4,8 @@
 
 // DecodePlan — the resolved, immutable decision for ONE decode step.
 //
-// decode_step used to read seven decode-path flags ad hoc at point of use
-// (force_dense, slice_prefill_head, forced_run, want_logits, tq_active,
+// decode_step used to read several decode-path flags ad hoc at point of use
+// (force_dense, slice_prefill_head, forced_run, want_logits,
 // feed_tokens_supported, has_decode_graph). Each was individually clean;
 // collectively they were an implicit, scattered, untested combinatorial
 // surface — the "path zoo" smell. This makes that surface first-class:
@@ -25,7 +25,7 @@ enum class DecodeDiagnostic {
 
 enum class DecodeRoute {
     Unified,     // build_decoding_graph (the single-token decode graph)
-    Bridge,      // legacy single-token run_prefill (TQ-aware / no decode graph)
+    Bridge,      // legacy single-token run_prefill (no decode graph)
 };
 
 struct DecodePlan {
@@ -34,8 +34,7 @@ struct DecodePlan {
 
     // Phase B forced-token elision permitted this step. Still gated at use
     // by the grammar actually yielding exactly one token (data, not a flag).
-    // Encodes !tq_active (feed_tokens is refused under TurboQuant by
-    // contract) and feed_tokens_supported.
+    // Encodes feed_tokens_supported.
     //
     // Invariant (used at the decode_step forced-block use site):
     //     plan.allow_forced_elision  ⇒  forced_run_enabled  (caller passed a
@@ -62,8 +61,7 @@ struct DecodePlan {
 // upstream contract violation). Self-tautology checks against the resolver's
 // own assignments are NOT here; they live in the unit test as assertions on
 // the resolved values.
-DecodePlan resolve_decode_plan_inputs(bool tq_active,
-                                      bool feed_tokens_supported,
+DecodePlan resolve_decode_plan_inputs(bool feed_tokens_supported,
                                       bool has_decode_graph,
                                       bool slice_prefill_head,
                                       bool force_dense,

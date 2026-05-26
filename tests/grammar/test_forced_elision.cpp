@@ -16,7 +16,7 @@
 // token-stable). Strict bytewise is not claimed (unattainable by construction).
 //
 // Combinatorial: iterates over resolved DecodePlan values (not raw flag
-// products) — {diagnostic} × {forced elision} for a Unified non-TQ recipe.
+// products) — {diagnostic} × {forced elision} for a Unified recipe.
 // Every legal plan must be token-stable vs the canonical baseline; illegal
 // combinations never reach here (resolve_decode_plan throws). Same harness
 // shape as test_sparse_differential.cpp: real model + grammar, per-case slot
@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     auto user_tokens = tok->encode(user_turn);
 
     // Combinatorial differential over resolved DecodePlan values (NOT raw
-    // flag products): for a Unified, non-TQ recipe the legal plans are the
+    // flag products): for a Unified recipe the legal plans are the
     // {diagnostic} × {forced elision} grid. Every legal plan must produce a
     // token-stable-identical stream to the canonical baseline (Optimized, no
     // forced elision). Plans that route through feed_tokens are token-stable,
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
     };
     constexpr int kNCases = sizeof(cases) / sizeof(cases[0]);
 
-    auto fp = create_forward_pass(model, &meta, 4096, kNCases + 1, 0);
+    auto fp = create_forward_pass(model, &meta, 4096, kNCases + 1);
     ggml_backend_sched_t sched = model.get_scheduler();
     const uint32_t prefill_slot = 0;
     fp->run_prefill(sys_tokens, 0, prefill_slot, sched);

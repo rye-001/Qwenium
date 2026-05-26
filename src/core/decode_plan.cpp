@@ -2,8 +2,7 @@
 
 #include <stdexcept>
 
-DecodePlan resolve_decode_plan_inputs(bool tq_active,
-                                      bool feed_tokens_supported,
+DecodePlan resolve_decode_plan_inputs(bool feed_tokens_supported,
                                       bool has_decode_graph,
                                       bool slice_prefill_head,
                                       bool force_dense,
@@ -22,14 +21,13 @@ DecodePlan resolve_decode_plan_inputs(bool tq_active,
 
     DecodePlan p;
     p.has_decode_graph     = has_decode_graph;
-    p.route                = (tq_active || !has_decode_graph)
-                             ? DecodeRoute::Bridge
-                             : DecodeRoute::Unified;
+    p.route                = has_decode_graph
+                             ? DecodeRoute::Unified
+                             : DecodeRoute::Bridge;
     p.diagnostic           = diag_dense ? DecodeDiagnostic::ForceDense
                                         : DecodeDiagnostic::Optimized;
     p.allow_forced_elision = forced_run_enabled
-                          && feed_tokens_supported
-                          && !tq_active;
+                          && feed_tokens_supported;
     p.sparse_head_allowed  = (p.route == DecodeRoute::Unified)
                           && (p.diagnostic == DecodeDiagnostic::Optimized);
     return p;
@@ -39,7 +37,6 @@ DecodePlan resolve_decode_plan(const ForwardPassBase* fp,
                                bool forced_run_enabled,
                                bool force_dense) {
     return resolve_decode_plan_inputs(
-        fp->tq_active(),
         fp->feed_tokens_supported(),
         fp->has_decode_graph(),
         fp->slice_prefill_head(),

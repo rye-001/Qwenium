@@ -312,8 +312,6 @@ int main(int argc, char** argv) {
     std::string user_query = "get all platinum customers";
     int n_tokens = 30;
     uint32_t context_length = 4096;
-    uint32_t kv_quant_bits = 0;
-
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i+1 < argc) model_path = argv[++i];
         else if (std::strcmp(argv[i], "--grammar") == 0 && i+1 < argc) grammar_path = argv[++i];
@@ -375,7 +373,7 @@ int main(int argc, char** argv) {
     // 4 slots: 0 = system prefill source, 1/2/3 = per-config session slots.
     // Dedicating a slot per config prevents DeltaNet recurrent-state contamination
     // across runs (overwrite-semantics state can't be rewound by set_cache_pos alone).
-    auto forward_pass = create_forward_pass(model, &meta, context_length, 4, kv_quant_bits);
+    auto forward_pass = create_forward_pass(model, &meta, context_length, 4);
     ggml_backend_sched_t scheduler = model.get_scheduler();
 
     const uint32_t prefill_slot = 0;

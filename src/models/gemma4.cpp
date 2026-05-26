@@ -244,17 +244,10 @@ constexpr size_t GEMMA4_GRAPH_SIZE = 32768;  // larger than G3 — dual FFN + Mo
 
 Gemma4ForwardPass::Gemma4ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata),
       config_(Gemma4Config::from_metadata(*metadata))
 {
-    if (kv_quant_bits != 0) {
-        throw std::runtime_error(
-            "Gemma4ForwardPass: kv_quant_bits != 0 not supported "
-            "(architecture='gemma4'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -760,14 +753,12 @@ void Gemma4ForwardPass::advance_cache(uint32_t n_tokens, uint32_t slot_idx)
 {
     if (kv_cache_swa_)    kv_cache_swa_->advance(n_tokens, slot_idx);
     if (kv_cache_global_) kv_cache_global_->advance(n_tokens, slot_idx);
-    snapkv_advance_seq_pos(slot_idx, n_tokens);
 }
 
 void Gemma4ForwardPass::clear_slot(uint32_t slot_idx)
 {
     if (kv_cache_swa_)    kv_cache_swa_->clear_slot(slot_idx);
     if (kv_cache_global_) kv_cache_global_->clear_slot(slot_idx);
-    snapkv_clear_seq_pos(slot_idx);
 }
 
 void Gemma4ForwardPass::set_cache_pos(uint32_t pos, uint32_t slot_idx)
@@ -777,15 +768,6 @@ void Gemma4ForwardPass::set_cache_pos(uint32_t pos, uint32_t slot_idx)
 }
 
 uint32_t Gemma4ForwardPass::get_cache_pos(uint32_t slot_idx) const
-{
-    const uint32_t seq = snapkv_get_seq_pos(slot_idx);
-    if (seq > 0) return seq;
-    if (kv_cache_swa_)    return kv_cache_swa_->get_pos(slot_idx);
-    if (kv_cache_global_) return kv_cache_global_->get_pos(slot_idx);
-    return 0;
-}
-
-uint32_t Gemma4ForwardPass::get_physical_cache_pos(uint32_t slot_idx) const
 {
     if (kv_cache_swa_)    return kv_cache_swa_->get_pos(slot_idx);
     if (kv_cache_global_) return kv_cache_global_->get_pos(slot_idx);

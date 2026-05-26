@@ -10,7 +10,6 @@
 // Unit test: tests/unit/test_transformer_block.cpp
 //
 // Tensor naming: verbose (matches build_prefill_graph convention).
-// Build-time only — negligible cost on the TQ hot path.
 
 #include "layer.h"
 #include "ggml.h"

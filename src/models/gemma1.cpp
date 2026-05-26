@@ -32,18 +32,9 @@ constexpr size_t GEMMA1_GRAPH_SIZE = 16384;
 
 Gemma1ForwardPass::Gemma1ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata)
 {
-    if (kv_quant_bits != 0) {
-        // TurboQuant for Gemma is not in scope for PR G1.5. The fail-loud
-        // contract: refuse rather than silently produce wrong outputs.
-        throw std::runtime_error(
-            "Gemma1ForwardPass: kv_quant_bits != 0 not supported in this phase "
-            "(architecture='gemma'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();

@@ -33,8 +33,7 @@ TokenizerConfig gemma1_tokenizer_config();
 class Gemma1ForwardPass : public ForwardPassBase {
 public:
     Gemma1ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1,
-                      int kv_quant_bits = 0);
+                      uint32_t context_len, uint32_t max_batch_size = 1);
     ~Gemma1ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,
@@ -58,21 +57,14 @@ public:
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);
-        snapkv_advance_seq_pos(slot_idx, n_tokens);
     }
     void clear_slot(uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->clear_slot(slot_idx);
-        snapkv_clear_seq_pos(slot_idx);
     }
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->set_pos(pos, slot_idx);
     }
     uint32_t get_cache_pos(uint32_t slot_idx) const override {
-        uint32_t seq = snapkv_get_seq_pos(slot_idx);
-        if (seq > 0) return seq;
-        return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
-    }
-    uint32_t get_physical_cache_pos(uint32_t slot_idx) const override {
         return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     }
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {

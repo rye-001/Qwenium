@@ -24,7 +24,6 @@
 namespace {
 
 struct Inputs {
-    bool tq;
     bool feed_ok;
     bool decode_graph;
     bool slice_pref;
@@ -46,13 +45,12 @@ struct Expected {
 Expected expect(const Inputs& in) {
     Expected e;
     e.has_decode_graph     = in.decode_graph;
-    e.route                = (in.tq || !in.decode_graph)
-                             ? DecodeRoute::Bridge
-                             : DecodeRoute::Unified;
+    e.route                = in.decode_graph ? DecodeRoute::Unified
+                                             : DecodeRoute::Bridge;
     const bool diag_dense  = in.force_dense_param || !in.slice_pref;
     e.diagnostic           = diag_dense ? DecodeDiagnostic::ForceDense
                                         : DecodeDiagnostic::Optimized;
-    e.allow_forced_elision = in.forced_run_enabled && in.feed_ok && !in.tq;
+    e.allow_forced_elision = in.forced_run_enabled && in.feed_ok;
     e.sparse_head_allowed  = (e.route == DecodeRoute::Unified)
                           && (e.diagnostic == DecodeDiagnostic::Optimized);
     return e;
@@ -60,8 +58,7 @@ Expected expect(const Inputs& in) {
 
 std::string label(const Inputs& in) {
     std::string s;
-    s += "tq=";       s += in.tq                ? '1' : '0';
-    s += " feed=";    s += in.feed_ok           ? '1' : '0';
+    s += "feed=";    s += in.feed_ok           ? '1' : '0';
     s += " dg=";      s += in.decode_graph      ? '1' : '0';
     s += " slice=";   s += in.slice_pref        ? '1' : '0';
     s += " fdense=";  s += in.force_dense_param ? '1' : '0';
@@ -73,13 +70,13 @@ Inputs decode_bits(int bits) {
     return Inputs {
         ((bits >> 0) & 1) != 0, ((bits >> 1) & 1) != 0,
         ((bits >> 2) & 1) != 0, ((bits >> 3) & 1) != 0,
-        ((bits >> 4) & 1) != 0, ((bits >> 5) & 1) != 0,
+        ((bits >> 4) & 1) != 0,
     };
 }
 
 DecodePlan resolve(const Inputs& in) {
     return resolve_decode_plan_inputs(
-        in.tq, in.feed_ok, in.decode_graph, in.slice_pref,
+        in.feed_ok, in.decode_graph, in.slice_pref,
         in.force_dense_param, in.forced_run_enabled);
 }
 
@@ -87,7 +84,7 @@ DecodePlan resolve(const Inputs& in) {
 
 TEST(DecodePlanTruthTable, AllResolvedValuesMatchIndependentDerivation) {
     int rows = 0;
-    for (int bits = 0; bits < (1 << 6); ++bits) {
+    for (int bits = 0; bits < (1 << 5); ++bits) {
         Inputs in = decode_bits(bits);
         // R3 rows throw — covered in a dedicated test; skip them here.
         if (in.forced_run_enabled && !in.feed_ok) continue;
@@ -103,9 +100,9 @@ TEST(DecodePlanTruthTable, AllResolvedValuesMatchIndependentDerivation) {
         EXPECT_EQ(p.sparse_head_allowed,          e.sparse_head_allowed);
         EXPECT_EQ(p.has_decode_graph,             e.has_decode_graph);
     }
-    // 64 total combos − 16 R3-throwing rows (forced=1, feed=0, other 4 axes
-    // free) = 48 non-throwing rows.
-    EXPECT_EQ(rows, 64 - 16);
+    // 32 total combos − 8 R3-throwing rows (forced=1, feed=0, other 3 axes
+    // free) = 24 non-throwing rows.
+    EXPECT_EQ(rows, 32 - 8);
 }
 
 // Dropped self-tautologies, re-asserted on resolved values where they
@@ -113,7 +110,7 @@ TEST(DecodePlanTruthTable, AllResolvedValuesMatchIndependentDerivation) {
 // the line above).
 
 TEST(DecodePlanTruthTable, UnifiedImpliesHasDecodeGraph) {  // ex-R1
-    for (int bits = 0; bits < (1 << 6); ++bits) {
+    for (int bits = 0; bits < (1 << 5); ++bits) {
         Inputs in = decode_bits(bits);
         if (in.forced_run_enabled && !in.feed_ok) continue;
         DecodePlan p = resolve(in);
@@ -122,18 +119,18 @@ TEST(DecodePlanTruthTable, UnifiedImpliesHasDecodeGraph) {  // ex-R1
     }
 }
 
-TEST(DecodePlanTruthTable, BridgeImpliesTQOrNoDecodeGraph) {  // ex-R2
-    for (int bits = 0; bits < (1 << 6); ++bits) {
+TEST(DecodePlanTruthTable, BridgeImpliesNoDecodeGraph) {  // ex-R2
+    for (int bits = 0; bits < (1 << 5); ++bits) {
         Inputs in = decode_bits(bits);
         if (in.forced_run_enabled && !in.feed_ok) continue;
         DecodePlan p = resolve(in);
         if (p.route == DecodeRoute::Bridge)
-            EXPECT_TRUE(in.tq || !in.decode_graph) << label(in);
+            EXPECT_FALSE(in.decode_graph) << label(in);
     }
 }
 
 TEST(DecodePlanTruthTable, SparseHeadAllowedOnlyOnUnifiedOptimized) {  // ex-R5
-    for (int bits = 0; bits < (1 << 6); ++bits) {
+    for (int bits = 0; bits < (1 << 5); ++bits) {
         Inputs in = decode_bits(bits);
         if (in.forced_run_enabled && !in.feed_ok) continue;
         DecodePlan p = resolve(in);
@@ -148,7 +145,7 @@ TEST(DecodePlanTruthTable, SparseHeadAllowedOnlyOnUnifiedOptimized) {  // ex-R5
 
 // The invariant the decode_step forced-block use site dereferences on.
 TEST(DecodePlanTruthTable, AllowForcedElisionImpliesForcedRunEnabled) {
-    for (int bits = 0; bits < (1 << 6); ++bits) {
+    for (int bits = 0; bits < (1 << 5); ++bits) {
         Inputs in = decode_bits(bits);
         if (in.forced_run_enabled && !in.feed_ok) continue;
         DecodePlan p = resolve(in);
@@ -158,16 +155,15 @@ TEST(DecodePlanTruthTable, AllowForcedElisionImpliesForcedRunEnabled) {
 }
 
 // R3 — the only remaining module-boundary rejection: forced_run on a
-// non-feed recipe must throw. The 4 free axes other than feed/forced give
-// 16 throwing rows.
+// non-feed recipe must throw. The 3 free axes other than feed/forced give
+// 8 throwing rows.
 TEST(DecodePlanBoundary, R3_ForcedRunWithoutFeedTokensSupportThrows) {
-    for (int bits = 0; bits < (1 << 4); ++bits) {
-        const bool tq           = ((bits >> 0) & 1) != 0;
-        const bool decode_graph = ((bits >> 1) & 1) != 0;
-        const bool slice_pref   = ((bits >> 2) & 1) != 0;
-        const bool force_dense  = ((bits >> 3) & 1) != 0;
+    for (int bits = 0; bits < (1 << 3); ++bits) {
+        const bool decode_graph = ((bits >> 0) & 1) != 0;
+        const bool slice_pref   = ((bits >> 1) & 1) != 0;
+        const bool force_dense  = ((bits >> 2) & 1) != 0;
         EXPECT_THROW(
-            resolve_decode_plan_inputs(tq, /*feed_ok=*/false, decode_graph,
+            resolve_decode_plan_inputs(/*feed_ok=*/false, decode_graph,
                                        slice_pref, force_dense,
                                        /*forced_run_enabled=*/true),
             std::runtime_error);

@@ -42,23 +42,11 @@ public:
     virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
     virtual uint32_t get_cache_pos(uint32_t slot_idx) const = 0;
 
-    // Physical cache position (KV write offset / attention entry count).
-    // Unlike get_cache_pos(), this always returns the physical position even
-    // when SnapKV seq_pos tracking is active. Used for KV gather sizing.
-    virtual uint32_t get_physical_cache_pos(uint32_t slot_idx) const = 0;
     virtual void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) = 0;
     virtual ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
-
-    // True when TurboQuant KV compression is active for this forward pass.
-    // BRIDGE (Option 1 pending): build_decoding_graph has no TurboQuant
-    // support — under TQ the full kv_cache_ is intentionally null. decode_step
-    // queries this to refuse the TQ-unaware decode graph and route to the
-    // legacy per-recipe single-token run_prefill path (which IS TQ-aware).
-    // Default false; recipes that allocate a compressed store override it.
-    virtual bool tq_active() const { return false; }
 
     // False ⇒ this recipe has no build_decoding_graph (it throws); decode_step
     // must route through the legacy single-token run_prefill bridge instead.
@@ -66,16 +54,12 @@ public:
     // (Gemma 1–4) override to false.
     virtual bool has_decode_graph() const { return true; }
 
-    // ── TurboQuant per-layer compute ────────────────────────────
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
-    // When TQ is enabled, processes one layer at a time with compressed KV.
-    // When TQ is disabled, delegates to the existing monolithic path.
     // Returns output logits.
     virtual std::vector<float> run_prefill(
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx,
         ggml_backend_sched_t scheduler) {
-        // Default: monolithic path (subclasses override for TQ)
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
@@ -95,21 +79,8 @@ public:
     // Standalone at the API; thin parameterization underneath: the internal
     // impl is the existing prefill builder with want_logits=false (exactly
     // one head-guard site per recipe). NOT a forked KV/recurrent write.
-    //
-    // TurboQuant is scoped OUT:
-    // feed_tokens onto a non-empty mid-decode cache under TQ is a
-    // compressed-store write path that is deliberately NOT folded into this
-    // primitive. It fails loud rather than silently corrupting compressed
-    // state, mirroring the existing decode bridge in decode_step.cpp.
     void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
                      ggml_backend_sched_t scheduler) {
-        if (tq_active())
-            throw std::runtime_error(
-                "feed_tokens: tq_active expected=false actual=true — "
-                "TurboQuant is scoped out (docs/plan-feed-tokens.md TQ "
-                "clause, option 2). feed_tokens onto a non-empty mid-decode "
-                "cache under TQ is a compressed-store write path not folded "
-                "into this primitive; refusing rather than corrupting state.");
         if (!feed_tokens_supported())
             throw std::runtime_error(
                 "feed_tokens: feed_tokens_supported expected=true "
@@ -176,44 +147,6 @@ public:
     std::vector<float> get_output_logits(ggml_cgraph* gf);
     std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
 
-    // ── SnapKV configuration ─────────────────────────────────────
-    void set_snapkv_config(uint32_t budget, uint32_t window) {
-        snapkv_budget_ = budget;
-        snapkv_window_ = window;
-    }
-    uint32_t snapkv_budget() const { return snapkv_budget_; }
-    uint32_t snapkv_window() const { return snapkv_window_; }
-
-    // ── SnapKV dual position tracking ──────────────────────────────
-    // After eviction, seq_pos tracks the logical sequence position (for RoPE)
-    // while the cache's physical position tracks the compacted length.
-    // When seq_pos > 0, get_cache_pos() should return seq_pos instead of
-    // the physical cache position.
-
-    // Called after SnapKV compaction to set the logical sequence position.
-    void snapkv_set_seq_pos(uint32_t slot_idx, uint32_t original_length) {
-        if (slot_idx >= snapkv_seq_pos_.size())
-            snapkv_seq_pos_.resize(slot_idx + 1, 0);
-        snapkv_seq_pos_[slot_idx] = original_length;
-    }
-
-    // Advance the logical sequence position (call alongside advance_cache).
-    void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens) {
-        if (slot_idx < snapkv_seq_pos_.size() && snapkv_seq_pos_[slot_idx] > 0)
-            snapkv_seq_pos_[slot_idx] += n_tokens;
-    }
-
-    // Reset seq_pos tracking for a slot (call on clear_slot).
-    void snapkv_clear_seq_pos(uint32_t slot_idx) {
-        if (slot_idx < snapkv_seq_pos_.size())
-            snapkv_seq_pos_[slot_idx] = 0;
-    }
-
-    // Get the logical sequence position (0 = SnapKV not active for this slot).
-    uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const {
-        return (slot_idx < snapkv_seq_pos_.size()) ? snapkv_seq_pos_[slot_idx] : 0;
-    }
-
 protected:
     const ModelMetadata& meta_;
     const Model& model_;
@@ -229,14 +162,6 @@ protected:
     // set_prefill_inputs / set_decode_inputs upload it via StepContext and
     // clear it (consume-on-use).
     std::vector<int32_t> sparse_decode_ids_;
-
-    // SnapKV: post-prefill KV eviction (0 = disabled)
-    uint32_t snapkv_budget_ = 0;
-    uint32_t snapkv_window_ = 32;
-
-    // Per-slot logical sequence position after SnapKV compaction.
-    // 0 = SnapKV not active (use physical cache position).
-    std::vector<uint32_t> snapkv_seq_pos_;
 
     // --- Context management ---
     // Reset the ggml context (call at the start of every graph build)

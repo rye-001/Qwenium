@@ -25,8 +25,8 @@
 // order, with the same stop/print/history handling it gives the return
 // value; grammar state for all of them is already advanced here). Empty on a
 // normal (branching) step. Opt-in: pass nullptr to disable (unchanged
-// behavior). Requires feed_tokens (supported recipe, not under TurboQuant);
-// otherwise the forced path is skipped and the normal path runs.
+// behavior). Requires feed_tokens (supported recipe); otherwise the forced
+// path is skipped and the normal path runs.
 //
 // Returns the sampled (or last forced) token ID.
 int32_t decode_step(

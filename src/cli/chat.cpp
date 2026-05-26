@@ -61,8 +61,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
         const auto& chat_meta = model.get_metadata();
         std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
-            model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
-        forward_pass->set_snapkv_config(args.snapkv_budget, args.snapkv_window);
+            model, &chat_meta, args.context_length, 2);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 

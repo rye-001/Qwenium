@@ -24,10 +24,16 @@ Key principles:
 ## Current Capabilities (Decode Phase)
 
 1. Weights: K-Quants
-2. KV Precision: TurboQuant
-3. KV Volume: SnapKV
-4. Output Leash: Grammar / TokenTrie
-5. Decode Speed: Speculative Decoding (in progress)
+2. Output Leash: Grammar / TokenTrie
+3. Decode Speed: Speculative Decoding (in progress)
+
+## Workload Envelope (load-bearing)
+
+This engine targets ≤10 concurrent slots, order-management-style prompts
+(≤4 K context), 12 GB-class quantized models on Apple Silicon unified
+memory. KV memory is not the constraint in this regime. TurboQuant
+(KV-precision compression) was removed because it adds complexity with no
+payoff inside this envelope.
 
 ## Target Models
 
