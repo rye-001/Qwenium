@@ -252,8 +252,8 @@ and don't compete with DeltaNet for the Phase 4 PR-1 slot.
    only 10 layers × estimated ~1 ms = ~10 ms/token (~20% of budget),
    and `ggml_flash_attn_ext` primarily targets long-context *prefill*,
    not single-token decode. Better next-wins live one level up:
-   speculative decoding (in progress; potentially 2-3×), GPU
-   TurboQuant (kills CPU↔GPU bus traffic), and the modular refactor.
+   speculative decoding (in progress; potentially 2-3×) and the modular
+   refactor. (TurboQuant was removed — outside workload envelope.)
    Revisit if a Metal Instruments capture shows attention is the
    single largest remaining slot at decode shape, or if a long-context
    prefill workload becomes a priority.

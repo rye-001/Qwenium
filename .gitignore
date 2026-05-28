@@ -54,3 +54,4 @@ __pycache__/
 tests/debug_gguf
 collected_tokens.txt
 temp/
+docs/*-prep.md

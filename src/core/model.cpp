@@ -1,6 +1,8 @@
 #include "model.h"
 #include "../loader/gguf_loader.h"
 #include "../loader/tokenizer.h"
+#include "../loader/multimodal_check.h"
+#include "../models/model_registry.h"
 #include "ggml-cpu.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
@@ -89,6 +91,11 @@ void Model::load_metadata(const std::string &model_path)
 {
     loader_->load_model(model_path);
     loader_->extract_metadata(metadata_);
+
+    // Refuse multimodal-only checkpoints at load time rather than at
+    // generation time
+    multimodal_check::enforce_text_only_or_throw(metadata_, model_path);
+
     is_loaded_ = true;
 }
 
@@ -204,10 +211,13 @@ void Model::load_tensors()
 
     std::cout << "All tensors loaded and assigned successfully." << std::endl;
 
-    // Derive tokenizer config from standard GGUF metadata fields (tokenizer_type,
-    // add_bos_token) so the tokenizer has no architecture string literals.
+    // Tokenizer config comes from the model registry, not the GGUF.  The
+    // architecture knows its invariants (e.g. Gemma always needs BOS); GGUF
+    // fields like tokenizer.ggml.add_bos_token can disagree (Unsloth exports
+    // ship Gemma GGUFs with add_bos_token=false because their Jinja template
+    // emits {{ bos_token }} as text
     std::cout << "Initializing tokenizer..." << std::endl;
-    TokenizerConfig tok_cfg = tokenizer_config_from_gguf(metadata_);
+    TokenizerConfig tok_cfg = lookup_tokenizer_config(metadata_.architecture);
     tokenizer_ = std::make_unique<Tokenizer>(&metadata_, tok_cfg);
     std::cout << "Tokenizer initialized." << std::endl;
 }

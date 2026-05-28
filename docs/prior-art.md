@@ -33,13 +33,12 @@ ggml-metal's `MUL_MAT_ID` kernel for sparse routing. The CUDA kernel in
 `ggml-cuda/moe.cu` is not the reference for that — graph shape and
 kernel are both wrong starting points for our case.
 
-### Hadamard transform on K/V + Q8_KV — PR 5.1b
+### Hadamard transform on K/V + Q8_KV — PR 5.1b (DROPPED)
 
 `ik_llama.cpp` ships a Hadamard rotation applied to K and V before
-INT8 quantization to suppress outliers. This is a different attack on
-the same problem as TurboQuant (Walsh–Hadamard + Lloyd–Max). PR 5.1b
-compares perplexity/bits between the two approaches on the same corpora.
-Do not port speculatively — measure first.
+INT8 quantization to suppress outliers. TurboQuant (which attacked the
+same problem via Walsh–Hadamard + Lloyd–Max) was removed — outside the
+workload envelope. PR 5.1b is dropped with it.
 
 ### Self-speculative + ngram decoding
 

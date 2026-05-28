@@ -470,13 +470,10 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
         // Fallback: scan token names for well-known EOT strings.
         static constexpr std::string_view kEotNames[] = {
             "<|im_end|>", "<end_of_turn>", "<|eot_id|>",
-            // Gemma 4 IT native end-of-turn marker. The tokenizer.ggml.model
-            // is "gemma4" with no tokenizer.ggml.eot_token_id, and eos
-            // (<eos>, id 1) is NOT what the IT model emits to close a turn —
-            // it emits <turn|> (id 106). Without this the chat loop never
-            // sees a stop and generates forever. Distinct string from G1–3's
-            // <end_of_turn>, so the existing entry does not cover it.
+            // Gemma 4 IT native end-of-turn marker.
             "<turn|>",
+            // MedGemma 1.5 ships generation_config.eos_token_id = [1, 106]
+            "<eos>",
         };
         for (size_t i = 0; i < metadata_.id_to_token.size(); ++i) {
             for (const auto& name : kEotNames) {

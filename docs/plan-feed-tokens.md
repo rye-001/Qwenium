@@ -106,34 +106,33 @@ TurboQuant was deleted (outside the workload envelope). No interaction remains.
 
 ---
 
-## The open decision fork (present; owner resolves)
+## Resolved decision: token-stable, global
 
-If the recurrent kernel chunks a span internally, `feed_tokens(N)` may diverge
-from N × `feed_tokens(1)` in low FP bits **even though it is one kernel**. This
-is not yet measured (it is the next probe — the mid-decode differential on
-qwen36). If it diverges:
+`feed_tokens(span)` vs N × single-token decode may diverge in low FP bits
+(chunked-vs-sequential reduction order). The decision fork asked: (a) bitwise,
+(b) token-stable, or (c) bounded-ε, and whether the guarantee is global or
+per-consumer. **Resolved: (b) token-stable, global.**
 
-- **(a) Make span-advance bitwise-reproducible** — deltanet-kernel work,
-  unbounded relative to the ~85-LOC adapter estimate.
-- **(b) Accept divergence if it never flips a sampled token on the workload** —
-  relax the gate to token-stable.
-- **(c) Bounded tolerance**: state within ε, sampled output byte-identical.
+**Rationale.** The consumer table shows the two shipping consumers
+(grammar-guided decode and speculative decoding) both re-verify or
+re-constrain at the next step — token-stable is sufficient for both. Option
+(a) requires unbounded kernel work (DeltaNet recurrence rewrite) for zero
+shipping benefit. Option (c) was falsified by gemma4's ≈0.126 MoE-expert-flip
+divergence — any tight ε sized for recurrent low-bit noise fails across
+recipes. A global guarantee (not per-consumer) is simpler and matches what
+the measurement actually shows: token-stable holds on all six recipes.
 
-**The answer may not be global — it may be per-consumer.** Speculative decoding
-re-verifies and tolerates (b); conversation branching *replays* a span where
-subtle divergence is a user-visible bug, pushing toward (a)/(c). A single
-engine-wide reproducibility knob may itself be the wrong abstraction. The
-owner must explicitly decide whether this is **one guarantee or N
-consumer-keyed policies** — assuming the question is singular smuggles in a
-default. Do not let "(a) by default" or "(c) by default" ride.
+**Conversation-branching carve-out.** Conversation branching (future-work) is
+the one consumer with a stronger reproducibility need — a subtly divergent
+replay is a user-visible correctness bug. If conversation branching is
+reopened, it owns its own per-consumer (a)/(c) decision at that time. That
+decision does not retroactively change this global contract; it would layer a
+stricter per-consumer policy on top. Until then, the engine-wide contract is
+token-stable.
 
-This decision has implications beyond Phase B (speculative decoding,
-conversation branching both lean on state reproducibility). It is an owner
-decision, documented here when made.
+### Measurement (resolved, see above)
 
-### Measurement (Phases 1–3 complete — fork consciously kept deferred)
-
-Mid-decode differentials run, feeding a 6-token span onto a non-empty
+Mid-decode differentials ran, feeding a 6-token span onto a non-empty
 mid-decode cache vs. 6 sequential single-token steps:
 
 | Recipe | Phase | bitwise (a) | `max_abs_diff` | token-stable (b) |
@@ -147,17 +146,17 @@ mid-decode cache vs. 6 sequential single-token steps:
 
 qwen35/36: predicted chunked-vs-sequential FP reduction-order divergence in
 the DeltaNet/SSM recurrence. gemma1–3: same class via attention-only
-KV-append. **Not** adapter defects (state-write path is the unmodified
+KV-append. Not adapter defects (state-write path is the unmodified
 prefill builder). "Attention-only so it's fine" was not a skip — each
 gemma owed and got its own KV-append mid-stream differential.
 
-**gemma4 is the falsifier (CLAUDE.md's designed role).** It is attention-
+**gemma4 was the falsifier (CLAUDE.md's designed role).** It is attention-
 only for *state* but has a parallel **dense + MoE FFN**: chunk-vs-sequential
-FP-order differences cross a top-k expert-selection boundary, producing a
-discrete **≈0.126** raw-logit shift that is *still token-stable*. qwen36
+FP-order differences crossed a top-k expert-selection boundary, producing a
+discrete **≈0.126** raw-logit shift that was *still token-stable*. qwen36
 (also MoE) stayed at 3e-6 only because its workload didn't flip an expert;
 gemma4's did. This invalidated the original tight ε (sized for recurrent
-low-bit noise) — see the gate-design decision below.
+low-bit noise) and was a key input to the resolved decision above.
 
 **Head-guard shape (uniform across recipes — one site each).** Exactly one
 `if (want_logits) { …head… }` site per recipe (qwen35, qwen36, gemma1–4).
@@ -179,26 +178,22 @@ consumer table needs — is **token-stable (option b)**. The per-recipe
 gross-regression sanity net (wrong positions / corrupt state → O(1)
 divergence and/or a token flip), explicitly **not** a precision claim.
 
-**Owner decision (recorded): keep the fork deferred — quarantined, not red.**
-The spine differential is split so the deferred fork is a *documented
-quarantined signal* instead of a permanently-red suite that would mask
-future regressions:
+**Test split (reflects resolved decision).**
+The spine differential is split so the resolved contract has a running
+regression guard and the strict bitwise variant remains as a noise-floor
+measurement tool:
 
 - `MidDecodeDifferentialTokenStable` — **runs and passes** on all 6
-  recipes. Asserts token-stable AND the coarse `max_abs_diff < 1.0` net.
-- `DISABLED_MidDecodeDifferentialBitwise` — the strict option (a) contract,
-  gtest-**disabled** (not red in CI). Carries the per-recipe measurement;
-  enable with `--gtest_also_run_disabled_tests` only once the fork is
-  consciously resolved toward (a).
+  recipes. Regression guard for the resolved token-stable contract.
+  Asserts token-stable AND the coarse `max_abs_diff < 1.0` net.
+- `DISABLED_MidDecodeDifferentialBitwise` — noise-floor measurement of the
+  FP divergence, gtest-**disabled** (not red in CI). Carries the per-recipe
+  measurement; run with `--gtest_also_run_disabled_tests` on request.
 
 **Phases 1–3 complete.** All six recipes (qwen36, qwen35, gemma1–4) ship
 the one-site head guard + the split differential; every
-`MidDecodeDifferentialTokenStable` passes, every bitwise variant stays
-quarantined. The phasing gate ("no recipe proceeds until the prior
-differential passes **or the fork is consciously resolved**") was satisfied
-at each step by the conscious deferral. Still explicitly unresolved — do
-not default: strict bitwise (a); per-consumer vs. global; whether
-conversation branching (stronger repro need) forces (a)/(c) when it lands.
+`MidDecodeDifferentialTokenStable` passes. The decision fork is resolved
+(token-stable, global) — see above.
 
 ---
 
@@ -241,8 +236,9 @@ the next recipe on it passing.
    recipe.
 2. Per-recipe mid-decode differential passes (bitwise, from non-empty cache),
    for every recipe shipped, with TQ handled per the TQ clause.
-3. The decision fork is consciously resolved and documented (global or
-   per-consumer), not defaulted.
+3. ~~The decision fork is consciously resolved and documented (global or
+   per-consumer), not defaulted.~~ **DONE** — resolved: token-stable, global.
+   See §"Resolved decision" above.
 4. No layer-module changes. KV-append vs recurrent-overwrite stay distinct.
    No forked state-write path. Head guard is one site per recipe.
 

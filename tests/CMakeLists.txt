@@ -574,6 +574,21 @@ target_link_libraries(model-registry-tests PRIVATE
 target_compile_features(model-registry-tests PRIVATE cxx_std_17)
 gtest_discover_tests(model-registry-tests)
 
+# Multimodal-only refusal — no model file needed.
+add_executable(multimodal-check-tests
+    unit/test_multimodal_check.cpp
+)
+
+target_link_libraries(multimodal-check-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+    core
+    ggml
+)
+
+target_compile_features(multimodal-check-tests PRIVATE cxx_std_17)
+gtest_discover_tests(multimodal-check-tests)
+
 # TransformerBlock unit tests — no model file needed.
 # Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.
 add_executable(transformer-block-tests

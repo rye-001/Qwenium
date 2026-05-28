@@ -5,6 +5,7 @@ add_library(qinf-loader STATIC
     tokenizer.cpp
     weight_binding.cpp
     chat_template.cpp
+    multimodal_check.cpp
 )
 
 target_include_directories(qinf-loader PUBLIC

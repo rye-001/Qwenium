@@ -91,8 +91,7 @@ yet; it migrates only when a concrete Phase 5 need drives it.
 **PR 1.2 — Move KV cache + quantization into `src/state/`.** `git mv`
 `src/kv-cache/compressed_kv_store` → `src/state/kv_cache_compressed`,
 `src/kv-cache/simple-kv-cache` → `src/state/kv_cache_simple`,
-`src/kv-cache/turboquant` → `src/state/turboquant`,
-`src/kv-cache/snapkv-eviction` → `src/state/snapkv`. Update `#include`
+Update `#include`
 paths only. No code changes inside the moved files. **The compressed
 and simple KV caches stay as two sibling files** — do not collapse or
 absorb them during the move. Whether they should be unified behind a
@@ -480,8 +479,8 @@ not compete for measurement-driven prioritization.)
 
 ## Phase 5 — State Optimizations
 
-**Goal:** extend TurboQuant to Qwen 3.6 attention; prototype DeltaNet
-state quantization; explore per-layer-type precision budgeting.
+**Goal:** prototype DeltaNet state quantization; explore per-layer-type
+precision budgeting. (TurboQuant was removed — outside workload envelope.)
 **Duration estimate:** ongoing / research-driven.
 **Branch:** `phase-5-quant` (and sub-branches for experiments).
 **Gate:** output quality within declared perplexity bounds on a held-out
@@ -498,19 +497,11 @@ Implement `tests/perf/perplexity.cpp` measuring perplexity on a held-
 out text (e.g. WikiText subset, code subset, dialogue subset).
 Gate: harness is deterministic and reproducible.
 
-**PR 5.1 — TurboQuant on Qwen 3.6 attention layers.** Tests first:
-perplexity on the three held-out corpora stays within declared
-bounds vs the unquantized baseline. Enable TurboQuant for the 10
-attention layers in Qwen 3.6. Gate: perplexity bounds met.
+**PR 5.1 — DROPPED (TurboQuant removed).** KV-precision compression is
+outside the workload envelope (≤10 slots, ≤4K context, 12GB models).
 
-**PR 5.1b — Hadamard-transform K/V comparison (research).** Tests first:
-the perplexity harness reports numbers for the current TurboQuant
-pipeline vs a Hadamard-rotation + Q8_KV variant on the same corpora
-(`ik_llama.cpp` ships the latter — worth comparing since both attack
-outlier-driven quant error via rotation). Prototype Hadamard+Q8_KV on
-one attention layer. Gate: research PR — deliverable is a quality/bits
-comparison table, not a ship decision. If Hadamard beats TurboQuant at
-equal bits, open a follow-up to port it in. See `docs/prior-art.md`.
+**PR 5.1b — DROPPED (TurboQuant removed).** Hadamard-transform K/V
+comparison no longer has a baseline to compare against.
 
 **PR 5.2 — DeltaNet state quantization prototype.** Tests first:
 the perplexity harness accepts a quantized-state build and reports
@@ -535,11 +526,9 @@ emerges (e.g. "shipping a role-quantized Qwen 3.6 preset").
 ### Phase 5 minimum viable slice
 
 If Phase 5 must be deferred or compressed, **PR 5.0 (perplexity harness)
-and PR 5.1 (TurboQuant on Qwen 3.6 attention) are load-bearing** and
-should not be skipped — without them, Qwen 3.6 runs with full-precision
-KV on its attention layers, which loses the engine's KV-quant story on
-our flagship target model. The rest of Phase 5 (5.1b, 5.2, 5.3) is
-genuinely research-shaped and can be deferred without blocking shipping.
+is load-bearing** and should not be skipped. PR 5.1/5.1b are dropped
+(TurboQuant removed). The rest of Phase 5 (5.2, 5.3) is genuinely
+research-shaped and can be deferred without blocking shipping.
 
 ---
 
@@ -552,8 +541,8 @@ above.
 - **`ik_llama.cpp`** (Iwan Kawrakow's llama.cpp fork). CPU/CUDA focus,
   no Metal. Worth watching:
   - **Fused MoE graph shape** — reference for PR 4.1.
-  - **Hadamard transform on K/V + Q8_KV** — comparison target for
-    PR 5.1b against our TurboQuant.
+  - **Hadamard transform on K/V + Q8_KV** — PR 5.1b dropped
+    (TurboQuant removed; no baseline to compare against).
   - **Self-speculative + ngram decoding** — reference when speculative
     decoding resumes as a separate initiative (see Cross-Cutting →
     Speculative Decoding).

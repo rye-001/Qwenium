@@ -74,7 +74,10 @@ public:
     // overwrite — over a span of already-known tokens WITHOUT building the
     // LM head or producing logits. The inverse of run_prefill-with-logits:
     // consume tokens to condition future predictions; predict nothing.
-    // State mutation, no return value. See docs/plan-feed-tokens.md.
+    // State mutation, no return value.
+    //
+    // Contract: token-stable across span vs. sequential decode — the sampled
+    // token never flips, low FP bits may differ. See plan-feed-tokens.md.
     //
     // Standalone at the API; thin parameterization underneath: the internal
     // impl is the existing prefill builder with want_logits=false (exactly

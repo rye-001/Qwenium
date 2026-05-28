@@ -20,13 +20,6 @@ struct pair_hash {
     }
 };
 
-// Derive a TokenizerConfig from standard GGUF metadata fields.
-// Reads tokenizer_type ("llama" vs "gpt2") and add_bos_token.
-// Call sites that know the architecture can refine the returned config before
-// passing it to the Tokenizer constructor, but for all built-in models this
-// derivation is sufficient.
-TokenizerConfig tokenizer_config_from_gguf(const ModelMetadata& meta);
-
 class Tokenizer {
     friend class TokenizerTest_TestUnknownCharacters_Test;
 public:

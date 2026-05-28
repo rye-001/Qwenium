@@ -16,6 +16,7 @@
 
 #include "../../src/core/model.h"
 #include "../../src/models/qwen35.h"
+#include "../../src/models/model_registry.h"
 #include "../../src/state/ssm_state_cache.h"
 
 static std::string get_qwen35_model_path() {
@@ -35,6 +36,7 @@ protected:
     static void SetUpTestSuite() {
         if (get_qwen35_model_path().empty()) return;
 
+        register_builtin_models();
         model_ = std::make_unique<Model>();
         model_->load_metadata(get_qwen35_model_path());
         model_->load_tensors();

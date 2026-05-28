@@ -32,8 +32,8 @@ Key principles:
 This engine targets ≤10 concurrent slots, order-management-style prompts
 (≤4 K context), 12 GB-class quantized models on Apple Silicon unified
 memory. KV memory is not the constraint in this regime. TurboQuant
-(KV-precision compression) was removed because it adds complexity with no
-payoff inside this envelope.
+(KV-precision compression) and SnapKV (post-prefill KV eviction) were
+removed because they add complexity with no payoff inside this envelope.
 
 ## Target Models
 

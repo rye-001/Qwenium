@@ -13,9 +13,8 @@
 //      that produces the SAME next-token logits as feeding those same tokens
 //      as N sequential single-token decode steps from the same starting
 //      state. A fresh-prefill-from-0 comparison would prove nothing; this
-//      starts from a populated cache. This bitwise probe also resolves-or-
-//      triggers the reproducibility decision fork (owner decision: defer
-//      until measured — this test IS the measurement for qwen36).
+//      starts from a populated cache. The reproducibility decision fork is
+//      resolved: token-stable, global (docs/plan-feed-tokens.md).
 //
 // Requires a qwen35moe GGUF; self-skips when absent.
 
@@ -91,25 +90,22 @@ TEST_F(Qwen36FeedTokensTest, HeadlessGraphHasNoLogits) {
 
 // ── The correctness contract (spine) ─────────────────────────────────────────
 //
-// The reproducibility decision fork (docs/plan-feed-tokens.md → open decision
-// fork) is, by owner decision, KEPT DEFERRED. Measured on qwen36:
+// Reproducibility decision: RESOLVED — token-stable, global
+// (docs/plan-feed-tokens.md → "Resolved decision: token-stable, global").
 //
+// Measured on qwen36:
 //   feed_tokens(6-token span) vs 6 sequential single-token steps onto a
 //   non-empty mid-decode cache →
 //     option (a) bitwise   : FAILS  (max_abs_diff ≈ 3.34e-6, ~79% of logits)
 //     option (b) token-stable: HOLDS (greedy top-1 identical)
 //
-// To keep the deferred fork a *quarantined documented signal* rather than a
-// permanently-red suite that masks future regressions, the spine is split:
+// The spine is split into two tests:
 //
-//   1. MidDecodeDifferentialTokenStable — RUNS, asserts the weaker contract
-//      that actually holds today (token-stable AND within ε). This is a real
-//      regression guard: if span-advance drifts beyond ε or flips a token,
-//      this goes red.
-//   2. DISABLED_MidDecodeDifferentialBitwise — the strict (a) contract,
-//      gtest-disabled so it is not red by default. Carries the 3.34e-6
-//      measurement; run with --gtest_also_run_disabled_tests when the fork
-//      is consciously resolved toward (a).
+//   1. MidDecodeDifferentialTokenStable — RUNS. Regression guard for the
+//      resolved token-stable contract.
+//   2. DISABLED_MidDecodeDifferentialBitwise — noise-floor measurement of the
+//      FP divergence, gtest-disabled (not red in CI). Carries the 3.34e-6
+//      measurement; run with --gtest_also_run_disabled_tests on request.
 
 // Gate design (owner decision, docs/plan-feed-tokens.md): token-stable +
 // a COARSE universal ceiling — same constant across qwen36/qwen35/gemma.
@@ -186,8 +182,7 @@ static DiffResult run_mid_decode_diff(Model& model) {
     return r;
 }
 
-// (1) Runs by default. The weaker contract that holds today — a genuine
-//     regression guard, NOT a restatement of the deferred fork.
+// (1) Runs by default. Regression guard for the resolved token-stable contract.
 TEST_F(Qwen36FeedTokensTest, MidDecodeDifferentialTokenStable) {
     SKIP_IF_NO_MODEL();
     DiffResult r = run_mid_decode_diff(*model_);
@@ -196,8 +191,8 @@ TEST_F(Qwen36FeedTokensTest, MidDecodeDifferentialTokenStable) {
         << "feed_tokens(span) flipped the greedily-sampled token vs "
         << "N×single-step decode (top1_A=" << r.top1_A
         << " top1_B=" << r.top1_B << "). Option (b) token-stable no longer "
-        << "holds — this is a regression beyond the deferred fork, not the "
-        << "documented 3.34e-6 low-bit divergence.";
+        << "holds — this is a regression beyond the resolved token-stable "
+        << "contract, not the documented 3.34e-6 low-bit divergence.";
 
     EXPECT_LT(r.max_abs_diff, kFeedTokensMaxAbsDiff)
         << "feed_tokens(span) diverged from N×single-step decode by "
@@ -207,24 +202,22 @@ TEST_F(Qwen36FeedTokensTest, MidDecodeDifferentialTokenStable) {
         << "regression (e.g. wrong positions / corrupt state).";
 }
 
-// (2) Disabled by default: the strict bitwise (a) contract. NOT red in CI.
-//     Carries the recorded measurement; enable with
-//     --gtest_also_run_disabled_tests once the fork is resolved toward (a).
-//     Quarantined documented signal of docs/plan-feed-tokens.md's open fork.
+// (2) Disabled by default: noise-floor measurement of the FP divergence.
+//     NOT red in CI. Carries the recorded measurement; run with
+//     --gtest_also_run_disabled_tests on request.
 TEST_F(Qwen36FeedTokensTest, DISABLED_MidDecodeDifferentialBitwise) {
     SKIP_IF_NO_MODEL();
     DiffResult r = run_mid_decode_diff(*model_);
 
     EXPECT_EQ(r.mismatches, 0u)
-        << "DEFERRED FORK (docs/plan-feed-tokens.md): feed_tokens(span) is "
-        << "NOT bitwise-reproducible vs N×single-step decode on qwen36. "
-        << "mismatched logits=" << r.mismatches << "/" << r.n_logits
-        << " max_abs_diff=" << r.max_abs_diff
+        << "NOISE-FLOOR MEASUREMENT (docs/plan-feed-tokens.md): "
+        << "feed_tokens(span) is NOT bitwise-reproducible vs N×single-step "
+        << "decode on qwen36. mismatched logits=" << r.mismatches << "/"
+        << r.n_logits << " max_abs_diff=" << r.max_abs_diff
         << " token_stable=" << (r.token_stable ? "true" : "false")
         << " (top1_A=" << r.top1_A << " top1_B=" << r.top1_B << "). "
         << "Recorded measurement ≈3.34e-6 (chunked DeltaNet recurrence FP "
-        << "reduction order, not an adapter defect). Option (a) is the "
-        << "unmet strict contract; the fork (a/b/c, global vs per-consumer) "
-        << "remains consciously deferred — do not default by re-enabling "
-        << "this test without an owner decision.";
+        << "reduction order, not an adapter defect). The resolved contract "
+        << "is token-stable, global — this strict bitwise variant is kept "
+        << "as a diagnostic tool, not a shipping gate.";
 }
