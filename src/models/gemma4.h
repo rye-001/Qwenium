@@ -135,12 +135,12 @@ TokenizerConfig gemma4_tokenizer_config();
 class Gemma4ForwardPass : public ForwardPassBase {
 public:
     Gemma4ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1,
-                      int kv_quant_bits = 0);
+                      uint32_t context_len, uint32_t max_batch_size = 1);
     ~Gemma4ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,
-                                      int pos, uint32_t slot_idx = 0) override;
+                                      int pos, uint32_t slot_idx = 0,
+                                      bool want_logits = true) override;
 
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>& tokens,
                                       const std::vector<uint32_t>& slots,
@@ -148,6 +148,11 @@ public:
 
     // build_decoding_graph throws; decode_step routes via run_prefill bridge.
     bool has_decode_graph() const override { return false; }
+
+    // Phase 3 of docs/plan-feed-tokens.md: gemma4 honors want_logits=false
+    // with one head-guard site. Attention-only (dense + MoE FFN, no
+    // recurrent state); still owes its own KV-append mid-stream differential.
+    bool feed_tokens_supported() const override { return true; }
 
     // Inputs are populated via the typed graph_inputs_ set built in
     // build_prefill_graph (no set_inputs override).
@@ -167,7 +172,6 @@ public:
     void clear_slot(uint32_t slot_idx) override;
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override;
     uint32_t get_cache_pos(uint32_t slot_idx) const override;
-    uint32_t get_physical_cache_pos(uint32_t slot_idx) const override;
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override;
 
 private:

@@ -172,7 +172,7 @@ TEST_F(Gemma1ModelFile, DumpInpLScaledForCompareWithHF) {
 
     register_builtin_models();
     auto fp = create_forward_pass(model, &model.get_metadata(),
-                                  /*ctx=*/256, /*bs=*/1, /*kvb=*/0);
+                                  /*ctx=*/256, /*bs=*/1);
 
     ggml_backend_sched_t sched = model.get_scheduler();
     ggml_backend_sched_reset(sched);
@@ -285,7 +285,7 @@ TEST_F(Gemma1ModelFile, GreedyTop1OnTrivialPromptIsSensible) {
 
     register_builtin_models();
     auto fp = create_forward_pass(model, &model.get_metadata(),
-                                  /*context_len=*/256, /*max_batch=*/1, /*kvb=*/0);
+                                  /*context_len=*/256, /*max_batch=*/1);
 
     std::vector<float> logits = fp->run_prefill(
         tokens, /*pos=*/0, /*slot_idx=*/0, model.get_scheduler());
@@ -329,7 +329,7 @@ TEST_F(Gemma1ModelFile, PrefillProducesFiniteLogits) {
 
     register_builtin_models();
     auto fp = create_forward_pass(model, &model.get_metadata(),
-                                  /*context_len=*/256, /*max_batch=*/1, /*kvb=*/0);
+                                  /*context_len=*/256, /*max_batch=*/1);
     ASSERT_NE(fp, nullptr);
 
     std::vector<float> logits = fp->run_prefill(

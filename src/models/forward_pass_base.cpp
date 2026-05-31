@@ -3,6 +3,7 @@
 #include "../layers/ffn.h"
 #include "../layers/norm.h"
 #include "../graph_inputs/sparse_head_input.h"
+#include "../graph_inputs/output_ids_input.h"
 
 #include <memory>
 
@@ -137,6 +138,29 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
     cur = ggml_mul_mat(ctx_, weight, cur);
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
+}
+
+ggml_tensor* ForwardPassBase::build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* cur) {
+    // Explicit dense-reference path (differential seam). Not a silent fallback:
+    // the caller chose it via set_slice_prefill_head(false).
+    if (!slice_prefill_head_) {
+        return cur;
+    }
+
+    // "out_ids": int32 token-position selector. Width 1 — last token only
+    // (OutputIdsInput fills it with n_rows-1 at set time). Gathering on the
+    // [hidden, n_tokens] hidden state elides the discarded first n_tokens-1
+    // head rows. Composes with build_output_head's vocab-axis weight slice:
+    // different tensor, different axis, order-independent.
+    ggml_tensor* out_ids = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_set_input(out_ids);
+    ggml_set_name(out_ids, "out_ids");
+    ggml_build_forward_expand(gf, out_ids);
+    graph_inputs_.add(std::make_unique<OutputIdsInput>());
+
+    ggml_tensor* sliced = ggml_get_rows(ctx_, cur, out_ids);
+    ggml_set_name(sliced, "out_ids_slice");
+    return sliced;
 }
 
 void ForwardPassBase::set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il) const {

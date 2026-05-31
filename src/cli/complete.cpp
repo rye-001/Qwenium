@@ -84,8 +84,7 @@ int run_complete(
         const auto& cmp_meta = model.get_metadata();
         register_builtin_models();
         std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
-            model, &cmp_meta, args.context_length, 1, args.kv_quant_bits);
-        forward_pass->set_snapkv_config(args.snapkv_budget, args.snapkv_window);
+            model, &cmp_meta, args.context_length, 1);
 
         // Prefill phase
         using Clock = std::chrono::steady_clock;

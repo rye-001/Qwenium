@@ -10,22 +10,6 @@
 #include <functional>  // std::greater
 #include <vector>      // std::vector (likely already included)
 
-TokenizerConfig tokenizer_config_from_gguf(const ModelMetadata& meta)
-{
-    TokenizerConfig cfg;
-    cfg.add_bos_token = meta.add_bos_token;
-    // tokenizer.ggml.model = "llama" means SentencePiece BPE with ▁-normalization
-    // and byte-fallback.  This is a standard GGUF field value, not a family name.
-    if (meta.tokenizer_type == "llama") {
-        cfg.normalizer    = NormalizerKind::SpaceToUnderscore;
-        cfg.byte_fallback = true;
-        // Some GGUF exports mark chat-control tokens as NORMAL rather than
-        // USER_DEFINED; force-promote them so the encoder handles them atomically.
-        cfg.extra_chat_specials = {"<start_of_turn>", "<end_of_turn>"};
-    }
-    return cfg;
-}
-
 Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& config)
     : metadata_(metadata), config_(config) {
     if (metadata_->id_to_token.empty()) {

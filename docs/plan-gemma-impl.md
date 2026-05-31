@@ -699,12 +699,9 @@ literals in those files.
 
 ### Quantization compatibility
 
-K-Quants and TurboQuant KV are architecture-agnostic and should work for
-Gemma without changes. SnapKV may interact poorly with shared KV cache
-(G4) and sliding-window-only layers (G2+) — verify in each phase that
-SnapKV either functions correctly or is gracefully disabled with a clear
-error message. Per the fail-loud contract, "silently degrades" is not
-acceptable.
+K-Quants are architecture-agnostic and work for Gemma without changes.
+TurboQuant and SnapKV were removed (outside the workload envelope); no
+KV-precision or KV-eviction interaction to verify.
 
 ### Speculative decoding
 

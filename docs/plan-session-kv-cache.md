@@ -77,10 +77,7 @@ map lookup / LRU bookkeeping, not across the inference call.
 - **System-prompt cache**: unchanged. `SessionEntry.system_prompt_hash` records
   which template the session was forked from; if a session's system prompt
   changes mid-conversation, invalidate the session (rare; log a warning).
-- **SnapKV**: evicting "unimportant" tokens within a session is safe as long
-  as eviction is append-only in position space. If SnapKV rewrites positions,
-  sessions must snapshot per-turn or defer SnapKV until session close. **Open
-  question — resolve before enabling SnapKV on session slots.**
+- **SnapKV**: removed (outside workload envelope). No interaction.
 - **DeltaNet / SSM recurrent state (Qwen3.5, Qwen3.6)**: recurrent state has
   overwrite semantics. A session slot must snapshot the recurrent state at
   each turn boundary, not just the KV cache. `ForwardPassBase` needs a
@@ -101,9 +98,6 @@ map lookup / LRU bookkeeping, not across the inference call.
 3. **Phase 3 — multi-prefix template cache.**
    Replace single `TEMPLATE_SLOT` with a radix tree of shared prefixes (à la
    SGLang). Only worth it if multiple distinct system prompts are in active use.
-4. **Phase 4 — SnapKV + sessions.**
-   Resolve the eviction-semantics question above; likely per-turn snapshots.
-
 ## Non-goals (v1)
 
 - Cross-process session persistence (disk-backed cache).

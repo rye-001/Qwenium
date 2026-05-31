@@ -31,12 +31,11 @@ public:
     FakeForwardPass(const Model& m, const ModelMetadata* meta)
         : ForwardPassBase(m, meta) {}
 
-    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t) override { return nullptr; }
+    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>&, int, uint32_t, bool) override { return nullptr; }
     void advance_cache(uint32_t, uint32_t) override {}
     void clear_slot(uint32_t) override {}
     void set_cache_pos(uint32_t, uint32_t) override {}
     uint32_t get_cache_pos(uint32_t) const override { return 0; }
-    uint32_t get_physical_cache_pos(uint32_t) const override { return 0; }
     void clone_slot(uint32_t, uint32_t, uint32_t) override {}
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>&,
                                       const std::vector<uint32_t>&,
@@ -52,7 +51,7 @@ TEST(ModelRegistry, RegisterAndLookupFakeFactory) {
     FakeForwardPass::construction_count = 0;
 
     register_model("fake_arch_test_only",
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
             ++FakeForwardPass::construction_count;
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
@@ -64,7 +63,7 @@ TEST(ModelRegistry, RegisterAndLookupFakeFactory) {
     ModelMetadata meta;
     meta.architecture = "fake_arch_test_only";
 
-    auto fp = create_forward_pass(dummy, &meta, /*ctx=*/128, /*bs=*/1, /*kvb=*/0);
+    auto fp = create_forward_pass(dummy, &meta, /*ctx=*/128, /*bs=*/1);
     EXPECT_NE(fp, nullptr);
     EXPECT_EQ(FakeForwardPass::construction_count, 1);
 
@@ -78,7 +77,7 @@ TEST(ModelRegistry, UnknownArchitectureFailsLoud) {
     meta.architecture = "definitely_not_registered";
 
     try {
-        (void)create_forward_pass(dummy, &meta, 128, 1, 0);
+        (void)create_forward_pass(dummy, &meta, 128, 1);
         FAIL() << "expected runtime_error";
     } catch (const std::runtime_error& e) {
         const std::string msg(e.what());
@@ -110,7 +109,7 @@ TEST(ModelRegistry, FakeValidatorIsCalledWithCorrectMetadata) {
     std::string captured_arch;
 
     register_model(arch,
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
         [&](const ModelMetadata& meta) {
@@ -126,7 +125,7 @@ TEST(ModelRegistry, FakeValidatorIsCalledWithCorrectMetadata) {
 
     // Verify that a validator error propagates verbatim as GGUFLoadError.
     register_model(arch,
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, int) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
         [](const ModelMetadata&) {

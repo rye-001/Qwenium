@@ -91,17 +91,10 @@ constexpr size_t GEMMA3_GRAPH_SIZE = 16384;
 
 Gemma3ForwardPass::Gemma3ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata),
       config_(Gemma3Config::from_metadata(*metadata))
 {
-    if (kv_quant_bits != 0) {
-        throw std::runtime_error(
-            "Gemma3ForwardPass: kv_quant_bits != 0 not supported "
-            "(architecture='gemma3'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -150,7 +143,8 @@ ggml_tensor* Gemma3ForwardPass::require_tensor(uint32_t il, const char* suffix) 
 // ── build_prefill_graph ───────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -241,25 +235,36 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, inpL);
     }
 
-    // 4. Final norm.
-    ggml_tensor* cur = build_rms_norm(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        config_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // 4. Output head. THE single per-recipe head-presence guard site for
+    // gemma3 (docs/plan-feed-tokens.md → Head-presence locality constraint:
+    // exactly one site, not scattered want_logits conditionals).
+    // want_logits=false (feed_tokens) prunes final norm → LM head. Head-less
+    // anchor is the per-layer ggml_set_output(inpL) from the layer loop
+    // (same invariant as the qwen35/qwen36 else-anchor, different mechanism).
+    // KV cpy_k/v state-write roots are independently expanded in
+    // build_transformer_layer; attention-only, still owes its KV-append
+    // mid-stream differential ("attention-only" is not a skip).
+    if (want_logits) {
+        // Final norm.
+        ggml_tensor* cur = build_rms_norm(
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            config_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    // 5. LM head (tied embeddings — no separate output.weight in Gemma 3).
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        // LM head (tied embeddings — no separate output.weight in Gemma 3).
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+
+        // No final soft-cap for Gemma 3 (removed in G3 vs. G2).
+
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-
-    // No final soft-cap for Gemma 3 (removed in G3 vs. G2).
-
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
 
     return gf;
 }

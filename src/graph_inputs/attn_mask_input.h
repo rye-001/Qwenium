@@ -5,8 +5,7 @@
 #include <cstdint>
 #include <string>
 
-// Owns one KQ mask slot. Parameterize-vs-split (DECIDED, see
-// docs/plan-typed-graph-inputs.md): the sliding window is a *parameter* here,
+// Owns one KQ mask slot. Parameterize-vs-split: the sliding window is a *parameter* here,
 // not a separate LocalMaskInput/GlobalMaskInput. window == 0 => global
 // (pure causal); window > 0 => causal AND within-window cutoff (Gemma 2/3/4
 // local layers).

@@ -244,17 +244,10 @@ constexpr size_t GEMMA4_GRAPH_SIZE = 32768;  // larger than G3 — dual FFN + Mo
 
 Gemma4ForwardPass::Gemma4ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata),
       config_(Gemma4Config::from_metadata(*metadata))
 {
-    if (kv_quant_bits != 0) {
-        throw std::runtime_error(
-            "Gemma4ForwardPass: kv_quant_bits != 0 not supported "
-            "(architecture='gemma4'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -592,7 +585,8 @@ ggml_tensor* Gemma4ForwardPass::build_block(
 // ── build_prefill_graph ──────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -635,28 +629,39 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, inpL);
     }
 
-    // 4. Final norm + LM head + final logit soft-cap (G4.6).
-    ggml_tensor* cur = build_rms_norm(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        config_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // 4. Output head. THE single per-recipe head-presence guard site for
+    // gemma4 (docs/plan-feed-tokens.md → Head-presence locality constraint:
+    // exactly one site, not scattered want_logits conditionals).
+    // want_logits=false (feed_tokens) prunes final norm → LM head → softcap.
+    // Head-less anchor is the per-layer ggml_set_output(inpL) from the layer
+    // loop above (same invariant as the qwen35/qwen36 else-anchor, different
+    // mechanism). KV cpy_k/v state-write roots are independently expanded in
+    // build_block; attention-only (dense + MoE FFN, no recurrent state),
+    // still owes its own KV-append mid-stream differential.
+    if (want_logits) {
+        // Final norm + LM head + final logit soft-cap (G4.6).
+        ggml_tensor* cur = build_rms_norm(
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            config_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    // Tied embeddings: prefer output.weight if explicitly present, else
-    // reuse token_embd.weight (the Gemma 1/2/3/4 path).
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        // Tied embeddings: prefer output.weight if explicitly present, else
+        // reuse token_embd.weight (the Gemma 1/2/3/4 path).
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+
+        if (config_.final_softcap > 0.0f) {
+            cur = build_softcap(ctx_, cur, config_.final_softcap);
+        }
+
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-
-    if (config_.final_softcap > 0.0f) {
-        cur = build_softcap(ctx_, cur, config_.final_softcap);
-    }
-
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
     return gf;
 }
 
@@ -748,14 +753,12 @@ void Gemma4ForwardPass::advance_cache(uint32_t n_tokens, uint32_t slot_idx)
 {
     if (kv_cache_swa_)    kv_cache_swa_->advance(n_tokens, slot_idx);
     if (kv_cache_global_) kv_cache_global_->advance(n_tokens, slot_idx);
-    snapkv_advance_seq_pos(slot_idx, n_tokens);
 }
 
 void Gemma4ForwardPass::clear_slot(uint32_t slot_idx)
 {
     if (kv_cache_swa_)    kv_cache_swa_->clear_slot(slot_idx);
     if (kv_cache_global_) kv_cache_global_->clear_slot(slot_idx);
-    snapkv_clear_seq_pos(slot_idx);
 }
 
 void Gemma4ForwardPass::set_cache_pos(uint32_t pos, uint32_t slot_idx)
@@ -765,15 +768,6 @@ void Gemma4ForwardPass::set_cache_pos(uint32_t pos, uint32_t slot_idx)
 }
 
 uint32_t Gemma4ForwardPass::get_cache_pos(uint32_t slot_idx) const
-{
-    const uint32_t seq = snapkv_get_seq_pos(slot_idx);
-    if (seq > 0) return seq;
-    if (kv_cache_swa_)    return kv_cache_swa_->get_pos(slot_idx);
-    if (kv_cache_global_) return kv_cache_global_->get_pos(slot_idx);
-    return 0;
-}
-
-uint32_t Gemma4ForwardPass::get_physical_cache_pos(uint32_t slot_idx) const
 {
     if (kv_cache_swa_)    return kv_cache_swa_->get_pos(slot_idx);
     if (kv_cache_global_) return kv_cache_global_->get_pos(slot_idx);

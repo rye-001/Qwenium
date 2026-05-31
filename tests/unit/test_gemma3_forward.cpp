@@ -141,7 +141,7 @@ TEST_F(Gemma3ModelFile, PrefillProducesFiniteLogits) {
     const std::vector<int32_t> tokens = {2, 100, 200, 1000, 5000};
 
     auto fp = create_forward_pass(model, &model.get_metadata(),
-                                  /*context_len=*/128, /*max_batch=*/1, /*kvb=*/0);
+                                  /*context_len=*/128, /*max_batch=*/1);
     ASSERT_NE(fp, nullptr);
 
     std::vector<float> logits = fp->run_prefill(
@@ -172,7 +172,7 @@ TEST_F(Gemma3ModelFile, LogitDistributionIsPeaked) {
     const std::vector<int32_t> tokens = {2, 100, 200, 1000, 5000};
 
     auto fp = create_forward_pass(model, &model.get_metadata(),
-                                  /*context_len=*/128, /*max_batch=*/1, /*kvb=*/0);
+                                  /*context_len=*/128, /*max_batch=*/1);
 
     std::vector<float> logits = fp->run_prefill(
         tokens, /*pos=*/0, /*slot_idx=*/0, model.get_scheduler());

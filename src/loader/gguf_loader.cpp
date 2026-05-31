@@ -470,6 +470,10 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
         // Fallback: scan token names for well-known EOT strings.
         static constexpr std::string_view kEotNames[] = {
             "<|im_end|>", "<end_of_turn>", "<|eot_id|>",
+            // Gemma 4 IT native end-of-turn marker.
+            "<turn|>",
+            // MedGemma 1.5 ships generation_config.eos_token_id = [1, 106]
+            "<eos>",
         };
         for (size_t i = 0; i < metadata_.id_to_token.size(); ++i) {
             for (const auto& name : kEotNames) {

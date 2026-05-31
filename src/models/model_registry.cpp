@@ -125,8 +125,7 @@ std::unique_ptr<ForwardPassBase> create_forward_pass(
     const Model&    model,
     const ModelMetadata* metadata,
     uint32_t             context_len,
-    uint32_t             max_batch_size,
-    int                  kv_quant_bits)
+    uint32_t             max_batch_size)
 {
     ForwardPassFactory factory;
     {
@@ -144,14 +143,14 @@ std::unique_ptr<ForwardPassBase> create_forward_pass(
         }
         factory = it->second.factory;
     }
-    return factory(model, metadata, context_len, max_batch_size, kv_quant_bits);
+    return factory(model, metadata, context_len, max_batch_size);
 }
 
 void register_builtin_models()
 {
     auto qwen3_factory = [](const Model& m, const ModelMetadata* meta,
-                            uint32_t ctx, uint32_t bs, int kvb) {
-        return std::make_unique<Qwen3ForwardPass>(m, meta, ctx, bs, kvb);
+                            uint32_t ctx, uint32_t bs) {
+        return std::make_unique<Qwen3ForwardPass>(m, meta, ctx, bs);
     };
     register_model("qwen2", qwen3_factory, validate_qwen3_inventory,
                    qwen_tokenizer_config(), std::make_unique<QwenChatTemplate>());
@@ -159,36 +158,36 @@ void register_builtin_models()
                    qwen_tokenizer_config(), std::make_unique<QwenChatTemplate>());
 
     register_model("qwen35",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Qwen35ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Qwen35ForwardPass>(m, meta, ctx, bs);
         },
         validate_qwen35_inventory,
         qwen_tokenizer_config(), std::make_unique<QwenChatTemplate>());
 
     register_model("qwen35moe",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Qwen36ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Qwen36ForwardPass>(m, meta, ctx, bs);
         },
         validate_qwen36_inventory,
         qwen_tokenizer_config(), std::make_unique<QwenChatTemplate>());
 
     register_model("gemma",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Gemma1ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Gemma1ForwardPass>(m, meta, ctx, bs);
         },
         validate_gemma1_inventory,
         gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
 
     register_model("gemma2",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Gemma2ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Gemma2ForwardPass>(m, meta, ctx, bs);
         },
         validate_gemma2_inventory,
         gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
 
     register_model("gemma3",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Gemma3ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Gemma3ForwardPass>(m, meta, ctx, bs);
         },
         validate_gemma3_inventory,
         gemma1_tokenizer_config(), std::make_unique<GemmaChatTemplate>());
@@ -201,8 +200,8 @@ void register_builtin_models()
     // rendering — the IT model's tool-calling Jinja is out of scope; see
     // docs/plan-gemma-impl.md → Phase G4 → "Out of scope for G4").
     register_model("gemma4",
-        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs, int kvb) {
-            return std::make_unique<Gemma4ForwardPass>(m, meta, ctx, bs, kvb);
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t bs) {
+            return std::make_unique<Gemma4ForwardPass>(m, meta, ctx, bs);
         },
         validate_gemma4_inventory,
         gemma4_tokenizer_config(),

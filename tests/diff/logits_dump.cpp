@@ -6,7 +6,7 @@
 // with the same fixed token prompt, and `cmp` the output files: any divergence
 // in input-tensor population perturbs logits and fails the gate.
 //
-// Usage: logits_dump <model.gguf> <kv_quant_bits> <out.bin>
+// Usage: logits_dump <model.gguf> <out.bin>
 
 #include <cstdint>
 #include <cstdio>
@@ -22,13 +22,12 @@
 #include "../../src/loader/tokenizer.h"
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::fprintf(stderr, "usage: %s <model.gguf> <kv_bits> <out.bin>\n", argv[0]);
+    if (argc != 3) {
+        std::fprintf(stderr, "usage: %s <model.gguf> <out.bin>\n", argv[0]);
         return 2;
     }
     const std::string model_path = argv[1];
-    const int kv_bits = std::atoi(argv[2]);
-    const std::string out_path = argv[3];
+    const std::string out_path = argv[2];
 
     ggml_backend_load_all();
     register_builtin_models();
@@ -40,7 +39,7 @@ int main(int argc, char** argv) {
     const auto& meta = model.get_metadata();
     const uint32_t vocab_size = meta.vocab_size;
 
-    auto fp = create_forward_pass(model, &meta, 4096, 1, kv_bits);
+    auto fp = create_forward_pass(model, &meta, 4096, 1);
     ggml_backend_sched_t sched = model.get_scheduler();
 
     // Fixed deterministic prompt (token ids only — no tokenizer variance).

@@ -18,7 +18,6 @@ add_executable(unit-tests
     unit/test_qwen35_forward_attn.cpp
     unit/test_qwen35_generation.cpp
     unit/test_grammar_vocab.cpp
-    unit/test_turboquant_generation.cpp
     unit/test_graph_input.cpp
     unit/test_tokens_input.cpp
     unit/test_positions_input.cpp
@@ -62,6 +61,7 @@ gtest_discover_tests(integration-tests)
 add_executable(logits-dump
     diff/logits_dump.cpp
     ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
 )
 target_link_libraries(logits-dump PRIVATE
     qinf-models
@@ -96,68 +96,6 @@ target_link_libraries(parallel-order-mngmt-test PRIVATE
     ggml
 )
 
-# TurboQuant unit tests (GTest, no model needed)
-add_executable(turboquant-tests
-    unit/test_turboquant.cpp
-)
-
-target_link_libraries(turboquant-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-)
-
-gtest_discover_tests(turboquant-tests)
-
-# Compressed KV store unit tests (GTest, no model needed)
-add_executable(compressed-kv-tests
-    unit/test_compressed_kv_store.cpp
-)
-
-target_link_libraries(compressed-kv-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-)
-
-gtest_discover_tests(compressed-kv-tests)
-
-# SnapKV CLI config tests (GTest, no model needed)
-add_executable(snapkv-cli-tests
-    unit/test_snapkv_cli.cpp
-)
-
-target_link_libraries(snapkv-cli-tests PRIVATE
-    GTest::gtest_main
-)
-
-gtest_discover_tests(snapkv-cli-tests)
-
-# SnapKV eviction + compaction unit tests (GTest, no model needed)
-add_executable(snapkv-eviction-tests
-    unit/test_snapkv_eviction.cpp
-)
-
-target_link_libraries(snapkv-eviction-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-    ggml
-)
-
-gtest_discover_tests(snapkv-eviction-tests)
-
-# SnapKV position tracking tests (GTest)
-add_executable(snapkv-position-tests
-    unit/test_snapkv_position.cpp
-)
-
-target_link_libraries(snapkv-position-tests PRIVATE
-    GTest::gtest_main
-    qinf-state
-    core
-    ggml
-)
-
-gtest_discover_tests(snapkv-position-tests)
-
 # TokenTrie unit tests (GTest, no model needed)
 add_executable(token-trie-tests
     unit/test_token_trie.cpp
@@ -169,6 +107,23 @@ target_link_libraries(token-trie-tests PRIVATE
 )
 
 gtest_discover_tests(token-trie-tests)
+
+# DecodePlan truth-table tests (GTest, no model needed). Enumerates the
+# resolver's input combinations and asserts the resolved plan — the
+# "first-class" half of the consolidation. Drops the self-tautology
+# rejections from the resolver and re-asserts them here on resolved values.
+add_executable(decode-plan-tests
+    unit/test_decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+)
+
+target_link_libraries(decode-plan-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+)
+
+target_compile_features(decode-plan-tests PRIVATE cxx_std_17)
+gtest_discover_tests(decode-plan-tests)
 
 # Parallel grammar test (Non-GTest)
 add_executable(parallel-grammar-test
@@ -315,6 +270,73 @@ target_link_libraries(forward-tests-qwen36 PRIVATE
 
 target_compile_features(forward-tests-qwen36 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-qwen36)
+
+# feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
+# differential (docs/plan-feed-tokens.md). Self-skips when model absent.
+add_executable(feed-tokens-tests-qwen36
+    unit/test_qwen36_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-qwen36 PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-qwen36 PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-qwen36)
+
+# feed_tokens Phase 2 — qwen35 head-less state-advance + mid-decode
+# differential (docs/plan-feed-tokens.md). Self-skips when model absent.
+add_executable(feed-tokens-tests-qwen35
+    unit/test_qwen35_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-qwen35 PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-qwen35 PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-qwen35)
+
+# feed_tokens Phase 3 — gemma1–4 head-less state-advance + per-recipe
+# KV-append mid-decode differential (docs/plan-feed-tokens.md). One
+# parameterized harness; each recipe self-skips when its model is absent.
+add_executable(feed-tokens-tests-gemma
+    unit/test_gemma_feed_tokens.cpp
+)
+
+target_link_libraries(feed-tokens-tests-gemma PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(feed-tokens-tests-gemma PRIVATE cxx_std_17)
+gtest_discover_tests(feed-tokens-tests-gemma)
+
+# Prefill output-ID slice (last-token LM-head elision). No-model fail-loud
+# unit tests run unconditionally; the qwen35 + gemma1 bit-identical /
+# composition differentials self-skip when their model is absent.
+add_executable(out-ids-slice-tests
+    unit/test_out_ids_slice.cpp
+)
+
+target_link_libraries(out-ids-slice-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-graph-inputs
+    core
+    ggml
+)
+
+target_compile_features(out-ids-slice-tests PRIVATE cxx_std_17)
+gtest_discover_tests(out-ids-slice-tests)
 
 # Qwen 3.6 hparam + inventory validation tests (PR 3.I.1).
 # Pure-unit tests (no model file) run unconditionally.
@@ -552,6 +574,21 @@ target_link_libraries(model-registry-tests PRIVATE
 target_compile_features(model-registry-tests PRIVATE cxx_std_17)
 gtest_discover_tests(model-registry-tests)
 
+# Multimodal-only refusal — no model file needed.
+add_executable(multimodal-check-tests
+    unit/test_multimodal_check.cpp
+)
+
+target_link_libraries(multimodal-check-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+    core
+    ggml
+)
+
+target_compile_features(multimodal-check-tests PRIVATE cxx_std_17)
+gtest_discover_tests(multimodal-check-tests)
+
 # TransformerBlock unit tests — no model file needed.
 # Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.
 add_executable(transformer-block-tests
@@ -722,32 +759,6 @@ target_link_libraries(forward-tests-gemma3 PRIVATE
 )
 target_compile_features(forward-tests-gemma3 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-gemma3)
-
-# ── TQ prefill canary tests ───────────────────────────────────────────────────
-# Regression gate for the TurboQuant prefill path (_build_layer_batch_graph).
-# Prerequisite for the build_transformer_layer extraction PR.
-# Self-skips when QWEN3_MODEL_PATH is unset or the model file is absent.
-# See: docs/kv-cache-unification.md open question #3.
-add_executable(tq-prefill-tests
-    unit/test_qwen3_tq_prefill.cpp
-)
-
-# Bake the source-tree fixture path into the binary so it resolves correctly
-# regardless of the working directory from which tests are invoked.
-target_compile_definitions(tq-prefill-tests PRIVATE
-    QWEN3_TQ_BASELINE_DEFAULT="${CMAKE_SOURCE_DIR}/tests/fixtures/qwen3_tq_prefill_baseline.json"
-)
-
-target_link_libraries(tq-prefill-tests PRIVATE
-    GTest::gtest_main
-    qinf-models
-    core
-    nlohmann_json::nlohmann_json
-    ggml
-)
-
-target_compile_features(tq-prefill-tests PRIVATE cxx_std_17)
-gtest_discover_tests(tq-prefill-tests)
 
 # ── Phase 4 tools ─────────────────────────────────────────────────────────────
 

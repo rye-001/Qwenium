@@ -6,8 +6,8 @@ to a composable, layer-type-driven architecture.
 ## Motivation
 
 The engine was built around a single model family: Qwen3 (pure transformer).
-Every optimization — TurboQuant, SnapKV, KV cache management — assumes that
-every layer is an attention layer backed by a key-value cache.
+Every optimization — KV cache management — assumes that every layer is an
+attention layer backed by a key-value cache.
 
 That assumption is now obsolete. Qwen 3.6 introduces a hybrid architecture
 where 30 of 40 layers are Gated DeltaNet (linear recurrence) and only 10 are
@@ -70,7 +70,7 @@ Traditional multi-head / grouped-query attention with KV cache.
 
 - **Compute:** Q/K/V projection, RoPE, scaled dot-product attention, output projection.
 - **State:** KV cache (grows linearly with sequence length).
-- **Quantization:** TurboQuant (compressed KV storage), SnapKV (KV eviction for long context).
+- **Quantization:** K-Quant on weights.
 - **Metal kernel:** Fused QKV projection, flash-attention-style tiled matmul.
 - **Models that use it:** Qwen3 (all layers), Qwen 3.6 (every 4th layer), Jamba (interleaved).
 
@@ -155,8 +155,6 @@ src/
     kv_cache.h / .cpp        # KV cache (used by attention only)
     ssm_state.h / .cpp       # SSM recurrent state
     deltanet_state.h / .cpp  # DeltaNet recurrent state
-    turboquant.h / .cpp      # KV cache quantization (attention-specific)
-    snapkv.h / .cpp          # KV eviction (attention-specific)
     state_quant.h / .cpp     # recurrent state quantization (future)
   models/
     model.h                  # common ModelInterface — layer composition
@@ -186,8 +184,6 @@ tests/
     test_kv_cache.cpp
     test_ssm_state.cpp
     test_deltanet_state.cpp
-    test_turboquant.cpp
-    test_snapkv.cpp
     test_model_qwen3.cpp
     test_model_qwen36.cpp
 ```
@@ -199,8 +195,6 @@ tests/
 | `src/core/forward-pass.cpp`  | `src/layers/attention` + `src/layers/ffn` | Extract |
 | `src/core/forward-pass-qwen35.cpp` | `src/layers/deltanet` + `src/layers/attention` + `src/layers/moe` | Extract |
 | `src/kv-cache/compressed_kv_store`  | `src/state/kv_cache`   | Move     |
-| `src/kv-cache/turboquant`           | `src/state/turboquant` | Move     |
-| `src/kv-cache/snapkv-eviction`      | `src/state/snapkv`     | Move     |
 | `src/kv-cache/ssm-state-cache`      | `src/state/ssm_state` + `src/state/deltanet_state` | Split |
 | `src/sampling/*`                    | `src/sampling/*`       | Keep     |
 | `src/core/gguf-loader`        | `src/loader/gguf_loader` | Move   |
@@ -308,8 +302,8 @@ minimal or it will invent methods that are no-ops on one side.
 |---|---|---|
 | **Growth** | Appends K/V for each new token. Grows linearly with sequence. | Fixed-size matrix. Does not grow. |
 | **Update** | Write-once append at position `head`. Pointer advances. | Full overwrite via exponential moving average: S = S*g + delta. |
-| **Eviction** | SnapKV can drop old entries. | No eviction — state is always fully overwritten. |
-| **Quantization** | TurboQuant compresses stored K/V. | Open research. State has structure (low-rank delta updates) but no proven compression scheme yet. |
+| **Eviction** | Not applicable (outside workload envelope; SnapKV was removed). | No eviction — state is always fully overwritten. |
+| **Quantization** | K-Quant on weights. KV-precision compression (TurboQuant) was removed — outside workload envelope. | Open research. State has structure (low-rank delta updates) but no proven compression scheme yet. |
 | **Batch reset** | Clear cache range for new sequence. | Zero the state matrix. |
 
 The common interface:
@@ -323,7 +317,6 @@ class LayerState {
 
 class KVCache : public LayerState {
     void truncate_to_position(int pos);   // O(1) head-pointer adjustment
-    void evict(...);                       // SnapKV-style eviction
     // ...
 };
 
@@ -368,10 +361,6 @@ rather than hiding it behind a shared method that silently no-ops.
 - **Speculative decoding:** checkpoint before drafting a batch of N tokens,
   restore + re-run the accepted prefix if verify rejects. One checkpoint
   per active draft batch.
-- **SnapKV:** continues to operate on KV cache only. It has no analog for
-  recurrent state, which is fine — recurrent state doesn't grow, so there
-  is nothing to evict.
-
 Per-kind methods (`KVCache::evict`, `RecurrentState::checkpoint`, etc.) live
 on the concrete class and are called only by code that knows which kind it
 is dealing with.
@@ -602,7 +591,6 @@ What this phase produces:
 What this phase does NOT touch:
 - Metal kernels (still called the same way, from the same code paths)
 - State management (KV cache stays exactly where it is)
-- Quantization (TurboQuant/SnapKV unchanged)
 - Public CLI flags, server endpoints, or GGUF loader behavior
 - DeltaNet, SSM, MoE (not yet — Qwen3 doesn't use them)
 
@@ -649,10 +637,10 @@ output, faster execution. Profile before and after with Metal GPU capture.
 
 ### Phase 5 — State Optimizations
 
-Apply quantization and compression techniques to the state modules. Extend
-TurboQuant to the 10 attention layers in Qwen 3.6. Research and prototype
-recurrent state quantization for DeltaNet. Experiment with MoE expert weight
-layout optimization.
+Apply quantization and compression techniques to the state modules. Research
+and prototype recurrent state quantization for DeltaNet. Experiment with MoE
+expert weight layout optimization. (TurboQuant was removed — outside workload
+envelope.)
 
 **Gate:** output quality within acceptable perplexity bounds (measured, not assumed).
 
@@ -668,8 +656,6 @@ tests. Commit. Then start the kernel work in the next phase.
 | Technique             | Current scope        | After refactor                      |
 |-----------------------|----------------------|-------------------------------------|
 | K-Quants              | All weights          | All weights (unchanged)             |
-| TurboQuant            | All KV cache         | Attention-layer KV cache only       |
-| SnapKV                | All KV cache         | Attention-layer KV cache only       |
 | Grammar/Trie          | Output sampling      | Output sampling (unchanged)         |
 | Speculative Decoding  | Full model           | Full model (unchanged)              |
 | State Quantization    | Not yet              | SSM + DeltaNet recurrent states     |

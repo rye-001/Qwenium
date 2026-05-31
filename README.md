@@ -22,8 +22,6 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 - **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
 - **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
 - **Prefix caching** — System prompt KV state cloned per slot. 2.25× faster wall time, 5.3× faster time-to-first-token.
-- **TurboQuant KV** — Compressed KV cache backed by Walsh–Hadamard rotation + Lloyd–Max quantization for long contexts.
-- **SnapKV** — Importance-based KV eviction to keep cache bounded on long multi-turn conversations.
 - **OpenAI-compatible API** — `/v1/completions` with SSE streaming. Drop-in for existing tools.
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
@@ -102,8 +100,6 @@ src/
 │   └── transformer_block.*      #   Per-layer composer (norm → attn → FFN → residual)
 ├── state/                       # Per-sequence state (KV + recurrent)
 │   ├── kv_cache_simple.*        #   ggml-backed slot KV cache
-│   ├── kv_cache_compressed.*    #   TurboQuant CPU-side compressed store
-│   ├── snapkv.*                 #   Importance-based KV eviction
 │   ├── deltanet_state.*         #   Recurrent state for GatedDeltaNet
 │   └── recurrent_state.*        #   Base for checkpoint/restore semantics
 ├── models/                      # Model recipes (compose layer modules)

@@ -32,18 +32,9 @@ constexpr size_t GEMMA1_GRAPH_SIZE = 16384;
 
 Gemma1ForwardPass::Gemma1ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata)
 {
-    if (kv_quant_bits != 0) {
-        // TurboQuant for Gemma is not in scope for PR G1.5. The fail-loud
-        // contract: refuse rather than silently produce wrong outputs.
-        throw std::runtime_error(
-            "Gemma1ForwardPass: kv_quant_bits != 0 not supported in this phase "
-            "(architecture='gemma'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -64,7 +55,8 @@ Gemma1ForwardPass::Gemma1ForwardPass(
 }
 
 ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -148,25 +140,37 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     }
 
     // 3. Output head: Gemma final norm (1+w) → tied LM head matmul.
-    // Also keep the post-block residual stream alive for diagnostics.
+    // The post-block residual stream is kept alive unconditionally — it is
+    // the head-less anchor (scheduler backend-propagation root; see the
+    // qwen35/qwen36 guard comments) as well as a diagnostic.
     ggml_set_output(inpL);
     ggml_build_forward_expand(gf, inpL);
     set_tensor_name(gf, inpL, "post_layers");
 
-    ggml_tensor* cur = build_rms_norm_gemma(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        meta_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // THE single per-recipe head-presence guard site for gemma1
+    // (docs/plan-feed-tokens.md → Head-presence locality constraint: exactly
+    // one site, identical in shape across recipes). want_logits=false
+    // (feed_tokens) prunes the head; KV cpy_k/v state-write roots are
+    // independently ggml_build_forward_expand'd in build_transformer_layer,
+    // so the head-less graph still advances attention KV. Gemma is
+    // attention-only — no recurrent state — but still owes its own
+    // KV-append mid-stream differential ("attention-only" is not a skip).
+    if (want_logits) {
+        ggml_tensor* cur = build_rms_norm_gemma(
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            meta_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
 
     return gf;
 }

@@ -66,16 +66,21 @@ void validate_gemma3_inventory(const ModelMetadata& meta);
 class Gemma3ForwardPass : public ForwardPassBase {
 public:
     Gemma3ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1,
-                      int kv_quant_bits = 0);
+                      uint32_t context_len, uint32_t max_batch_size = 1);
     ~Gemma3ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,
-                                      int pos, uint32_t slot_idx = 0) override;
+                                      int pos, uint32_t slot_idx = 0,
+                                      bool want_logits = true) override;
 
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>& tokens,
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
+
+    // Phase 3 of docs/plan-feed-tokens.md: gemma3 honors want_logits=false
+    // with one head-guard site. Attention-only; still owes its own
+    // KV-append mid-stream differential.
+    bool feed_tokens_supported() const override { return true; }
 
     // build_decoding_graph throws; decode_step routes via run_prefill bridge.
     bool has_decode_graph() const override { return false; }
@@ -85,21 +90,14 @@ public:
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);
-        snapkv_advance_seq_pos(slot_idx, n_tokens);
     }
     void clear_slot(uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->clear_slot(slot_idx);
-        snapkv_clear_seq_pos(slot_idx);
     }
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->set_pos(pos, slot_idx);
     }
     uint32_t get_cache_pos(uint32_t slot_idx) const override {
-        uint32_t seq = snapkv_get_seq_pos(slot_idx);
-        if (seq > 0) return seq;
-        return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
-    }
-    uint32_t get_physical_cache_pos(uint32_t slot_idx) const override {
         return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     }
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {

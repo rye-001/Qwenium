@@ -83,17 +83,10 @@ constexpr size_t GEMMA2_GRAPH_SIZE = 16384;
 
 Gemma2ForwardPass::Gemma2ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    uint32_t context_len, uint32_t max_batch_size)
     : ForwardPassBase(model, metadata),
       config_(Gemma2Config::from_metadata(*metadata))
 {
-    if (kv_quant_bits != 0) {
-        throw std::runtime_error(
-            "Gemma2ForwardPass: kv_quant_bits != 0 not supported "
-            "(architecture='gemma2'); expected 0, got " +
-            std::to_string(kv_quant_bits));
-    }
-
     ggml_backend_t cache_backend = model_.has_metal_backend()
         ? model_.get_backend_metal()
         : model_.get_backend_cpu();
@@ -137,7 +130,8 @@ ggml_tensor* Gemma2ForwardPass::require_tensor(uint32_t il, const char* suffix) 
 // ── build_prefill_graph ───────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma2ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx)
+    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    bool want_logits)
 {
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -224,28 +218,41 @@ ggml_cgraph* Gemma2ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, inpL);
     }
 
-    // 4. Final norm (Gemma GGUF pre-shifts weights, so standard build_rms_norm).
-    ggml_tensor* cur = build_rms_norm(
-        ctx_, inpL, model_.get_output_norm_weight(),
-        config_.rms_norm_eps, /*il=*/-1);
-    set_tensor_name(gf, cur, "final_norm");
-    ggml_set_output(cur);
-    ggml_build_forward_expand(gf, cur);
+    // 4. Output head. THE single per-recipe head-presence guard site for
+    // gemma2 (docs/plan-feed-tokens.md → Head-presence locality constraint:
+    // exactly one site, not scattered want_logits conditionals).
+    // want_logits=false (feed_tokens) prunes final norm → LM head → softcap.
+    // The head-less anchor is the per-layer ggml_set_output(inpL) already
+    // emitted in the layer loop (scheduler backend-propagation root), so no
+    // separate else is needed here — same invariant as the qwen35/qwen36
+    // else-anchor, different mechanism because Gemma already keeps layer
+    // outputs alive. KV cpy_k/v state-write roots are independently
+    // ggml_build_forward_expand'd in build_transformer_layer; attention-only,
+    // but still owes its own KV-append mid-stream differential.
+    if (want_logits) {
+        // Final norm (Gemma GGUF pre-shifts weights → standard build_rms_norm).
+        ggml_tensor* cur = build_rms_norm(
+            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            config_.rms_norm_eps, /*il=*/-1);
+        set_tensor_name(gf, cur, "final_norm");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
 
-    // 5. LM head (tied embeddings — no separate output.weight).
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        // LM head (tied embeddings — no separate output.weight).
+        if (model_.get_output_weight() != nullptr) {
+            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+        } else {
+            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+        }
+
+        // Final logit soft-capping (Gemma 2 only).
+        if (config_.final_softcap > 0.0f) {
+            cur = build_softcap(ctx_, cur, config_.final_softcap);
+        }
+
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
     }
-
-    // 6. Final logit soft-capping (Gemma 2 only).
-    if (config_.final_softcap > 0.0f) {
-        cur = build_softcap(ctx_, cur, config_.final_softcap);
-    }
-
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
 
     return gf;
 }

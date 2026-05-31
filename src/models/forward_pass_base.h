@@ -32,29 +32,21 @@ public:
     ForwardPassBase(const Model& model, const ModelMetadata* metadata);
     virtual ~ForwardPassBase();
 
-    virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) = 0;
+    // want_logits=false prunes the LM head (the single per-recipe head-guard
+    // site) so the graph advances state only — see feed_tokens and
+    // docs/plan-feed-tokens.md. State-write roots are independent graph roots;
+    // pruning the head leaves them intact.
+    virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0, bool want_logits = true) = 0;
     virtual void advance_cache(uint32_t n_tokens, uint32_t slot_idx) = 0;
     virtual void clear_slot(uint32_t slot_idx) = 0;
     virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
     virtual uint32_t get_cache_pos(uint32_t slot_idx) const = 0;
 
-    // Physical cache position (KV write offset / attention entry count).
-    // Unlike get_cache_pos(), this always returns the physical position even
-    // when SnapKV seq_pos tracking is active. Used for KV gather sizing.
-    virtual uint32_t get_physical_cache_pos(uint32_t slot_idx) const = 0;
     virtual void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) = 0;
     virtual ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
-
-    // True when TurboQuant KV compression is active for this forward pass.
-    // BRIDGE (Option 1 pending): build_decoding_graph has no TurboQuant
-    // support — under TQ the full kv_cache_ is intentionally null. decode_step
-    // queries this to refuse the TQ-unaware decode graph and route to the
-    // legacy per-recipe single-token run_prefill path (which IS TQ-aware).
-    // Default false; recipes that allocate a compressed store override it.
-    virtual bool tq_active() const { return false; }
 
     // False ⇒ this recipe has no build_decoding_graph (it throws); decode_step
     // must route through the legacy single-token run_prefill bridge instead.
@@ -62,16 +54,12 @@ public:
     // (Gemma 1–4) override to false.
     virtual bool has_decode_graph() const { return true; }
 
-    // ── TurboQuant per-layer compute ────────────────────────────
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
-    // When TQ is enabled, processes one layer at a time with compressed KV.
-    // When TQ is disabled, delegates to the existing monolithic path.
     // Returns output logits.
     virtual std::vector<float> run_prefill(
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx,
         ggml_backend_sched_t scheduler) {
-        // Default: monolithic path (subclasses override for TQ)
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
@@ -80,6 +68,47 @@ public:
         advance_cache(tokens.size(), slot_idx);
         return get_output_logits(gf);
     }
+
+    // ── feed_tokens ──────────────────────────────────────────────
+    // Advance this slot's model state — attention KV-append AND recurrent
+    // overwrite — over a span of already-known tokens WITHOUT building the
+    // LM head or producing logits. The inverse of run_prefill-with-logits:
+    // consume tokens to condition future predictions; predict nothing.
+    // State mutation, no return value.
+    //
+    // Contract: token-stable across span vs. sequential decode — the sampled
+    // token never flips, low FP bits may differ. See plan-feed-tokens.md.
+    //
+    // Standalone at the API; thin parameterization underneath: the internal
+    // impl is the existing prefill builder with want_logits=false (exactly
+    // one head-guard site per recipe). NOT a forked KV/recurrent write.
+    void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
+                     ggml_backend_sched_t scheduler) {
+        if (!feed_tokens_supported())
+            throw std::runtime_error(
+                "feed_tokens: feed_tokens_supported expected=true "
+                "actual=false — this recipe has no want_logits=false head "
+                "guard yet. docs/plan-feed-tokens.md is phased (qwen36 "
+                "first); refusing rather than silently building the head.");
+
+        const int pos = static_cast<int>(get_cache_pos(slot));
+
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf =
+            build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_prefill_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+        advance_cache(static_cast<uint32_t>(tokens.size()), slot);
+        // No get_output_logits: head-less by contract.
+    }
+
+    // True only for recipes whose build_prefill_graph honors want_logits=false
+    // with exactly one head-guard site. Phased per docs/plan-feed-tokens.md
+    // (qwen36 first). Default false so feed_tokens fails loud for recipes
+    // that have not implemented the guard, rather than silently building the
+    // head (wasteful) or shipping an unverified state-advance path.
+    virtual bool feed_tokens_supported() const { return false; }
 
     // Typed inputs the most-recently-built graph owns. Populated by the
     // recipe's build_*_graph; consumed by run_prefill / decode_step via
@@ -121,44 +150,6 @@ public:
     std::vector<float> get_output_logits(ggml_cgraph* gf);
     std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
 
-    // ── SnapKV configuration ─────────────────────────────────────
-    void set_snapkv_config(uint32_t budget, uint32_t window) {
-        snapkv_budget_ = budget;
-        snapkv_window_ = window;
-    }
-    uint32_t snapkv_budget() const { return snapkv_budget_; }
-    uint32_t snapkv_window() const { return snapkv_window_; }
-
-    // ── SnapKV dual position tracking ──────────────────────────────
-    // After eviction, seq_pos tracks the logical sequence position (for RoPE)
-    // while the cache's physical position tracks the compacted length.
-    // When seq_pos > 0, get_cache_pos() should return seq_pos instead of
-    // the physical cache position.
-
-    // Called after SnapKV compaction to set the logical sequence position.
-    void snapkv_set_seq_pos(uint32_t slot_idx, uint32_t original_length) {
-        if (slot_idx >= snapkv_seq_pos_.size())
-            snapkv_seq_pos_.resize(slot_idx + 1, 0);
-        snapkv_seq_pos_[slot_idx] = original_length;
-    }
-
-    // Advance the logical sequence position (call alongside advance_cache).
-    void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens) {
-        if (slot_idx < snapkv_seq_pos_.size() && snapkv_seq_pos_[slot_idx] > 0)
-            snapkv_seq_pos_[slot_idx] += n_tokens;
-    }
-
-    // Reset seq_pos tracking for a slot (call on clear_slot).
-    void snapkv_clear_seq_pos(uint32_t slot_idx) {
-        if (slot_idx < snapkv_seq_pos_.size())
-            snapkv_seq_pos_[slot_idx] = 0;
-    }
-
-    // Get the logical sequence position (0 = SnapKV not active for this slot).
-    uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const {
-        return (slot_idx < snapkv_seq_pos_.size()) ? snapkv_seq_pos_[slot_idx] : 0;
-    }
-
 protected:
     const ModelMetadata& meta_;
     const Model& model_;
@@ -174,14 +165,6 @@ protected:
     // set_prefill_inputs / set_decode_inputs upload it via StepContext and
     // clear it (consume-on-use).
     std::vector<int32_t> sparse_decode_ids_;
-
-    // SnapKV: post-prefill KV eviction (0 = disabled)
-    uint32_t snapkv_budget_ = 0;
-    uint32_t snapkv_window_ = 32;
-
-    // Per-slot logical sequence position after SnapKV compaction.
-    // 0 = SnapKV not active (use physical cache position).
-    std::vector<uint32_t> snapkv_seq_pos_;
 
     // --- Context management ---
     // Reset the ggml context (call at the start of every graph build)
@@ -221,6 +204,20 @@ protected:
     // created automatically from sparse_decode_ids_ (set by set_sparse_decode_ids).
     void build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx = nullptr);
 
+    // Prefill-only token-position slice. Inserts a ggml_get_rows on the hidden
+    // state immediately before the LM head so the ~150k-wide head runs only on
+    // the position(s) that produce logits (default: last token). Registers an
+    // OutputIdsInput owning the "out_ids" slot. Returns `cur` unchanged when
+    // the slice is disabled (the differential dense-reference seam) — this is
+    // an explicit, caller-selected path, NOT a silent fallback on error.
+    //
+    // Orthogonal to the vocab-axis sparse slice in build_output_head: this
+    // gathers the hidden state, that gathers the head weight. Both compose
+    // order-independently in one graph. Called at the single per-recipe
+    // prefill head site only — never from build_decoding_graph (decode with
+    // n_tokens=1 is already trivially sliced).
+    ggml_tensor* build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* cur);
+
     void set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il = -1) const;
 
 public:
@@ -231,4 +228,15 @@ public:
     void set_sparse_decode_ids(std::vector<int32_t> ids) {
         sparse_decode_ids_ = std::move(ids);
     }
+
+    // Differential seam for the prefill output-position slice. Default true:
+    // prefill builds the LM head only on the last token (the optimization).
+    // Set false to build the dense head over all N positions — the bit-for-bit
+    // reference the slice differential compares against. Explicit and
+    // caller-selected; not an error fallback (CLAUDE.md fail-loud contract).
+    void set_slice_prefill_head(bool on) { slice_prefill_head_ = on; }
+    bool slice_prefill_head() const { return slice_prefill_head_; }
+
+protected:
+    bool slice_prefill_head_ = true;
 };

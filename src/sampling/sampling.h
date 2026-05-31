@@ -64,6 +64,9 @@ public:
     // dense path.
     std::vector<int32_t> peek_valid_set();
 
+    // Registered stop token IDs (for forced-run termination in decode_step).
+    const std::vector<int32_t>& eos_token_ids() const { return eos_token_ids_; }
+
     // Advance grammar state after a token is committed.
     // No-op when no grammar is attached.
     void accept_token(int32_t token_id) {

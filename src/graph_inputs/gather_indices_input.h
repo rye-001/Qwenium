@@ -6,8 +6,7 @@
 
 // Owns the "gather_indices" slot used by batched decode to gather per-slot KV
 // rows out of the shared cache. The per-slot row stride differs by recipe KV
-// layout (parameterize-vs-split: a stride *policy* parameter, not a separate
-// class — same reasoning as the sliding-window parameter on AttnMaskInput):
+// layout (parameterize-vs-split):
 //
 //   - NCtxMax: index = slot * kv_cache->get_n_ctx_max() + t   (qwen3, qwen35)
 //   - NKvLen : index = slot * n_kv_len + t                    (qwen36)
