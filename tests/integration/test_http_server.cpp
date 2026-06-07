@@ -138,6 +138,7 @@ protected:
         qwenium::InferenceServer::Config config;
         config.max_slots = 4;
         config.max_queue_depth = 10;
+        config.max_context = 64;  // small ceiling so the fail-loud test can exceed it
         config.request_timeout = std::chrono::seconds(5);
 
         server_ = std::make_unique<qwenium::InferenceServer>(config);
@@ -208,6 +209,17 @@ protected:
             inf_req->prompt = prompt;
             inf_req->max_tokens = body.value("max_tokens", 256);
 
+            if (body.contains("stop")) {
+                const auto& stop = body["stop"];
+                if (stop.is_string()) {
+                    inf_req->stop.push_back(stop.get<std::string>());
+                } else if (stop.is_array()) {
+                    for (const auto& s : stop) {
+                        if (s.is_string()) inf_req->stop.push_back(s.get<std::string>());
+                    }
+                }
+            }
+
             bool stream = body.value("stream", false);
 
             if (!server_->submit(inf_req)) {
@@ -242,13 +254,27 @@ protected:
                     }
                 );
             } else {
-                std::string full_text;
-                while (true) {
-                    int token_id = inf_req->token_queue->pop_blocking();
-                    if (token_id == qwenium::TokenQueue::QUEUE_END) break;
-                    full_text += server_->decode_token(token_id);
+                // Mirror production: the server owns the canonical output_text,
+                // token counts, and finish_reason. Drain only to wait for the end.
+                while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
                 }
-                json response = {{"choices", {{{"text", full_text}}}}};
+                if (!inf_req->error_message.empty()) {
+                    res.status = 413;
+                    res.set_content(json({{"error", inf_req->error_message}}).dump(),
+                                    "application/json");
+                    return;
+                }
+                json response = {
+                    {"choices", {{
+                        {"text", inf_req->output_text},
+                        {"finish_reason", inf_req->finish_reason}
+                    }}},
+                    {"usage", {
+                        {"prompt_tokens", inf_req->prompt_tokens},
+                        {"completion_tokens", inf_req->completion_tokens},
+                        {"total_tokens", inf_req->prompt_tokens + inf_req->completion_tokens}
+                    }}
+                };
                 res.set_content(response.dump(), "application/json");
             }
         });
@@ -448,6 +474,134 @@ TEST_F(HttpServerTest, MaxTokensRespected) {
     
     // Should be limited to 3 tokens (including the first one from prefill)
     EXPECT_LE(text.length(), 3u);
+}
+
+// =============================================================================
+// Delegation-contract smoke tests (items 1-6)
+//
+// These exercise the server-owned request lifecycle that the production HTTP
+// handler depends on: canonical output_text, stop-string truncation,
+// finish_reason, usage counts, slot reset between requests, and the fail-loud
+// oversized-prompt guard. The mock backend is deterministic by construction, so
+// any cross-request variation here is a server-logic bug, not a model effect.
+// =============================================================================
+
+// Item 1 (determinism): the same request body submitted twice yields a
+// byte-identical completion and finish_reason. Proves the slot is reset to a
+// clean state between independent requests.
+TEST_F(HttpServerTest, DeterminismSameRequestTwice) {
+    mock_->set_response({'H', 'e', 'l', 'l', 'o', 0});
+    auto client = get_client();
+    json request = {{"prompt", "hi"}, {"max_tokens", 50}, {"stream", false}};
+
+    auto a = client.Post("/v1/completions", request.dump(), "application/json");
+    auto b = client.Post("/v1/completions", request.dump(), "application/json");
+
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+    ASSERT_EQ(a->status, 200);
+    ASSERT_EQ(b->status, 200);
+    auto ja = json::parse(a->body);
+    auto jb = json::parse(b->body);
+    EXPECT_EQ(ja["choices"][0]["text"], jb["choices"][0]["text"]);
+    EXPECT_EQ(ja["choices"][0]["text"], "Hello");
+    EXPECT_EQ(ja["choices"][0]["finish_reason"], jb["choices"][0]["finish_reason"]);
+}
+
+// Item 4 (slot isolation): request B must not inherit request A's per-slot
+// state. The mock advances a per-slot decode cursor that is only reset by
+// clear_slot(); if isolation were broken, B would resume mid-sequence (or hit
+// EOS immediately) instead of producing its own full response.
+TEST_F(HttpServerTest, SlotIsolationBetweenRequests) {
+    auto client = get_client();
+
+    mock_->set_response({'A', 'A', 'A', 0});
+    auto a = client.Post("/v1/completions",
+                         json({{"prompt", "first"}, {"max_tokens", 50}}).dump(),
+                         "application/json");
+    ASSERT_TRUE(a);
+    EXPECT_EQ(json::parse(a->body)["choices"][0]["text"], "AAA");
+
+    mock_->set_response({'B', 'B', 'B', 'B', 0});
+    auto b = client.Post("/v1/completions",
+                         json({{"prompt", "second"}, {"max_tokens", 50}}).dump(),
+                         "application/json");
+    ASSERT_TRUE(b);
+    // Full fresh response, not truncated by A's stale cursor.
+    EXPECT_EQ(json::parse(b->body)["choices"][0]["text"], "BBBB");
+}
+
+// Item 2 (stop sequences): output ends *before* the stop string, not after,
+// and the stop string itself is excluded.
+TEST_F(HttpServerTest, StopSequenceTruncatesOutput) {
+    mock_->set_response({'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', 0});
+    auto client = get_client();
+    json request = {
+        {"prompt", "hi"},
+        {"max_tokens", 100},
+        {"stop", json::array({"world"})}
+    };
+
+    auto res = client.Post("/v1/completions", request.dump(), "application/json");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+    auto body = json::parse(res->body);
+    EXPECT_EQ(body["choices"][0]["text"], "Hello, ");
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "stop");
+}
+
+// Item 3 (max_tokens): generation is bounded and the truncation is reported as
+// finish_reason "length" (not a generic "stop").
+TEST_F(HttpServerTest, MaxTokensReportsLengthFinishReason) {
+    mock_->set_response({'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 0});
+    auto client = get_client();
+    json request = {{"prompt", "hi"}, {"max_tokens", 3}, {"stream", false}};
+
+    auto res = client.Post("/v1/completions", request.dump(), "application/json");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+    auto body = json::parse(res->body);
+    EXPECT_LE(std::string(body["choices"][0]["text"]).length(), 3u);
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "length");
+    EXPECT_EQ(body["usage"]["completion_tokens"], 3);
+}
+
+// Item 6 (usage counts): prompt/completion/total token counts are present and
+// internally consistent.
+TEST_F(HttpServerTest, UsageCountsReported) {
+    mock_->set_response({'x', 'y', 'z', 0});
+    auto client = get_client();
+    json request = {{"prompt", "abcd"}, {"max_tokens", 50}, {"stream", false}};
+
+    auto res = client.Post("/v1/completions", request.dump(), "application/json");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+    auto body = json::parse(res->body);
+    ASSERT_TRUE(body.contains("usage"));
+    int prompt_tokens     = body["usage"]["prompt_tokens"];
+    int completion_tokens = body["usage"]["completion_tokens"];
+    int total_tokens      = body["usage"]["total_tokens"];
+    EXPECT_EQ(prompt_tokens, 4);          // "abcd" -> 4 char tokens
+    EXPECT_EQ(completion_tokens, 3);      // "xyz"
+    EXPECT_EQ(total_tokens, prompt_tokens + completion_tokens);
+}
+
+// Item 5 (fail-loud): an oversized prompt is rejected with a named error
+// (slot, expected ceiling, actual count) instead of overflowing the KV cache.
+TEST_F(HttpServerTest, OversizedPromptFailsLoud) {
+    auto client = get_client();
+    std::string huge(200, 'a');  // 200 char-tokens > config.max_context (64)
+    json request = {{"prompt", huge}, {"max_tokens", 10}, {"stream", false}};
+
+    auto res = client.Post("/v1/completions", request.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 413);
+    auto body = json::parse(res->body);
+    ASSERT_TRUE(body.contains("error"));
+    std::string err = body["error"];
+    EXPECT_NE(err.find("prompt too large"), std::string::npos);
+    EXPECT_NE(err.find("64"), std::string::npos);   // expected ceiling
+    EXPECT_NE(err.find("200"), std::string::npos);  // actual count
 }
 
 // =============================================================================

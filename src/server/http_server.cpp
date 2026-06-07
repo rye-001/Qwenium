@@ -81,15 +81,19 @@ public:
         : max_ctx_per_slot_(max_ctx_per_slot) {
         
         std::cout << "Loading model from: " << model_path << std::endl;
+        // Register architectures BEFORE load_metadata: the GGUF loader validates
+        // the model's architecture against the registered allow-list, so the
+        // registry must be populated first or every load fails with an empty
+        // "expected one of:" list.
+        register_builtin_models();
         model_.load_metadata(model_path);
         model_.load_tensors();
-        
+
         tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata());
         sampler_ = std::make_unique<qwenium::GreedySampler>();
-        
+
         // Initialize forward pass with MAX_SLOTS slots
         const auto& srv_meta = model_.get_metadata();
-        register_builtin_models();
         forward_pass_ = create_forward_pass(
             model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
         
@@ -250,6 +254,8 @@ public:
         return system_prompt_cache_len_;
     }
 
+    int max_ctx_per_slot() const { return max_ctx_per_slot_; }
+
 private:
     int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {
         std::lock_guard<std::mutex> lock(model_mutex_);
@@ -366,7 +372,24 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         inf_req->prompt = prompt;
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
-        
+
+        // Stop sequences: OpenAI allows a single string or an array of strings.
+        if (body.contains("stop")) {
+            const auto& stop = body["stop"];
+            if (stop.is_string()) {
+                inf_req->stop.push_back(stop.get<std::string>());
+            } else if (stop.is_array()) {
+                for (const auto& s : stop) {
+                    if (s.is_string()) inf_req->stop.push_back(s.get<std::string>());
+                }
+            } else {
+                res.status = 400;
+                res.set_content(json({{"error", "'stop' must be a string or array of strings"}}).dump(),
+                                "application/json");
+                return;
+            }
+        }
+
         // Handle system prompt caching
         std::string system_prompt = body.value("system_prompt", "");
         if (!system_prompt.empty()) {
@@ -431,26 +454,32 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                 }
             );
         } else {
-            // Non-streaming: collect all tokens
-            std::string full_text;
-            int token_count = 0;
-            
-            while (true) {
-                int token_id = inf_req->token_queue->pop_blocking();
-                if (token_id == qwenium::TokenQueue::QUEUE_END) break;
-                full_text += inference.decode_token(token_id);
-                token_count++;
+            // Non-streaming: block until the inference thread signals completion.
+            // The server owns the canonical (stop-truncated) output_text, token
+            // counts, and finish_reason; drain the queue only to wait for the end.
+            while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
+                // tokens are folded into output_text on the inference thread
+            }
+
+            // Fail-loud: a named rejection (e.g. oversized prompt) ends the
+            // request with no slot and a populated error_message.
+            if (!inf_req->error_message.empty()) {
+                res.status = 413;  // Payload Too Large
+                res.set_content(json({{"error", inf_req->error_message}}).dump(), "application/json");
+                return;
             }
 
             json response = {
                 {"object", "text_completion"},
                 {"choices", {{
-                    {"text", full_text},
+                    {"text", inf_req->output_text},
                     {"index", 0},
-                    {"finish_reason", "stop"}
+                    {"finish_reason", inf_req->finish_reason}
                 }}},
                 {"usage", {
-                    {"completion_tokens", token_count}
+                    {"prompt_tokens", inf_req->prompt_tokens},
+                    {"completion_tokens", inf_req->completion_tokens},
+                    {"total_tokens", inf_req->prompt_tokens + inf_req->completion_tokens}
                 }}
             };
             res.set_content(response.dump(), "application/json");
@@ -507,6 +536,7 @@ int main(int argc, char* argv[]) {
         qwenium::InferenceServer::Config config;
         config.max_slots = 10;
         config.max_queue_depth = 100;
+        config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
         config.request_timeout = std::chrono::seconds(120);
 
         qwenium::InferenceServer inference(config);

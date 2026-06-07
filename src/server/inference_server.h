@@ -79,8 +79,18 @@ struct InferenceRequest {
     int max_tokens = 256;
     float temperature = 0.0f;  // 0 = greedy
     int start_pos = 0;         // Set by server when system prompt is cached
+    std::vector<std::string> stop;  // Optional: generation ends before first match
     std::shared_ptr<TokenQueue> token_queue = std::make_shared<TokenQueue>();
     std::atomic<bool> cancelled{false};
+
+    // Outputs set by the inference thread. These are written before
+    // token_queue->finish(), so the happens-before edge of the queue mutex makes
+    // them safe to read once the HTTP handler observes QUEUE_END.
+    int         prompt_tokens     = 0;   // Tokens in the (templated) prompt
+    int         completion_tokens = 0;   // Tokens generated so far
+    std::string output_text;             // Canonical completion (stop-truncated)
+    std::string finish_reason;           // "stop" | "length" | "timeout" | "cancelled" | "error"
+    std::string error_message;           // Non-empty => fail-loud: request rejected with a named reason
 
     // Timing info (set by server)
     std::chrono::steady_clock::time_point submitted_at;
@@ -167,6 +177,7 @@ public:
         int max_slots = 10;
         int max_queue_depth = 100;  // 0 = unlimited
         int system_prompt_len = 0;  // If using prefix caching
+        int max_context = 0;        // Per-slot prompt-token ceiling; 0 = no limit (fail-loud guard)
         std::chrono::seconds request_timeout{60};
     };
 
@@ -268,6 +279,20 @@ private:
 
         // Tokenize prompt
         std::vector<int32_t> tokens = tokenize_(req->prompt);
+        req->prompt_tokens = static_cast<int>(tokens.size());
+
+        // Fail-loud guard: an oversized prompt would overflow the per-slot KV
+        // cache (a downstream GGML_ASSERT abort). Reject it here with a named
+        // error naming the slot, the expected ceiling, and the actual count.
+        if (config_.max_context > 0 && req->prompt_tokens > config_.max_context) {
+            req->error_message =
+                "slot " + std::to_string(slot_id) +
+                ": prompt too large; expected: <= " + std::to_string(config_.max_context) +
+                " tokens, actual: " + std::to_string(req->prompt_tokens);
+            req->finish_reason = "error";
+            req->token_queue->finish();  // slot not consumed
+            return;
+        }
 
         // Clone system prompt cache if using prefix caching
         int start_pos = req->start_pos;
@@ -282,16 +307,62 @@ private:
         auto& slot = slots_[slot_id];
         slot.request = req;
         slot.context_tokens = std::move(tokens);
-        slot.context_tokens.push_back(first_token);
         slot.last_token = first_token;
         slot.tokens_generated = 1;
         slot.active = true;
         active_slot_ids_.insert(slot_id);
         stats_.active_slots = active_slot_ids_.size();
 
-        // Deliver first token
-        req->token_queue->push(first_token);
+        // Deliver first token (may already be EOS / hit a stop string / max_tokens).
+        if (deliver_token(slot, first_token)) {
+            req->token_queue->finish();
+            stats_.requests_completed++;
+            if (clear_slot_) clear_slot_(slot_id);
+            slots_[slot_id].reset();
+            active_slot_ids_.erase(slot_id);
+            stats_.active_slots = active_slot_ids_.size();
+        }
+    }
+
+    // Record one generated token against a slot's request: deliver it to streaming
+    // consumers, fold it into the canonical output_text, and decide whether the
+    // request is now complete. Callers must set slot.tokens_generated to the count
+    // including this token before calling. Returns true when generation is done;
+    // the request's finish_reason is set on the boundary.
+    bool deliver_token(Slot& slot, int token) {
+        auto& req = *slot.request;
+
+        // Always deliver the raw token id to streaming consumers.
+        req.token_queue->push(token);
         stats_.tokens_generated++;
+
+        if (token == get_eos_token_()) {
+            req.finish_reason = "stop";
+            return true;
+        }
+
+        req.completion_tokens = slot.tokens_generated;
+        req.output_text += detokenize_(token);
+        slot.context_tokens.push_back(token);
+        slot.last_token = token;
+
+        // Stop strings (item 2): end the output *before* the first match.
+        for (const auto& s : req.stop) {
+            if (s.empty()) continue;
+            size_t pos = req.output_text.find(s);
+            if (pos != std::string::npos) {
+                req.output_text.erase(pos);
+                req.finish_reason = "stop";
+                return true;
+            }
+        }
+
+        // max_tokens bound (item 3): clean termination, reason reported.
+        if (slot.tokens_generated >= req.max_tokens) {
+            req.finish_reason = "length";
+            return true;
+        }
+        return false;
     }
 
     void decode_step() {
@@ -309,7 +380,6 @@ private:
 
         // Process results
         std::vector<int> slots_to_remove;
-        int eos_token = get_eos_token_();
 
         for (size_t i = 0; i < batch_slot_ids.size(); ++i) {
             int slot_id = batch_slot_ids[i];
@@ -318,6 +388,7 @@ private:
 
             // Check for cancellation
             if (slot.request->cancelled) {
+                slot.request->finish_reason = "cancelled";
                 slots_to_remove.push_back(slot_id);
                 slot.request->token_queue->finish();
                 stats_.requests_cancelled++;
@@ -327,24 +398,16 @@ private:
             // Check for timeout
             auto elapsed = std::chrono::steady_clock::now() - slot.request->started_at;
             if (elapsed > config_.request_timeout) {
+                slot.request->finish_reason = "timeout";
                 slots_to_remove.push_back(slot_id);
                 slot.request->token_queue->finish();
                 stats_.requests_cancelled++;
                 continue;
             }
 
-            // Deliver token
-            slot.request->token_queue->push(next_token);
-            slot.context_tokens.push_back(next_token);
-            slot.last_token = next_token;
+            // Deliver token, fold into output_text, decide completion (eos / stop / max_tokens)
             slot.tokens_generated++;
-            stats_.tokens_generated++;
-
-            // Check completion
-            bool done = (next_token == eos_token) ||
-                       (slot.tokens_generated >= slot.request->max_tokens);
-
-            if (done) {
+            if (deliver_token(slot, next_token)) {
                 slots_to_remove.push_back(slot_id);
                 slot.request->token_queue->finish();
                 stats_.requests_completed++;
