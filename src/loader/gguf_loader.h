@@ -46,7 +46,15 @@ public:
     GGUFLoader();
     ~GGUFLoader();
 
-    void load_model(const std::string& path);
+    // `validate_as_text_model` (default true): run text-model arch +
+    // inventory validation against the registered architectures (Qwen /
+    // Gemma family). Pass false for non-text-model GGUFs (e.g. the
+    // Gemma 3 mmproj, which declares general.architecture="clip" and
+    // ships a vision-tensor inventory neither validator knows about).
+    // The binary GGUF parse + raw_kv extraction + tensor inventory
+    // population are identical either way; only the two text-model
+    // gates are skipped. See src/vision/vision_loader.cpp.
+    void load_model(const std::string& path, bool validate_as_text_model = true);
     void extract_metadata(ModelMetadata& metadata) const;
     
     size_t calculate_tensors_memory_size() const;
@@ -73,6 +81,7 @@ private:
     std::string model_path_;
     std::unique_ptr<FileMapper> file_mapper_;
     bool is_loaded_;
+    bool validate_as_text_model_ = true;  // set by load_model; gates arch + inventory validation
     uint64_t tensor_data_offset_;
     ModelMetadata metadata_;
 

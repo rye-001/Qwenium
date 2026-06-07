@@ -45,10 +45,13 @@ GGUFLoader::GGUFLoader() : is_loaded_(false), tensor_data_offset_(0) {}
 
 GGUFLoader::~GGUFLoader() { cleanup_resources(); }
 
-void GGUFLoader::load_model(const std::string &path)
+void GGUFLoader::load_model(const std::string &path, bool validate_as_text_model)
 {
     model_path_ = path;
-    std::cout << "Loading GGUF model: " << path << std::endl;
+    validate_as_text_model_ = validate_as_text_model;
+    std::cout << "Loading GGUF model: " << path
+              << (validate_as_text_model ? "" : " [non-text-model: skipping arch+inventory validation]")
+              << std::endl;
 
     file_mapper_ = std::make_unique<FileMapper>(path);
     if (!file_mapper_->is_open()) {
@@ -85,8 +88,12 @@ void GGUFLoader::load_model(const std::string &path)
     const long alignment = 32;
     tensor_data_offset_ = (offset + alignment - 1) / alignment * alignment;
 
-    // 5. Validate tensor inventory
-    validate_tensor_inventory();
+    // 5. Validate tensor inventory (text-model only; mmproj/vision GGUFs
+    //    declare their own tensor namespace that the text-arch validators
+    //    don't know about).
+    if (validate_as_text_model_) {
+        validate_tensor_inventory();
+    }
 
     is_loaded_ = true;
 }
@@ -257,7 +264,9 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
     if (metadata_.architecture.empty()) {
         throw GGUFLoadError("general.architecture not found in metadata");
     }
-    validate_architecture(metadata_);
+    if (validate_as_text_model_) {
+        validate_architecture(metadata_);
+    }
     const std::string prefix = metadata_.architecture + ".";
 
     // Second pass: parse all metadata using the correct prefix

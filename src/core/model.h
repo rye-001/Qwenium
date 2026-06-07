@@ -129,7 +129,12 @@ public:
     Model();
     ~Model();
 
-    void load_metadata(const std::string& model_path);
+    // `allow_multimodal=true` opts out of the load-time multimodal-only
+    // refusal — the caller is supplying a vision projector (mmproj) and will
+    // run the vision pipeline, so a checkpoint carrying image-placeholder
+    // tokens is expected, not a misuse. Default false keeps the fail-loud
+    // guard for the text-only path.
+    void load_metadata(const std::string& model_path, bool allow_multimodal = false);
     void load_tensors();
 
     bool validate_architecture() const;

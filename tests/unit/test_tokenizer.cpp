@@ -2,6 +2,7 @@
 #include "loader/tokenizer.h"
 #include "core/model.h"
 #include "loader/gguf_loader.h"
+#include "models/model_registry.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -14,6 +15,10 @@ protected:
     static std::string model_path_;
 
     static void SetUpTestSuite() {
+        // Populate the architecture allow-list the loader validates against;
+        // the CLI / server do this at startup, so the bare-loader path here
+        // must too (otherwise validate_architecture sees an empty list).
+        register_builtin_models();
         const char* model_env_path = std::getenv("QWEN3_MODEL_PATH");
         if (model_env_path) {
             model_path_ = model_env_path;

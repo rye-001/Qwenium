@@ -204,6 +204,24 @@ Treat Phase 4 as a real correctness phase, not a one-line guard.
   call-sites in one recipe is a locality-of-reasoning violation and
   needs an explicit owner decision, not a quiet drift.
 
+**RESOLVED (2026-06-02).** Bidi is the reference-correct behavior (llama.cpp
+mtmd `mtmd_decode_use_non_causal == true` for `PROJECTOR_TYPE_GEMMA3`) and is
+now **enabled by default** in `gemma3.cpp::build_prefill_graph`
+(`QINF_GEMMA3_IMAGE_CAUSAL=1` opt-out for A/B). The mask itself was correct all
+along; the bidi corruption (`<start_of_image>` spam) was a **separate, latent
+RoPE bug**: global layers ignored the GGUF's linear RoPE scaling
+(`gemma3.rope.scaling.factor=8` → `freq_scale=0.125`), making their relative
+positions 8× too large. Causal masking hid this (attention is local-dominated);
+the bidi span exposed it (image tokens attend across the full ±256 span). Fixed
+via `Gemma3Config::layer_rope_scale` → `TransformerBlockHparams::freq_scale`.
+The single mask site composed with the sliding window correctly throughout —
+no second site was needed. Gates: `test_attn_mask_input` (values, 3 configs ×
+local/global), `test_gemma3_config` (`layer_rope_scale`), and
+`multimodal-prefill-tests::BidiImageAttentionProducesNonImageNextToken` (the
+true **e2e effect** gate — argmax @ temp 0 must not be an image control token;
+verified to fail when `freq_scale` is reverted). e2e parity with the llama.cpp
+mtmd reference confirmed on medgemma-1.5-4b.
+
 ### Phase 5 — Prefill orchestrator
 
 Add the **one** new call site in `src/core/` that, when the chunk list

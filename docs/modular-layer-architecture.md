@@ -134,6 +134,64 @@ Standard feed-forward network (SwiGLU). The non-MoE baseline.
 - **Metal kernel:** Existing fused SwiGLU kernel.
 - **Models that use it:** Qwen3 (all layers), attention-only transformers.
 
+## Not a Layer-Type Module: the Vision Tower (C3 — provisional)
+
+> **Status:** Provisional answer, validated against exactly **one** recipe
+> (Gemma 3 + SigLIP). Per CLAUDE.md's cross-family rule, this is "presumed
+> Gemma-shaped until a second multimodal recipe proves otherwise." See
+> [`plan-gemma-vision-impl.md`](plan-gemma-vision-impl.md) → "C3 deliverable".
+
+When multimodal support landed (Gemma 3 vision, Phase 2), it forced the
+question: **is the vision tower a sixth layer-type module, alongside the five
+above — or is it something else?**
+
+**Working answer: it is a pre-decoder pipeline, not a layer-type module.**
+The five modules above share one defining property — they participate in the
+**decoder's residual stream**, building into the shared `ggml_cgraph` via the
+norm-then-branch-then-add recipe pattern (see Key Design Principle). The
+vision tower does none of that:
+
+- **Different signal flow.** It runs *once, before* decode, transforming a
+  bitmap into image embeddings. It does not sit inside the per-layer residual
+  loop; it terminates at the **embedding boundary**, where its output
+  substitutes for token embeddings at image-placeholder positions.
+- **Its own graph, context, and scheduler.** `src/vision/` owns a separate
+  `ggml_cgraph`, a separate `ggml_context`, and a separate
+  `ggml_backend_sched_t`. It *shares* the engine's Metal `ggml_backend_t`
+  (one device, two schedulers) but nothing else. It has zero dependency on
+  `Model` / `ForwardPassBase` — the separation is directory-enforced.
+- **Internal sub-layers stay internal.** The vision tower has its own
+  attention / MLP / LayerNorm blocks, but these are *not promoted* to
+  `src/layers/`. They are SigLIP-internal, built inside `src/vision/`, and
+  governed by a different contract (LayerNorm not RMSNorm, learned absolute
+  position embeddings not RoPE, bidirectional not causal, GELU not SwiGLU).
+  Promoting them would be a false abstraction: they share a *name* with the
+  decoder's attention/FFN, not a *contract*.
+
+This mirrors the separation llama.cpp consciously chose (`mtmd` outside
+`libllama`), expressed in our directory conventions.
+
+**Concretely grounded (Phase 2.4).** The standalone encoder
+(`src/vision/vision_encoder.cpp`) builds the entire SigLIP pipeline —
+conv2d patch embed → 27 transformer layers → post-LN → 4×4 average pool →
+RMS soft-emb-norm → linear projection — as one self-contained graph, and
+its output matches the llama.cpp reference to cosine ≈ 0.99997 / relative
+L2 ≈ 0.3% on the gray-input fixture (low-bit BF16 + reduction-order FP
+divergence, the same class documented for `feed_tokens`; the shipping gate
+is coarse cosine/rel-L2, not bitwise). That the encoder ships as its own
+graph terminating at the embedding boundary — never touching the decoder's
+residual stream — is the evidence for the "pipeline, not module" answer.
+
+**What would promote this from provisional to validated.** A *second*
+vision-bearing recipe in a different family, with a structurally different
+vision encoder (e.g. Gemma 3n's MobileNetV5, or a Qwen-VL ViT variant),
+integrating through the same pre-decoder-pipeline boundary **without
+requiring logic edits to `src/vision/`'s contract** — only new recipe code.
+Until then, the answer is grounded on Gemma 3 alone and is a working
+hypothesis, not a cross-family conclusion. If a second recipe instead
+forces edits to the pipeline boundary itself, that is an interface defect
+to fix, per the Architecture Pressure Test — not a second module to add.
+
 ## Refactored Source Structure
 
 ```

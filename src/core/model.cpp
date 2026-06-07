@@ -87,14 +87,18 @@ Model::~Model()
     }
 }
 
-void Model::load_metadata(const std::string &model_path)
+void Model::load_metadata(const std::string &model_path, bool allow_multimodal)
 {
     loader_->load_model(model_path);
     loader_->extract_metadata(metadata_);
 
     // Refuse multimodal-only checkpoints at load time rather than at
-    // generation time
-    multimodal_check::enforce_text_only_or_throw(metadata_, model_path);
+    // generation time — UNLESS the caller is supplying a vision projector and
+    // will drive the vision pipeline (allow_multimodal). This is the
+    // "recognize if present" branch the detect/enforce split was built for
+    // (multimodal_check.h): same metadata, opposite decision.
+    if (!allow_multimodal)
+        multimodal_check::enforce_text_only_or_throw(metadata_, model_path);
 
     is_loaded_ = true;
 }

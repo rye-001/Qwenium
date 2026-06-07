@@ -51,6 +51,7 @@
 //     test_kv_reference_mode.cpp.
 
 #include "forward_pass_base.h"
+#include "i_image_embeddable.h"
 #include "../state/kv_cache_simple.h"
 #include "../loader/tokenizer_config.h"
 #include <vector>
@@ -87,8 +88,16 @@ struct Gemma4Config {
     // FFN
     uint32_t ffn_dim_dense     = 0;   // gemma4.feed_forward_length (= 2112)
     uint32_t ffn_dim_expert    = 0;   // gemma4.expert_feed_forward_length (= 704)
-    uint32_t n_experts         = 0;   // gemma4.expert_count (= 128)
+    uint32_t n_experts         = 0;   // gemma4.expert_count (= 128; 0 ⇒ dense variant)
     uint32_t expert_top_k      = 0;   // gemma4.expert_used_count (= 8)
+
+    // Dense vs MoE topology selector.  The 26B-A4B / 31B variants carry a
+    // parallel dense+MoE FFN per layer; the 12B-it variant is dense-only
+    // (single GeGLU FFN, no expert tensors).  Derived from n_experts > 0.
+    // This is a *parameter on the FFN block*, not a separate recipe — every
+    // other Gemma 4 system (per-layer-kind attention, QK-norm, dual KV cache,
+    // sandwich norm, embed scale, softcap, tied head) is shared verbatim.
+    bool     is_moe            = false;
 
     // Output head
     float    final_softcap     = 0.f; // gemma4.final_logit_softcapping (= 30)
@@ -132,7 +141,7 @@ void validate_gemma4_inventory(const ModelMetadata& meta);
 // at the runtime-config level.
 TokenizerConfig gemma4_tokenizer_config();
 
-class Gemma4ForwardPass : public ForwardPassBase {
+class Gemma4ForwardPass : public ForwardPassBase, public IImageEmbeddable {
 public:
     Gemma4ForwardPass(const Model& model, const ModelMetadata* metadata,
                       uint32_t context_len, uint32_t max_batch_size = 1);
@@ -154,15 +163,28 @@ public:
     // recurrent state); still owes its own KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
-    // Inputs are populated via the typed graph_inputs_ set built in
-    // build_prefill_graph (no set_inputs override).
+    // ── Vision: image-token embedding substitution (IImageEmbeddable, Seam B) ─
+    // Arm precomputed image-token embeddings before the next prefill build.
+    // `embd` is [hidden_dim · n_tokens] row-major (hidden_dim fastest) — the
+    // layout Gemma4UvEncoder::encode returns. The n_tokens embeddings replace
+    // the SCALED text embeddings at columns [span_start, span_start + n_tokens)
+    // (image rows enter unscaled — substitution happens after build_embed_scale).
+    // Consumed (moved out) by the next build_prefill_graph; re-arm to repeat.
+    //
+    // Unlike Gemma 3, image attention is plain causal here — there is NO
+    // bidirectional image span. The existing per-layer AttnMaskInput is already
+    // correct; this hook touches only the residual stream.
+    void set_image_embeddings(std::vector<float> embd,
+                              int32_t span_start,
+                              uint32_t n_tokens) override {
+        image_embd_       = std::move(embd);
+        image_span_start_ = span_start;
+        image_n_tokens_   = n_tokens;
+    }
 
-    // DEBUG: instrumented prefill — same as base, but reads back named
-    // intermediate tensors after compute and prints stats (G4 hallucination).
-    std::vector<float> run_prefill(
-        const std::vector<int32_t>& tokens,
-        int pos, uint32_t slot_idx,
-        ggml_backend_sched_t scheduler) override;
+    // Inputs are populated via the typed graph_inputs_ set built in
+    // build_prefill_graph (no set_inputs override). run_prefill uses the base
+    // implementation (build → alloc → set → compute → advance → logits).
 
     // Cache routing: every per-slot position-management op fans out to BOTH
     // the sliding and global caches so the per-layer logical positions stay
@@ -178,6 +200,12 @@ private:
     Gemma4Config                     config_;
     std::unique_ptr<simple_kv_cache> kv_cache_swa_;
     std::unique_ptr<simple_kv_cache> kv_cache_global_;
+
+    // Armed image-token embeddings for the next prefill (empty => text-only).
+    // Consumed (moved) by build_prefill_graph. See set_image_embeddings.
+    std::vector<float> image_embd_;
+    int32_t            image_span_start_ = -1;
+    uint32_t           image_n_tokens_   = 0;
 
     // Per-block weight handles loaded once at construction so the hot path
     // is a vector lookup instead of a string-keyed ggml_get_tensor every

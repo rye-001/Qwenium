@@ -27,6 +27,15 @@ struct TransformerBlockHparams {
     int   n_head_kv;       // KV head count (GQA)
     int   n_embd_head;     // Q per-head dimension (= hidden_dim / n_head for Qwen/Gemma 1-3)
     float freq_base;       // RoPE frequency base
+    // RoPE frequency scale (linear position scaling: effective pos = pos *
+    // freq_scale). Default 1.0 = no scaling (bit-identical for Qwen/Gemma 1-2
+    // and Gemma 3 local layers). Gemma 3 GLOBAL layers set this to
+    // 1/rope.scaling.factor (= 0.125 for factor 8) — the linear context
+    // extension the GGUF declares (rope.scaling.type=linear). Without it,
+    // global-layer relative positions are 8x too large; causal degrades
+    // gracefully (attention is local-dominated) but the bidirectional image
+    // span amplifies the error into incoherent output.
+    float freq_scale = 1.0f;
     int   context_length;  // original context length for RoPE ext
     float rms_norm_eps;    // epsilon for RMS norm
 

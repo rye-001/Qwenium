@@ -161,6 +161,39 @@ TEST(Gemma3Config, GlobalRopeBaseDefaultsToOneMillion) {
     EXPECT_FLOAT_EQ(cfg.global_rope_base, 1000000.0f);
 }
 
+// ── Linear RoPE scaling (gemma3.rope.scaling.factor) ──────────────────────────
+//
+// Global layers carry the GGUF's linear RoPE scale (freq_scale = 1/factor);
+// local/SWA layers always use 1.0. This is the bidi-image-attention fix:
+// without it, global-layer relative positions are 8x too large and the
+// bidirectional image span produces incoherent output.
+
+// factor 8 => global layers freq_scale 0.125; local layers 1.0.
+TEST(Gemma3Config, LayerRopeScaleGlobalLinearFactor) {
+    auto meta = make_gemma3_meta(26, 512);
+    meta.raw_kv.set("gemma3.rope.scaling.factor", 8.0f);
+    auto cfg = Gemma3Config::from_metadata(meta);
+
+    ASSERT_EQ(cfg.layer_rope_scale.size(), 26u);
+    for (uint32_t i = 0; i < 26; ++i) {
+        if (i % 6 == 5) {
+            EXPECT_FLOAT_EQ(cfg.layer_rope_scale[i], 0.125f)
+                << "global layer " << i << " must use 1/factor";
+        } else {
+            EXPECT_FLOAT_EQ(cfg.layer_rope_scale[i], 1.0f)
+                << "local layer " << i << " must use 1.0";
+        }
+    }
+}
+
+// Absent scaling.factor => all layers 1.0 (no scaling; bit-identical legacy).
+TEST(Gemma3Config, LayerRopeScaleDefaultsToOneWhenAbsent) {
+    auto cfg = Gemma3Config::from_metadata(make_gemma3_meta(12, 512));
+    ASSERT_EQ(cfg.layer_rope_scale.size(), 12u);
+    for (uint32_t i = 0; i < 12; ++i)
+        EXPECT_FLOAT_EQ(cfg.layer_rope_scale[i], 1.0f) << "layer " << i;
+}
+
 // ── PR G3.1: QK-norm weight dimensionality ────────────────────────────────────
 //
 // Gemma 3 uses a [head_dim]-shaped RMS-norm weight for both Q and K norms.

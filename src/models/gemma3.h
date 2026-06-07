@@ -21,6 +21,7 @@
 // stub boundary.
 
 #include "forward_pass_base.h"
+#include "i_image_embeddable.h"
 #include "../state/kv_cache_simple.h"
 #include "../loader/tokenizer_config.h"
 #include <vector>
@@ -50,6 +51,12 @@ struct Gemma3Config {
     // local_rope_base for sliding layers, global_rope_base for global layers.
     std::vector<float> layer_rope_base;
 
+    // Linear RoPE frequency scale applied to GLOBAL layers (gemma3.rope.scaling
+    // .type=linear; freq_scale = 1/scaling.factor, e.g. 0.125 for factor 8).
+    // Local/SWA layers use 1.0 (freq_scale_swa). Defaults to 1.0 when the GGUF
+    // declares no scaling. Matches llama.cpp get_rope_freq_scale per layer.
+    std::vector<float> layer_rope_scale;
+
     // Factory: reads all required fields from GGUF metadata.
     // Throws std::runtime_error (fail-loud contract) for missing/wrong-type keys.
     static Gemma3Config from_metadata(const ModelMetadata& meta);
@@ -63,7 +70,7 @@ struct Gemma3Config {
 // Throws std::runtime_error naming the missing tensor on failure.
 void validate_gemma3_inventory(const ModelMetadata& meta);
 
-class Gemma3ForwardPass : public ForwardPassBase {
+class Gemma3ForwardPass : public ForwardPassBase, public IImageEmbeddable {
 public:
     Gemma3ForwardPass(const Model& model, const ModelMetadata* metadata,
                       uint32_t context_len, uint32_t max_batch_size = 1);
@@ -76,6 +83,26 @@ public:
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>& tokens,
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
+
+    // ── Vision: image-token embedding substitution (Phase 3) ──────────────────
+    // Arm precomputed image-token embeddings before the next prefill build.
+    // `embd` is [hidden_dim * n_tokens] row-major (hidden_dim fastest) — exactly
+    // the layout VisionEncoder::encode returns. `span_start` is the position of
+    // the first image soft-token; the n_tokens embeddings replace the scaled
+    // text embeddings at [span_start, span_start + n_tokens). Consumed (moved
+    // out) by the next build_prefill_graph; re-arm to repeat.
+    //
+    // This is the single C3 coupling point between the text recipe and the
+    // vision subsystem: the recipe owns the residual stream and performs the
+    // substitution; it does NOT know how the embeddings were produced. Vision
+    // stays out of ForwardPassBase and StepContext.
+    void set_image_embeddings(std::vector<float> embd,
+                              int32_t span_start,
+                              uint32_t n_tokens) override {
+        image_embd_       = std::move(embd);
+        image_span_start_ = span_start;
+        image_n_tokens_   = n_tokens;
+    }
 
     // Phase 3 of docs/plan-feed-tokens.md: gemma3 honors want_logits=false
     // with one head-guard site. Attention-only; still owes its own
@@ -115,6 +142,12 @@ private:
     // Per-block QK-norm weight pointers (G3-new).
     std::vector<ggml_tensor*> q_norm_;  // blk.N.attn_q_norm.weight
     std::vector<ggml_tensor*> k_norm_;  // blk.N.attn_k_norm.weight
+
+    // Armed image-token embeddings for the next prefill (empty => text-only).
+    // Consumed (moved) by build_prefill_graph. See set_image_embeddings.
+    std::vector<float> image_embd_;
+    int32_t            image_span_start_ = -1;
+    uint32_t           image_n_tokens_   = 0;
 
     // Retrieve a named tensor from the model context; throws on missing.
     ggml_tensor* require_tensor(uint32_t il, const char* suffix) const;

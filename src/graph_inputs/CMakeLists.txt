@@ -9,6 +9,7 @@ add_library(qinf-graph-inputs STATIC
     gather_indices_input.cpp
     sparse_head_input.cpp
     output_ids_input.cpp
+    image_embeddings_input.cpp
 )
 
 target_include_directories(qinf-graph-inputs PUBLIC

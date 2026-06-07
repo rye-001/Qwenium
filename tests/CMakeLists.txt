@@ -17,11 +17,9 @@ add_executable(unit-tests
     unit/test_qwen35_hybrid_cache.cpp
     unit/test_qwen35_forward_attn.cpp
     unit/test_qwen35_generation.cpp
-    unit/test_grammar_vocab.cpp
     unit/test_graph_input.cpp
     unit/test_tokens_input.cpp
     unit/test_positions_input.cpp
-    unit/test_attn_mask_input.cpp
     unit/test_gather_indices_input.cpp
     unit/test_sparse_head_input.cpp
 )
@@ -39,6 +37,45 @@ target_link_libraries(unit-tests PRIVATE
 # Discover and add unit tests to CTest
 include(GoogleTest)
 gtest_discover_tests(unit-tests)
+
+# AttnMaskInput — dedicated gtest executable using gtest_main, so the
+# causal / sliding-window / image-span-bidi (Phase 4) mask gate actually runs.
+add_executable(attn-mask-input-tests
+    unit/test_attn_mask_input.cpp
+)
+target_link_libraries(attn-mask-input-tests PRIVATE
+    GTest::gtest_main
+    qinf-graph-inputs
+    ggml
+)
+target_compile_features(attn-mask-input-tests PRIVATE cxx_std_17)
+gtest_discover_tests(attn-mask-input-tests)
+
+# GrammarVocab — standalone non-GTest harness. test_grammar_vocab.cpp defines
+# its own int main() (g_pass/g_fail counters, no RUN_ALL_TESTS). It lived in the
+# unit-tests aggregate, where its main() hijacked the linker and silently
+# suppressed every gtest TEST() in the other unit-tests sources (and broke
+# gtest_discover_tests). Kept as its own executable so both run independently.
+add_executable(grammar-vocab-tests
+    unit/test_grammar_vocab.cpp
+)
+target_link_libraries(grammar-vocab-tests PRIVATE
+    sampling
+)
+target_compile_features(grammar-vocab-tests PRIVATE cxx_std_17)
+add_test(NAME grammar-vocab-tests COMMAND grammar-vocab-tests)
+
+# Speculative decoding — standalone non-GTest harness (its own int main()).
+# prompt_lookup.h / speculative.h are header-only under src/sampling, reachable
+# via the sampling target's PUBLIC include dir.
+add_executable(speculative-tests
+    unit/test_speculative.cpp
+)
+target_link_libraries(speculative-tests PRIVATE
+    sampling
+)
+target_compile_features(speculative-tests PRIVATE cxx_std_17)
+add_test(NAME speculative-tests COMMAND speculative-tests)
 
 # Define the integration test executable
 add_executable(integration-tests
@@ -589,6 +626,126 @@ target_link_libraries(multimodal-check-tests PRIVATE
 target_compile_features(multimodal-check-tests PRIVATE cxx_std_17)
 gtest_discover_tests(multimodal-check-tests)
 
+# Vision loader (Phase 2.1) — requires ./mmproj-BF16.gguf to be present;
+# self-skips otherwise. See docs/plan-gemma-vision-impl.md.
+add_executable(vision-loader-tests
+    unit/test_vision_loader.cpp
+)
+
+target_link_libraries(vision-loader-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-loader
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(vision-loader-tests PRIVATE cxx_std_17)
+gtest_discover_tests(vision-loader-tests)
+
+# SigLIP encoder (Gemma 3 vision, Phase 2.3/2.4) — SigLIP ViT forward-graph +
+# differential gate. Requires ./mmproj-BF16.gguf; self-skips otherwise. Renamed
+# from vision-encoder-tests when the encoder class became SiglipEncoder (Seam A).
+add_executable(siglip-encoder-tests
+    unit/test_siglip_encoder.cpp
+)
+
+target_link_libraries(siglip-encoder-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-loader
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(siglip-encoder-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(siglip-encoder-tests PRIVATE ggml-metal)
+    target_compile_definitions(siglip-encoder-tests PRIVATE QINF_TEST_HAS_METAL)
+endif()
+gtest_discover_tests(siglip-encoder-tests)
+
+# Gemma 4 unified-vision encoder (gemma4uv) — blockless projector graph smoke +
+# loader-acceptance gate. Requires ./mmproj-gemma-4-12B-it-Q8_0.gguf; self-skips
+# otherwise. The bit-level differential vs llama.cpp is DISABLED pending a
+# captured reference (plan §8 gate 1).
+add_executable(gemma4uv-encoder-tests
+    unit/test_gemma4uv_encoder.cpp
+)
+
+target_link_libraries(gemma4uv-encoder-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-loader
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(gemma4uv-encoder-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(gemma4uv-encoder-tests PRIVATE ggml-metal)
+    target_compile_definitions(gemma4uv-encoder-tests PRIVATE QINF_TEST_HAS_METAL)
+endif()
+gtest_discover_tests(gemma4uv-encoder-tests)
+
+# Multimodal prefill orchestrator (Phase 5 vision). Compiles the orchestrator
+# source directly (it lives in src/core/ but is not in the `core` lib — same
+# arrangement as decode_step.cpp — because it bridges qinf-vision + qinf-models
+# which both sit above `core`). Self-skips without a Gemma 3 text model + mmproj.
+add_executable(multimodal-prefill-tests
+    unit/test_multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+    # cli host-side image pipeline, compiled directly (cli is an exe, not a lib)
+    # so the e2e gate can decode a real image + expand the marker stream.
+    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
+)
+target_link_libraries(multimodal-prefill-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(multimodal-prefill-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(multimodal-prefill-tests PRIVATE ggml-metal)
+    target_compile_definitions(multimodal-prefill-tests PRIVATE QINF_TEST_HAS_METAL)
+endif()
+gtest_discover_tests(multimodal-prefill-tests)
+
+# Phase 6 host-side image pipeline — no model file needed. Both compile their
+# src/cli/ sources directly (the cli builds an executable, not a lib).
+add_executable(image-loader-tests
+    unit/test_image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
+)
+target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main)
+target_compile_features(image-loader-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-loader-tests)
+
+add_executable(image-prompt-tests
+    unit/test_image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
+)
+target_link_libraries(image-prompt-tests PRIVATE GTest::gtest_main)
+target_compile_features(image-prompt-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-prompt-tests)
+
+# Phase 7 image-embedding reuse cache — no model file needed (counting lambda).
+add_executable(image-embedding-cache-tests
+    unit/test_image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+)
+target_link_libraries(image-embedding-cache-tests PRIVATE GTest::gtest_main)
+target_compile_features(image-embedding-cache-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-embedding-cache-tests)
+
 # TransformerBlock unit tests — no model file needed.
 # Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.
 add_executable(transformer-block-tests
@@ -759,6 +916,37 @@ target_link_libraries(forward-tests-gemma3 PRIVATE
 )
 target_compile_features(forward-tests-gemma3 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-gemma3)
+
+# Gemma 3 image-embedding substitution (Phase 3 vision). Self-consistency gate;
+# self-skips without a Gemma 3 text model. See docs/plan-gemma-vision-impl.md.
+add_executable(gemma3-image-substitution-tests
+    unit/test_gemma3_image_substitution.cpp
+)
+target_link_libraries(gemma3-image-substitution-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(gemma3-image-substitution-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma3-image-substitution-tests)
+
+# Gemma 4 recipe image-substitution hook (plan-gemma4-vision-impl §6/§8). Same
+# self-consistency gate as Gemma 3, minus the bidi-mask wiring (Gemma 4 image
+# attention is causal). Needs the dense gemma-4-12B-it text export; self-skips.
+add_executable(gemma4-image-substitution-tests
+    unit/test_gemma4_image_substitution.cpp
+)
+target_link_libraries(gemma4-image-substitution-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+target_compile_features(gemma4-image-substitution-tests PRIVATE cxx_std_17)
+gtest_discover_tests(gemma4-image-substitution-tests)
 
 # ── Phase 4 tools ─────────────────────────────────────────────────────────────
 

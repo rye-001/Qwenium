@@ -68,8 +68,15 @@ int run_complete(
         }
 
 
-        // 2. Tokenize the prompt
+        // 2. Tokenize the prompt.  encode() does not prepend BOS; honor the
+        //    model's add_bos_token contract here (chat.cpp does the same at
+        //    its first prefill).  Gemma -it models go degenerate without BOS.
         std::vector<int32_t> tokens = tokenizer->encode(args.prompt);
+        {
+            const auto& md = model.get_metadata();
+            if (md.add_bos_token && md.bos_token_id >= 0)
+                tokens.insert(tokens.begin(), md.bos_token_id);
+        }
         log_tokens(tokens);
 
         if (args.verbose) {

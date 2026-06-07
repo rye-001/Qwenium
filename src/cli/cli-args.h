@@ -28,6 +28,10 @@ struct CliArgs {
     bool speculative = false;
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
+    // Vision: a single image applied to the first user turn. Both
+    // must be set together; requires a Gemma multimodal-capable tokenizer.
+    std::string image_path;    // --image: JPEG/PNG to attach to the first turn
+    std::string mmproj_path;   // --mmproj: Gemma vision projector GGUF
 };
 
 inline std::string make_readable(std::string str) {
