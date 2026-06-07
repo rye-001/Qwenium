@@ -7,7 +7,9 @@
 #include "../graph_inputs/tokens_input.h"
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/image_embeddings_input.h"
 
+#include <cstdlib>
 #include "ggml.h"
 
 #include <cmath>
@@ -37,14 +39,26 @@ Gemma3Config Gemma3Config::from_metadata(const ModelMetadata& meta)
 
     cfg.sliding_window = meta.raw_kv.get_uint32("gemma3.attention.sliding_window");
 
+    // Linear RoPE scaling on global layers (gemma3.rope.scaling.type=linear;
+    // factor 8 for the 131K-context models). freq_scale = 1/factor; absent key
+    // => 1.0 (no scaling). Local/SWA layers always use 1.0.
+    const std::optional<float> rope_scale_factor =
+        meta.raw_kv.get_float_opt("gemma3.rope.scaling.factor");
+    const float global_rope_scale =
+        (rope_scale_factor && *rope_scale_factor > 0.0f)
+            ? 1.0f / *rope_scale_factor
+            : 1.0f;
+
     // 5:1 alternation: five local (sliding-window) layers then one global,
     // repeating from layer 0. Layer i is global iff (i % 6 == 5).
     cfg.layer_window.resize(cfg.n_layers);
     cfg.layer_rope_base.resize(cfg.n_layers);
+    cfg.layer_rope_scale.resize(cfg.n_layers);
     for (uint32_t i = 0; i < cfg.n_layers; ++i) {
         const bool is_global = (i % 6 == 5);
-        cfg.layer_window[i]    = is_global ? 0u : cfg.sliding_window;
-        cfg.layer_rope_base[i] = is_global ? cfg.global_rope_base : cfg.local_rope_base;
+        cfg.layer_window[i]     = is_global ? 0u : cfg.sliding_window;
+        cfg.layer_rope_base[i]  = is_global ? cfg.global_rope_base : cfg.local_rope_base;
+        cfg.layer_rope_scale[i] = is_global ? global_rope_scale : 1.0f;
     }
 
     return cfg;
@@ -143,7 +157,7 @@ ggml_tensor* Gemma3ForwardPass::require_tensor(uint32_t il, const char* suffix) 
 // ── build_prefill_graph ───────────────────────────────────────────────────────
 
 ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
-    const std::vector<int32_t>& tokens, int /*pos*/, uint32_t slot_idx,
+    const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx,
     bool want_logits)
 {
     reset_context();
@@ -170,6 +184,35 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
+    // Image-span bidirectional mask (Phase 4). When image embeddings are armed,
+    // the soft-token span attends bidirectionally (recipe property — Gemma 3
+    // specific). image_span_start_ is a LOCAL index into this batch (it is a
+    // column offset into inpL in the substitution below); the mask works in
+    // ABSOLUTE positions (q_pos = pos + r, key index j is absolute), so convert:
+    // absolute span start = pos + image_span_start_. Disabled (len 0) for
+    // text-only prefill, recovering the pure causal+window mask. This is the
+    // single mask site — the bidi span is a *parameter* on AttnMaskInput, the
+    // same parameterize-don't-split discipline as the sliding window itself.
+    const bool img_armed = !image_embd_.empty();
+    // Bidirectional image attention is the reference-correct behavior for
+    // Gemma 3 (llama.cpp mtmd: mtmd_decode_use_non_causal == true for
+    // PROJECTOR_TYPE_GEMMA3 — the image chunk is decoded with causal_attn=false).
+    // It is therefore enabled by default whenever image embeddings are armed.
+    //
+    // This was previously gated off because bidi corrupted generation (the model
+    // repeated <start_of_image>). Root cause: global layers ignored the GGUF's
+    // linear RoPE scaling (gemma3.rope.scaling.factor=8 → freq_scale=0.125), so
+    // their relative positions were 8x too large. Causal masking hides this
+    // (attention is local-dominated) but the bidi span forces image tokens to
+    // attend across the full ±n_img span, where the position error is fatal.
+    // Fixed by Gemma3Config::layer_rope_scale (wired into blk_hp.freq_scale).
+    // Set QINF_GEMMA3_IMAGE_CAUSAL=1 to force the legacy causal span for A/B
+    // investigation. See docs/gemma-vision-handoff.md and plan-gemma-vision-impl.md §P4.
+    const bool     use_bidi      = img_armed &&
+        (std::getenv("QINF_GEMMA3_IMAGE_CAUSAL") == nullptr);
+    const int32_t  bidi_start    = use_bidi ? pos + image_span_start_ : -1;
+    const uint32_t bidi_len      = use_bidi ? image_n_tokens_ : 0u;
+
     // Typed inputs (replaces set_inputs). Gemma 3 uses a 5:1 local:global
     // pattern; the per-layer sliding window is a parameter on AttnMaskInput
     // (config_.layer_window[il]; 0 = global). Per-layer RoPE base is a graph
@@ -179,7 +222,71 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     graph_inputs_.add(std::make_unique<PositionsInput>());
     for (uint32_t il = 0; il < config_.n_layers; ++il)
         graph_inputs_.add(std::make_unique<AttnMaskInput>(
-            "kq_mask." + std::to_string(il), config_.layer_window[il]));
+            "kq_mask." + std::to_string(il), config_.layer_window[il],
+            bidi_start, bidi_len));
+
+    // 1b. Image-token embedding substitution (Phase 3 — the one C3 boundary
+    // site between this recipe and the vision subsystem). When image
+    // embeddings are armed (set_image_embeddings), overwrite the SCALED text
+    // embeddings at [span_start, span_start + n_img) with the precomputed
+    // image embeddings. Gemma 3 scales token embeddings by sqrt(d_model) but
+    // image embeddings enter the residual stream UNSCALED — llama.cpp gemma3:
+    //   inpL = ggml_scale(inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+    // Substituting AFTER build_embed_scale and overwriting the rows wholesale
+    // is exactly that semantics (the scaled values at those positions are
+    // discarded). Single parameterized site, mirroring the want_logits head
+    // guard's locality discipline. Consumed (moved) here; re-arm to repeat.
+    if (!image_embd_.empty()) {
+        const uint32_t n_img = image_n_tokens_;
+        const size_t   want  = static_cast<size_t>(hidden_dim) * n_img;
+        if (image_embd_.size() != want)
+            throw std::runtime_error(
+                "Gemma3ForwardPass: slot 'image_embeddings': expected " +
+                std::to_string(want) + " floats (hidden_dim=" +
+                std::to_string(hidden_dim) + " * n_img=" +
+                std::to_string(n_img) + "), got: " +
+                std::to_string(image_embd_.size()));
+        if (image_span_start_ < 0 ||
+            static_cast<size_t>(image_span_start_) + n_img > n_tokens)
+            throw std::runtime_error(
+                "Gemma3ForwardPass: slot 'image_span': expected span within "
+                "[0, " + std::to_string(n_tokens) + "), got: start=" +
+                std::to_string(image_span_start_) + " n_img=" +
+                std::to_string(n_img));
+
+        ggml_tensor* img_in = ggml_new_tensor_2d(
+            ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
+        ggml_set_input(img_in);
+        set_tensor_name(gf, img_in, "image_embeddings");
+        ggml_build_forward_expand(gf, img_in);
+
+        // Overwrite the image-span columns of the residual stream in place:
+        //   inpL[:, span : span+n_img] = img_in
+        // inpL is [hidden_dim, n_tokens] and contiguous, so the image span is a
+        // clean 2-D sub-block; ggml_set_2d copies inpL and writes img_in at the
+        // column offset (one op, one node). The image columns enter UNSCALED
+        // while the surviving text columns keep their sqrt(d_model) scale —
+        // exactly llama.cpp gemma3.cpp:93 (scale = ubatch.token ? sqrt : 1.0),
+        // since the scaled text values at those positions are discarded.
+        //
+        // NOTE: an earlier revision used a 3-way ggml_concat splice with a
+        // comment claiming ggml_set_2d was a "silent no-op." That was backwards:
+        // the differential test (SubstitutedEmbeddingsChangeLogits) showed the
+        // CONCAT path never propagated img_in into the residual stream (output
+        // bit-identical to the text-only baseline, even with img_in scaled
+        // 1000x), while ggml_set_2d substitutes correctly. set_2d is the right
+        // primitive for an in-place sub-block overwrite.
+        const int64_t span = image_span_start_;
+        inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
+                           static_cast<size_t>(span) * inpL->nb[1]);
+        set_tensor_name(gf, inpL, "inpL_image_subst");
+        ggml_build_forward_expand(gf, inpL);
+
+        graph_inputs_.add(
+            std::make_unique<ImageEmbeddingsInput>(std::move(image_embd_)));
+        image_span_start_ = -1;  // consume-on-use (image_embd_ moved out)
+        image_n_tokens_   = 0;
+    }
 
     // 2. Base block hyperparameters (per-layer freq_base is overwritten in the loop).
     TransformerBlockHparams blk_hp;
@@ -201,7 +308,8 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
         const auto& block = model_.get_block(il);
 
         // Update per-layer RoPE base: local layers 10K, global layers 1M.
-        blk_hp.freq_base = config_.layer_rope_base[il];
+        blk_hp.freq_base  = config_.layer_rope_base[il];
+        blk_hp.freq_scale = config_.layer_rope_scale[il];
 
         TransformerBlockWeights w{};
         w.attn_norm = block.attn_norm_weight;

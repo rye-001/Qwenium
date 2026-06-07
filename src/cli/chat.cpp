@@ -5,7 +5,19 @@
 
 #include "chat.h"
 #include "../core/decode_step.h"
+#include "../core/multimodal_prefill.h"
+#include "../core/image_embedding_cache.h"
 #include "../models/model_registry.h"
+#include "../models/gemma3.h"
+#include "../models/i_image_embeddable.h"
+#include "../vision/vision_model.h"
+#include "../vision/vision_loader.h"
+#include "../vision/i_vision_encoder.h"
+#include "../vision/siglip_encoder.h"
+#include "../vision/gemma4uv_encoder.h"
+#include "../vision/bitmap.h"
+#include "image_loader.h"
+#include "image_prompt.h"
 
 int run_chat(
     Model& model,
@@ -65,6 +77,102 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 
+        // One image attached to the first user turn.
+        // All vision state is local and inert unless --image is given; the
+        // text-only path below is byte-for-byte unchanged. Fail-loud at setup
+        const bool image_mode = !args.image_path.empty();
+        std::unique_ptr<qinf::vision::VisionModel>    vmodel;
+        std::unique_ptr<qinf::vision::VisionLoader>   vloader;
+        std::unique_ptr<qinf::vision::IVisionEncoder> vencoder;
+        IImageEmbeddable* img_recipe = nullptr;
+        qinf::vision::Bitmap image_bitmap;
+        int32_t boi_id = -1, eoi_id = -1, soft_id = -1;
+        // The string inserted before the user's text on the image turn: the
+        // wrapped image marker (projector-specific). expand_image_markers then
+        // turns the single marker token into the soft-token span.
+        std::string image_render_prefix;
+        bool image_pending = false;
+        // Per-session encode cache: the same image referenced again in
+        // a later turn reuses its embeddings instead of re-encoding. Also holds
+        // the image-count cap.
+        ImageEmbeddingCache image_cache;
+        if (image_mode) {
+            if (args.mmproj_path.empty())
+                throw std::runtime_error(
+                    "run_chat: parameter '--image': requires '--mmproj' (the "
+                    "vision projector GGUF), got: empty mmproj path");
+            // (Gemma 3 or Gemma 4). Fail loud at setup, not mid-conversation.
+            img_recipe = dynamic_cast<IImageEmbeddable*>(forward_pass.get());
+            if (img_recipe == nullptr)
+                throw std::runtime_error(
+                    "run_chat: parameter '--image': expected a recipe "
+                    "implementing IImageEmbeddable (Gemma 3 or Gemma 4 vision), "
+                    "got: a different recipe");
+
+            ggml_backend_t backend = model.has_metal_backend()
+                ? model.get_backend_metal() : model.get_backend_cpu();
+            vmodel  = std::make_unique<qinf::vision::VisionModel>();
+            vloader = std::make_unique<qinf::vision::VisionLoader>();
+            vloader->parse_metadata(args.mmproj_path, *vmodel);
+            vloader->load_tensors(*vmodel, backend);
+
+            const auto& id_to_token = tokenizer->get_vocabulary();
+            auto find_id = [&](const std::string& s) -> int32_t {
+                for (size_t i = 0; i < id_to_token.size(); ++i)
+                    if (id_to_token[i] == s) return static_cast<int32_t>(i);
+                return -1;
+            };
+
+            using PT = qinf::vision::VisionProjectorType;
+            if (vmodel->config().projector_type == PT::Gemma3Siglip) {
+                vencoder = std::make_unique<qinf::vision::SiglipEncoder>(
+                    *vmodel, backend, vmodel->config().projection_dim);
+                boi_id  = find_id("<start_of_image>");
+                eoi_id  = find_id("<end_of_image>");
+                soft_id = find_id("<image_soft_token>");
+                if (boi_id < 0 || eoi_id < 0 || soft_id < 0)
+                    throw std::runtime_error(
+                        "run_chat: parameter '--image': expected the model's "
+                        "tokenizer to define <start_of_image>/<image_soft_token>/"
+                        "<end_of_image>, got: a text-only (non-multimodal) vocab");
+                // HF Gemma3Processor wraps the image block in "\n\n" on both sides.
+                image_render_prefix = "\n\n<start_of_image>\n\n";
+                image_bitmap = qinf::cli::load_image_to_bitmap(
+                    args.image_path,
+                    qinf::cli::gemma3_preprocess(
+                        static_cast<int>(vmodel->config().image_size)));
+            } else {  // VisionProjectorType::Gemma4Uv
+                vencoder = std::make_unique<qinf::vision::Gemma4UvEncoder>(
+                    *vmodel, backend, vmodel->config().projection_dim);
+                // Markers per llama.cpp mtmd: <|image> … <image|>. The per-position
+                // filler <|image|> is cosmetic — its embedding is overwritten by
+                // the substitution; only the N reserved positions matter.
+                boi_id  = find_id("<|image>");
+                eoi_id  = find_id("<image|>");
+                soft_id = find_id("<|image|>");
+                if (boi_id < 0 || eoi_id < 0 || soft_id < 0)
+                    throw std::runtime_error(
+                        "run_chat: parameter '--image': expected the model's "
+                        "tokenizer to define <|image>/<|image|>/<image|>, got: a "
+                        "text-only (non-multimodal) vocab");
+                // The image block is wrapped in "\n\n" — empirically load-bearing:
+                // without the surrounding newlines the begin marker abuts
+                // "<|turn>user\n"/the user text and the image is not read at all
+                // (the model reports a blank/garbled message). With them, the
+                // X-ray is read correctly. (A separate, milder degenerate-prefix
+                // artifact at generation start is still under investigation.)
+                image_render_prefix = "\n\n<|image>\n\n";
+                const int eff_patch = static_cast<int>(
+                    vmodel->config().patch_size * vmodel->config().n_merge);
+                image_bitmap = qinf::cli::load_image_to_bitmap(
+                    args.image_path, qinf::cli::gemma4uv_preprocess(eff_patch));
+            }
+            image_pending = true;
+            std::cout << "Vision: mmproj '" << args.mmproj_path << "' + image '"
+                      << args.image_path << "' ("
+                      << vencoder->mm_tokens_for(image_bitmap) << " soft tokens)\n";
+        }
+
         // System Prompt Prefill
         std::string system_content;
         std::string sys_prompt_file = args.system_prompt;
@@ -88,11 +196,12 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         std::string system_turn = tmpl.render({chat_history.back()}, false);
         std::vector<int32_t> system_tokens = tokenizer->encode(system_turn);
 
-        // Only prefill and clone when there is actual system content.
-        // An empty render (e.g. Gemma with no system prompt) must not inject
-        // a spurious turn into the KV cache — slot 1 stays at pos=0 and the
-        // first user-turn encode will own the BOS.
-        if (!system_tokens.empty()) {
+        // Only prefill and clone when there is actual system CONTENT. Gemma
+        // renders an empty system prompt as a non-empty wrapper
+        // (<start_of_turn>user\n<end_of_turn>\n), so guarding on system_tokens
+        // would still inject a spurious empty turn and push slot 1 off pos 0 —
+        // which also robs the first user turn of its BOS. Guard on the content.
+        if (!system_content.empty() && !system_tokens.empty()) {
             log_tokens(system_tokens);
             all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
             forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
@@ -127,22 +236,54 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             }
             chat_history.push_back({"user", user_input});
 
-            // Format only the new user turn for tokenization
-            std::string turn_prompt = tmpl.render({{"user", user_input}}, true);
-            std::vector<int32_t> new_tokens = tokenizer->encode(turn_prompt);
-            log_tokens(new_tokens);
-            
             // Reset grammar state for the new turn
             if (grammar) {
                 grammar->reset();
             }
-            
+
             // Use Slot 1 for User Session
             const uint32_t session_slot = 1;
             int current_pos = forward_pass->get_cache_pos(session_slot);
 
-            // Process only the new tokens
-            std::vector<float> logits = forward_pass->run_prefill(new_tokens, current_pos, session_slot, scheduler);
+            // Gemma requires a BOS at the very start of the conversation. encode()
+            // does not prepend it, so do it here for the first prefill (pos 0).
+            const int32_t bos_id = model.get_metadata().bos_token_id;
+            const bool prepend_bos = (current_pos == 0) && (bos_id >= 0);
+
+            std::vector<int32_t> new_tokens;
+            std::vector<float> logits;
+            if (image_pending) {
+                // Image turn: put the image marker (projector-specific, wrapped
+                // in image_render_prefix) in the rendered content, tokenize, then
+                // expand the single marker token into the soft-token span the
+                // encoder fills. expand_image_markers inserts soft×N + the
+                // end-of-image token right after the begin marker.
+                std::string turn_prompt = tmpl.render(
+                    {{"user", image_render_prefix + user_input}}, true);
+                std::vector<int32_t> raw = tokenizer->encode(turn_prompt);
+                qinf::cli::ExpandedImagePrompt built = qinf::cli::expand_image_markers(
+                    raw, boi_id, soft_id, eoi_id, vencoder->mm_tokens_for(image_bitmap));
+                new_tokens = std::move(built.tokens);
+                int img_span_start = built.span_start;
+                if (prepend_bos) {
+                    new_tokens.insert(new_tokens.begin(), bos_id);
+                    img_span_start += 1;  // BOS shifts every position right by one
+                }
+                log_tokens(new_tokens);
+
+                std::vector<ImagePromptChunk> chunks = {{&image_bitmap, img_span_start}};
+                logits = prefill_multimodal(*forward_pass, *vencoder, scheduler,
+                                            new_tokens, chunks, current_pos,
+                                            session_slot, &image_cache);
+                image_pending = false;
+            } else {
+                // Format only the new user turn for tokenization
+                std::string turn_prompt = tmpl.render({{"user", user_input}}, true);
+                new_tokens = tokenizer->encode(turn_prompt);
+                if (prepend_bos) new_tokens.insert(new_tokens.begin(), bos_id);
+                log_tokens(new_tokens);
+                logits = forward_pass->run_prefill(new_tokens, current_pos, session_slot, scheduler);
+            }
             all_tokens.insert(all_tokens.end(), new_tokens.begin(), new_tokens.end());
 
             size_t vocab_size = model.get_metadata().vocab_size;

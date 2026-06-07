@@ -38,7 +38,8 @@
 // Defaults: 6 blocks, layer 5 global → 5 sliding + 1 global, mirrors the
 // short-form pattern G3 uses.
 static ModelMetadata make_gemma4_meta(uint32_t n_blocks       = 6,
-                                       uint32_t period_global = 6)
+                                       uint32_t period_global = 6,
+                                       bool     moe           = true)
 {
     ModelMetadata m;
     m.architecture           = "gemma4";
@@ -56,9 +57,11 @@ static ModelMetadata make_gemma4_meta(uint32_t n_blocks       = 6,
     m.raw_kv.set("gemma4.rope.freq_base_swa",            1.0e4f);
     m.raw_kv.set("gemma4.attention.sliding_window",      (uint32_t)1024);
     m.raw_kv.set("gemma4.feed_forward_length",           (uint32_t)2112);
-    m.raw_kv.set("gemma4.expert_feed_forward_length",    (uint32_t)704);
-    m.raw_kv.set("gemma4.expert_count",                  (uint32_t)128);
-    m.raw_kv.set("gemma4.expert_used_count",             (uint32_t)8);
+    if (moe) {
+        m.raw_kv.set("gemma4.expert_feed_forward_length", (uint32_t)704);
+        m.raw_kv.set("gemma4.expert_count",               (uint32_t)128);
+        m.raw_kv.set("gemma4.expert_used_count",          (uint32_t)8);
+    }
     m.raw_kv.set("gemma4.final_logit_softcapping",       30.0f);
     m.raw_kv.set("gemma4.attention.shared_kv_layers",    (uint32_t)0);
     m.raw_kv.set("gemma4.embedding_length_per_layer_input",(uint32_t)0);
@@ -107,15 +110,60 @@ static ModelMetadata make_gemma4_meta(uint32_t n_blocks       = 6,
         add(p + "ffn_down.weight",     {2112, 2816});
         add(p + "post_ffw_norm.weight",{2816});
 
-        // MoE FFN
-        add(p + "pre_ffw_norm_2.weight",        {2816});
-        add(p + "ffn_gate_inp.scale",            {2816});
-        add(p + "ffn_gate_inp.weight",           {2816, 128});
-        add(p + "ffn_gate_up_exps.weight",       {2816, 1408, 128});
-        add(p + "ffn_down_exps.weight",          {704, 2816, 128});
+        // MoE FFN (parallel-branch post-norms present in the real A4B GGUF).
+        // Absent on the dense 12B-it variant.
+        if (moe) {
+            add(p + "post_ffw_norm_1.weight",       {2816});
+            add(p + "post_ffw_norm_2.weight",       {2816});
+            add(p + "pre_ffw_norm_2.weight",        {2816});
+            add(p + "ffn_gate_inp.scale",            {2816});
+            add(p + "ffn_gate_inp.weight",           {2816, 128});
+            add(p + "ffn_gate_up_exps.weight",       {2816, 1408, 128});
+            add(p + "ffn_down_exps.weight",          {704, 2816, 128});
+        }
         add(p + "layer_output_scale.weight",     {1});
     }
     return m;
+}
+
+// Strip the synthetic A4B fixture down to the dense 12B-it variant: drop the
+// expert keys and every MoE-only per-block tensor, leaving a single GeGLU FFN.
+// Mirrors what ggml-org's gemma-4-12B-it GGUF actually exports (no expert_*
+// metadata; per block only ffn_{norm,gate,up,down} + post_ffw_norm).
+static ModelMetadata make_gemma4_dense_meta(uint32_t n_blocks       = 6,
+                                            uint32_t period_global = 6)
+{
+    return make_gemma4_meta(n_blocks, period_global, /*moe=*/false);
+}
+
+// 0a. Dense variant (12B-it): absent expert keys ⇒ is_moe = false, dense FFN
+//     dims still parse, and validation passes without the MoE tensors.
+TEST(Gemma4Config, ConfigDense12B) {
+    const auto m = make_gemma4_dense_meta();
+    auto cfg = Gemma4Config::from_metadata(m);
+
+    EXPECT_FALSE(cfg.is_moe);
+    EXPECT_EQ(cfg.n_experts,      0u);
+    EXPECT_EQ(cfg.expert_top_k,   0u);
+    EXPECT_EQ(cfg.ffn_dim_expert, 0u);
+    // Shared (non-FFN) config is identical to the MoE fixture.
+    EXPECT_EQ(cfg.ffn_dim_dense,  2112u);
+    EXPECT_EQ(cfg.n_kv_heads_swa, 8u);
+    EXPECT_TRUE(cfg.is_global[5]);
+}
+
+// 0b. The dense inventory validates, and the MoE-only tensors are NOT
+//     required when expert_count is absent.
+TEST(Gemma4Inventory, AcceptsDenseVariant) {
+    const auto m = make_gemma4_dense_meta();
+    EXPECT_NO_THROW(validate_gemma4_inventory(m));
+}
+
+// 0c. A dense inventory missing a *common* FFN tensor is still fail-loud.
+TEST(Gemma4Inventory, DenseRejectsMissingPostFfwNorm) {
+    auto m = make_gemma4_dense_meta();
+    m.tensor_inventory.erase("blk.1.post_ffw_norm.weight");
+    EXPECT_THROW(validate_gemma4_inventory(m), std::runtime_error);
 }
 
 // 1. Full A4B-shape metadata yields the documented per-kind shapes.

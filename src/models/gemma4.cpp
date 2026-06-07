@@ -7,6 +7,7 @@
 #include "../graph_inputs/tokens_input.h"
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/image_embeddings_input.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -20,48 +21,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-// ── DEBUG (G4): runtime diagnostics for the <tool_call|> hallucination ───────
-namespace {
-struct TStats { float min, max, mean, absmean; size_t nan; size_t n; };
-static TStats tensor_stats_f32(ggml_tensor* t) {
-    TStats s{0,0,0,0,0,0};
-    if (!t) return s;
-    const size_t n = ggml_nelements(t);
-    std::vector<float> buf(n);
-    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
-    s.n = n;
-    s.min = std::numeric_limits<float>::infinity();
-    s.max = -std::numeric_limits<float>::infinity();
-    double sum = 0, asum = 0;
-    for (float v : buf) {
-        if (std::isnan(v)) { s.nan++; continue; }
-        s.min = std::min(s.min, v);
-        s.max = std::max(s.max, v);
-        sum  += v;
-        asum += std::fabs(v);
-    }
-    const size_t live = n - s.nan;
-    s.mean    = live ? float(sum  / live) : 0.f;
-    s.absmean = live ? float(asum / live) : 0.f;
-    return s;
-}
-static void print_stats(const char* label, ggml_tensor* t) {
-    if (!t) { std::fprintf(stderr, "[G4DBG] %-32s = (null)\n", label); return; }
-    if (t->type != GGML_TYPE_F32) {
-        std::fprintf(stderr, "[G4DBG] %-32s type=%s (skipped, non-F32)  shape=[%lld,%lld,%lld,%lld]\n",
-                     label, ggml_type_name(t->type),
-                     (long long)t->ne[0], (long long)t->ne[1],
-                     (long long)t->ne[2], (long long)t->ne[3]);
-        return;
-    }
-    TStats s = tensor_stats_f32(t);
-    std::fprintf(stderr,
-        "[G4DBG] %-32s n=%zu  min=%.6f  max=%.6f  mean=%.6f  |mean|=%.6f  nan=%zu\n",
-        label, s.n, s.min, s.max, s.mean, s.absmean, s.nan);
-}
-} // namespace
-
 
 // ── gemma4_tokenizer_config (unchanged from G4.7) ────────────────────────────
 
@@ -97,10 +56,16 @@ Gemma4Config Gemma4Config::from_metadata(const ModelMetadata& meta)
     cfg.sliding_window    = meta.raw_kv.get_uint32("gemma4.attention.sliding_window");
 
     cfg.ffn_dim_dense     = meta.raw_kv.get_uint32("gemma4.feed_forward_length");
-    cfg.ffn_dim_expert    = meta.raw_kv.get_uint32("gemma4.expert_feed_forward_length");
-    cfg.n_experts         = meta.raw_kv.get_uint32("gemma4.expert_count");
-    cfg.expert_top_k      = meta.raw_kv.get_uint32("gemma4.expert_used_count");
     cfg.final_softcap     = meta.raw_kv.get_float ("gemma4.final_logit_softcapping");
+
+    // Expert keys are absent on the dense 12B-it variant; present on
+    // 26B-A4B / 31B.  Optional reads default to 0 ⇒ is_moe = false, which
+    // selects the dense FFN branch in build_block and relaxes the inventory
+    // validator's MoE-tensor requirements.
+    cfg.ffn_dim_expert    = meta.raw_kv.get_uint32_opt("gemma4.expert_feed_forward_length").value_or(0);
+    cfg.n_experts         = meta.raw_kv.get_uint32_opt("gemma4.expert_count").value_or(0);
+    cfg.expert_top_k      = meta.raw_kv.get_uint32_opt("gemma4.expert_used_count").value_or(0);
+    cfg.is_moe            = cfg.n_experts > 0;
 
     // Optional "dormant" keys — present in 26B-A4B GGUF as 0; we accept
     // missing too so synthetic / cut-down test fixtures don't trip.
@@ -200,31 +165,45 @@ void validate_gemma4_inventory(const ModelMetadata& meta)
     require("output_norm.weight");
     // Tied embeddings — no separate output.weight.
 
-    // Per-block tensors common to every layer kind.
+    // expert_count absent (or 0) ⇒ dense variant (12B-it): single GeGLU FFN,
+    // no expert tensors and no parallel-branch post-norms.  expert_count > 0
+    // ⇒ MoE variant (26B-A4B / 31B): parallel dense+MoE FFN per layer.
+    const bool is_moe =
+        meta.raw_kv.get_uint32_opt("gemma4.expert_count").value_or(0) > 0;
+
+    // Per-block tensors common to BOTH variants.
     static const std::vector<std::string> per_block_common = {
         "attn_norm.weight",
         "attn_q.weight",  "attn_k.weight",
         "attn_q_norm.weight", "attn_k_norm.weight",
         "attn_output.weight",
         "post_attention_norm.weight",
-        // Dense FFN (sandwich: ffn_norm → ffn → post_ffw_norm_1)
+        // FFN entry norm + GeGLU weights (dense FFN, or MoE's shared dense MLP).
         "ffn_norm.weight",
         "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        // Outer post-norm applied to the FFN output before the residual add
+        // (common to dense and MoE; for MoE it follows the dense+moe sum).
+        "post_ffw_norm.weight",
+        // Per-layer output scale.
+        "layer_output_scale.weight",
+    };
+    // MoE-only per-block tensors: the parallel-branch post-norms and the
+    // expert dispatch weights.  Required only when expert_count > 0.
+    static const std::vector<std::string> per_block_moe = {
+        // Dense-branch post-norm (post_ffw_norm_1) + MoE-branch sandwich
+        // (pre_ffw_norm_2 → moe → post_ffw_norm_2).
         "post_ffw_norm_1.weight",
-        // MoE FFN (sandwich: pre_ffw_norm_2 → moe → post_ffw_norm_2)
         "pre_ffw_norm_2.weight",
         "post_ffw_norm_2.weight",
         "ffn_gate_inp.scale",   "ffn_gate_inp.weight",
         "ffn_gate_up_exps.weight",
         "ffn_down_exps.weight",
-        // Outer post-norm applied after (dense + moe) sum.
-        "post_ffw_norm.weight",
-        // Output scale
-        "layer_output_scale.weight",
     };
     for (uint32_t i = 0; i < meta.block_count; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
         for (const auto& t : per_block_common) require(p + t);
+        if (is_moe)
+            for (const auto& t : per_block_moe) require(p + t);
         // attn_v.weight is conditional: present iff the layer is sliding
         // (global layers reuse K as V).  We do not enforce it either way
         // here — Gemma4Config::from_metadata derives the per-layer pattern
@@ -232,10 +211,6 @@ void validate_gemma4_inventory(const ModelMetadata& meta)
         // with that derivation will surface as a shape mismatch at
         // graph-build time, not silently produce wrong logits.
     }
-
-    // (post_ffw_norm_1 / post_ffw_norm_2 are required above — they are the
-    // dense-branch and MoE-branch post-norms in Gemma 4's parallel-FFN
-    // topology, not Altup artifacts as an earlier draft assumed.)
 }
 
 // ── Gemma4ForwardPass ────────────────────────────────────────────────────────
@@ -290,47 +265,22 @@ Gemma4ForwardPass::Gemma4ForwardPass(
         w.ffn_down    = blk.ffn_down_weight;
 
         w.post_attn_norm   = require_tensor(il, "post_attention_norm.weight");
-        w.post_ffn_norm_1  = require_tensor(il, "post_ffw_norm_1.weight");
         w.post_ffn_norm    = require_tensor(il, "post_ffw_norm.weight");
-        w.pre_moe_norm     = require_tensor(il, "pre_ffw_norm_2.weight");
-        w.post_ffn_norm_2  = require_tensor(il, "post_ffw_norm_2.weight");
-        w.moe_router_scale = require_tensor(il, "ffn_gate_inp.scale");
-        w.moe_router       = require_tensor(il, "ffn_gate_inp.weight");
-        w.moe_gate_up_exps = require_tensor(il, "ffn_gate_up_exps.weight");
-        w.moe_down_exps    = require_tensor(il, "ffn_down_exps.weight");
         w.layer_out_scale  = require_tensor(il, "layer_output_scale.weight");
+
+        // MoE-only handles stay null on the dense variant (build_block
+        // branches on config_.is_moe and never dereferences them).
+        if (config_.is_moe) {
+            w.post_ffn_norm_1  = require_tensor(il, "post_ffw_norm_1.weight");
+            w.pre_moe_norm     = require_tensor(il, "pre_ffw_norm_2.weight");
+            w.post_ffn_norm_2  = require_tensor(il, "post_ffw_norm_2.weight");
+            w.moe_router_scale = require_tensor(il, "ffn_gate_inp.scale");
+            w.moe_router       = require_tensor(il, "ffn_gate_inp.weight");
+            w.moe_gate_up_exps = require_tensor(il, "ffn_gate_up_exps.weight");
+            w.moe_down_exps    = require_tensor(il, "ffn_down_exps.weight");
+        }
     }
 
-    // ── DEBUG: dump resolved hparams + weight stats for layer 0 ─────────────
-    // Goal: settle the (1+w) pre-bake question empirically.
-    //   - If attn_norm.weight mean ≈ 1.0  → GGUF IS pre-baked → use build_rms_norm.
-    //   - If attn_norm.weight mean ≈ 0.0  → GGUF is RAW       → use build_rms_norm_gemma.
-    std::fprintf(stderr, "[G4DBG] ── Gemma4Config ─────────────────────────\n");
-    std::fprintf(stderr, "[G4DBG] n_layers=%u  n_head=%u  hidden=%u  ctx=%u\n",
-                 config_.n_layers, config_.n_head, config_.hidden_dim, config_.context_len);
-    std::fprintf(stderr, "[G4DBG] head_dim_swa=%u  head_dim_global=%u  rope_base_swa=%.1f  rope_base_global=%.1f\n",
-                 config_.head_dim_swa, config_.head_dim_global,
-                 config_.rope_base_swa, config_.rope_base_global);
-    std::fprintf(stderr, "[G4DBG] n_kv_heads_swa=%u  n_kv_heads_global=%u  sliding_window=%u  final_softcap=%.1f\n",
-                 config_.n_kv_heads_swa, config_.n_kv_heads_global,
-                 config_.sliding_window, config_.final_softcap);
-    std::fprintf(stderr, "[G4DBG] n_swa_layers=%u  n_global_layers=%u  layer0_kind=%s\n",
-                 config_.n_swa_layers, config_.n_global_layers,
-                 config_.is_global[0] ? "GLOBAL" : "SWA");
-    std::fprintf(stderr, "[G4DBG] ── Norm weights (raw GGUF values) ────────\n");
-    print_stats("blk.0.attn_norm",         block_w_[0].attn_norm);
-    print_stats("blk.0.attn_q_norm",       block_w_[0].attn_q_norm);
-    print_stats("blk.0.attn_k_norm",       block_w_[0].attn_k_norm);
-    print_stats("blk.0.post_attention_norm", block_w_[0].post_attn_norm);
-    print_stats("blk.0.ffn_norm",          block_w_[0].ffn_norm);
-    print_stats("blk.0.post_ffw_norm_1",   block_w_[0].post_ffn_norm_1);
-    print_stats("blk.0.post_ffw_norm",     block_w_[0].post_ffn_norm);
-    print_stats("blk.0.pre_ffw_norm_2",    block_w_[0].pre_moe_norm);
-    print_stats("blk.0.post_ffw_norm_2",   block_w_[0].post_ffn_norm_2);
-    print_stats("blk.0.layer_output_scale",block_w_[0].layer_out_scale);
-    print_stats("output_norm",             model_.get_output_norm_weight());
-    print_stats("token_embd",              model_.get_token_embedding_weight());
-    std::fprintf(stderr, "[G4DBG] ── (mean ≈ 1 ⇒ pre-baked  |  mean ≈ 0 ⇒ raw) ─────\n");
 }
 
 ggml_tensor* Gemma4ForwardPass::require_tensor(uint32_t il, const char* suffix) const
@@ -529,53 +479,70 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     set_tensor_name(gf, attn_out, "attn_residual", static_cast<int>(il));
     if (il == 0) { ggml_set_output(attn_out); ggml_build_forward_expand(gf, attn_out); }
 
-    // ── B. Parallel dense + MoE feed-forward (Gemma 4 topology) ──────────
-    // Both branches feed off attn_out (NOT off each other's residuals).
-    // Their outputs are summed, the sum is post-normed, the scaled result
-    // is added to attn_out as the single block residual.
+    // ── B. Feed-forward (Gemma 4 topology) ───────────────────────────────
+    // Two variants, selected by config_.is_moe (= expert_count > 0):
+    //   - Dense (12B-it): a single GeGLU-tanh FFN.
+    //   - MoE (26B-A4B / 31B): parallel dense + MoE branches, summed.
+    // Both feed off attn_out; the result `ffn_inner` then passes through the
+    // common outer post-norm (post_ffw_norm), is added to attn_out as the
+    // single block residual, and scaled by layer_output_scale.  The MoE path
+    // is byte-identical to the pre-dense recipe (same ops, same order).
+    ggml_tensor* ffn_inner;
+    if (config_.is_moe) {
+        // B.1 Dense (shared) MLP sandwich: ffn_norm → GeGLU-tanh → post_ffw_norm_1
+        ggml_tensor* cur_mlp = build_rms_norm(ctx_, attn_out, w.ffn_norm,
+                                              config_.rms_norm_eps,
+                                              static_cast<int>(il));
+        cur_mlp = build_ffn_geglu_tanh(ctx_, gf, cur_mlp,
+                                       w.ffn_gate, w.ffn_up, w.ffn_down,
+                                       static_cast<int>(il));
+        cur_mlp = build_rms_norm(ctx_, cur_mlp, w.post_ffn_norm_1,
+                                 config_.rms_norm_eps, static_cast<int>(il));
+        set_tensor_name(gf, cur_mlp, "ffn_mlp", static_cast<int>(il));
 
-    // B.1 Dense FFN sandwich: ffn_norm → GeGLU-tanh → post_ffw_norm_1
-    ggml_tensor* cur_mlp = build_rms_norm(ctx_, attn_out, w.ffn_norm,
-                                          config_.rms_norm_eps,
-                                          static_cast<int>(il));
-    cur_mlp = build_ffn_geglu_tanh(ctx_, gf, cur_mlp,
-                                   w.ffn_gate, w.ffn_up, w.ffn_down,
-                                   static_cast<int>(il));
-    cur_mlp = build_rms_norm(ctx_, cur_mlp, w.post_ffn_norm_1,
-                             config_.rms_norm_eps, static_cast<int>(il));
-    set_tensor_name(gf, cur_mlp, "ffn_mlp", static_cast<int>(il));
+        // B.2 MoE branch — expert input uses pre_ffw_norm_2(attn_out); the
+        //     router uses an unweighted rms_norm of attn_out scaled by
+        //     1/sqrt(n_embd) and the per-channel ffn_gate_inp.scale.  This
+        //     mirrors llama.cpp's gemma4-iswa reference exactly.
+        ggml_tensor* expert_in = build_rms_norm(ctx_, attn_out, w.pre_moe_norm,
+                                                config_.rms_norm_eps,
+                                                static_cast<int>(il));
+        set_tensor_name(gf, expert_in, "ffn_norm_2", static_cast<int>(il));
 
-    // B.2 MoE branch — expert input uses pre_ffw_norm_2(attn_out); the
-    //     router uses an unweighted rms_norm of attn_out scaled by
-    //     1/sqrt(n_embd) and the per-channel ffn_gate_inp.scale.  This
-    //     mirrors llama.cpp's gemma4-iswa reference exactly.
-    ggml_tensor* expert_in = build_rms_norm(ctx_, attn_out, w.pre_moe_norm,
-                                            config_.rms_norm_eps,
-                                            static_cast<int>(il));
-    set_tensor_name(gf, expert_in, "ffn_norm_2", static_cast<int>(il));
+        ggml_tensor* router_in = ggml_rms_norm(ctx_, attn_out, config_.rms_norm_eps);
+        router_in = ggml_scale(ctx_, router_in,
+                               1.0f / std::sqrt(static_cast<float>(config_.hidden_dim)));
+        router_in = ggml_mul(ctx_, router_in, w.moe_router_scale);
+        set_tensor_name(gf, router_in, "moe_router_in", static_cast<int>(il));
 
-    ggml_tensor* router_in = ggml_rms_norm(ctx_, attn_out, config_.rms_norm_eps);
-    router_in = ggml_scale(ctx_, router_in,
-                           1.0f / std::sqrt(static_cast<float>(config_.hidden_dim)));
-    router_in = ggml_mul(ctx_, router_in, w.moe_router_scale);
-    set_tensor_name(gf, router_in, "moe_router_in", static_cast<int>(il));
+        ggml_tensor* cur_moe = build_moe_geglu(gf, expert_in, router_in, w, il, n_tokens);
+        cur_moe = build_rms_norm(ctx_, cur_moe, w.post_ffn_norm_2,
+                                 config_.rms_norm_eps, static_cast<int>(il));
+        set_tensor_name(gf, cur_moe, "ffn_moe", static_cast<int>(il));
 
-    ggml_tensor* cur_moe = build_moe_geglu(gf, expert_in, router_in, w, il, n_tokens);
-    cur_moe = build_rms_norm(ctx_, cur_moe, w.post_ffn_norm_2,
-                             config_.rms_norm_eps, static_cast<int>(il));
-    set_tensor_name(gf, cur_moe, "ffn_moe", static_cast<int>(il));
+        // B.3 Sum dense + MoE.
+        ffn_inner = ggml_add(ctx_, cur_mlp, cur_moe);
+        set_tensor_name(gf, ffn_inner, "ffn_moe_combined", static_cast<int>(il));
+        if (il == 0) { ggml_set_output(ffn_inner); ggml_build_forward_expand(gf, ffn_inner); }
+    } else {
+        // Dense variant: a single GeGLU-tanh FFN (no parallel MoE branch and
+        // no post_ffw_norm_1; the common post_ffw_norm below is the only
+        // FFN post-norm).  Matches llama.cpp gemma4.cpp non-MoE branch.
+        ffn_inner = build_rms_norm(ctx_, attn_out, w.ffn_norm,
+                                   config_.rms_norm_eps, static_cast<int>(il));
+        ffn_inner = build_ffn_geglu_tanh(ctx_, gf, ffn_inner,
+                                         w.ffn_gate, w.ffn_up, w.ffn_down,
+                                         static_cast<int>(il));
+        set_tensor_name(gf, ffn_inner, "ffn_out", static_cast<int>(il));
+    }
 
-    // B.3 Sum dense + MoE → outer post-norm.
-    ggml_tensor* ffn_combined = ggml_add(ctx_, cur_mlp, cur_moe);
-    set_tensor_name(gf, ffn_combined, "ffn_moe_combined", static_cast<int>(il));
-    if (il == 0) { ggml_set_output(ffn_combined); ggml_build_forward_expand(gf, ffn_combined); }
-
-    cur = build_rms_norm(ctx_, ffn_combined, w.post_ffn_norm,
+    // B.4 Common outer post-norm (post_ffw_norm), single residual, and
+    //     layer_output_scale on the whole layer output.  Matches llama.cpp's
+    //     `ffn_post_norm` (applied to either branch result) + `out_scale`.
+    cur = build_rms_norm(ctx_, ffn_inner, w.post_ffn_norm,
                          config_.rms_norm_eps, static_cast<int>(il));
     set_tensor_name(gf, cur, "ffn_post_norm", static_cast<int>(il));
 
-    // B.4 Single residual; layer_output_scale applied to the whole layer
-    //     output (not to MoE alone).  Matches llama.cpp's `out_scale` hook.
     ggml_tensor* layer_out = ggml_add(ctx_, attn_out, cur);
     layer_out = ggml_mul(ctx_, layer_out, w.layer_out_scale);
     set_tensor_name(gf, layer_out, "layer_out_scaled", static_cast<int>(il));
@@ -617,6 +584,57 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
         graph_inputs_.add(std::make_unique<AttnMaskInput>(
             "kq_mask." + std::to_string(il),
             config_.is_global[il] ? 0u : config_.sliding_window));
+
+    // 2b. Image-token embedding substitution (IImageEmbeddable, Seam B — the one
+    //     C3 boundary site between this recipe and the vision subsystem). When
+    //     image embeddings are armed (set_image_embeddings), overwrite the SCALED
+    //     text embeddings at columns [span, span + n_img) with the precomputed
+    //     image embeddings. Gemma scales token embeddings by sqrt(d_model) but
+    //     image embeddings enter UNSCALED — substituting AFTER build_embed_scale
+    //     and overwriting wholesale is exactly that semantics (the scaled values
+    //     at those positions are discarded). Direct analog of the Gemma 3 site;
+    //     the ONE difference is there is NO bidirectional mask span here — Gemma 4
+    //     image attention is plain causal, so the AttnMaskInput above is already
+    //     correct and image_span_start_ never needs the local→absolute
+    //     conversion the Gemma 3 mask required. Consumed (moved) here.
+    if (!image_embd_.empty()) {
+        const uint32_t n_img = image_n_tokens_;
+        const int      hidden_dim = static_cast<int>(config_.hidden_dim);
+        const size_t   want  = static_cast<size_t>(hidden_dim) * n_img;
+        if (image_embd_.size() != want)
+            throw std::runtime_error(
+                "Gemma4ForwardPass: slot 'image_embeddings': expected " +
+                std::to_string(want) + " floats (hidden_dim=" +
+                std::to_string(hidden_dim) + " * n_img=" +
+                std::to_string(n_img) + "), got: " +
+                std::to_string(image_embd_.size()));
+        if (image_span_start_ < 0 ||
+            static_cast<size_t>(image_span_start_) + n_img > n_tokens)
+            throw std::runtime_error(
+                "Gemma4ForwardPass: slot 'image_span': expected span within "
+                "[0, " + std::to_string(n_tokens) + "), got: start=" +
+                std::to_string(image_span_start_) + " n_img=" +
+                std::to_string(n_img));
+
+        ggml_tensor* img_in = ggml_new_tensor_2d(
+            ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
+        ggml_set_input(img_in);
+        set_tensor_name(gf, img_in, "image_embeddings");
+        ggml_build_forward_expand(gf, img_in);
+
+        // inpL[:, span : span+n_img] = img_in (one op; surviving text columns
+        // keep their sqrt(d_model) scale, image columns enter unscaled).
+        const int64_t span = image_span_start_;
+        inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
+                           static_cast<size_t>(span) * inpL->nb[1]);
+        set_tensor_name(gf, inpL, "inpL_image_subst");
+        ggml_build_forward_expand(gf, inpL);
+
+        graph_inputs_.add(
+            std::make_unique<ImageEmbeddingsInput>(std::move(image_embd_)));
+        image_span_start_ = -1;  // consume-on-use (image_embd_ moved out)
+        image_n_tokens_   = 0;
+    }
 
     // 3. Transformer stack (manual composition; build_transformer_layer
     //    can't host this — see the gemma4.h scope comment).
@@ -663,64 +681,6 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
         ggml_build_forward_expand(gf, cur);
     }
     return gf;
-}
-
-// ── DEBUG run_prefill: read back intermediates after compute ─────────────────
-std::vector<float> Gemma4ForwardPass::run_prefill(
-    const std::vector<int32_t>& tokens,
-    int pos, uint32_t slot_idx,
-    ggml_backend_sched_t scheduler)
-{
-    static int dbg_call = 0;
-    ggml_backend_sched_reset(scheduler);
-    ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-    ggml_backend_sched_alloc_graph(scheduler, gf);
-    set_prefill_inputs(gf, tokens, pos);
-    ggml_backend_sched_graph_compute(scheduler, gf);
-
-    if (dbg_call < 2) {
-        std::fprintf(stderr, "[G4DBG] ── post-compute intermediates (call #%d) ─\n", dbg_call);
-        print_stats("inpL_scaled (post-embed)", ggml_graph_get_tensor(gf, "inpL_scaled"));
-        // Layer 0 sub-components
-        print_stats("L0 attn_residual", ggml_graph_get_tensor(gf, "attn_residual.0"));
-        print_stats("L0 dense_ffn_residual", ggml_graph_get_tensor(gf, "dense_ffn_residual.0"));
-        // First, mid, last layer outputs
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "layer_out.%u", 0u);
-        print_stats("layer_out.0",   ggml_graph_get_tensor(gf, buf));
-        if (config_.n_layers > 2) {
-            std::snprintf(buf, sizeof(buf), "layer_out.%u", config_.n_layers/2);
-            print_stats("layer_out.mid", ggml_graph_get_tensor(gf, buf));
-        }
-        std::snprintf(buf, sizeof(buf), "layer_out.%u", config_.n_layers - 1);
-        print_stats("layer_out.last", ggml_graph_get_tensor(gf, buf));
-        print_stats("final_norm",   ggml_graph_get_tensor(gf, "final_norm"));
-        // Logits stats + top-K
-        ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-        if (logits) {
-            print_stats("logits", logits);
-            const size_t vocab  = static_cast<size_t>(logits->ne[0]);
-            const size_t ntok   = static_cast<size_t>(logits->ne[1]);
-            std::vector<float> last(vocab);
-            const size_t off = (ntok - 1) * vocab * sizeof(float);
-            ggml_backend_tensor_get(logits, last.data(), off, vocab * sizeof(float));
-            // top-10
-            std::vector<int> idx(vocab);
-            for (size_t i = 0; i < vocab; ++i) idx[i] = (int)i;
-            std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(),
-                [&](int a, int b){ return last[a] > last[b]; });
-            std::fprintf(stderr, "[G4DBG] last-token logits top-10:\n");
-            for (int k = 0; k < 10; ++k) {
-                std::fprintf(stderr, "[G4DBG]   #%d  id=%6d  logit=%.4f\n",
-                             k, idx[k], last[idx[k]]);
-            }
-        }
-        std::fprintf(stderr, "[G4DBG] ──────────────────────────────────────────\n");
-        dbg_call++;
-    }
-
-    advance_cache(tokens.size(), slot_idx);
-    return get_output_logits(gf);
 }
 
 // ── Decoding (batched) — stubbed in G4.8, mirrors G2/G3 ──────────────────────

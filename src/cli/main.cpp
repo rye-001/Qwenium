@@ -56,6 +56,8 @@ void print_usage(const char* program_name) {
     std::cout << "  --speculative           Enable Prompt Lookup Decoding (speculative)\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
+    std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
+    std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";
@@ -124,6 +126,12 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--pld-max-draft") {
             if (i + 1 >= argc) return false;
             args.pld_max_draft = std::stoi(argv[++i]);
+        } else if (arg == "--image") {
+            if (i + 1 >= argc) return false;
+            args.image_path = argv[++i];
+        } else if (arg == "--mmproj") {
+            if (i + 1 >= argc) return false;
+            args.mmproj_path = argv[++i];
         } else if (args.model_path.empty()) {
             args.model_path = arg;
         }
@@ -186,7 +194,9 @@ int main(int argc, char** argv) {
     Model model;
     try {
         register_builtin_models();
-        model.load_metadata(args.model_path);
+        // --mmproj signals the vision pipeline: allow a checkpoint carrying
+        // image-placeholder tokens instead of refusing it as multimodal-only.
+        model.load_metadata(args.model_path, /*allow_multimodal=*/!args.mmproj_path.empty());
         model.print_metadata();
         model.load_tensors();
     } catch (const GGUFLoadError& e) {

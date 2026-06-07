@@ -105,7 +105,7 @@ ggml_tensor* build_transformer_layer(
     // D. RoPE — n_rot may be < head_dim_k (p-RoPE lands in G4.5).
     Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
                           n_rot, GGML_ROPE_TYPE_NEOX, hp.context_length,
-                          hp.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+                          hp.freq_base, hp.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
     tblk_name(Qcur, "Qcur_roped", il);
 
     if (!hp.is_qwen2 && w.k_norm != nullptr) {
@@ -114,7 +114,7 @@ ggml_tensor* build_transformer_layer(
     }
     Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
                           n_rot, GGML_ROPE_TYPE_NEOX, hp.context_length,
-                          hp.freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+                          hp.freq_base, hp.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
     tblk_name(Kcur, "Kcur_roped", il);
 
     // E. Grouped-Query Attention
