@@ -19,6 +19,7 @@
 #include "core/model.h"
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
+#include "loader/chat_template.h"
 #include "sampling/sampling.h"
 #include "state/kv_cache_simple.h"
 
@@ -58,8 +59,13 @@ std::string normalize_output(const std::string& output) {
         pos += 1;
     }
     
-    // Remove end tokens
-    std::vector<std::string> end_tokens = {"<|im_end|>", "<|endoftext|>", "</s>"};
+    // Remove end-of-turn / EOS markers. Qwen (<|im_end|>) and Gemma
+    // (<end_of_turn>, <eos>) markers are both listed — they are mutually
+    // exclusive in practice (a model emits only its own), so the union is
+    // safe cross-family and keeps this free function model-agnostic. (F6)
+    std::vector<std::string> end_tokens = {
+        "<|im_end|>", "<|endoftext|>", "</s>",
+        "<end_of_turn>", "<eos>"};
     for (const auto& token : end_tokens) {
         pos = normalized.find(token);
         if (pos != std::string::npos) {
@@ -92,8 +98,25 @@ public:
         model_.load_metadata(model_path);
         model_.load_tensors();
 
-        tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata());
+        // F6: build the tokenizer with the architecture's registered
+        // TokenizerConfig (NOT a config-less default). For Gemma this carries the
+        // SPM normalizer, byte-fallback, BOS, and the <start_of_turn>/<end_of_turn>
+        // specials; without it the server byte-explodes Gemma's control tokens
+        // into garbage. Mirrors core/model.cpp's tokenizer init.
+        const std::string& arch = model_.get_metadata().architecture;
+        tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata(),
+                                                 lookup_tokenizer_config(arch));
         sampler_ = std::make_unique<qwenium::GreedySampler>();
+
+        // F6: render prompts with the architecture's registered ChatTemplate
+        // (Qwen <|im_start|> vs Gemma <start_of_turn> vs Gemma-4's own markers),
+        // not a hardwired Qwen string.
+        chat_template_ = lookup_chat_template(arch);
+        if (!chat_template_)
+            throw std::runtime_error(
+                "QwenServerIntegration: no chat template registered for arch '" +
+                arch + "'");
+        std::cout << "Tokenizer + chat template wired for arch=" << arch << std::endl;
 
         // Initialize forward pass with max_slots_ slots (KV cache is sized
         // ctx × slots × F32, so fewer slots frees context headroom — the right
@@ -170,8 +193,8 @@ public:
             return system_prompt_cache_len_;
         }
         
-        // Format and tokenize system prompt
-        std::string formatted = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+        // Format and tokenize system prompt (model-aware, F6).
+        std::string formatted = wrap_system(system_prompt);
         std::vector<int32_t> tokens = tokenizer_->encode(formatted);
         
         if (tokens.empty()) {
@@ -201,10 +224,9 @@ public:
 
     void configure_server(qwenium::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
-            // Apply Qwen chat template for user message only
-            // System prompt handled separately via caching
-            std::string formatted = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-            return tokenizer_->encode(formatted);
+            // Model-aware single user-turn template (F6). System prompt is
+            // handled separately via caching.
+            return tokenizer_->encode(wrap_user_turn(text));
         });
 
         server.set_raw_tokenize([this](const std::string& text) {
@@ -267,6 +289,21 @@ public:
 
     int max_ctx_per_slot() const { return max_ctx_per_slot_; }
     int max_slots() const { return max_slots_; }
+    const ChatTemplate* chat_template() const { return chat_template_; }
+
+    // ── F6: model-aware chat templating via the registered ChatTemplate ──────
+    // A single user turn = a 1-message history with the assistant prompt opened.
+    std::string wrap_user_turn(const std::string& text) const {
+        return chat_template_->render({ChatMessage{"user", text}},
+                                      /*add_assistant_prompt=*/true);
+    }
+    // System prefix = a system turn with NO assistant prompt (the user turn is
+    // appended after, via set_tokenize, on top of the cached prefix). The
+    // ChatTemplate maps the system role per family (e.g. Gemma → user turn).
+    std::string wrap_system(const std::string& text) const {
+        return chat_template_->render({ChatMessage{"system", text}},
+                                      /*add_assistant_prompt=*/false);
+    }
 
 private:
     int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {
@@ -337,6 +374,7 @@ private:
     std::unique_ptr<qwenium::GreedySampler> sampler_;
     ggml_backend_sched_t scheduler_;
     std::mutex model_mutex_;  // Protects all model operations
+    const ChatTemplate* chat_template_ = nullptr;  // F6: arch-registered renderer
     int max_ctx_per_slot_;
     int max_slots_;
     
@@ -365,20 +403,19 @@ static std::string chat_content_to_text(const json& content) {
     return "";  // null / absent (e.g. an assistant tool-call message)
 }
 
-// Render an OpenAI messages[] array into the Qwen <|im_start|> chat template,
-// ending with the assistant generation tag. Same template the single-turn path
-// uses (QwenServerIntegration::configure_server / cache_system_prompt), applied
-// across every turn so multi-turn history and the system role are preserved.
-static std::string render_qwen_chat(const json& messages) {
-    std::string out;
+// Render an OpenAI messages[] array into the model's chat template (F6) via the
+// architecture's registered ChatTemplate — handles Qwen <|im_start|>, Gemma
+// <start_of_turn>, and Gemma-4's distinct markers, including per-family role
+// mapping (assistant→model, system handling).
+static std::string render_chat(const json& messages, const ChatTemplate* tmpl) {
+    std::vector<ChatMessage> history;
+    history.reserve(messages.size());
     for (const auto& msg : messages) {
-        const std::string role = msg.value("role", "user");
-        const std::string content =
-            chat_content_to_text(msg.contains("content") ? msg["content"] : json());
-        out += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        history.push_back(ChatMessage{
+            msg.value("role", "user"),
+            chat_content_to_text(msg.contains("content") ? msg["content"] : json())});
     }
-    out += "<|im_start|>assistant\n";
-    return out;
+    return tmpl->render(history, /*add_assistant_prompt=*/true);
 }
 
 // OpenAI chat finish_reason enum is narrower than the engine's. Map onto it.
@@ -564,7 +601,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         }
 
         auto inf_req = std::make_shared<qwenium::InferenceRequest>();
-        inf_req->prompt = render_qwen_chat(body["messages"]);
+        inf_req->prompt = render_chat(body["messages"], integration.chat_template());
         inf_req->skip_template = true;  // already fully <|im_start|>-rendered
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
