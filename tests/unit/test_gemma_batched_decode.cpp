@@ -45,6 +45,7 @@
 #include "../../src/core/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/gemma1.h"
+#include "../../src/models/gemma2.h"
 
 // Coarse universal gross-regression ceiling, identical in spirit and value to
 // the feed_tokens harness (kFeedTokensMaxAbsDiff). It is NOT a precision claim:
@@ -311,7 +312,12 @@ static void expect_tier2_bitwise(const DiffResult& r, const char* recipe) {
         expect_tier2_bitwise(run_tier2_multi_slot<FP>(*model_), #SUITE);    \
     }
 
-// Phase 1: Gemma 1 only. Gemma 2/3/4 are added by Phases 2–4 once their
+// Phase 1: Gemma 1. Gemma 3/4 are added by Phases 3–4 once their
 // build_decoding_graph is implemented (today they still throw).
 GEMMA_BATCHED_DECODE_SUITE(Gemma1BatchedDecodeTest, Gemma1ForwardPass,
                            "GEMMA1_MODEL_PATH", "./Gemma_2b_it_v1p1.gguf")
+
+// Phase 2: Gemma 2 — interleaved local/global sliding-window mask + attention
+// and final logit soft-capping + sandwich norm, all in the batched decode graph.
+GEMMA_BATCHED_DECODE_SUITE(Gemma2BatchedDecodeTest, Gemma2ForwardPass,
+                           "GEMMA2_MODEL_PATH", "./models/Gemma_2b_it_v2.gguf")

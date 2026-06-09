@@ -106,7 +106,7 @@ ggml_tensor* ForwardPassBase::build_attn_mha(
     return ::build_attn_mha(ctx_, gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
 }
 
-void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx, bool gemma_final_norm) {
+void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx, bool gemma_final_norm, float final_softcap) {
     // Auto-create the sparse row-selection tensor from host-side ids if the
     // caller didn't supply one. Do NOT clear sparse_decode_ids_ here — it is
     // uploaded later by SparseHeadInput (via set_prefill/decode_inputs) and
@@ -141,6 +141,12 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
         ggml_set_name(weight, "output_weight_k");
     }
     cur = ggml_mul_mat(ctx_, weight, cur);
+    // Gemma 2 final logit soft-capping (cap == 0 → off, byte-identical for all
+    // non-Gemma-2 recipes). Applied before the "logits" name so get_output_logits
+    // reads the capped values, matching the recipe's prefill head.
+    if (final_softcap > 0.0f) {
+        cur = build_softcap(ctx_, cur, final_softcap);
+    }
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
 }

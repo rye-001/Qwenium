@@ -212,7 +212,8 @@ protected:
     //   ::gemma_rms_norm on the per-layer norm — not a forked head.
     void build_output_head(ggml_cgraph* gf, ggml_tensor* cur,
                            ggml_tensor* valid_idx = nullptr,
-                           bool gemma_final_norm = false);
+                           bool gemma_final_norm = false,
+                           float final_softcap = 0.0f);
 
     // Prefill-only token-position slice. Inserts a ggml_get_rows on the hidden
     // state immediately before the LM head so the ~150k-wide head runs only on
