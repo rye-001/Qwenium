@@ -106,7 +106,7 @@ ggml_tensor* ForwardPassBase::build_attn_mha(
     return ::build_attn_mha(ctx_, gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
 }
 
-void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx) {
+void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx, bool gemma_final_norm) {
     // Auto-create the sparse row-selection tensor from host-side ids if the
     // caller didn't supply one. Do NOT clear sparse_decode_ids_ here — it is
     // uploaded later by SparseHeadInput (via set_prefill/decode_inputs) and
@@ -124,7 +124,12 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
         graph_inputs_.add(std::make_unique<SparseHeadInput>());
     }
 
-    cur = build_norm(gf, cur, model_.get_output_norm_weight(), -1);
+    // Gemma's final norm is (x / rms(x)) * (1 + w); every other recipe uses
+    // x * w. Default false keeps Qwen and all non-Gemma recipes byte-identical.
+    cur = gemma_final_norm
+        ? build_rms_norm_gemma(ctx_, cur, model_.get_output_norm_weight(),
+                               meta_.rms_norm_eps, /*il=*/-1)
+        : build_norm(gf, cur, model_.get_output_norm_weight(), -1);
     set_tensor_name(gf, cur, "final_norm");
 
     ggml_tensor* weight = model_.get_output_weight()

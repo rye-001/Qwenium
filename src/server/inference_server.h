@@ -80,6 +80,11 @@ struct InferenceRequest {
     float temperature = 0.0f;  // 0 = greedy
     int start_pos = 0;         // Set by server when system prompt is cached
     std::vector<std::string> stop;  // Optional: generation ends before first match
+    bool skip_template = false;  // true => `prompt` is ALREADY fully templated
+                                 // (e.g. a rendered <|im_start|> chat conversation
+                                 // from /v1/chat/completions); tokenize it raw
+                                 // instead of wrapping it as a single user turn.
+                                 // Default false keeps /v1/completions unchanged.
     std::shared_ptr<TokenQueue> token_queue = std::make_shared<TokenQueue>();
     std::atomic<bool> cancelled{false};
 
@@ -199,6 +204,8 @@ public:
 
     // Wire up callbacks before calling start()
     void set_tokenize(TokenizeFunc fn) { tokenize_ = std::move(fn); }
+    // Raw (no chat template) tokenizer for requests with skip_template=true.
+    void set_raw_tokenize(TokenizeFunc fn) { raw_tokenize_ = std::move(fn); }
     void set_detokenize(DetokenizeFunc fn) { detokenize_ = std::move(fn); }
     void set_prefill(PrefillFunc fn) { prefill_ = std::move(fn); }
     void set_batched_decode(BatchedDecodeFunc fn) { batched_decode_ = std::move(fn); }
@@ -277,8 +284,11 @@ private:
 
         req->started_at = std::chrono::steady_clock::now();
 
-        // Tokenize prompt
-        std::vector<int32_t> tokens = tokenize_(req->prompt);
+        // Tokenize prompt. skip_template requests (chat-completions, already
+        // fully <|im_start|>-rendered) bypass the single-user-turn wrap.
+        std::vector<int32_t> tokens = (req->skip_template && raw_tokenize_)
+            ? raw_tokenize_(req->prompt)
+            : tokenize_(req->prompt);
         req->prompt_tokens = static_cast<int>(tokens.size());
 
         // Fail-loud guard: an oversized prompt would overflow the per-slot KV
@@ -434,6 +444,7 @@ private:
 
     // Callbacks
     TokenizeFunc tokenize_;
+    TokenizeFunc raw_tokenize_;   // no-template variant (skip_template requests)
     DetokenizeFunc detokenize_;
     PrefillFunc prefill_;
     BatchedDecodeFunc batched_decode_;

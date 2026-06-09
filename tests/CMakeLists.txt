@@ -357,6 +357,24 @@ target_link_libraries(feed-tokens-tests-gemma PRIVATE
 target_compile_features(feed-tokens-tests-gemma PRIVATE cxx_std_17)
 gtest_discover_tests(feed-tokens-tests-gemma)
 
+# Gemma batched decode — per-recipe two-tier differential (Tier-1 single-slot
+# bitwise vs single-token run_prefill; Tier-2 multi-slot token-stable) for the
+# new build_decoding_graph. One parameterized harness; Phase 1 wires Gemma 1.
+# docs/plan-gemma-batched-decode.md. Self-skips when the model is absent.
+add_executable(batched-decode-tests-gemma
+    unit/test_gemma_batched_decode.cpp
+)
+
+target_link_libraries(batched-decode-tests-gemma PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(batched-decode-tests-gemma PRIVATE cxx_std_17)
+gtest_discover_tests(batched-decode-tests-gemma)
+
 # Prefill output-ID slice (last-token LM-head elision). No-model fail-loud
 # unit tests run unconditionally; the qwen35 + gemma1 bit-identical /
 # composition differentials self-skip when their model is absent.

@@ -49,11 +49,12 @@ public:
     // recurrent state); still owes its own KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
-    // build_decoding_graph throws; decode_step routes via run_prefill bridge.
-    bool has_decode_graph() const override { return false; }
+    // has_decode_graph() inherits the default (true): build_decoding_graph is
+    // the real batched decode path (docs/plan-gemma-batched-decode.md Phase 1),
+    // so decode_step routes Gemma 1 via DecodeRoute::Unified, not the bridge.
 
     // Inputs are populated via the typed graph_inputs_ set built in
-    // build_prefill_graph (no set_inputs override).
+    // build_prefill_graph / build_decoding_graph (no set_inputs override).
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);
