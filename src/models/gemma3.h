@@ -16,9 +16,8 @@
 // Gemma 3 otherwise inherits from Gemma 2: sandwich norm, GeGLU-tanh FFN,
 // Gemma RMS norm (1+w), tied embeddings, no QKV biases.
 //
-// Scope (PR G3.4): prefill path producing logits — sufficient for the canary
-// logit-agreement gate. Decode is stubbed with a clear error, matching G2's
-// stub boundary.
+// Prefill and batched decode are both implemented; decode is gated Tier-1
+// bitwise against single-token run_prefill (tests/unit/test_gemma_batched_decode.cpp).
 
 #include "forward_pass_base.h"
 #include "i_image_embeddable.h"
@@ -109,11 +108,11 @@ public:
     // KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
-    // build_decoding_graph throws; decode_step routes via run_prefill bridge.
-    bool has_decode_graph() const override { return false; }
+    // has_decode_graph() inherits the default (true): build_decoding_graph is
+    // implemented (Phase 3 of docs/plan-gemma-batched-decode.md).
 
     // Inputs are populated via the typed graph_inputs_ set built in
-    // build_prefill_graph (no set_inputs override).
+    // build_prefill_graph / build_decoding_graph (no set_inputs override).
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);

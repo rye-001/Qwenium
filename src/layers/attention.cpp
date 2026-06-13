@@ -220,7 +220,8 @@ ggml_tensor* build_batched_attention(
     const std::vector<int32_t>&  positions,
     ggml_tensor*                 kq_mask,
     ggml_tensor*                 gather_indices,
-    int                          il)
+    int                          il,
+    float                        softcap)
 {
     const size_t n_batch    = slots.size();
     const int    n_embd_head = k->ne[0];
@@ -278,7 +279,7 @@ ggml_tensor* build_batched_attention(
         0);
 
     // 4. Run MHA
-    return build_attn_mha(ctx, gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
+    return build_attn_mha(ctx, gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il, softcap);
 }
 
 // ── build_gated_attention ─────────────────────────────────────────────────────

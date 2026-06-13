@@ -7,6 +7,7 @@
 #include "../graph_inputs/tokens_input.h"
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/gather_indices_input.h"
 
 #include "ggml.h"
 
@@ -176,19 +177,126 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
 }
 
 ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
-    const std::vector<int32_t>& /*tokens*/,
-    const std::vector<uint32_t>& /*slots*/,
-    const std::vector<int32_t>& /*positions*/)
+    const std::vector<int32_t>& tokens,
+    const std::vector<uint32_t>& slots,
+    const std::vector<int32_t>& positions)
 {
-    // TODO(sparse): when single-token decode lands here, build the LM head
-    // via build_output_head(gf, inpL) — NOT a hand-rolled ggml_mul_mat like
-    // build_prefill_graph does. decode_step arms sparse_decode_ids_ for
-    // grammar-constrained decode; a hand-rolled head ignores them and returns
-    // full-vocab logits, causing sample_sparse size-mismatch / bad-access
-    // (the class of bug fixed in qwen3.cpp / qwen35.cpp).
-    throw std::runtime_error(
-        "Gemma1ForwardPass::build_decoding_graph: batched decode not "
-        "implemented in PR G1.5; expected: prefill-only path, got: batched call");
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    const int n_layers    = meta_.block_count;
+    const int hidden_dim  = meta_.embedding_length;
+    const int n_head      = meta_.attention_head_count;
+    const int n_head_kv   = meta_.attention_head_count_kv;
+    const int n_embd_head = meta_.attention_key_length;
+    const int n_rot       = n_embd_head;
+    const size_t n_tokens = tokens.size();   // total tokens across all slots
+
+    // Gemma 1 RoPE base, with the same >0 guard prefill uses.
+    const float freq_base = (meta_.rope_freq_base > 0) ? meta_.rope_freq_base : 10000.0f;
+
+    // 1. Token embedding lookup followed by sqrt(d_model) scaling (Gemma). The
+    //    embed scale is THE head-of-graph delta from Qwen decode — without it
+    //    the residual stream enters attention sqrt(2048)≈45x too small.
+    ggml_tensor* inpL = embedding(gf, tokens);
+    set_tensor_name(gf, inpL, "inpL");
+    inpL = build_embed_scale(ctx_, inpL, std::sqrt(static_cast<float>(hidden_dim)));
+    set_tensor_name(gf, inpL, "inpL_scaled");
+
+    // Position tensor (one per token across all slots).
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp_pos);
+    set_tensor_name(gf, inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    // Shared decode mask + KV gather indices, sized from the deepest slot.
+    uint32_t max_pos = 0;
+    for (uint32_t s : slots) {
+        uint32_t p = get_cache_pos(s);
+        if (p > max_pos) max_pos = p;
+    }
+    uint32_t n_kv_len = max_pos + 1;
+
+    // Attention mask, shared across layers: [n_kv_len, 1, 1, n_tokens].
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
+    ggml_set_input(kq_mask);
+    ggml_set_name(kq_mask, "kq_mask_b");
+    ggml_build_forward_expand(gf, kq_mask);
+
+    // KV gather indices, shared across layers: [n_tokens * n_kv_len].
+    uint32_t n_total_indices = n_tokens * n_kv_len;
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_set_input(gather_indices);
+    ggml_set_name(gather_indices, "gather_indices");
+
+    // Typed inputs for the decode graph. Gemma 1 is pure causal — all layers
+    // global, one shared mask. build_output_head appends SparseHeadInput on the
+    // sparse path.
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
+    graph_inputs_.add(std::make_unique<GatherIndicesInput>(kv_cache_->get_n_ctx_max()));
+
+    // 2. Transformer stack — hand-rolled batched decode layer (mirrors
+    //    Qwen3ForwardPass::build_decoding_graph). Gemma 1 deltas vs Qwen3:
+    //    no QKV bias, no QK norm, GeGLU FFN instead of SwiGLU. Same batched
+    //    attention kernel (build_batched_attention).
+    ggml_tensor* cur;
+    for (uint32_t il = 0; il < static_cast<uint32_t>(n_layers); ++il) {
+        ggml_tensor* inpSA = inpL;
+        const auto& block = model_.get_block(il);
+
+        // A. Pre-attention norm — standard build_norm: Gemma blk norm weights
+        //    are pre-shifted to (1+w) in the GGUF, matching prefill's
+        //    gemma_rms_norm=false path.
+        cur = build_norm(gf, inpL, block.attn_norm_weight, il);
+
+        // B. Q/K/V projections (no bias — Gemma 1).
+        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
+        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
+        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
+
+        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        // (No QK norm — Gemma 1 has no q_norm/k_norm.)
+
+        // C. RoPE — NEOX, same constants as prefill (transformer_block.cpp):
+        //    freq_scale 1.0, ext_factor 0.0, attn_factor 1.0, beta 32/1.
+        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot,
+                             GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
+                             1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot,
+                             GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
+                             1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        // D. Batched attention (per-slot scatter + gather MHA).
+        float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
+        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur,
+                                      il, kq_scale, slots, positions,
+                                      kq_mask, gather_indices, il);
+
+        // E. Output projection + post-attention residual.
+        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
+        ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
+
+        // F. Pre-FFN norm → GeGLU-tanh FFN (Gemma) → residual.
+        cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
+        cur = build_ffn_geglu_tanh(ctx_, gf, cur, block.ffn_gate_weight,
+                                   block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ggml_add(ctx_, cur, ffn_inp);
+        inpL = cur;
+    }
+
+    // 3. Output head — Gemma final norm (1+w) + tied LM head, routed through
+    //    build_output_head so the sparse decode path (sparse_decode_ids_ →
+    //    ggml_get_rows on the output weight) is honored. gemma_final_norm=true
+    //    matches prefill's build_rms_norm_gemma final norm bit-for-bit.
+    build_output_head(gf, inpL, /*valid_idx=*/nullptr, /*gemma_final_norm=*/true);
+
+    return gf;
 }
 
 

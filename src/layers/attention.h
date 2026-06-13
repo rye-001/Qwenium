@@ -122,7 +122,8 @@ ggml_tensor* build_batched_attention(
     const std::vector<int32_t>&     positions,
     ggml_tensor*                    kq_mask,
     ggml_tensor*                    gather_indices,
-    int                             il);
+    int                             il,
+    float                           softcap = 0.0f);
 
 // ── Gated attention variants (Qwen3.5, Qwen3.6) ─────────────────────────────
 // These models use a joint Q+Gate projection, Q/K RMS norms, partial RoPE, and

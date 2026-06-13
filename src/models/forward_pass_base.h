@@ -202,7 +202,18 @@ protected:
     // ahead of the forward pass and wants to avoid materializing the full vocab matmul.
     // If valid_idx is nullptr and sparse_decode_ids_ is non-empty, the tensor is
     // created automatically from sparse_decode_ids_ (set by set_sparse_decode_ids).
-    void build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx = nullptr);
+    //
+    // gemma_final_norm: false (default) → standard final norm (x * w), which is
+    //   byte-identical for Qwen and every non-Gemma recipe. true → Gemma's
+    //   (x / rms(x)) * (1 + w) form (build_rms_norm_gemma). Gemma stores the
+    //   final-norm weight as a delta-from-unity, so the (1+w) form is required
+    //   for the decode head to match the Gemma recipe's prefill final norm
+    //   bit-for-bit. This is a knob on the head, mirroring TransformerBlockHparams
+    //   ::gemma_rms_norm on the per-layer norm — not a forked head.
+    void build_output_head(ggml_cgraph* gf, ggml_tensor* cur,
+                           ggml_tensor* valid_idx = nullptr,
+                           bool gemma_final_norm = false,
+                           float final_softcap = 0.0f);
 
     // Prefill-only token-position slice. Inserts a ggml_get_rows on the hidden
     // state immediately before the LM head so the ~150k-wide head runs only on

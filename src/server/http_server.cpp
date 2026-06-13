@@ -19,6 +19,7 @@
 #include "core/model.h"
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
+#include "loader/chat_template.h"
 #include "sampling/sampling.h"
 #include "state/kv_cache_simple.h"
 
@@ -26,6 +27,7 @@
 #include <thread>
 #include <csignal>
 #include <atomic>
+#include <ctime>
 
 using json = nlohmann::json;
 
@@ -57,8 +59,13 @@ std::string normalize_output(const std::string& output) {
         pos += 1;
     }
     
-    // Remove end tokens
-    std::vector<std::string> end_tokens = {"<|im_end|>", "<|endoftext|>", "</s>"};
+    // Remove end-of-turn / EOS markers. Qwen (<|im_end|>) and Gemma
+    // (<end_of_turn>, <eos>) markers are both listed — they are mutually
+    // exclusive in practice (a model emits only its own), so the union is
+    // safe cross-family and keeps this free function model-agnostic. (F6)
+    std::vector<std::string> end_tokens = {
+        "<|im_end|>", "<|endoftext|>", "</s>",
+        "<end_of_turn>", "<eos>"};
     for (const auto& token : end_tokens) {
         pos = normalized.find(token);
         if (pos != std::string::npos) {
@@ -77,9 +84,11 @@ class QwenServerIntegration {
     static constexpr int TEMPLATE_SLOT = 0;  // Reserved for system prompt cache
 
 public:
-    QwenServerIntegration(const std::string& model_path, int max_ctx_per_slot = 2048)
-        : max_ctx_per_slot_(max_ctx_per_slot) {
-        
+    QwenServerIntegration(const std::string& model_path, int max_ctx_per_slot = 2048,
+                          int max_slots = MAX_SLOTS)
+        : max_ctx_per_slot_(max_ctx_per_slot),
+          max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)) {
+
         std::cout << "Loading model from: " << model_path << std::endl;
         // Register architectures BEFORE load_metadata: the GGUF loader validates
         // the model's architecture against the registered allow-list, so the
@@ -89,13 +98,32 @@ public:
         model_.load_metadata(model_path);
         model_.load_tensors();
 
-        tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata());
+        // F6: build the tokenizer with the architecture's registered
+        // TokenizerConfig (NOT a config-less default). For Gemma this carries the
+        // SPM normalizer, byte-fallback, BOS, and the <start_of_turn>/<end_of_turn>
+        // specials; without it the server byte-explodes Gemma's control tokens
+        // into garbage. Mirrors core/model.cpp's tokenizer init.
+        const std::string& arch = model_.get_metadata().architecture;
+        tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata(),
+                                                 lookup_tokenizer_config(arch));
         sampler_ = std::make_unique<qwenium::GreedySampler>();
 
-        // Initialize forward pass with MAX_SLOTS slots
+        // F6: render prompts with the architecture's registered ChatTemplate
+        // (Qwen <|im_start|> vs Gemma <start_of_turn> vs Gemma-4's own markers),
+        // not a hardwired Qwen string.
+        chat_template_ = lookup_chat_template(arch);
+        if (!chat_template_)
+            throw std::runtime_error(
+                "QwenServerIntegration: no chat template registered for arch '" +
+                arch + "'");
+        std::cout << "Tokenizer + chat template wired for arch=" << arch << std::endl;
+
+        // Initialize forward pass with max_slots_ slots (KV cache is sized
+        // ctx × slots × F32, so fewer slots frees context headroom — the right
+        // trade for one-request-at-a-time delegation).
         const auto& srv_meta = model_.get_metadata();
         forward_pass_ = create_forward_pass(
-            model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
+            model_, &srv_meta, max_ctx_per_slot_, max_slots_);
         
         scheduler_ = model_.get_scheduler();
         
@@ -106,15 +134,15 @@ public:
     }
 
     void reserve_max_batch() {
-        std::cout << "Reserving memory for max batch size: " << MAX_SLOTS << " and max ctx: " << max_ctx_per_slot_ << std::endl;
-        
+        std::cout << "Reserving memory for max batch size: " << max_slots_ << " and max ctx: " << max_ctx_per_slot_ << std::endl;
+
         // 1. Reserve for max decode batch
         {
-            std::vector<int32_t> tokens(MAX_SLOTS, 0);       // Dummy tokens
-            std::vector<uint32_t> slot_ids(MAX_SLOTS);       // 0..MAX_SLOTS-1
-            std::vector<int32_t> positions(MAX_SLOTS, 0);    // Dummy positions
-            
-            for (int i = 0; i < MAX_SLOTS; ++i) {
+            std::vector<int32_t> tokens(max_slots_, 0);      // Dummy tokens
+            std::vector<uint32_t> slot_ids(max_slots_);      // 0..max_slots_-1
+            std::vector<int32_t> positions(max_slots_, 0);   // Dummy positions
+
+            for (int i = 0; i < max_slots_; ++i) {
                 slot_ids[i] = i;
             }
 
@@ -165,8 +193,8 @@ public:
             return system_prompt_cache_len_;
         }
         
-        // Format and tokenize system prompt
-        std::string formatted = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+        // Format and tokenize system prompt (model-aware, F6).
+        std::string formatted = wrap_system(system_prompt);
         std::vector<int32_t> tokens = tokenizer_->encode(formatted);
         
         if (tokens.empty()) {
@@ -196,10 +224,15 @@ public:
 
     void configure_server(qwenium::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
-            // Apply Qwen chat template for user message only
-            // System prompt handled separately via caching
-            std::string formatted = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-            return tokenizer_->encode(formatted);
+            // Model-aware single user-turn template (F6). System prompt is
+            // handled separately via caching.
+            return tokenizer_->encode(wrap_user_turn(text));
+        });
+
+        server.set_raw_tokenize([this](const std::string& text) {
+            // No chat template: the /v1/chat/completions route has already
+            // rendered the full <|im_start|> conversation. Encode verbatim.
+            return tokenizer_->encode(text);
         });
 
         server.set_detokenize([this](int token_id) {
@@ -255,6 +288,22 @@ public:
     }
 
     int max_ctx_per_slot() const { return max_ctx_per_slot_; }
+    int max_slots() const { return max_slots_; }
+    const ChatTemplate* chat_template() const { return chat_template_; }
+
+    // ── F6: model-aware chat templating via the registered ChatTemplate ──────
+    // A single user turn = a 1-message history with the assistant prompt opened.
+    std::string wrap_user_turn(const std::string& text) const {
+        return chat_template_->render({ChatMessage{"user", text}},
+                                      /*add_assistant_prompt=*/true);
+    }
+    // System prefix = a system turn with NO assistant prompt (the user turn is
+    // appended after, via set_tokenize, on top of the cached prefix). The
+    // ChatTemplate maps the system role per family (e.g. Gemma → user turn).
+    std::string wrap_system(const std::string& text) const {
+        return chat_template_->render({ChatMessage{"system", text}},
+                                      /*add_assistant_prompt=*/false);
+    }
 
 private:
     int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {
@@ -325,12 +374,54 @@ private:
     std::unique_ptr<qwenium::GreedySampler> sampler_;
     ggml_backend_sched_t scheduler_;
     std::mutex model_mutex_;  // Protects all model operations
+    const ChatTemplate* chat_template_ = nullptr;  // F6: arch-registered renderer
     int max_ctx_per_slot_;
+    int max_slots_;
     
     // System prompt caching
     size_t cached_system_hash_ = 0;
     int system_prompt_cache_len_ = 0;
 };
+
+// =============================================================================
+// Chat-completions helpers
+// =============================================================================
+
+// Extract a chat message's text. OpenAI allows `content` to be a string OR an
+// array of content parts ({type:"text", text:"..."}); join the text parts.
+static std::string chat_content_to_text(const json& content) {
+    if (content.is_string()) return content.get<std::string>();
+    if (content.is_array()) {
+        std::string out;
+        for (const auto& part : content) {
+            if (part.is_string()) out += part.get<std::string>();
+            else if (part.is_object() && part.value("type", "") == "text")
+                out += part.value("text", "");
+        }
+        return out;
+    }
+    return "";  // null / absent (e.g. an assistant tool-call message)
+}
+
+// Render an OpenAI messages[] array into the model's chat template (F6) via the
+// architecture's registered ChatTemplate — handles Qwen <|im_start|>, Gemma
+// <start_of_turn>, and Gemma-4's distinct markers, including per-family role
+// mapping (assistant→model, system handling).
+static std::string render_chat(const json& messages, const ChatTemplate* tmpl) {
+    std::vector<ChatMessage> history;
+    history.reserve(messages.size());
+    for (const auto& msg : messages) {
+        history.push_back(ChatMessage{
+            msg.value("role", "user"),
+            chat_content_to_text(msg.contains("content") ? msg["content"] : json())});
+    }
+    return tmpl->render(history, /*add_assistant_prompt=*/true);
+}
+
+// OpenAI chat finish_reason enum is narrower than the engine's. Map onto it.
+static std::string chat_finish_reason(const std::string& engine_reason) {
+    return engine_reason == "length" ? "length" : "stop";
+}
 
 // =============================================================================
 // HTTP Routes
@@ -486,6 +577,171 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         }
     });
 
+    // OpenAI-compatible CHAT completions endpoint. Renders messages[] through
+    // the Qwen <|im_start|> template and reuses the same generation path as
+    // /v1/completions (skip_template=true so it is not re-wrapped). Supports
+    // the OpenAI chat.completion (non-stream) and chat.completion.chunk (SSE)
+    // response shapes so standard chat clients (e.g. Qwen Code) can connect.
+    http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::parse_error& e) {
+            res.status = 400;
+            res.set_content(json({{"error", "Invalid JSON"}}).dump(), "application/json");
+            return;
+        }
+
+        if (!body.contains("messages") || !body["messages"].is_array() ||
+            body["messages"].empty()) {
+            res.status = 400;
+            res.set_content(json({{"error", "Missing or empty 'messages' array"}}).dump(),
+                            "application/json");
+            return;
+        }
+
+        auto inf_req = std::make_shared<qwenium::InferenceRequest>();
+        inf_req->prompt = render_chat(body["messages"], integration.chat_template());
+        inf_req->skip_template = true;  // already fully <|im_start|>-rendered
+        inf_req->max_tokens = body.value("max_tokens", 256);
+        inf_req->temperature = body.value("temperature", 0.0f);
+
+        // Stop sequences: OpenAI allows a single string or an array of strings.
+        if (body.contains("stop")) {
+            const auto& stop = body["stop"];
+            if (stop.is_string()) {
+                inf_req->stop.push_back(stop.get<std::string>());
+            } else if (stop.is_array()) {
+                for (const auto& s : stop) {
+                    if (s.is_string()) inf_req->stop.push_back(s.get<std::string>());
+                }
+            } else {
+                res.status = 400;
+                res.set_content(json({{"error", "'stop' must be a string or array of strings"}}).dump(),
+                                "application/json");
+                return;
+            }
+        }
+
+        const std::string model_name = body.value("model", "qwen-local");
+        const long created = static_cast<long>(std::time(nullptr));
+        const bool stream = body.value("stream", false);
+
+        if (!inference.submit(inf_req)) {
+            res.status = 503;
+            res.set_content(json({{"error", "Server overloaded, queue full"}}).dump(), "application/json");
+            return;
+        }
+
+        if (stream) {
+            res.set_header("Content-Type", "text/event-stream");
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("Connection", "keep-alive");
+            res.set_header("X-Accel-Buffering", "no");
+
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [inf_req, &inference, model_name, created](size_t /*offset*/, httplib::DataSink& sink) {
+                    // First chunk announces the assistant role (OpenAI convention).
+                    json head = {
+                        {"object", "chat.completion.chunk"},
+                        {"created", created},
+                        {"model", model_name},
+                        {"choices", {{
+                            {"index", 0},
+                            {"delta", {{"role", "assistant"}}},
+                            {"finish_reason", nullptr}
+                        }}}
+                    };
+                    std::string s = "data: " + head.dump() + "\n\n";
+                    if (!sink.write(s.c_str(), s.size())) { inf_req->cancelled = true; return false; }
+
+                    while (true) {
+                        int token_id = inf_req->token_queue->pop_blocking();
+                        if (token_id == qwenium::TokenQueue::QUEUE_END) {
+                            std::string payload;
+                            if (!inf_req->error_message.empty()) {
+                                // Fail-loud: surface the named rejection (e.g.
+                                // oversized prompt) in the stream rather than
+                                // ending empty — clients otherwise report
+                                // "stream ended with empty response text".
+                                json err = {{"error", {
+                                    {"message", inf_req->error_message},
+                                    {"type", "invalid_request_error"}
+                                }}};
+                                payload = "data: " + err.dump() + "\n\ndata: [DONE]\n\n";
+                            } else {
+                                json tail = {
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", created},
+                                    {"model", model_name},
+                                    {"choices", {{
+                                        {"index", 0},
+                                        {"delta", json::object()},
+                                        {"finish_reason", chat_finish_reason(inf_req->finish_reason)}
+                                    }}}
+                                };
+                                payload = "data: " + tail.dump() + "\n\ndata: [DONE]\n\n";
+                            }
+                            sink.write(payload.c_str(), payload.size());
+                            sink.done();
+                            return false;
+                        }
+
+                        std::string token_text = inference.decode_token(token_id);
+                        json chunk = {
+                            {"object", "chat.completion.chunk"},
+                            {"created", created},
+                            {"model", model_name},
+                            {"choices", {{
+                                {"index", 0},
+                                {"delta", {{"content", token_text}}},
+                                {"finish_reason", nullptr}
+                            }}}
+                        };
+                        std::string sse = "data: " + chunk.dump() + "\n\n";
+                        if (!sink.write(sse.c_str(), sse.size())) {
+                            inf_req->cancelled = true;
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                [inf_req](bool success) {
+                    if (!success) inf_req->cancelled = true;
+                }
+            );
+        } else {
+            // Block until the inference thread signals completion.
+            while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
+                // tokens are folded into output_text on the inference thread
+            }
+
+            if (!inf_req->error_message.empty()) {
+                res.status = 413;  // Payload Too Large (fail-loud, named reason)
+                res.set_content(json({{"error", inf_req->error_message}}).dump(), "application/json");
+                return;
+            }
+
+            json response = {
+                {"object", "chat.completion"},
+                {"created", created},
+                {"model", model_name},
+                {"choices", {{
+                    {"index", 0},
+                    {"message", {{"role", "assistant"}, {"content", inf_req->output_text}}},
+                    {"finish_reason", chat_finish_reason(inf_req->finish_reason)}
+                }}},
+                {"usage", {
+                    {"prompt_tokens", inf_req->prompt_tokens},
+                    {"completion_tokens", inf_req->completion_tokens},
+                    {"total_tokens", inf_req->prompt_tokens + inf_req->completion_tokens}
+                }}
+            };
+            res.set_content(response.dump(), "application/json");
+        }
+    });
+
     // Models endpoint (for compatibility)
     http.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json response = {
@@ -507,19 +763,33 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     int port = 8080;
     std::string model_path;
-    
+    int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
+                         // prompt guard). Raise for agent clients (e.g. Qwen
+                         // Code) whose system prompt exceeds 2048 tokens.
+    int max_slots = 10;  // concurrent slots. KV cache = ctx × slots × F32, so
+                         // dropping to 1 frees ~10× context headroom — the right
+                         // trade for one-request-at-a-time delegation.
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if ((arg == "--model" || arg == "-m") && i + 1 < argc) {
             model_path = argv[++i];
+        } else if ((arg == "--ctx" || arg == "-c") && i + 1 < argc) {
+            max_ctx = std::stoi(argv[++i]);
+        } else if ((arg == "--slots" || arg == "-s") && i + 1 < argc) {
+            max_slots = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
-                      << "  --port, -p PORT    Port to listen on (default: 8080)\n"
+                      << "  --port,  -p PORT   Port to listen on (default: 8080)\n"
                       << "  --model, -m PATH   Path to model file\n"
-                      << "  --help, -h         Show this help\n";
+                      << "  --ctx,   -c N      Per-slot context ceiling in tokens "
+                         "(default: 2048)\n"
+                      << "  --slots, -s N      Concurrent slots, 1..10 (default: 10). "
+                         "Fewer slots = more context headroom.\n"
+                      << "  --help,  -h        Show this help\n";
             return 0;
         }
     }
@@ -530,11 +800,11 @@ int main(int argc, char* argv[]) {
 
     try {
         // Initialize model integration
-        QwenServerIntegration integration(model_path);
+        QwenServerIntegration integration(model_path, max_ctx, max_slots);
 
         // Create inference server
         qwenium::InferenceServer::Config config;
-        config.max_slots = 10;
+        config.max_slots = integration.max_slots();
         config.max_queue_depth = 100;
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
         config.request_timeout = std::chrono::seconds(120);
