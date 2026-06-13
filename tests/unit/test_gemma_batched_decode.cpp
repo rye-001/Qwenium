@@ -46,6 +46,7 @@
 #include "../../src/models/model_registry.h"
 #include "../../src/models/gemma1.h"
 #include "../../src/models/gemma2.h"
+#include "../../src/models/gemma3.h"
 
 // Coarse universal gross-regression ceiling, identical in spirit and value to
 // the feed_tokens harness (kFeedTokensMaxAbsDiff). It is NOT a precision claim:
@@ -321,3 +322,8 @@ GEMMA_BATCHED_DECODE_SUITE(Gemma1BatchedDecodeTest, Gemma1ForwardPass,
 // and final logit soft-capping + sandwich norm, all in the batched decode graph.
 GEMMA_BATCHED_DECODE_SUITE(Gemma2BatchedDecodeTest, Gemma2ForwardPass,
                            "GEMMA2_MODEL_PATH", "./models/Gemma_2b_it_v2.gguf")
+
+// Phase 3: Gemma 3 — per-layer RoPE base/scale (5:1 local:global), QK-norm,
+// no softcap, all in the batched decode graph.
+GEMMA_BATCHED_DECODE_SUITE(Gemma3BatchedDecodeTest, Gemma3ForwardPass,
+                           "GEMMA3_MODEL_PATH", "./models/gemma-3-1b-it-BF16.gguf")

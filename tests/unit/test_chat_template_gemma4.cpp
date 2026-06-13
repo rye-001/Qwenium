@@ -37,6 +37,21 @@ TEST(Gemma4ChatTemplateRegistry, SingleTurnRendersNativeFormat) {
               "<|channel>thought\n<channel|>");
 }
 
+// 1b. Thinking defaults OFF for Gemma 4 (nullopt → false): the empty
+//     thought-channel marker is emitted, byte-identical to the prior behaviour.
+//     enable_thinking=true omits the marker so the model emits its channel.
+TEST(Gemma4ChatTemplateRegistry, EnableThinkingTrueOmitsThoughtChannel) {
+    register_builtin_models();
+    const ChatTemplate* tmpl = lookup_chat_template("gemma4");
+    ASSERT_NE(tmpl, nullptr);
+
+    const std::string out = tmpl->render({{"user", "hi"}}, true, /*enable_thinking=*/true);
+    EXPECT_EQ(out,
+              "<|turn>user\n"
+              "hi<turn|>\n"
+              "<|turn>model\n");
+}
+
 // 2. Tokenizer config registry lookup unchanged.
 TEST(Gemma4TokenizerConfigRegistry, GemmaFourLookupYieldsGemmaShape) {
     register_builtin_models();

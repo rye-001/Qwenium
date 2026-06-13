@@ -31,6 +31,44 @@ TEST(QwenChatTemplate, TurnEndSuffix) {
     EXPECT_EQ(tmpl.turn_end_suffix(), "<|im_end|>\n");
 }
 
+TEST(QwenChatTemplate, ThinkingOnByDefaultEmitsNoBlock) {
+    QwenChatTemplate tmpl;
+    // No soft-switch, no explicit flag → thinking ON → byte-identical to before.
+    std::string out = tmpl.render({{"user", "hi"}}, true);
+    EXPECT_EQ(out, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+}
+
+TEST(QwenChatTemplate, NoThinkSoftSwitchInjectsEmptyBlockAndStrips) {
+    QwenChatTemplate tmpl;
+    std::string out = tmpl.render({{"user", "translate this /no_think"}}, true);
+    EXPECT_EQ(out,
+        "<|im_start|>user\ntranslate this<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+}
+
+TEST(QwenChatTemplate, ExplicitEnableThinkingFalseInjectsBlock) {
+    QwenChatTemplate tmpl;
+    std::string out = tmpl.render({{"user", "hi"}}, true, /*enable_thinking=*/false);
+    EXPECT_EQ(out,
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+}
+
+TEST(QwenChatTemplate, ExplicitEnableThinkingTrueOverridesSoftSwitch) {
+    QwenChatTemplate tmpl;
+    // Explicit flag wins over the "/no_think" soft-switch, but the token is
+    // still stripped from content (it is a switch marker, not real text).
+    std::string out = tmpl.render({{"user", "hi /no_think"}}, true, /*enable_thinking=*/true);
+    EXPECT_EQ(out, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+}
+
+TEST(QwenChatTemplate, NoBlockWithoutAssistantPrompt) {
+    QwenChatTemplate tmpl;
+    // The empty block belongs to the generation prompt; a bare turn omits it.
+    std::string out = tmpl.render({{"user", "hi /no_think"}}, false);
+    EXPECT_EQ(out, "<|im_start|>user\nhi<|im_end|>\n");
+}
+
 TEST(QwenChatTemplate, MultiTurnDialog) {
     QwenChatTemplate tmpl;
     std::vector<ChatMessage> hist = {

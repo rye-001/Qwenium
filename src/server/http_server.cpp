@@ -407,7 +407,8 @@ static std::string chat_content_to_text(const json& content) {
 // architecture's registered ChatTemplate — handles Qwen <|im_start|>, Gemma
 // <start_of_turn>, and Gemma-4's distinct markers, including per-family role
 // mapping (assistant→model, system handling).
-static std::string render_chat(const json& messages, const ChatTemplate* tmpl) {
+static std::string render_chat(const json& messages, const ChatTemplate* tmpl,
+                               std::optional<bool> enable_thinking) {
     std::vector<ChatMessage> history;
     history.reserve(messages.size());
     for (const auto& msg : messages) {
@@ -415,7 +416,23 @@ static std::string render_chat(const json& messages, const ChatTemplate* tmpl) {
             msg.value("role", "user"),
             chat_content_to_text(msg.contains("content") ? msg["content"] : json())});
     }
-    return tmpl->render(history, /*add_assistant_prompt=*/true);
+    return tmpl->render(history, /*add_assistant_prompt=*/true, enable_thinking);
+}
+
+// Extract an explicit thinking toggle from an OpenAI-style request body.
+// Honors a top-level "enable_thinking" and the vLLM/Qwen
+// "chat_template_kwargs": {"enable_thinking": bool} convention; nullopt means
+// the caller did not specify, so the template's family default applies (and
+// for Qwen, a "/no_think" soft-switch in the messages can still take effect).
+static std::optional<bool> extract_enable_thinking(const json& body) {
+    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
+        return body["enable_thinking"].get<bool>();
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto& kw = body["chat_template_kwargs"];
+        if (kw.contains("enable_thinking") && kw["enable_thinking"].is_boolean())
+            return kw["enable_thinking"].get<bool>();
+    }
+    return std::nullopt;
 }
 
 // OpenAI chat finish_reason enum is narrower than the engine's. Map onto it.
@@ -459,6 +476,8 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             return;
         }
 
+        std::cout << "Received prompt: " << prompt << std::endl;
+
         auto inf_req = std::make_shared<qwenium::InferenceRequest>();
         inf_req->prompt = prompt;
         inf_req->max_tokens = body.value("max_tokens", 256);
@@ -484,6 +503,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         // Handle system prompt caching
         std::string system_prompt = body.value("system_prompt", "");
         if (!system_prompt.empty()) {
+            std::cout << "Received system prompt: " << system_prompt << std::endl;
             inf_req->system_prompt = system_prompt;
             inf_req->start_pos = integration.prepare_system_prompt(system_prompt);
         }
@@ -511,6 +531,9 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                         int token_id = inf_req->token_queue->pop_blocking();
 
                         if (token_id == qwenium::TokenQueue::QUEUE_END) {
+                            std::cout << "=========Qwenium Response===========" << std::endl;
+                            std::cout << inf_req->output_text << std::endl;
+                            std::cout << "=========Qwenium Response End===========" << std::endl;
                             // Send final event
                             std::string done_event = "data: [DONE]\n\n";
                             sink.write(done_event.c_str(), done_event.size());
@@ -559,6 +582,10 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                 res.set_content(json({{"error", inf_req->error_message}}).dump(), "application/json");
                 return;
             }
+            std::cout << "=========Qwenium Response===========" << std::endl;
+            std::cout << inf_req->output_text << std::endl;
+            std::cout << "=========Qwenium Response End===========" << std::endl;
+
 
             json response = {
                 {"object", "text_completion"},
@@ -601,7 +628,9 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         }
 
         auto inf_req = std::make_shared<qwenium::InferenceRequest>();
-        inf_req->prompt = render_chat(body["messages"], integration.chat_template());
+        inf_req->prompt = render_chat(body["messages"], integration.chat_template(),
+                                      extract_enable_thinking(body));
+        std::cout << "Received prompt: " << inf_req->prompt << std::endl;
         inf_req->skip_template = true;  // already fully <|im_start|>-rendered
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
@@ -671,6 +700,11 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                                 }}};
                                 payload = "data: " + err.dump() + "\n\ndata: [DONE]\n\n";
                             } else {
+
+                                std::cout << "=========Qwenium Response===========" << std::endl;
+                                std::cout << inf_req->output_text << std::endl;
+                                std::cout << "=========Qwenium Response End===========" << std::endl;
+
                                 json tail = {
                                     {"object", "chat.completion.chunk"},
                                     {"created", created},
@@ -722,6 +756,9 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                 res.set_content(json({{"error", inf_req->error_message}}).dump(), "application/json");
                 return;
             }
+            std::cout << "=========Qwenium Response===========" << std::endl;
+            std::cout << inf_req->output_text << std::endl;
+            std::cout << "=========Qwenium Response End===========" << std::endl;
 
             json response = {
                 {"object", "chat.completion"},
