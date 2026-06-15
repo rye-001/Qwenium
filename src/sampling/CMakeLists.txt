@@ -3,6 +3,7 @@ add_library(sampling STATIC
     sampling.cpp
     grammar_vocab.cpp
     token-trie.cpp
+    sampling_snapshot.cpp
 )
 
 target_include_directories(sampling PUBLIC
@@ -10,7 +11,10 @@ target_include_directories(sampling PUBLIC
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
+# qinf-session: the snapshot contract + IO. SamplerStateSection / Grammar-
+# StateSection (sampling_snapshot) serialize sampling-owned L1 control state.
 target_link_libraries(sampling PUBLIC
+    qinf-session
 )
 
 # Enable position-independent code for static library

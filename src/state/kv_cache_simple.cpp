@@ -1,7 +1,11 @@
 #include "kv_cache_simple.h"
+#include "snapshot_io.h"
 
+#include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 simple_kv_cache::simple_kv_cache(
         uint32_t n_layers,
@@ -173,6 +177,19 @@ ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uin
 ggml_tensor * simple_kv_cache::cpy_k(ggml_context * ctx_compute, ggml_tensor * k_cur, int32_t il, uint32_t slot_idx) {
     const uint32_t n_tokens = k_cur->ne[2];
 
+    if (slot_idx >= n_batch_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::cpy_k: slot_idx (" + std::to_string(slot_idx) +
+            ") exceeds n_batch_max (" + std::to_string(n_batch_max) + ")");
+    }
+    if (positions[slot_idx] + n_tokens > n_ctx_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::cpy_k: KV cache context overflow on slot " + std::to_string(slot_idx) +
+            ": current pos=" + std::to_string(positions[slot_idx]) +
+            ", adding " + std::to_string(n_tokens) + " tokens exceeds n_ctx_max=" +
+            std::to_string(n_ctx_max));
+    }
+
     // Create view at current position: [n_embd_k, n_tokens]
     ggml_tensor * k_dst = ggml_view_2d(ctx_compute, k_cache[il],
         n_embd_k, n_tokens,
@@ -184,6 +201,19 @@ ggml_tensor * simple_kv_cache::cpy_k(ggml_context * ctx_compute, ggml_tensor * k
 
 ggml_tensor * simple_kv_cache::cpy_v(ggml_context * ctx_compute, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx) {
     const uint32_t n_tokens = v_cur->ne[2];
+
+    if (slot_idx >= n_batch_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::cpy_v: slot_idx (" + std::to_string(slot_idx) +
+            ") exceeds n_batch_max (" + std::to_string(n_batch_max) + ")");
+    }
+    if (positions[slot_idx] + n_tokens > n_ctx_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::cpy_v: KV cache context overflow on slot " + std::to_string(slot_idx) +
+            ": current pos=" + std::to_string(positions[slot_idx]) +
+            ", adding " + std::to_string(n_tokens) + " tokens exceeds n_ctx_max=" +
+            std::to_string(n_ctx_max));
+    }
 
     // Create view at current position: [n_embd_v, n_tokens]
     ggml_tensor * v_dst = ggml_view_2d(ctx_compute, v_cache[il],
@@ -245,6 +275,103 @@ void simple_kv_cache::clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t 
     
     ggml_free(scratch_ctx);
     positions[dst_slot] = n_tokens;
+}
+
+// --- L2 session snapshot (AppendKV lane) -----------------------------------
+
+uint64_t simple_kv_cache::path_tag() const {
+    const char* buft = buf
+        ? ggml_backend_buft_name(ggml_backend_buffer_get_type(buf.get()))
+        : "none";
+    const std::string s = std::string(buft) + "|tk" +
+        std::to_string(static_cast<int>(type_k)) + "|tv" +
+        std::to_string(static_cast<int>(type_v)) + "|ctx" +
+        std::to_string(n_ctx_max);
+    return static_cast<uint64_t>(std::hash<std::string>{}(s));
+}
+
+void simple_kv_cache::serialize_slot(qinf::session::SnapshotWriter& w,
+                                     uint32_t slot) const {
+    if (slot >= n_batch_max) {
+        throw std::runtime_error(
+            "kv_cache: serialize slot expected < " + std::to_string(n_batch_max) +
+            ", got " + std::to_string(slot));
+    }
+    const uint32_t N = positions[slot];
+
+    w.put_u32(n_layers);
+    w.put_u32(n_embd_k);
+    w.put_u32(n_embd_v);
+    w.put_u32(static_cast<uint32_t>(type_k));
+    w.put_u32(static_cast<uint32_t>(type_v));
+    w.put_u32(n_ctx_max);
+    w.put_u32(N);
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        if (is_reference_layer(il)) continue;  // aliased; source carries the data
+        ggml_tensor* k = k_cache[il];
+        ggml_tensor* v = v_cache[il];
+        const size_t k_bytes = static_cast<size_t>(N) * k->nb[1];
+        const size_t v_bytes = static_cast<size_t>(N) * v->nb[1];
+        std::vector<uint8_t> kbuf(k_bytes), vbuf(v_bytes);
+        ggml_backend_tensor_get(k, kbuf.data(),
+                                static_cast<size_t>(slot) * k->nb[2], k_bytes);
+        ggml_backend_tensor_get(v, vbuf.data(),
+                                static_cast<size_t>(slot) * v->nb[2], v_bytes);
+        w.put_bytes(kbuf.data(), k_bytes);
+        w.put_bytes(vbuf.data(), v_bytes);
+    }
+}
+
+void simple_kv_cache::deserialize_slot(qinf::session::SnapshotReader& r,
+                                       uint32_t slot) {
+    if (slot >= n_batch_max) {
+        throw std::runtime_error(
+            "kv_cache: restore slot expected < " + std::to_string(n_batch_max) +
+            ", got " + std::to_string(slot));
+    }
+    auto require = [](const char* field, uint64_t expected, uint64_t actual) {
+        if (expected != actual) {
+            throw std::runtime_error(
+                std::string("kv_cache: field \"") + field + "\" expected " +
+                std::to_string(expected) + ", got " + std::to_string(actual));
+        }
+    };
+    require("n_layers", n_layers, r.get_u32());
+    require("n_embd_k", n_embd_k, r.get_u32());
+    require("n_embd_v", n_embd_v, r.get_u32());
+    require("type_k", static_cast<uint32_t>(type_k), r.get_u32());
+    require("type_v", static_cast<uint32_t>(type_v), r.get_u32());
+    r.get_u32();  // producer n_ctx_max — not required to match, only N must fit
+    const uint32_t N = r.get_u32();
+    if (N > n_ctx_max) {
+        throw std::runtime_error(
+            "kv_cache: restore span length expected <= n_ctx_max " +
+            std::to_string(n_ctx_max) + ", got " + std::to_string(N));
+    }
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        if (is_reference_layer(il)) continue;
+        ggml_tensor* k = k_cache[il];
+        ggml_tensor* v = v_cache[il];
+        const size_t k_bytes = static_cast<size_t>(N) * k->nb[1];
+        const size_t v_bytes = static_cast<size_t>(N) * v->nb[1];
+        std::vector<uint8_t> kbuf, vbuf;
+        r.get_bytes(kbuf);
+        r.get_bytes(vbuf);
+        if (kbuf.size() != k_bytes || vbuf.size() != v_bytes) {
+            throw std::runtime_error(
+                "kv_cache: layer " + std::to_string(il) +
+                " block size expected k=" + std::to_string(k_bytes) + " v=" +
+                std::to_string(v_bytes) + ", got k=" + std::to_string(kbuf.size()) +
+                " v=" + std::to_string(vbuf.size()));
+        }
+        ggml_backend_tensor_set(k, kbuf.data(),
+                                static_cast<size_t>(slot) * k->nb[2], k_bytes);
+        ggml_backend_tensor_set(v, vbuf.data(),
+                                static_cast<size_t>(slot) * v->nb[2], v_bytes);
+    }
+    positions[slot] = N;
 }
 
 ggml_tensor* simple_kv_cache::gather_k(ggml_context* ctx_compute, ggml_cgraph* gf, int32_t il, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv) {

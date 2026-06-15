@@ -92,6 +92,9 @@ include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
 add_subdirectory(src/core)
+# Session snapshot seams: dependency-free; declared before its consumers
+# (sampling, state) so their target_link_libraries reference resolves cleanly.
+add_subdirectory(src/session)
 add_subdirectory(src/sampling)
 
 # Main CLI executable

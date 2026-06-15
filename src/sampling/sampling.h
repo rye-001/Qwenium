@@ -11,11 +11,27 @@
 #include <vector>
 #include <string>
 
+namespace qinf::session {
+class SnapshotWriter;
+class SnapshotReader;
+}  // namespace qinf::session
+
 namespace qwenium {
 
 class Sampler {
 public:
     virtual ~Sampler() = default;
+
+    // --- L1 session snapshot: stochastic (RNG) state ---
+    // A sampler's only non-derivable control state is its PRNG. Greedy sampling
+    // is deterministic, so the base is a no-op; TemperatureSampler overrides to
+    // serialize its std::mt19937 engine state exactly (bitwise-restorable).
+    // last_tokens is NOT sampler state — it is a window over the caller's token
+    // vector (see TokenSequenceSection), passed into sample() per call.
+    // Co-located section: src/sampling/sampling_snapshot.{h,cpp}.
+    virtual bool has_rng_state() const { return false; }
+    virtual void write_rng_state(qinf::session::SnapshotWriter&) const {}
+    virtual void read_rng_state(qinf::session::SnapshotReader&) {}
 
     // Sample a token ID from full-vocab logits.
     // last_tokens: recent token history for repetition penalty.
@@ -138,6 +154,16 @@ public:
     int32_t sample_sparse(std::vector<float>& sparse_logits,
                           const std::vector<int32_t>& valid_ids,
                           const std::vector<int32_t>& last_tokens) override;
+
+    // Deterministic reproducibility: reseed the engine to a caller-chosen value
+    // (e.g. an OpenAI `seed`). Omit to keep the random_device seeding the ctor
+    // applies (non-deterministic — the default).
+    void seed(uint32_t value) { gen_.seed(value); }
+
+    // L1 snapshot: serialize/restore the mt19937 engine state exactly.
+    bool has_rng_state() const override { return true; }
+    void write_rng_state(qinf::session::SnapshotWriter&) const override;
+    void read_rng_state(qinf::session::SnapshotReader&) override;
 
 private:
     void apply_repetition_penalty(std::vector<float>& logits,

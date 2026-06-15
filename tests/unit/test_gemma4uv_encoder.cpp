@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -29,12 +30,16 @@
 #include "../../src/vision/gemma4uv_encoder.h"
 #include "../../src/vision/vision_loader.h"
 #include "../../src/vision/vision_model.h"
+#include "../../src/core/persistent_image_embedding_store.h"
+#include "../../src/graph_inputs/image_embedding_section.h"
+#include "../../src/session/compat_header.h"
 
 using qinf::vision::Bitmap;
 using qinf::vision::Gemma4UvEncoder;
 using qinf::vision::VisionLoader;
 using qinf::vision::VisionModel;
 using qinf::vision::VisionProjectorType;
+using qinf::session::CompatHeader;
 
 namespace {
 
@@ -161,6 +166,83 @@ TEST(Gemma4UvEncoder, NonSquareTokenCountMatchesEncode) {
     std::vector<float> emb = encoder.encode(bmp);
     EXPECT_EQ(emb.size() / model.config().projection_dim, expect);
 
+    ggml_backend_free(backend);
+}
+
+// ── Vision V1: embedding cache is a valid ViT-skip substitute ────────────────
+// The gemma4uv counterpart of SiglipEncoder.V1EmbeddingCacheIsByteExactVitSkip
+// Substitute, closing the plan's open question for the SECOND encoder family
+// (docs/plan-session-snapshot.md, "Encode batch-shape invariance"). gemma4uv's
+// token count is VARIABLE across images (causal, raw pre-LM form) — but for ONE
+// fixed image the batch shape is fixed, so a fixed backend should still encode
+// byte-for-byte run-to-run, making the cached raw embedding a BYTE (not merely
+// token-stable) ViT-skip substitute. This test is the falsifier for that claim:
+// (1) two encodes of the same bitmap are byte-identical, (2) the persist
+// round-trip is byte (pure memcpy), (3) a fresh store HITS byte-identical to the
+// original encode.
+TEST(Gemma4UvEncoder, V1EmbeddingCacheIsByteExactVitSkipSubstitute) {
+    SKIP_IF_NO_MMPROJ();
+
+    VisionModel model;
+    VisionLoader loader;
+    loader.parse_metadata(mmproj_path(), model);
+    ggml_backend_t backend = make_test_backend();
+    ASSERT_NE(backend, nullptr);
+    loader.load_tensors(model, backend);
+
+    const auto& cfg = model.config();
+    Gemma4UvEncoder encoder(model, backend, cfg.projection_dim);
+
+    Bitmap bmp = make_gray_bitmap(480, 480);   // fixed dims → 10·10 = 100 tokens
+    bmp.content_id = 0xC0FFEEULL;               // producer-set key (encoder is content-blind)
+    const uint32_t n_tokens = encoder.mm_tokens_for(bmp);
+    ASSERT_EQ(n_tokens, 100u);
+
+    std::vector<float> e1 = encoder.encode(bmp);
+    std::vector<float> e2 = encoder.encode(bmp);
+    ASSERT_EQ(e1.size(), e2.size());
+    ASSERT_EQ(e1.size(), static_cast<size_t>(n_tokens) * cfg.projection_dim);
+
+    // (1) Encode determinism — the byte-vs-token-stable hinge. Fixed image ⇒
+    // fixed batch shape ⇒ a fixed backend should reproduce bit-for-bit.
+    const bool encode_byte =
+        std::memcmp(e1.data(), e2.data(), e1.size() * sizeof(float)) == 0;
+    std::fprintf(stderr, "[v1] backend=%s gemma4uv encode determinism: %s (%zu floats)\n",
+                 ggml_backend_name(backend),
+                 encode_byte ? "BYTE-identical" : "DIFFERS", e1.size());
+    EXPECT_TRUE(encode_byte)
+        << "gemma4uv encode is not run-to-run byte-deterministic on this backend "
+           "— V1 cache is only a token-stable substitute for this family, not byte.";
+
+    // (2) Persist + (3) a second loader HITS without re-encoding, byte-identical
+    // to the fresh encode. n_tokens is per-image here (no fixed constant).
+    const std::string dir = std::string(testing::TempDir()) + "/v1_gemma4uv_store";
+    CompatHeader h = make_vision_header("gemma4uv", cfg.projection_dim,
+                                        ggml_backend_name(backend));
+
+    int encode_calls = 0;
+    auto make = [&]() {
+        ++encode_calls;
+        qinf::vision::ImageEmbedding e;
+        e.content_id = bmp.content_id;
+        e.n_embd = cfg.projection_dim;
+        e.n_tokens = n_tokens;
+        e.data = encoder.encode(bmp);
+        return e;
+    };
+    qinf::vision::ImageEmbedding first =
+        PersistentImageEmbeddingStore(dir, h).get_or_encode(bmp.content_id, make);
+    EXPECT_EQ(encode_calls, 1) << "first lookup should miss and encode once";
+
+    qinf::vision::ImageEmbedding hit;
+    ASSERT_TRUE(PersistentImageEmbeddingStore(dir, h).try_load(bmp.content_id, hit))
+        << "second lookup (fresh store, same identity) should hit disk";
+    ASSERT_EQ(hit.data.size(), e1.size());
+    EXPECT_EQ(std::memcmp(hit.data.data(), e1.data(), e1.size() * sizeof(float)), 0)
+        << "reloaded gemma4uv embedding differs from a fresh encode — ViT-skip invalid";
+
+    std::remove(
+        (dir + "/img-" + std::to_string(bmp.content_id) + ".embd").c_str());
     ggml_backend_free(backend);
 }
 

@@ -122,11 +122,21 @@ std::string Gemma4ChatTemplate::render(const std::vector<ChatMessage>& history,
 
     std::ostringstream out;
     for (const auto& m : history) {
-        out << "<|turn>" << gemma4_role_for(m.role) << "\n"
-            << m.content << "<turn|>\n";
+        out << "<|turn>" << gemma4_role_for(m.role) << "\n";
+        // Thinking branch: the official template carries the thinking switch as
+        // a <|think|> marker inside the system turn (HF add_generation_prompt).
+        // The model needs this present to enter thinking mode; a forced empty
+        // <|channel>thought\n<channel|> generation prompt WITHOUT it degenerates
+        // on image input (docs/server-image-multirequest-bug.md §5).
+        if (think && m.role == "system")
+            out << "<|think|>\n";
+        out << m.content << "<turn|>\n";
     }
     if (add_assistant_prompt) {
         out << "<|turn>model\n";
+        // No-think branch: force an empty thought channel so the IT model skips
+        // its reasoning and answers directly (the order-management default).
+        // Think branch ends at "model\n" and lets the model open the channel.
         if (!think)
             out << "<|channel>thought\n<channel|>";
     }

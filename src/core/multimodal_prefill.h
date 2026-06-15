@@ -25,6 +25,7 @@
 
 class ForwardPassBase;
 class ImageEmbeddingCache;
+class PersistentImageEmbeddingStore;
 
 namespace qinf::vision {
 class IVisionEncoder;
@@ -57,6 +58,13 @@ struct ImagePromptChunk {
 // turns reuses the encode instead of recomputing it (and the C4 image cap is
 // enforced there). When null, the image is encoded directly every call.
 //
+// `embed_store` (vision V1, docs/plan-session-snapshot.md): when non-null, a
+// per-session cache miss consults this disk-backed store BEFORE encoding, so an
+// image encoded on a previous run/process is loaded instead of re-running the
+// ViT pass (and the fresh encode is persisted on a store miss). Layering:
+// in-memory `cache` -> `embed_store` (disk) -> encoder. Opportunistic — a
+// version/identity mismatch is a miss, never an error.
+//
 // Fail-loud (CLAUDE.md): names the parameter, expected, actual. Span/size
 // validation of the encoded embeddings is delegated to the recipe's
 // substitution site (it owns the residual stream and the placeholder span).
@@ -68,4 +76,5 @@ std::vector<float> prefill_multimodal(
     const std::vector<ImagePromptChunk>& images,
     int                                  pos,
     uint32_t                             slot,
-    ImageEmbeddingCache*                 cache = nullptr);
+    ImageEmbeddingCache*                 cache = nullptr,
+    const PersistentImageEmbeddingStore* embed_store = nullptr);

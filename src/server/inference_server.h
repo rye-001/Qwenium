@@ -10,6 +10,8 @@
 #include <chrono>
 #include <string>
 #include <functional>
+#include <cstdint>
+#include <stdexcept>
 
 namespace qwenium {
 
@@ -74,17 +76,49 @@ private:
 // InferenceRequest: Submitted by HTTP handlers
 // =============================================================================
 struct InferenceRequest {
-    std::string system_prompt;  // Optional: enables prefix caching if provided
     std::string prompt;
     int max_tokens = 256;
+    // Sampling controls (per request → built into a per-slot sampler at assign
+    // time). temperature 0 => greedy (deterministic argmax, byte-identical to the
+    // pre-sampling server). temperature > 0 => TemperatureSampler with top_k/top_p
+    // nucleus sampling; `seed` >= 0 makes that draw stream reproducible (OpenAI
+    // `seed`), < 0 leaves it random_device-seeded.
     float temperature = 0.0f;  // 0 = greedy
-    int start_pos = 0;         // Set by server when system prompt is cached
+    float top_p = 0.95f;       // nucleus cutoff (temperature path only)
+    int   top_k = 40;          // top-k cutoff (temperature path only)
+    long long seed = -1;       // >=0 => reproducible; <0 => non-deterministic
+    // Optional GBNF grammar for constrained (structured) output. Empty => no
+    // constraint. When set (text requests only), the slot's sampler masks logits
+    // to grammar-valid tokens each step and generation ends when the grammar
+    // reaches an accepting state. A parse failure is a fail-loud request error.
+    std::string grammar;
     std::vector<std::string> stop;  // Optional: generation ends before first match
     bool skip_template = false;  // true => `prompt` is ALREADY fully templated
                                  // (e.g. a rendered <|im_start|> chat conversation
                                  // from /v1/chat/completions); tokenize it raw
                                  // instead of wrapping it as a single user turn.
                                  // Default false keeps /v1/completions unchanged.
+
+    // Decoded image payloads (raw PNG/JPEG/… bytes). Empty for every text-only request, so
+    // the text path is byte-identical. When non-empty, `prompt` has already had
+    // the projector's image marker rendered into the turn, and the server routes
+    // this request through the multimodal prefill callback (which tokenizes,
+    // expands the marker into the soft-token span, encodes the image, splices the
+    // soft tokens, and prefills). Only /v1/chat/completions populates this;
+    // /v1/completions never does.
+    std::vector<std::vector<uint8_t>> image_bytes;
+
+    // Optional content-keyed prefix-cache hint (text path, server §1 decision A
+    // follow-on). When non-empty, this is the ALREADY-TEMPLATED leading prefix
+    // of `prompt` (the system-turn block) whose KV is a recurring, cacheable
+    // unit — the route fills it from the system message so a recurring system
+    // prompt skips its prefill on a cache HIT. Empty => no prefix caching (the
+    // request prefills its whole prompt fresh, unchanged). Only consulted when
+    // the server has a text prefix cache wired AND this is a text request
+    // (image requests use the multimodal path instead). Transparent: a HIT is
+    // byte-identical to a full re-prefill, version-gated fail-loud.
+    std::string cacheable_prefix_text;
+
     std::shared_ptr<TokenQueue> token_queue = std::make_shared<TokenQueue>();
     std::atomic<bool> cancelled{false};
 
@@ -181,7 +215,6 @@ public:
     struct Config {
         int max_slots = 10;
         int max_queue_depth = 100;  // 0 = unlimited
-        int system_prompt_len = 0;  // If using prefix caching
         int max_context = 0;        // Per-slot prompt-token ceiling; 0 = no limit (fail-loud guard)
         std::chrono::seconds request_timeout{60};
     };
@@ -190,11 +223,47 @@ public:
     using TokenizeFunc = std::function<std::vector<int32_t>(const std::string&)>;
     using DetokenizeFunc = std::function<std::string(int)>;
     using PrefillFunc = std::function<int(int slot_id, const std::vector<int32_t>& tokens, int start_pos)>;
+    // Multimodal prefill: the image variant of PrefillFunc. The integration owns
+    // the whole image-prefill flow — it tokenizes req.prompt (already image-marker
+    // rendered), expands the marker into the soft-token span, encodes req.image_bytes
+    // through the vision encoder, splices the soft tokens into the residual stream,
+    // and prefills slot_id at start_pos. Returns the sampled first token and writes
+    // the FULL expanded token stream (incl. the soft-token placeholders) back via
+    // `out_tokens`, so the slot's context length / prompt_tokens / KV positions are
+    // correct. Fail-loud: throws (named param) on a malformed image, a missing
+    // capability, or an over-ceiling prompt; the server catches and surfaces it as
+    // a named request error. Optional — when unset, image requests are rejected.
+    using MultimodalPrefillFunc = std::function<int(
+        int slot_id, const InferenceRequest& req, int start_pos,
+        std::vector<int32_t>& out_tokens)>;
+    // Cached text prefill: the prefix-cache variant of PrefillFunc (same shape
+    // as MultimodalPrefillFunc — request-aware, writes the full token stream
+    // back). The integration tokenizes req.prompt, splits off the cacheable
+    // system-prefix (req.cacheable_prefix_text), restores/stores its KV via the
+    // prefix library, and prefills only the variable suffix. Optional — used
+    // only for a text request whose cacheable_prefix_text is non-empty when a
+    // text prefix cache is wired; otherwise the plain PrefillFunc runs.
+    using CachedTextPrefillFunc = MultimodalPrefillFunc;
+    // Configure the per-slot control state (sampler, and later grammar) for a
+    // freshly assigned request, BEFORE its prefill samples the first token. The
+    // integration owns the slot→sampler mapping; the engine just signals "slot
+    // slot_id now serves this request." Optional — unset leaves whatever default
+    // the integration set up.
+    using PrepareSlotFunc = std::function<void(int slot_id, const InferenceRequest& req)>;
+    // True iff slot slot_id has reached its own self-contained completion (today:
+    // a constrained-output grammar in an accepting state). Checked after each
+    // delivered token, alongside the stop-token / stop-string / max_tokens
+    // checks. Generic: the engine does not know WHY the slot is done. Optional —
+    // unset means only the token/string/length checks apply.
+    using SlotCompleteFunc = std::function<bool(int slot_id)>;
     using BatchedDecodeFunc = std::function<std::vector<int>(const std::vector<int32_t>& tokens,
                                                               const std::vector<int>& slot_ids)>;
     using ClearSlotFunc = std::function<void(int slot_id)>;
-    using CloneSlotFunc = std::function<void(int from_slot, int to_slot)>;
-    using GetEosTokenFunc = std::function<int()>;
+    // True iff `token` ends generation. The model has a SET of stop tokens
+    // (primary EOS plus family end-of-turn markers, e.g. Gemma 4 IT's <turn|>),
+    // not one — checking only the primary EOS lets a model emit its turn-ender,
+    // have it ignored, and run past the turn boundary to the max_tokens cap.
+    using IsStopTokenFunc = std::function<bool(int)>;
 
     InferenceServer(const Config& config) : config_(config), slots_(config.max_slots) {
         for (int i = 0; i < config.max_slots; ++i) {
@@ -208,10 +277,19 @@ public:
     void set_raw_tokenize(TokenizeFunc fn) { raw_tokenize_ = std::move(fn); }
     void set_detokenize(DetokenizeFunc fn) { detokenize_ = std::move(fn); }
     void set_prefill(PrefillFunc fn) { prefill_ = std::move(fn); }
+    // Optional: per-slot sampler/grammar setup, invoked once per request at
+    // assignment (before prefill). Leave unset for a fixed default sampler.
+    void set_prepare_slot(PrepareSlotFunc fn) { prepare_slot_ = std::move(fn); }
+    // Optional: per-slot self-completion check (e.g. grammar accepting state).
+    void set_slot_complete(SlotCompleteFunc fn) { slot_complete_ = std::move(fn); }
+    // Optional: enables image input. Leave unset for a text-only server.
+    void set_multimodal_prefill(MultimodalPrefillFunc fn) { multimodal_prefill_ = std::move(fn); }
+    // Optional: enables content-keyed text prefix caching. Leave unset to always
+    // prefill text prompts whole (the stateless default).
+    void set_cached_text_prefill(CachedTextPrefillFunc fn) { cached_text_prefill_ = std::move(fn); }
     void set_batched_decode(BatchedDecodeFunc fn) { batched_decode_ = std::move(fn); }
     void set_clear_slot(ClearSlotFunc fn) { clear_slot_ = std::move(fn); }
-    void set_clone_slot(CloneSlotFunc fn) { clone_slot_ = std::move(fn); }
-    void set_get_eos_token(GetEosTokenFunc fn) { get_eos_token_ = std::move(fn); }
+    void set_is_stop_token(IsStopTokenFunc fn) { is_stop_token_ = std::move(fn); }
 
     // Submit a request (called from HTTP thread)
     bool submit(std::shared_ptr<InferenceRequest> req) {
@@ -284,34 +362,94 @@ private:
 
         req->started_at = std::chrono::steady_clock::now();
 
-        // Tokenize prompt. skip_template requests (chat-completions, already
-        // fully <|im_start|>-rendered) bypass the single-user-turn wrap.
-        std::vector<int32_t> tokens = (req->skip_template && raw_tokenize_)
-            ? raw_tokenize_(req->prompt)
-            : tokenize_(req->prompt);
-        req->prompt_tokens = static_cast<int>(tokens.size());
-
-        // Fail-loud guard: an oversized prompt would overflow the per-slot KV
-        // cache (a downstream GGML_ASSERT abort). Reject it here with a named
-        // error naming the slot, the expected ceiling, and the actual count.
-        if (config_.max_context > 0 && req->prompt_tokens > config_.max_context) {
-            req->error_message =
-                "slot " + std::to_string(slot_id) +
-                ": prompt too large; expected: <= " + std::to_string(config_.max_context) +
-                " tokens, actual: " + std::to_string(req->prompt_tokens);
-            req->finish_reason = "error";
-            req->token_queue->finish();  // slot not consumed
-            return;
+        // Configure this slot's sampler + grammar from the request BEFORE prefill
+        // samples the first token, so the whole generation — first token included
+        // — honors the request's temperature/top_p/seed and grammar. Fail-loud: a
+        // bad GBNF grammar ends the request with a named error and no slot used.
+        if (prepare_slot_) {
+            try {
+                prepare_slot_(slot_id, *req);
+            } catch (const std::exception& e) {
+                req->error_message = e.what();
+                req->finish_reason = "error";
+                req->token_queue->finish();  // slot not consumed
+                return;
+            }
         }
 
-        // Clone system prompt cache if using prefix caching
-        int start_pos = req->start_pos;
-        if (clone_slot_ && start_pos > 0) {
-            clone_slot_(0, slot_id);
-        }
+        std::vector<int32_t> tokens;
+        int first_token = 0;
 
-        // Run prefill and get first token
-        int first_token = prefill_(slot_id, tokens, start_pos);
+        if (!req->image_bytes.empty()) {
+            // ── Image request: the integration owns the whole image-prefill flow
+            // (tokenize → expand marker → encode → splice → prefill). It writes the
+            // expanded token stream (with the soft-token span) back into `tokens`,
+            // so slot bookkeeping below is unchanged. Decode after this is identical
+            // text decode over the spliced KV cache.
+            if (!multimodal_prefill_) {
+                req->error_message =
+                    "slot " + std::to_string(slot_id) +
+                    ": parameter 'image': expected a vision-capable server "
+                    "(started with --mmproj), actual: no multimodal prefill "
+                    "configured (text-only server)";
+                req->finish_reason = "error";
+                req->token_queue->finish();  // slot not consumed
+                return;
+            }
+            try {
+                first_token = multimodal_prefill_(slot_id, *req, /*start_pos=*/0, tokens);
+            } catch (const std::exception& e) {
+                // Fail-loud: malformed image, capability mismatch, or over-ceiling
+                // prompt. The callback guards before touching the slot KV, so the
+                // slot is not consumed.
+                req->error_message = e.what();
+                req->finish_reason = "error";
+                req->token_queue->finish();
+                return;
+            }
+            req->prompt_tokens = static_cast<int>(tokens.size());
+        } else if (cached_text_prefill_ && !req->cacheable_prefix_text.empty()) {
+            // ── Text prefix-cache request: the integration owns the whole flow
+            // (tokenize → split off the cacheable system-prefix → restore/store
+            // its KV → prefill only the variable suffix). Like the image branch,
+            // it does its own tokenize + oversize guard and writes the full token
+            // stream back into `tokens`. Decode after this is identical. The
+            // result is byte-identical to the plain prefill below (transparent);
+            // a foreign/stale cached blob is refused fail-loud, never re-used.
+            try {
+                first_token = cached_text_prefill_(slot_id, *req, /*start_pos=*/0, tokens);
+            } catch (const std::exception& e) {
+                req->error_message = e.what();
+                req->finish_reason = "error";
+                req->token_queue->finish();  // slot not consumed
+                return;
+            }
+            req->prompt_tokens = static_cast<int>(tokens.size());
+        } else {
+            // Tokenize prompt. skip_template requests (chat-completions, already
+            // fully <|im_start|>-rendered) bypass the single-user-turn wrap.
+            tokens = (req->skip_template && raw_tokenize_)
+                ? raw_tokenize_(req->prompt)
+                : tokenize_(req->prompt);
+            req->prompt_tokens = static_cast<int>(tokens.size());
+
+            // Fail-loud guard: an oversized prompt would overflow the per-slot KV
+            // cache (a downstream GGML_ASSERT abort). Reject it here with a named
+            // error naming the slot, the expected ceiling, and the actual count.
+            if (config_.max_context > 0 && req->prompt_tokens > config_.max_context) {
+                req->error_message =
+                    "slot " + std::to_string(slot_id) +
+                    ": prompt too large; expected: <= " + std::to_string(config_.max_context) +
+                    " tokens, actual: " + std::to_string(req->prompt_tokens);
+                req->finish_reason = "error";
+                req->token_queue->finish();  // slot not consumed
+                return;
+            }
+
+            // Stateless: every request prefills its full prompt fresh at
+            // position 0 (no system-prompt prefix cache).
+            first_token = prefill_(slot_id, tokens, /*start_pos=*/0);
+        }
 
         // Setup slot state
         auto& slot = slots_[slot_id];
@@ -346,7 +484,7 @@ private:
         req.token_queue->push(token);
         stats_.tokens_generated++;
 
-        if (token == get_eos_token_()) {
+        if (is_stop_token_(token)) {
             req.finish_reason = "stop";
             return true;
         }
@@ -365,6 +503,16 @@ private:
                 req.finish_reason = "stop";
                 return true;
             }
+        }
+
+        // Grammar completion (item 4): the slot's grammar has reached an
+        // accepting state after this token — the constrained output is complete,
+        // so stop (mirrors the CLI's is_accepting_state() break). The grammar
+        // was already advanced by accept_token in the prefill/decode callback,
+        // so this reflects post-token state. No-op when no grammar is attached.
+        if (slot_complete_ && slot_complete_(slot.slot_id)) {
+            req.finish_reason = "stop";
+            return true;
         }
 
         // max_tokens bound (item 3): clean termination, reason reported.
@@ -447,10 +595,13 @@ private:
     TokenizeFunc raw_tokenize_;   // no-template variant (skip_template requests)
     DetokenizeFunc detokenize_;
     PrefillFunc prefill_;
+    PrepareSlotFunc prepare_slot_;  // optional; per-slot sampler/grammar setup
+    SlotCompleteFunc slot_complete_;  // optional; grammar accepting-state stop
+    MultimodalPrefillFunc multimodal_prefill_;  // optional; image requests only
+    CachedTextPrefillFunc cached_text_prefill_;  // optional; text prefix-cache path
     BatchedDecodeFunc batched_decode_;
     ClearSlotFunc clear_slot_;
-    CloneSlotFunc clone_slot_;
-    GetEosTokenFunc get_eos_token_;
+    IsStopTokenFunc is_stop_token_;
 };
 
 }  // namespace qwenium

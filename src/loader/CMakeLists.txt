@@ -6,6 +6,7 @@ add_library(qinf-loader STATIC
     weight_binding.cpp
     chat_template.cpp
     multimodal_check.cpp
+    channel_filter.cpp
 )
 
 target_include_directories(qinf-loader PUBLIC

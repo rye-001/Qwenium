@@ -155,8 +155,9 @@ public:
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
 
-    // build_decoding_graph throws; decode_step routes via run_prefill bridge.
-    bool has_decode_graph() const override { return false; }
+    // has_decode_graph() inherits the default (true): build_decoding_graph is
+    // implemented (batched decode), so decode_step routes via the unified path,
+    // not the run_prefill bridge — matching Gemma 1/2/3.
 
     // Phase 3 of docs/plan-feed-tokens.md: gemma4 honors want_logits=false
     // with one head-guard site. Attention-only (dense + MoE FFN, no
@@ -195,6 +196,19 @@ public:
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override;
     uint32_t get_cache_pos(uint32_t slot_idx) const override;
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override;
+
+    // L2/V2 snapshot reach-through. Gemma4 has TWO physical KV caches (disjoint
+    // global + sliding layer sets, advancing in lockstep), so it overrides the
+    // multi-cache accessor rather than the single one. FIXED order [global, swa]
+    // — capture and restore add one KvCacheSection per cache in this order, and
+    // the manifest matches them positionally. No recurrent state (pure
+    // attention), so snapshot_recurrent() keeps the nullptr default.
+    std::vector<simple_kv_cache*> snapshot_kv_caches() override {
+        std::vector<simple_kv_cache*> out;
+        if (kv_cache_global_) out.push_back(kv_cache_global_.get());
+        if (kv_cache_swa_)    out.push_back(kv_cache_swa_.get());
+        return out;
+    }
 
 private:
     Gemma4Config                     config_;
@@ -242,10 +256,24 @@ private:
     ggml_tensor* require_tensor(uint32_t il, const char* suffix) const;
     ggml_tensor* maybe_tensor  (uint32_t il, const char* suffix) const;
 
+    // Phase descriptor selecting the attention path inside build_block. The
+    // block body (QKV proj, QK-norm, V-norm, RoPE, dual-FFN/MoE) is identical
+    // for prefill and batched decode; ONLY the attention call differs. Prefill
+    // leaves slots == nullptr and uses slot_idx; decode sets slots/positions/
+    // layer_masks/gather_indices (the batched scatter-gather inputs).
+    struct AttnPhase {
+        uint32_t                          slot_idx      = 0;        // prefill
+        const std::vector<uint32_t>*      slots         = nullptr;  // non-null ⇒ decode
+        const std::vector<int32_t>*       positions     = nullptr;
+        const std::vector<ggml_tensor*>*  layer_masks   = nullptr;
+        ggml_tensor*                      gather_indices = nullptr;
+        bool is_decode() const { return slots != nullptr; }
+    };
+
     // Build one Gemma 4 block into gf and return the updated residual.
     ggml_tensor* build_block(ggml_cgraph* gf, ggml_tensor* cur,
                               ggml_tensor* inp_pos, uint32_t il,
-                              uint32_t slot_idx, uint32_t n_tokens);
+                              uint32_t n_tokens, const AttnPhase& phase);
 
     // Inline MoE GeGLU dispatch — separate from MoELayer because
     // MoELayer uses SwiGLU (silu) and Gemma 4 uses GeGLU-tanh.

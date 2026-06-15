@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "snapshot_io.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -6,6 +7,7 @@
 #include <numeric>
 #include <vector>
 #include <iostream>
+#include <sstream>
 
 namespace qwenium {
 
@@ -352,6 +354,30 @@ int32_t TemperatureSampler::sample_sparse(std::vector<float>& sparse_logits,
 
     std::discrete_distribution<> dist(probs.begin(), probs.end());
     return check_id(sorted[static_cast<size_t>(dist(gen_))].first);
+}
+
+// --- L1 snapshot: mt19937 engine state ---
+// std::mt19937 exposes no "draw counter"; its operator<< / operator>> serialize
+// the full internal state (the 624-word array + position) as space-separated
+// decimal text. That round-trips exactly and portably, so a restored sampler
+// produces a bit-identical draw sequence. We carry it as a length-prefixed
+// string in the snapshot stream.
+void TemperatureSampler::write_rng_state(qinf::session::SnapshotWriter& w) const {
+    std::ostringstream oss;
+    oss << gen_;
+    w.put_string(oss.str());
+}
+
+void TemperatureSampler::read_rng_state(qinf::session::SnapshotReader& r) {
+    std::string state = r.get_string();
+    std::istringstream iss(state);
+    iss >> gen_;
+    if (iss.fail()) {
+        throw std::runtime_error(
+            "sampler_rng: field \"mt19937_state\" expected a valid serialized "
+            "std::mt19937 state, got an unparseable string of length " +
+            std::to_string(state.size()));
+    }
 }
 
 } // namespace qwenium

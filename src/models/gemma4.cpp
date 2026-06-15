@@ -7,7 +7,7 @@
 #include "../graph_inputs/tokens_input.h"
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
-#include "../graph_inputs/image_embeddings_input.h"
+#include "../graph_inputs/gather_indices_input.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -395,7 +396,7 @@ ggml_tensor* Gemma4ForwardPass::build_moe_geglu(
 
 ggml_tensor* Gemma4ForwardPass::build_block(
     ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* inp_pos,
-    uint32_t il, uint32_t slot_idx, uint32_t n_tokens)
+    uint32_t il, uint32_t n_tokens, const AttnPhase& phase)
 {
     const BlockWeights& w = block_w_[il];
     const bool is_global  = config_.is_global[il];
@@ -461,12 +462,27 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     // into the q_norm / k_norm weights.
     const float kq_scale = 1.0f;
 
-    cur = build_attention(ctx_, gf, cache, Qcur, Kcur, Vcur,
-                          /*layer_idx=*/cache_il,
-                          kq_scale, n_tokens, slot_idx,
-                          /*il=*/static_cast<int>(il),
-                          head_dim, head_dim, n_kv_heads,
-                          /*softcap=*/0.0f);  // attn softcap off for G4 (QK-norm replaces it)
+    // Attention — the ONE fork between prefill and batched decode. The K/V
+    // tensors are reshaped identically above; build_batched_attention infers
+    // head_dim / n_kv_heads from Kcur->ne[0]/ne[1], so the per-kind shape
+    // (global vs swa) flows through without explicit dims. softcap off for G4
+    // (QK-norm replaces it).
+    if (phase.is_decode()) {
+        cur = build_batched_attention(ctx_, gf, cache, Qcur, Kcur, Vcur,
+                                      /*layer_idx=*/cache_il, kq_scale,
+                                      *phase.slots, *phase.positions,
+                                      (*phase.layer_masks)[il],
+                                      phase.gather_indices,
+                                      /*il=*/static_cast<int>(il),
+                                      /*softcap=*/0.0f);
+    } else {
+        cur = build_attention(ctx_, gf, cache, Qcur, Kcur, Vcur,
+                              /*layer_idx=*/cache_il,
+                              kq_scale, n_tokens, phase.slot_idx,
+                              /*il=*/static_cast<int>(il),
+                              head_dim, head_dim, n_kv_heads,
+                              /*softcap=*/0.0f);
+    }
 
     cur = ggml_mul_mat(ctx_, w.attn_output, cur);
     set_tensor_name(gf, cur, "attn_out", static_cast<int>(il));
@@ -477,7 +493,6 @@ ggml_tensor* Gemma4ForwardPass::build_block(
 
     ggml_tensor* attn_out = ggml_add(ctx_, cur, inpSA);
     set_tensor_name(gf, attn_out, "attn_residual", static_cast<int>(il));
-    if (il == 0) { ggml_set_output(attn_out); ggml_build_forward_expand(gf, attn_out); }
 
     // ── B. Feed-forward (Gemma 4 topology) ───────────────────────────────
     // Two variants, selected by config_.is_moe (= expert_count > 0):
@@ -523,7 +538,6 @@ ggml_tensor* Gemma4ForwardPass::build_block(
         // B.3 Sum dense + MoE.
         ffn_inner = ggml_add(ctx_, cur_mlp, cur_moe);
         set_tensor_name(gf, ffn_inner, "ffn_moe_combined", static_cast<int>(il));
-        if (il == 0) { ggml_set_output(ffn_inner); ggml_build_forward_expand(gf, ffn_inner); }
     } else {
         // Dense variant: a single GeGLU-tanh FFN (no parallel MoE branch and
         // no post_ffw_norm_1; the common post_ffw_norm below is the only
@@ -565,7 +579,6 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     inpL = build_embed_scale(ctx_, inpL,
                              std::sqrt(static_cast<float>(config_.hidden_dim)));
     set_tensor_name(gf, inpL, "inpL_scaled");
-    ggml_set_output(inpL);
     ggml_build_forward_expand(gf, inpL);
 
     // 2. Position tensor (one per token; per-layer rope_base differs but
@@ -575,8 +588,18 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
-    // Typed inputs (replaces set_inputs). Per-layer sliding window is a
-    // parameter on AttnMaskInput: global layers => 0, sliding => window.
+    // Image attention mask: CAUSAL (bidi span UNWIRED 2026-06-16).
+    //
+    // The AttnMaskInput bidi span (bidi_start/bidi_len) is the mechanism llama
+    // uses for Gemma image attention (mtmd_decode_use_non_causal==true for
+    // PROJECTOR_TYPE_GEMMA4UV). It is RETAINED and unit-tested (Gemma 3 arms it;
+    // see test_attn_mask_input.cpp) but DELIBERATELY NOT ARMED here: bidi is not
+    // the bug. Proven via `LLAMA_FORCE_IMAGE_CAUSAL` — llama with CAUSAL image
+    // attention is fully correct ("…rib cage and spine area"), so causal is
+    // sufficient. Our image-causal forward is what diverges from llama-causal;
+    // arming bidi only makes it worse (token-soup). Fix the causal forward first,
+    // then revisit bidi. To re-arm: pass `pos + image_span_start_` and
+    // `image_n_tokens_` as the bidi_start/bidi_len args below (image-armed only).
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
@@ -586,60 +609,26 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
             config_.is_global[il] ? 0u : config_.sliding_window));
 
     // 2b. Image-token embedding substitution (IImageEmbeddable, Seam B — the one
-    //     C3 boundary site between this recipe and the vision subsystem). When
-    //     image embeddings are armed (set_image_embeddings), overwrite the SCALED
-    //     text embeddings at columns [span, span + n_img) with the precomputed
-    //     image embeddings. Gemma scales token embeddings by sqrt(d_model) but
-    //     image embeddings enter UNSCALED — substituting AFTER build_embed_scale
-    //     and overwriting wholesale is exactly that semantics (the scaled values
-    //     at those positions are discarded). Direct analog of the Gemma 3 site;
-    //     the ONE difference is there is NO bidirectional mask span here — Gemma 4
-    //     image attention is plain causal, so the AttnMaskInput above is already
-    //     correct and image_span_start_ never needs the local→absolute
-    //     conversion the Gemma 3 mask required. Consumed (moved) here.
+    //     C3 boundary site between this recipe and the vision subsystem). The
+    //     residual-stream overwrite is the shared
+    //     ForwardPassBase::build_image_substitution (image rows enter unscaled,
+    //     hence AFTER build_embed_scale above). The recipe-specific image concern
+    //     — the bidirectional image-span mask — is handled in the AttnMaskInput
+    //     wiring above; this step is only the substitution.
+    //     Consumed (moved) here.
     if (!image_embd_.empty()) {
-        const uint32_t n_img = image_n_tokens_;
-        const int      hidden_dim = static_cast<int>(config_.hidden_dim);
-        const size_t   want  = static_cast<size_t>(hidden_dim) * n_img;
-        if (image_embd_.size() != want)
-            throw std::runtime_error(
-                "Gemma4ForwardPass: slot 'image_embeddings': expected " +
-                std::to_string(want) + " floats (hidden_dim=" +
-                std::to_string(hidden_dim) + " * n_img=" +
-                std::to_string(n_img) + "), got: " +
-                std::to_string(image_embd_.size()));
-        if (image_span_start_ < 0 ||
-            static_cast<size_t>(image_span_start_) + n_img > n_tokens)
-            throw std::runtime_error(
-                "Gemma4ForwardPass: slot 'image_span': expected span within "
-                "[0, " + std::to_string(n_tokens) + "), got: start=" +
-                std::to_string(image_span_start_) + " n_img=" +
-                std::to_string(n_img));
-
-        ggml_tensor* img_in = ggml_new_tensor_2d(
-            ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
-        ggml_set_input(img_in);
-        set_tensor_name(gf, img_in, "image_embeddings");
-        ggml_build_forward_expand(gf, img_in);
-
-        // inpL[:, span : span+n_img] = img_in (one op; surviving text columns
-        // keep their sqrt(d_model) scale, image columns enter unscaled).
-        const int64_t span = image_span_start_;
-        inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
-                           static_cast<size_t>(span) * inpL->nb[1]);
-        set_tensor_name(gf, inpL, "inpL_image_subst");
-        ggml_build_forward_expand(gf, inpL);
-
-        graph_inputs_.add(
-            std::make_unique<ImageEmbeddingsInput>(std::move(image_embd_)));
+        inpL = build_image_substitution(
+            gf, inpL, std::move(image_embd_), image_span_start_,
+            image_n_tokens_, static_cast<int>(config_.hidden_dim), n_tokens);
         image_span_start_ = -1;  // consume-on-use (image_embd_ moved out)
         image_n_tokens_   = 0;
     }
 
     // 3. Transformer stack (manual composition; build_transformer_layer
     //    can't host this — see the gemma4.h scope comment).
+    const AttnPhase prefill_phase{ /*slot_idx=*/slot_idx };
     for (uint32_t il = 0; il < config_.n_layers; ++il) {
-        inpL = build_block(gf, inpL, inp_pos, il, slot_idx, n_tokens);
+        inpL = build_block(gf, inpL, inp_pos, il, n_tokens, prefill_phase);
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);
         set_tensor_name(gf, inpL, dbg);
@@ -683,23 +672,92 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     return gf;
 }
 
-// ── Decoding (batched) — stubbed in G4.8, mirrors G2/G3 ──────────────────────
+// ── Decoding (batched) ────────────────────────────────────────────────────────
+//
+// Mirrors the proven Gemma 3 decode transform (gemma3.cpp): same head-of-graph
+// embedding+scale delta, per-layer AttnMaskInput windows, one shared
+// gather_indices, and build_output_head for the sparse-aware LM head. The block
+// body is reused via build_block(phase=decode) — only the attention call differs
+// from prefill. 
+// The two physical KV caches share context_len (n_ctx_max) and advance in
+// lockstep, so a single gather_indices addresses both and n_kv_len is common.
 
 ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
-    const std::vector<int32_t>& /*tokens*/,
-    const std::vector<uint32_t>& /*slots*/,
-    const std::vector<int32_t>& /*positions*/)
+    const std::vector<int32_t>& tokens,
+    const std::vector<uint32_t>& slots,
+    const std::vector<int32_t>& positions)
 {
-    // TODO(sparse): when single-token decode lands here, build the LM head
-    // via build_output_head(gf, inpL) — NOT a hand-rolled ggml_mul_mat like
-    // build_prefill_graph does. decode_step arms sparse_decode_ids_ for
-    // grammar-constrained decode; a hand-rolled head ignores them and returns
-    // full-vocab logits, causing sample_sparse size-mismatch / bad-access
-    // (the class of bug fixed in qwen3.cpp / qwen35.cpp).
-    throw std::runtime_error(
-        "Gemma4ForwardPass::build_decoding_graph: batched decode not "
-        "implemented in PR G4.8 (architecture='gemma4'); expected: "
-        "prefill-only path, got: batched call");
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    const int    n_layers   = static_cast<int>(config_.n_layers);
+    const int    hidden_dim = static_cast<int>(config_.hidden_dim);
+    const size_t n_tokens   = tokens.size();   // total tokens across all slots
+
+    // 1. Token embedding + sqrt(d_model) scale (fp32).
+    ggml_tensor* inpL = embedding(gf, tokens);
+    set_tensor_name(gf, inpL, "inpL");
+    inpL = build_embed_scale(ctx_, inpL, std::sqrt(static_cast<float>(hidden_dim)));
+    set_tensor_name(gf, inpL, "inpL_scaled");
+
+    // 2. Position tensor (one per token across all slots; per-layer rope_base
+    //    differs but all layers consume the same int32 positions).
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp_pos);
+    set_tensor_name(gf, inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    // 3. KV gather window, sized from the deepest slot (both caches lockstep).
+    uint32_t max_pos = 0;
+    for (uint32_t s : slots) {
+        uint32_t p = get_cache_pos(s);
+        if (p > max_pos) max_pos = p;
+    }
+    const uint32_t n_kv_len = max_pos + 1;
+
+    // 4. Per-layer attention windows: global layers see the full history
+    //    (window 0), sliding layers see config_.sliding_window. The same window
+    //    seam as prefill, no mask-body fork.
+    std::vector<uint32_t> layer_windows(n_layers);
+    for (int il = 0; il < n_layers; ++il)
+        layer_windows[il] = config_.is_global[il] ? 0u : config_.sliding_window;
+
+    // 5. KV gather indices, shared across all layers AND both caches (identical
+    //    n_ctx_max + lockstep positions ⇒ one index tensor addresses both).
+    ggml_tensor* gather_indices =
+        ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens * n_kv_len);
+    ggml_set_input(gather_indices);
+    ggml_set_name(gather_indices, "gather_indices");
+
+    // 6. Typed inputs. Masks are deduplicated by window (global + sliding ⇒ 2
+    //    tensors, not n_layers) so the decode graph-input count stays under the
+    //    backend scheduler's split-input cap on Metal. Shared gather indices are
+    //    sized by the (common) cache n_ctx_max. Text-only decode — no image span.
+    graph_inputs_.clear();
+    graph_inputs_.add(std::make_unique<TokensInput>());
+    graph_inputs_.add(std::make_unique<PositionsInput>());
+    std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
+        gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
+    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
+        kv_cache_global_->get_n_ctx_max()));
+
+    // 7. Transformer stack — reuse build_block with the decode attention path.
+    const AttnPhase decode_phase{
+        /*slot_idx=*/0, &slots, &positions, &layer_masks, gather_indices };
+    for (uint32_t il = 0; il < config_.n_layers; ++il) {
+        inpL = build_block(gf, inpL, inp_pos, il, n_tokens, decode_phase);
+    }
+
+    // 8. Output head — final norm + tied LM head, routed through
+    //    build_output_head so the grammar→sparse decode path is honored
+    //    (decode_step arms sparse_decode_ids_; a hand-rolled ggml_mul_mat would
+    //    ignore them and break sample_sparse). gemma_final_norm=false: Gemma 4
+    //    prefill uses standard build_rms_norm on the output-norm weight, so the
+    //    decode head matches with the standard form. final_softcap from config, matching prefill.
+    build_output_head(gf, inpL, /*valid_idx=*/nullptr, /*gemma_final_norm=*/false,
+                      /*final_softcap=*/config_.final_softcap);
+
+    return gf;
 }
 
 // ── Cache routing ────────────────────────────────────────────────────────────

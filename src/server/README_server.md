@@ -50,7 +50,7 @@ Or use CMake FetchContent (see CMakeLists_server.txt).
 
 ### 2. Wire Up Your Forward Pass
 
-Edit `http_server.cpp` `QwenServerIntegration` class to match your API:
+Edit `http_server.cpp` `QweniumServerIntegration` class to match your API:
 
 ```cpp
 int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {

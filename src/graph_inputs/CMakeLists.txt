@@ -10,14 +10,16 @@ add_library(qinf-graph-inputs STATIC
     sparse_head_input.cpp
     output_ids_input.cpp
     image_embeddings_input.cpp
+    image_embedding_section.cpp
 )
 
 target_include_directories(qinf-graph-inputs PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
-target_link_libraries(qinf-graph-inputs PUBLIC ggml)
+target_link_libraries(qinf-graph-inputs PUBLIC ggml qinf-session)
 
 set_target_properties(qinf-graph-inputs PROPERTIES
     POSITION_INDEPENDENT_CODE ON

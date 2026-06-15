@@ -41,6 +41,49 @@ struct GGUFHeader
     uint64_t metadata_kv_count;
 };
 
+namespace {
+// FNV-1a fold of one 64-bit word's little-endian bytes into the running hash.
+inline void fnv_fold_u64(uint64_t& h, uint64_t v) {
+    for (int b = 0; b < 8; ++b) {
+        h ^= static_cast<uint8_t>(v >> (8 * b));
+        h *= 1099511628211ull;
+    }
+}
+
+// Content identity of the model weights from the (already-parsed) tensor
+// inventory + architecture. Deterministic across processes/hosts: tensors are
+// folded in NAME ORDER (the inventory map is unordered), each contributing its
+// name bytes + ggml_type + shape dims + byte offset — so arch, shape, quant
+// (per-tensor type), and layout all change the hash. Pure metadata; no
+// weight-data read. See ModelMetadata::weights_hash for the finetune caveat.
+uint64_t compute_weights_hash(const ModelMetadata& m) {
+    std::vector<const TensorMetadata*> tensors;
+    tensors.reserve(m.tensor_inventory.size());
+    for (const auto& kv : m.tensor_inventory) tensors.push_back(&kv.second);
+    std::sort(tensors.begin(), tensors.end(),
+              [](const TensorMetadata* a, const TensorMetadata* b) {
+                  return a->name < b->name;
+              });
+
+    uint64_t h = 1469598103934665603ull;  // FNV-1a offset basis
+    for (char c : m.architecture) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    for (const TensorMetadata* t : tensors) {
+        for (char c : t->name) {
+            h ^= static_cast<uint8_t>(c);
+            h *= 1099511628211ull;
+        }
+        fnv_fold_u64(h, static_cast<uint64_t>(t->type));
+        fnv_fold_u64(h, static_cast<uint64_t>(t->shape.size()));
+        for (uint64_t d : t->shape) fnv_fold_u64(h, d);
+        fnv_fold_u64(h, t->offset);
+    }
+    return h == 0 ? 1 : h;  // reserve 0 for "not computed"
+}
+}  // namespace
+
 GGUFLoader::GGUFLoader() : is_loaded_(false), tensor_data_offset_(0) {}
 
 GGUFLoader::~GGUFLoader() { cleanup_resources(); }
@@ -94,6 +137,10 @@ void GGUFLoader::load_model(const std::string &path, bool validate_as_text_model
     if (validate_as_text_model_) {
         validate_tensor_inventory();
     }
+
+    // 6. Content identity of the weights (cheap, metadata-only). Load-bearing for
+    //    session / prefix-blob compatibility gating (CompatHeader::weights_hash).
+    metadata_.weights_hash = compute_weights_hash(metadata_);
 
     is_loaded_ = true;
 }

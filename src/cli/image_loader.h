@@ -67,4 +67,12 @@ qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
 // Back-compat overload: Gemma 3 fixed-square preprocessing (existing callers).
 qinf::vision::Bitmap load_image_to_bitmap(const std::string& path, int target = 896);
 
+// Same as load_image_to_bitmap(path, pp) but the encoded image FILE bytes are
+// already in memory (e.g. a base64-decoded `image_url` data URI from the HTTP
+// chat endpoint) rather than on disk. stb decodes the format from the bytes.
+// Fail-loud (CLAUDE.md): throws naming the source and the stb reason on failure.
+qinf::vision::Bitmap load_image_to_bitmap_from_memory(const uint8_t* data,
+                                                      size_t len,
+                                                      const ImagePreprocess& pp);
+
 }  // namespace qinf::cli

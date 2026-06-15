@@ -298,20 +298,14 @@ ggml_cgraph* Gemma2ForwardPass::build_decoding_graph(
     }
     uint32_t n_kv_len = max_pos + 1;
 
-    // Per-layer attention masks: Gemma 2 interleaves local (even) / global (odd).
-    // Each layer's mask honors config_.layer_window[il]; AttnMaskInput computes
-    // the sliding window from decode positions (StepContext::row_pos). This is
-    // the SAME per-layer mask seam prefill uses — the decode path hosts the
-    // interleave as a parameter on the mask, no mask-body fork. The Gemma 1
-    // decode used a single shared mask (all-global, window 0); this is the only
-    // structural delta in the decode preamble.
-    std::vector<ggml_tensor*> layer_masks(n_layers);
-    for (int il = 0; il < n_layers; ++il) {
-        layer_masks[il] = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
-        ggml_set_input(layer_masks[il]);
-        ggml_set_name(layer_masks[il], ("kq_mask." + std::to_string(il)).c_str());
-        ggml_build_forward_expand(gf, layer_masks[il]);
-    }
+    // Per-layer attention windows: Gemma 2 interleaves local (even) / global
+    // (odd) via config_.layer_window[il] (0 = global). The SAME window seam
+    // prefill uses — the interleave is a parameter on the mask, no mask-body
+    // fork. Masks are deduplicated by window value below (global + local ⇒ 2
+    // tensors), so the decode graph-input count stays O(distinct windows).
+    std::vector<uint32_t> layer_windows(n_layers);
+    for (int il = 0; il < n_layers; ++il)
+        layer_windows[il] = config_.layer_window[il];
 
     // KV gather indices, shared across layers.
     uint32_t n_total_indices = n_tokens * n_kv_len;
@@ -319,13 +313,13 @@ ggml_cgraph* Gemma2ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
-    // Typed inputs: one AttnMaskInput per layer carrying that layer's window.
+    // Typed inputs: window-deduplicated masks (one AttnMaskInput per distinct
+    // window) plus the shared gather indices.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
-    for (uint32_t il = 0; il < config_.n_layers; ++il)
-        graph_inputs_.add(std::make_unique<AttnMaskInput>(
-            "kq_mask." + std::to_string(il), config_.layer_window[il]));
+    std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
+        gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(kv_cache_->get_n_ctx_max()));
 
     // 2. Transformer stack — hand-rolled batched decode (mirrors Gemma 1 decode).
