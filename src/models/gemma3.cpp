@@ -8,7 +8,6 @@
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
 #include "../graph_inputs/gather_indices_input.h"
-#include "../graph_inputs/image_embeddings_input.h"
 
 #include <cstdlib>
 #include "ggml.h"
@@ -195,22 +194,29 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     // single mask site — the bidi span is a *parameter* on AttnMaskInput, the
     // same parameterize-don't-split discipline as the sliding window itself.
     const bool img_armed = !image_embd_.empty();
-    // Bidirectional image attention is the reference-correct behavior for
-    // Gemma 3 (llama.cpp mtmd: mtmd_decode_use_non_causal == true for
-    // PROJECTOR_TYPE_GEMMA3 — the image chunk is decoded with causal_attn=false).
-    // It is therefore enabled by default whenever image embeddings are armed.
+    // Image-span attention is CAUSAL by default for Gemma 3.
     //
-    // This was previously gated off because bidi corrupted generation (the model
-    // repeated <start_of_image>). Root cause: global layers ignored the GGUF's
-    // linear RoPE scaling (gemma3.rope.scaling.factor=8 → freq_scale=0.125), so
-    // their relative positions were 8x too large. Causal masking hides this
-    // (attention is local-dominated) but the bidi span forces image tokens to
-    // attend across the full ±n_img span, where the position error is fatal.
-    // Fixed by Gemma3Config::layer_rope_scale (wired into blk_hp.freq_scale).
-    // Set QINF_GEMMA3_IMAGE_CAUSAL=1 to force the legacy causal span for A/B
+    // Bidirectional image attention is the nominal reference behavior (llama.cpp
+    // mtmd: mtmd_decode_use_non_causal == true for PROJECTOR_TYPE_GEMMA3), and a
+    // prior revision enabled it by default after wiring the global-layer linear
+    // RoPE scaling (gemma3.rope.scaling.factor=8 → freq_scale=0.125, see
+    // Gemma3Config::layer_rope_scale). However, measured on the real target model
+    // (medgemma gemma3-siglip + mmproj-BF16), bidi STILL corrupts generation:
+    // with bidi armed the model degenerates into token-soup / immediate <eos> for
+    // almost any prompt phrasing (e.g. "Describe this image." → "://://://…"),
+    // surviving only for a few near-exact phrasings. Flipping the SAME mask to
+    // causal — the only difference being the image↔image sub-block — produces
+    // coherent, image-grounded answers across prompts (verified A/B, identical
+    // model/image/prompt, env var the only change). The bidi'd image-span hidden
+    // states are evidently brittle in a way the rope-scale fix did not resolve;
+    // root cause is still open (candidate: image-embedding magnitude exposed only
+    // under full-span aggregation). Causal is correct-enough and robust, so it is
+    // the shipping default until bidi is genuinely fixed.
+    //
+    // Set QINF_GEMMA3_IMAGE_BIDI=1 to re-enable the bidirectional span for that
     // investigation. See docs/gemma-vision-handoff.md and plan-gemma-vision-impl.md §P4.
     const bool     use_bidi      = img_armed &&
-        (std::getenv("QINF_GEMMA3_IMAGE_CAUSAL") == nullptr);
+        (std::getenv("QINF_GEMMA3_IMAGE_BIDI") != nullptr);
     const int32_t  bidi_start    = use_bidi ? pos + image_span_start_ : -1;
     const uint32_t bidi_len      = use_bidi ? image_n_tokens_ : 0u;
 
@@ -227,64 +233,16 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
             bidi_start, bidi_len));
 
     // 1b. Image-token embedding substitution (Phase 3 — the one C3 boundary
-    // site between this recipe and the vision subsystem). When image
-    // embeddings are armed (set_image_embeddings), overwrite the SCALED text
-    // embeddings at [span_start, span_start + n_img) with the precomputed
-    // image embeddings. Gemma 3 scales token embeddings by sqrt(d_model) but
-    // image embeddings enter the residual stream UNSCALED — llama.cpp gemma3:
-    //   inpL = ggml_scale(inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
-    // Substituting AFTER build_embed_scale and overwriting the rows wholesale
-    // is exactly that semantics (the scaled values at those positions are
-    // discarded). Single parameterized site, mirroring the want_logits head
-    // guard's locality discipline. Consumed (moved) here; re-arm to repeat.
+    // site between this recipe and the vision subsystem). The residual-stream
+    // overwrite is the shared ForwardPassBase::build_image_substitution (image
+    // rows enter unscaled, hence AFTER build_embed_scale above). Gemma 3's
+    // recipe-specific image concern — the bidirectional image-span mask — is
+    // handled separately in the AttnMaskInput wiring above; this step is only
+    // the substitution. Consumed (moved) here; re-arm to repeat.
     if (!image_embd_.empty()) {
-        const uint32_t n_img = image_n_tokens_;
-        const size_t   want  = static_cast<size_t>(hidden_dim) * n_img;
-        if (image_embd_.size() != want)
-            throw std::runtime_error(
-                "Gemma3ForwardPass: slot 'image_embeddings': expected " +
-                std::to_string(want) + " floats (hidden_dim=" +
-                std::to_string(hidden_dim) + " * n_img=" +
-                std::to_string(n_img) + "), got: " +
-                std::to_string(image_embd_.size()));
-        if (image_span_start_ < 0 ||
-            static_cast<size_t>(image_span_start_) + n_img > n_tokens)
-            throw std::runtime_error(
-                "Gemma3ForwardPass: slot 'image_span': expected span within "
-                "[0, " + std::to_string(n_tokens) + "), got: start=" +
-                std::to_string(image_span_start_) + " n_img=" +
-                std::to_string(n_img));
-
-        ggml_tensor* img_in = ggml_new_tensor_2d(
-            ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
-        ggml_set_input(img_in);
-        set_tensor_name(gf, img_in, "image_embeddings");
-        ggml_build_forward_expand(gf, img_in);
-
-        // Overwrite the image-span columns of the residual stream in place:
-        //   inpL[:, span : span+n_img] = img_in
-        // inpL is [hidden_dim, n_tokens] and contiguous, so the image span is a
-        // clean 2-D sub-block; ggml_set_2d copies inpL and writes img_in at the
-        // column offset (one op, one node). The image columns enter UNSCALED
-        // while the surviving text columns keep their sqrt(d_model) scale —
-        // exactly llama.cpp gemma3.cpp:93 (scale = ubatch.token ? sqrt : 1.0),
-        // since the scaled text values at those positions are discarded.
-        //
-        // NOTE: an earlier revision used a 3-way ggml_concat splice with a
-        // comment claiming ggml_set_2d was a "silent no-op." That was backwards:
-        // the differential test (SubstitutedEmbeddingsChangeLogits) showed the
-        // CONCAT path never propagated img_in into the residual stream (output
-        // bit-identical to the text-only baseline, even with img_in scaled
-        // 1000x), while ggml_set_2d substitutes correctly. set_2d is the right
-        // primitive for an in-place sub-block overwrite.
-        const int64_t span = image_span_start_;
-        inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
-                           static_cast<size_t>(span) * inpL->nb[1]);
-        set_tensor_name(gf, inpL, "inpL_image_subst");
-        ggml_build_forward_expand(gf, inpL);
-
-        graph_inputs_.add(
-            std::make_unique<ImageEmbeddingsInput>(std::move(image_embd_)));
+        inpL = build_image_substitution(
+            gf, inpL, std::move(image_embd_), image_span_start_,
+            image_n_tokens_, hidden_dim, n_tokens);
         image_span_start_ = -1;  // consume-on-use (image_embd_ moved out)
         image_n_tokens_   = 0;
     }
@@ -417,17 +375,14 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     }
     uint32_t n_kv_len = max_pos + 1;
 
-    // Per-layer attention masks: Gemma 3 runs five local (sliding-window)
-    // layers per one global (config_.layer_window[il]; 0 = global). Same
-    // per-layer mask seam as Gemma 2 decode — the 5:1 pattern lives entirely
-    // in the per-layer window values, no mask-body fork.
-    std::vector<ggml_tensor*> layer_masks(n_layers);
-    for (int il = 0; il < n_layers; ++il) {
-        layer_masks[il] = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
-        ggml_set_input(layer_masks[il]);
-        ggml_set_name(layer_masks[il], ("kq_mask." + std::to_string(il)).c_str());
-        ggml_build_forward_expand(gf, layer_masks[il]);
-    }
+    // Per-layer attention windows: Gemma 3 runs five local (sliding-window)
+    // layers per one global (config_.layer_window[il]; 0 = global). The 5:1
+    // pattern lives entirely in the per-layer window values, no mask-body fork.
+    // Masks are deduplicated by window value below (global + sliding ⇒ 2
+    // tensors), so the decode graph-input count stays O(distinct windows).
+    std::vector<uint32_t> layer_windows(n_layers);
+    for (int il = 0; il < n_layers; ++il)
+        layer_windows[il] = config_.layer_window[il];
 
     // KV gather indices, shared across layers.
     uint32_t n_total_indices = n_tokens * n_kv_len;
@@ -435,15 +390,14 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
-    // Typed inputs: one AttnMaskInput per layer carrying that layer's window.
-    // Text-only decode — the image bidi span stays disabled (constructor
-    // defaults), same as the text-only prefill path.
+    // Typed inputs: window-deduplicated masks (one AttnMaskInput per distinct
+    // window) plus the shared gather indices. Text-only decode — the image bidi
+    // span stays disabled (window-only masks), same as the text-only prefill path.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
-    for (uint32_t il = 0; il < config_.n_layers; ++il)
-        graph_inputs_.add(std::make_unique<AttnMaskInput>(
-            "kq_mask." + std::to_string(il), config_.layer_window[il]));
+    std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
+        gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(kv_cache_->get_n_ctx_max()));
 
     // 2. Transformer stack — hand-rolled batched decode (mirrors Gemma 2

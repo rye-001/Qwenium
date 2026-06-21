@@ -27,6 +27,8 @@
 
 #include "layer_state.h"
 #include "recurrent_state.h"  // for CheckpointId / kInvalidCheckpoint
+#include "session/section_ids.h"
+#include "session/snapshot_section.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -37,6 +39,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace qinf::session {
+class SnapshotWriter;
+class SnapshotReader;
+}  // namespace qinf::session
 
 class DeltaNetState : public LayerState {
 public:
@@ -82,6 +89,14 @@ public:
     void get_conv(uint32_t dn_idx, uint32_t slot, float* dst) const;
     void set_conv(uint32_t dn_idx, uint32_t slot, const float* src);
 
+    // --- L2 session snapshot (OverwriteRecurrent lane) ---
+    // Serialize / restore the full recurrent + conv state for one slot across
+    // all DeltaNet layers. Authoritative — L2 skips prefill, so this state is
+    // stored, never feed_tokens-rebuilt. deserialize validates layer count and
+    // per-slot float widths fail-loud. Co-located section: DeltaNetStateSection.
+    void serialize_slot(qinf::session::SnapshotWriter& w, uint32_t slot) const;
+    void deserialize_slot(qinf::session::SnapshotReader& r, uint32_t slot);
+
     // Zero all state across all layers for the given slot.
     void clear_slot(uint32_t slot);
 
@@ -120,4 +135,27 @@ private:
     void init_storage();
     void validate_slot(uint32_t slot, const char* caller) const;
     void validate_checkpoint(CheckpointId id, const char* caller) const;
+};
+
+// L2 OverwriteRecurrent section: serializes one slot's full DeltaNet state.
+class DeltaNetStateSection : public qinf::session::SnapshotSection {
+public:
+    DeltaNetStateSection(DeltaNetState& state, uint32_t slot)
+        : state_(state), slot_(slot) {}
+    qinf::session::SectionId id() const override {
+        return qinf::session::kDeltaNetStateSectionId;
+    }
+    qinf::session::StateLane lane() const override {
+        return qinf::session::StateLane::OverwriteRecurrent;
+    }
+    void write(qinf::session::SnapshotWriter& w) const override {
+        state_.serialize_slot(w, slot_);
+    }
+    void read(qinf::session::SnapshotReader& r) override {
+        state_.deserialize_slot(r, slot_);
+    }
+
+private:
+    DeltaNetState& state_;
+    uint32_t       slot_;
 };

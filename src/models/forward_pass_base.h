@@ -13,6 +13,7 @@
 struct ggml_context;
 struct ggml_tensor;
 struct ggml_cgraph;
+class DeltaNetState;  // L2 snapshot reach-through (OverwriteRecurrent lane)
 
 constexpr size_t FP_GRAPH_SIZE_METADATA = 128 * 1024 * 1024;
 constexpr size_t FP_GRAPH_SIZE = 16384;
@@ -109,6 +110,32 @@ public:
     // that have not implemented the guard, rather than silently building the
     // head (wasteful) or shipping an unverified state-advance path.
     virtual bool feed_tokens_supported() const { return false; }
+
+    // ── L2 session snapshot reach-through ────────────────────────────────────
+    // Accessors (not logic) exposing the per-sequence state an L2 snapshot
+    // serializes: the AppendKV cache and the OverwriteRecurrent state. A recipe
+    // returns its own member, or nullptr if it has none (e.g. pure-attention
+    // recipes have no recurrent state). The L2 manifest borrows these to build a
+    // KvCacheSection / DeltaNetStateSection. Default nullptr so a recipe without
+    // a snapshot accessor is treated fail-loud (no silent empty section) by the
+    // caller rather than silently snapshotting nothing.
+    virtual simple_kv_cache* snapshot_kv_cache() { return nullptr; }
+    virtual DeltaNetState*   snapshot_recurrent() { return nullptr; }
+
+    // Multi-cache reach-through: the ordered list of AppendKV caches an L2
+    // snapshot serializes. Single-cache recipes (Qwen35, Gemma3) inherit this
+    // default, which wraps snapshot_kv_cache(). Recipes with more than one
+    // physical KV cache (Gemma4 — disjoint sliding + global caches) OVERRIDE it
+    // to return all of them IN A FIXED ORDER; the manifest adds one
+    // KvCacheSection per cache, matched positionally on restore. The order MUST
+    // be identical between capture and restore. Empty when the recipe has no L2
+    // support. This is the load-bearing generalization that lets Gemma4's dual
+    // cache host L2/V2 without bending the single-cache recipes.
+    virtual std::vector<simple_kv_cache*> snapshot_kv_caches() {
+        simple_kv_cache* one = snapshot_kv_cache();
+        if (one) return {one};
+        return {};
+    }
 
     // Typed inputs the most-recently-built graph owns. Populated by the
     // recipe's build_*_graph; consumed by run_prefill / decode_step via
@@ -228,6 +255,38 @@ protected:
     // prefill head site only — never from build_decoding_graph (decode with
     // n_tokens=1 is already trivially sliced).
     ggml_tensor* build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* cur);
+
+    // Substitute a span of precomputed image-token embeddings into the scaled
+    // residual stream at columns [span_start, span_start + n_img). Shared by
+    // every vision recipe (Gemma 3, Gemma 4): one graph shape, one fail-loud
+    // validation, and the galloc-output pin that keeps multi-request image
+    // prefill deterministic (docs/server-image-multirequest-bug.md). Operates on
+    // a generic float span — it does NOT know how the embeddings were produced;
+    // vision stays out of the base (see i_image_embeddable.h). Consumes `embd`
+    // (moved into the registered ImageEmbeddingsInput). Returns the new residual
+    // root, named "inpL_image_subst" and pinned as a graph output.
+    //
+    // Image rows enter UNSCALED: the recipe must call this AFTER its
+    // sqrt(d_model) embed scale, so ggml_set_2d overwrites the scaled text
+    // columns wholesale (llama.cpp gemma3: scale = ubatch.token ? sqrt : 1.0).
+    // Recipe-specific concerns (e.g. Gemma 3's bidirectional image mask) stay in
+    // the recipe; this is only the residual-stream substitution.
+    ggml_tensor* build_image_substitution(
+        ggml_cgraph* gf,
+        ggml_tensor* inpL,
+        std::vector<float>&& embd,
+        int32_t span_start,
+        uint32_t n_img,
+        int hidden_dim,
+        size_t n_tokens);
+
+    // Build the batched-decode KQ masks, deduplicated by window value. Qwen and Gemma 1
+    // already use a single mask, so they are unaffected; this is the Gemma
+    // 2/3/4 sliding-window
+    std::vector<ggml_tensor*> build_decode_layer_masks(
+        ggml_cgraph* gf,
+        const std::vector<uint32_t>& layer_windows,
+        uint32_t n_kv_len, uint32_t n_tokens);
 
     void set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il = -1) const;
 

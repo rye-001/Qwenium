@@ -5,6 +5,7 @@ add_library(qinf-state STATIC
     ssm_state_cache.cpp
     recurrent_state.cpp
     deltanet_state.cpp
+    token_sequence_section.cpp
 )
 
 target_include_directories(qinf-state PUBLIC
@@ -12,7 +13,9 @@ target_include_directories(qinf-state PUBLIC
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
-target_link_libraries(qinf-state PUBLIC ggml)
+# qinf-session: snapshot contract + IO. TokenSequenceSection serializes the
+# per-sequence Control-lane token vector (L1 session snapshots).
+target_link_libraries(qinf-state PUBLIC ggml qinf-session)
 
 set_target_properties(qinf-state PROPERTIES
     POSITION_INDEPENDENT_CODE ON

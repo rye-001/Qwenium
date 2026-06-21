@@ -73,12 +73,8 @@ public:
             slot_positions_.erase(slot_id);
         });
 
-        server.set_clone_slot([](int from_slot, int to_slot) {
-            (void)from_slot; (void)to_slot;
-        });
-
-        server.set_get_eos_token([this]() {
-            return eos_token_;
+        server.set_is_stop_token([this](int token_id) {
+            return token_id == eos_token_;
         });
     }
 

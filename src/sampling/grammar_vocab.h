@@ -4,6 +4,11 @@
 #include <string>
 #include <vector>
 
+namespace qinf::session {
+class SnapshotWriter;
+class SnapshotReader;
+}  // namespace qinf::session
+
 namespace qwenium {
 
 class TokenTrie;  // forward declaration
@@ -46,6 +51,19 @@ public:
     // before consuming the cache. A divergence means accept_token was
     // called between peek and apply — the cache would be stale.
     uint64_t state_version() const noexcept { return state_version_; }
+
+    // --- L1 session snapshot: the grammar cursor ---
+    // The ONLY persistent state after each accept_token is impl_->stacks — a
+    // list of {pos, char_idx, continuations}, where pos/continuations are raw
+    // pointers into impl_->rules. The consume_token/resolve_* recursion is
+    // transient and persists nothing. So the cursor is fully externalizable:
+    // each pointer serializes as a (rule_idx, elem_offset) coordinate, and the
+    // rules themselves are rebuilt deterministically by re-parsing the same
+    // GBNF. read_cursor REQUIRES this object was already constructed via
+    // parse_impl(<same GBNF>) — it restores only the cursor, not the grammar.
+    // Co-located section: src/sampling/sampling_snapshot.{h,cpp}.
+    void write_cursor(qinf::session::SnapshotWriter&) const;
+    void read_cursor(qinf::session::SnapshotReader&);
 
 private:
     struct Impl;

@@ -130,6 +130,9 @@ public:
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);
     }
 
+    // L2 snapshot reach-through (pure attention: AppendKV only, no recurrent).
+    simple_kv_cache* snapshot_kv_cache() override { return kv_cache_.get(); }
+
 private:
     Gemma3Config                    config_;
     std::unique_ptr<simple_kv_cache> kv_cache_;

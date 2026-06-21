@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <fstream>
 
@@ -7,8 +8,17 @@
 #include "../core/decode_step.h"
 #include "../core/multimodal_prefill.h"
 #include "../core/image_embedding_cache.h"
+#include "../core/persistent_image_embedding_store.h"
+#include "../core/prefix_library.h"
+#include "../core/slot_snapshot.h"
+#include "../session/compat_header.h"
+#include "../session/session_manifest.h"
+#include "../session/snapshot_io.h"
+#include "../state/kv_cache_simple.h"
+#include "../state/deltanet_state.h"
 #include "../models/model_registry.h"
 #include "../models/gemma3.h"
+#include "../loader/channel_filter.h"
 #include "../models/i_image_embeddable.h"
 #include "../vision/vision_model.h"
 #include "../vision/vision_loader.h"
@@ -77,6 +87,24 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 
+        // Opt-in warm-prefix KV cache (--prefix-cache): a recurring system prompt
+        // is prefilled once and its slot-0 KV (+ recurrent) reused on later runs,
+        // skipping the prefill. Version-gated fail-loud (Phase 4). Requires a
+        // recipe that exposes its KV cache; refuse loudly if not (the user opted
+        // in explicitly).
+        std::unique_ptr<PrefixLibrary> prefix_lib;
+        if (!args.prefix_cache_dir.empty()) {
+            if (forward_pass->snapshot_kv_caches().empty())
+                throw std::runtime_error(
+                    "run_chat: parameter '--prefix-cache': expected a recipe that "
+                    "exposes its KV cache (snapshot_kv_caches non-empty), got: a "
+                    "recipe without L2 snapshot support");
+            prefix_lib = std::make_unique<PrefixLibrary>(
+                args.prefix_cache_dir,
+                qinf::snapshot::make_snapshot_header(
+                    chat_meta, forward_pass->snapshot_kv_caches()));
+        }
+
         // One image attached to the first user turn.
         // All vision state is local and inert unless --image is given; the
         // text-only path below is byte-for-byte unchanged. Fail-loud at setup
@@ -92,10 +120,26 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         // turns the single marker token into the soft-token span.
         std::string image_render_prefix;
         bool image_pending = false;
+        // Gemma 4 image input requires the thinking branch (system <|think|> turn
+        // + no forced channel); Gemma 3 image input keeps its no-think path. Set
+        // per projector below. See docs/server-image-multirequest-bug.md §5.
+        bool image_wants_thinking = false;
         // Per-session encode cache: the same image referenced again in
         // a later turn reuses its embeddings instead of re-encoding. Also holds
         // the image-count cap.
         ImageEmbeddingCache image_cache;
+        // Opt-in disk-backed embedding cache (--image-embed-cache): persists the
+        // ViT output per image hash so a recurring image is encoded once per node
+        // ever. Built below once the encoder identity (projector + dim + backend)
+        // is known; null = in-memory session reuse only. (vision V1.)
+        std::unique_ptr<PersistentImageEmbeddingStore> embed_store;
+        // Opt-in image-prefix KV cache (--image-prefix-cache; vision V2): the
+        // image turn's KV up to and including the image span is stored keyed by
+        // (preceding context + image content_id); a later run with the SAME
+        // image + context skips BOTH the ViT encode and the image-position
+        // prefill. Version-gated fail-loud like --prefix-cache. Requires a recipe
+        // that exposes its KV cache(s); refuse loudly otherwise (explicit opt-in).
+        std::unique_ptr<PrefixLibrary> image_prefix_lib;
         if (image_mode) {
             if (args.mmproj_path.empty())
                 throw std::runtime_error(
@@ -123,8 +167,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 return -1;
             };
 
+            // Encoder identity tag for the persistent embedding cache header.
+            std::string projector_tag;
             using PT = qinf::vision::VisionProjectorType;
             if (vmodel->config().projector_type == PT::Gemma3Siglip) {
+                projector_tag = "gemma3-siglip";
                 vencoder = std::make_unique<qinf::vision::SiglipEncoder>(
                     *vmodel, backend, vmodel->config().projection_dim);
                 boi_id  = find_id("<start_of_image>");
@@ -142,6 +189,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     qinf::cli::gemma3_preprocess(
                         static_cast<int>(vmodel->config().image_size)));
             } else {  // VisionProjectorType::Gemma4Uv
+                projector_tag = "gemma4uv";
                 vencoder = std::make_unique<qinf::vision::Gemma4UvEncoder>(
                     *vmodel, backend, vmodel->config().projection_dim);
                 // Markers per llama.cpp mtmd: <|image> … <image|>. The per-position
@@ -161,11 +209,45 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 // (the model reports a blank/garbled message). With them, the
                 // X-ray is read correctly. (A separate, milder degenerate-prefix
                 // artifact at generation start is still under investigation.)
-                image_render_prefix = "\n\n<|image>\n\n";
+                // Gemma 4 image framing per llama.cpp mtmd: inline, NO surrounding
+                // newlines (<|turn>user\n<|image>[img]<image|>text). The gemma3-style
+                // "\n\n<|image>\n\n" copied here originally made the model misread the
+                // image ("abstract digital…" instead of the real content). Combined
+                // with the think branch below, this matches llama's exact token
+                // stream and yields coherent, image-grounded output.
+                image_render_prefix = "<|image>";
+                image_wants_thinking = true;
                 const int eff_patch = static_cast<int>(
                     vmodel->config().patch_size * vmodel->config().n_merge);
                 image_bitmap = qinf::cli::load_image_to_bitmap(
                     args.image_path, qinf::cli::gemma4uv_preprocess(eff_patch));
+            }
+            if (!args.image_embed_cache_dir.empty()) {
+                // Key identity = projector + projection_dim + encode backend. A
+                // different encoder / dim / backend ⇒ different header ⇒ miss
+                // (opportunistic, never a wrong result). gemma4uv caches its raw
+                // pre-LM form; SigLIP the encoded form (cache-boundary rule).
+                embed_store = std::make_unique<PersistentImageEmbeddingStore>(
+                    args.image_embed_cache_dir,
+                    make_vision_header(projector_tag,
+                                       vmodel->config().projection_dim,
+                                       ggml_backend_name(backend)));
+                std::cout << "Vision: image-embed cache '"
+                          << args.image_embed_cache_dir << "' (encode once per node)\n";
+            }
+            if (!args.image_prefix_cache_dir.empty()) {
+                if (forward_pass->snapshot_kv_caches().empty())
+                    throw std::runtime_error(
+                        "run_chat: parameter '--image-prefix-cache': expected a "
+                        "recipe that exposes its KV cache(s) (snapshot_kv_caches "
+                        "non-empty), got: a recipe without L2 snapshot support");
+                image_prefix_lib = std::make_unique<PrefixLibrary>(
+                    args.image_prefix_cache_dir,
+                    qinf::snapshot::make_snapshot_header(
+                        chat_meta, forward_pass->snapshot_kv_caches()));
+                std::cout << "Vision: image-prefix cache '"
+                          << args.image_prefix_cache_dir
+                          << "' (skip ViT + image prefill on a recurring image)\n";
             }
             image_pending = true;
             std::cout << "Vision: mmproj '" << args.mmproj_path << "' + image '"
@@ -204,7 +286,50 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         if (!system_content.empty() && !system_tokens.empty()) {
             log_tokens(system_tokens);
             all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
-            forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
+
+            // Warm-prefix path: on a HIT, memcpy the cached system-prompt KV
+            // (+ recurrent) into slot 0 and SKIP the prefill; on a MISS, prefill
+            // and store. A present blob with a mismatched node identity is
+            // refused fail-loud by try_load — never silently re-prefilled (the
+            // F9 rule); surfaced here as an actionable fatal so the user clears
+            // or re-points the cache dir.
+            bool warm = false;
+            const uint64_t pkey =
+                prefix_lib ? PrefixLibrary::key_for(system_tokens) : 0;
+            if (prefix_lib) {
+                std::vector<uint8_t> blob;
+                bool hit;
+                try {
+                    hit = prefix_lib->try_load(pkey, blob);
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(
+                        std::string("run_chat: '--prefix-cache': a stored blob for "
+                        "this system prompt was built under a different model / "
+                        "quant / backend and is refused (") + e.what() +
+                        "). Clear or re-point --prefix-cache " +
+                        args.prefix_cache_dir);
+                }
+                if (hit) {
+                    qinf::snapshot::restore_slot(
+                        *forward_pass, 0, blob,
+                        qinf::snapshot::make_snapshot_header(
+                            chat_meta, forward_pass->snapshot_kv_caches()));
+                    warm = true;
+                    std::cout << "[prefix-cache] HIT: skipped prefill of "
+                              << system_tokens.size() << " system tokens\n";
+                }
+            }
+            if (!warm) {
+                forward_pass->run_prefill(system_tokens, 0, 0, scheduler);
+                if (prefix_lib) {
+                    prefix_lib->store(pkey, qinf::snapshot::capture_slot(
+                        *forward_pass, 0,
+                        qinf::snapshot::make_snapshot_header(
+                            chat_meta, forward_pass->snapshot_kv_caches())));
+                    std::cout << "[prefix-cache] MISS: prefilled + stored "
+                              << system_tokens.size() << " system tokens\n";
+                }
+            }
             forward_pass->clone_slot(0, 1, system_tokens.size());
         }
         
@@ -236,6 +361,13 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             }
             chat_history.push_back({"user", user_input});
 
+            // Guard the whole turn (tokenize → prefill → decode → suffix) so a
+            // KV-cache context overflow becomes a clean session reset instead of
+            // an uncaught std::runtime_error that aborts the process. Only the
+            // overflow error is handled here; any other error is re-thrown to
+            // preserve the fail-loud contract.
+            try {
+
             // Reset grammar state for the new turn
             if (grammar) {
                 grammar->reset();
@@ -258,8 +390,22 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 // expand the single marker token into the soft-token span the
                 // encoder fills. expand_image_markers inserts soft×N + the
                 // end-of-image token right after the begin marker.
+                // TEST (docs §5): match llama.cpp mtmd thinking branch exactly —
+                // prepend a system <|think|> turn and use enable_thinking=true so
+                // the generation prompt ends at "<|turn>model\n" (NO forced
+                // <|channel>thought\n<channel|>). llama produces coherent image
+                // output with this exact sequence.
+                // Gemma 4 needs the thinking branch for image input: a leading
+                // system <|think|> turn (rendered by the template when thinking is
+                // on) and a generation prompt that ends at "model\n". Gemma 3 keeps
+                // its existing no-think image path. See docs §5.
+                std::vector<ChatMessage> turn;
+                if (image_wants_thinking)
+                    turn.push_back({"system", ""});
+                turn.push_back({"user", image_render_prefix + user_input});
                 std::string turn_prompt = tmpl.render(
-                    {{"user", image_render_prefix + user_input}}, true);
+                    turn, /*add_assistant_prompt=*/true,
+                    image_wants_thinking ? std::optional<bool>(true) : std::nullopt);
                 std::vector<int32_t> raw = tokenizer->encode(turn_prompt);
                 qinf::cli::ExpandedImagePrompt built = qinf::cli::expand_image_markers(
                     raw, boi_id, soft_id, eoi_id, vencoder->mm_tokens_for(image_bitmap));
@@ -272,9 +418,75 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 log_tokens(new_tokens);
 
                 std::vector<ImagePromptChunk> chunks = {{&image_bitmap, img_span_start}};
-                logits = prefill_multimodal(*forward_pass, *vencoder, scheduler,
-                                            new_tokens, chunks, current_pos,
-                                            session_slot, &image_cache);
+                if (!image_prefix_lib) {
+                    // No image-prefix cache: the original single-call path —
+                    // encode + chunked [pre-image | image | question] in one go.
+                    logits = prefill_multimodal(
+                        *forward_pass, *vencoder, model.get_scheduler(), new_tokens,
+                        chunks, current_pos, session_slot, &image_cache,
+                        embed_store.get());
+                } else {
+                    // Vision V2: cache the KV up to and including the image span,
+                    // then prefill only the variable question suffix. The split is
+                    // byte-identical to the single call (the image is its own chunk
+                    // either way — proven by test-image-prefix-roundtrip GATE 2).
+                    const uint32_t n_img = vencoder->mm_tokens_for(image_bitmap);
+                    const int img_end_local = img_span_start + static_cast<int>(n_img);
+                    const std::vector<int32_t> image_inclusive(
+                        new_tokens.begin(), new_tokens.begin() + img_end_local);
+                    const std::vector<int32_t> suffix(
+                        new_tokens.begin() + img_end_local, new_tokens.end());
+                    const int img_end_pos = current_pos + img_end_local;
+
+                    // Key over the FIXED context before the image span (slot tokens
+                    // already prefilled = all_tokens, plus this turn's pre-image
+                    // text) and the image content_id. The question (after the span)
+                    // is NOT in the key.
+                    std::vector<int32_t> preceding = all_tokens;  // slot [0, current_pos)
+                    preceding.insert(preceding.end(), new_tokens.begin(),
+                                     new_tokens.begin() + img_span_start);
+                    const uint64_t ikey = PrefixLibrary::key_for(
+                        preceding, image_bitmap.content_id);
+
+                    std::vector<uint8_t> blob;
+                    bool ihit = false;
+                    try {
+                        ihit = image_prefix_lib->try_load(ikey, blob);
+                    } catch (const std::exception& e) {
+                        throw std::runtime_error(
+                            std::string("run_chat: '--image-prefix-cache': a stored "
+                            "blob for this (context, image) was built under a "
+                            "different model / quant / backend and is refused (") +
+                            e.what() + "). Clear or re-point --image-prefix-cache " +
+                            args.image_prefix_cache_dir);
+                    }
+                    if (ihit) {
+                        // Restore the image-inclusive KV into the session slot and
+                        // SKIP both the ViT encode and the image-position prefill.
+                        qinf::snapshot::restore_slot(
+                            *forward_pass, session_slot, blob,
+                            qinf::snapshot::make_snapshot_header(
+                                chat_meta, forward_pass->snapshot_kv_caches()));
+                        std::cout << "[image-prefix-cache] HIT: skipped ViT + image "
+                                     "prefill (" << n_img << " soft tokens)\n";
+                    } else {
+                        // MISS: encode + chunked-prefill [pre-image | image], then
+                        // capture the post-image KV and store it under the key.
+                        prefill_multimodal(
+                            *forward_pass, *vencoder, model.get_scheduler(),
+                            image_inclusive, chunks, current_pos, session_slot,
+                            &image_cache, embed_store.get());
+                        image_prefix_lib->store(ikey, qinf::snapshot::capture_slot(
+                            *forward_pass, session_slot,
+                            qinf::snapshot::make_snapshot_header(
+                                chat_meta, forward_pass->snapshot_kv_caches())));
+                        std::cout << "[image-prefix-cache] MISS: encoded + prefilled "
+                                     "+ stored (" << n_img << " soft tokens)\n";
+                    }
+                    // The question suffix rides the plain text path either way.
+                    logits = forward_pass->run_prefill(suffix, img_end_pos,
+                                                       session_slot, scheduler);
+                }
                 image_pending = false;
             } else {
                 // Format only the new user turn for tokenization
@@ -298,6 +510,12 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             std::string assistant_response = "";
             std::cout << "Assistant: " << std::flush;
 
+            // Gemma 4 channel-stream filter (shared with the server — see
+            // loader/channel_filter.h). Per-turn instance: suppresses the
+            // thought channel and the <|channel>/<channel|>/<|turn> framing,
+            // robust to token-boundary splits. Inert for non-Gemma-4 models.
+            ChannelFilter channel_filter;
+
             // generated_tokens = tokens generated in this assistant turn
             std::vector<int32_t> prompt_tokens_for_pld = all_tokens;
             std::vector<int32_t> generated_tokens;
@@ -319,8 +537,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     break;
                 }
                 log_token(next_token_id);
-                print_token(decoded_token);
-                assistant_response += decoded_token;
+                std::string vis = channel_filter.feed(decoded_token);
+                if (!vis.empty()) {
+                    print_token(vis);
+                    assistant_response += vis;
+                }
                 all_tokens.push_back(next_token_id);
                 generated_tokens.push_back(next_token_id);
 
@@ -343,8 +564,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     }
                     std::string ft_str = tokenizer->decode(ft);
                     log_token(ft);
-                    print_token(ft_str);
-                    assistant_response += ft_str;
+                    std::string ft_vis = channel_filter.feed(ft_str);
+                    if (!ft_vis.empty()) {
+                        print_token(ft_vis);
+                        assistant_response += ft_vis;
+                    }
                     all_tokens.push_back(ft);
                     generated_tokens.push_back(ft);
                 }
@@ -377,6 +601,24 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
 
 
             chat_history.push_back({"assistant", assistant_response});
-        }    
+
+            } catch (const std::exception& e) {
+                // Only a KV-cache context overflow is recoverable here; rethrow
+                // anything else so genuine faults stay loud.
+                const std::string msg = e.what();
+                if (msg.find("overflow") == std::string::npos) throw;
+
+                std::cout << "\n\033[1;33m[System] KV cache context limit reached. "
+                             "Resetting conversation context...\033[0m\n";
+                // Flush both slots (0 = system-prompt template slot, 1 = session)
+                // back to pos 0 and drop the in-memory transcript so the next turn
+                // starts fresh (and re-prepends BOS at pos 0).
+                forward_pass->clear_slot(0);
+                forward_pass->clear_slot(1);
+                all_tokens.clear();
+                chat_history.clear();
+                continue;
+            }
+        }
     return 0;
 }

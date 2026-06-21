@@ -4,8 +4,12 @@
 #include "../layers/norm.h"
 #include "../graph_inputs/sparse_head_input.h"
 #include "../graph_inputs/output_ids_input.h"
+#include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/image_embeddings_input.h"
 
+#include <map>
 #include <memory>
+#include <string>
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -172,6 +176,78 @@ ggml_tensor* ForwardPassBase::build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* 
     ggml_tensor* sliced = ggml_get_rows(ctx_, cur, out_ids);
     ggml_set_name(sliced, "out_ids_slice");
     return sliced;
+}
+
+ggml_tensor* ForwardPassBase::build_image_substitution(
+    ggml_cgraph* gf, ggml_tensor* inpL, std::vector<float>&& embd,
+    int32_t span_start, uint32_t n_img, int hidden_dim, size_t n_tokens)
+{
+    const size_t want = static_cast<size_t>(hidden_dim) * n_img;
+    if (embd.size() != want)
+        throw std::runtime_error(
+            "build_image_substitution: slot 'image_embeddings': expected " +
+            std::to_string(want) + " floats (hidden_dim=" +
+            std::to_string(hidden_dim) + " * n_img=" + std::to_string(n_img) +
+            "), got: " + std::to_string(embd.size()));
+    if (span_start < 0 ||
+        static_cast<size_t>(span_start) + n_img > n_tokens)
+        throw std::runtime_error(
+            "build_image_substitution: slot 'image_span': expected span within "
+            "[0, " + std::to_string(n_tokens) + "), got: start=" +
+            std::to_string(span_start) + " n_img=" + std::to_string(n_img));
+
+    ggml_tensor* img_in = ggml_new_tensor_2d(
+        ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
+    ggml_set_input(img_in);
+    set_tensor_name(gf, img_in, "image_embeddings");
+    ggml_build_forward_expand(gf, img_in);
+
+    // inpL[:, span : span+n_img] = img_in (one op; the surviving text columns
+    // keep their sqrt(d_model) scale, the image columns enter unscaled).
+    inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
+                       static_cast<size_t>(span_start) * inpL->nb[1]);
+    set_tensor_name(gf, inpL, "inpL_image_subst");
+    // Pin the substituted residual as a graph output. Without this, galloc
+    // reuses this intermediate's buffer across the server's alternating graph
+    // shapes, so the 2nd+ image request reads stale memory here and degenerates
+    // (token-soup). Marking it an output keeps its buffer live and makes
+    // multi-request image prefill deterministic. The single owner of this pin —
+    // every vision recipe routes through here, so it cannot be forgotten by one.
+    ggml_set_output(inpL);
+    ggml_build_forward_expand(gf, inpL);
+
+    graph_inputs_.add(std::make_unique<ImageEmbeddingsInput>(std::move(embd)));
+    return inpL;
+}
+
+std::vector<ggml_tensor*> ForwardPassBase::build_decode_layer_masks(
+    ggml_cgraph* gf,
+    const std::vector<uint32_t>& layer_windows,
+    uint32_t n_kv_len, uint32_t n_tokens)
+{
+    std::vector<ggml_tensor*>        per_layer(layer_windows.size(), nullptr);
+    std::map<uint32_t, ggml_tensor*> by_window;  // distinct window -> shared mask
+
+    for (size_t il = 0; il < layer_windows.size(); ++il) {
+        const uint32_t w  = layer_windows[il];
+        auto           it = by_window.find(w);
+        if (it == by_window.end()) {
+            // One tensor + one typed input per distinct window. The mask body is
+            // identical for every layer of this window within a decode step
+            // (same positions/slots/n_kv), so sharing is bit-for-bit equivalent
+            // to the former tensor-per-layer while collapsing the input count.
+            ggml_tensor* m = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+                                                n_kv_len, 1, 1, n_tokens);
+            ggml_set_input(m);
+            const std::string name = "kq_mask.w" + std::to_string(w);
+            ggml_set_name(m, name.c_str());
+            ggml_build_forward_expand(gf, m);
+            graph_inputs_.add(std::make_unique<AttnMaskInput>(name, w));
+            it = by_window.emplace(w, m).first;
+        }
+        per_layer[il] = it->second;
+    }
+    return per_layer;
 }
 
 void ForwardPassBase::set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il) const {

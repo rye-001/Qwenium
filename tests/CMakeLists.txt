@@ -191,6 +191,139 @@ target_link_libraries(http-server-test PRIVATE
 target_compile_features(http-server-test PRIVATE cxx_std_17)
 gtest_discover_tests(http-server-test)
 
+# Chat-endpoint image-input parsing gate (server image_url data URIs). No model
+# file / encoder — pure request parsing + fail-loud guards. Compiles the server
+# parse module directly (header-only consumers + nlohmann json).
+add_executable(image-data-uri-tests
+    unit/test_image_data_uri.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/image_data_uri.cpp
+)
+target_link_libraries(image-data-uri-tests PRIVATE
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
+)
+target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-data-uri-tests)
+
+# Session snapshot seams (Phase 0). Model-free — links only qinf-session.
+add_executable(session-tests
+    unit/test_session_manifest.cpp
+)
+target_link_libraries(session-tests PRIVATE
+    GTest::gtest_main
+    qinf-session
+)
+target_compile_features(session-tests PRIVATE cxx_std_17)
+gtest_discover_tests(session-tests)
+
+# L1 control-state sections (Phase 1a). Model-free — links sampling + qinf-state
+# (both pull qinf-session). Proves RNG/grammar/token sections round-trip bitwise.
+add_executable(l1-section-tests
+    unit/test_l1_sections.cpp
+)
+target_link_libraries(l1-section-tests PRIVATE
+    GTest::gtest_main
+    sampling
+    qinf-state
+)
+target_compile_features(l1-section-tests PRIVATE cxx_std_17)
+gtest_discover_tests(l1-section-tests)
+
+# Image-embedding V1 sections + persistent store (vision). Model-free — links
+# core (pulls qinf-graph-inputs + qinf-session). Byte round-trip + store
+# hit/miss/version-gating semantics.
+add_executable(image-embedding-section-tests
+    unit/test_image_embedding_section.cpp
+)
+target_link_libraries(image-embedding-section-tests PRIVATE
+    GTest::gtest_main
+    core
+)
+target_compile_features(image-embedding-section-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-embedding-section-tests)
+
+# Prefix library (Phase 4 L2 service surface). Model-free — links core (pulls
+# qinf-session for CompatHeader + snapshot_io). Key stability, hit/miss, the
+# fail-loud header refusal (the Phase 4 non-negotiable), eviction, atomic store.
+add_executable(prefix-library-tests
+    unit/test_prefix_library.cpp
+)
+target_link_libraries(prefix-library-tests PRIVATE
+    GTest::gtest_main
+    core
+)
+target_compile_features(prefix-library-tests PRIVATE cxx_std_17)
+gtest_discover_tests(prefix-library-tests)
+
+# L1 session round-trip (Phase 1b). Model-based standalone harness (takes a GGUF
+# path as argv[1]); NOT auto-discovered — run manually against a Qwen and a Gemma
+# recipe. Captures mid-decode, restores via feed_tokens, asserts token-stable
+# continuation (gate A) + bitwise restore-vs-restore on CPU (gate B).
+add_executable(test-l1-session-roundtrip
+    integration/test_l1_session_roundtrip.cpp
+)
+target_link_libraries(test-l1-session-roundtrip PRIVATE
+    qinf-models
+    qinf-state
+    core
+    sampling
+    ggml
+)
+target_compile_features(test-l1-session-roundtrip PRIVATE cxx_std_17)
+
+# L2 session round-trip (Phase 3). Model-based standalone harness (GGUF argv[1]).
+# Gate 1 fidelity=byte (vs live), Gate 2 substitutability=token-stable (vs L1
+# feed_tokens), Gate 3 build_path_tag fail-loud. Run on Qwen35 (KV+recurrent) and
+# Gemma3 (KV only).
+add_executable(test-l2-session-roundtrip
+    integration/test_l2_session_roundtrip.cpp
+)
+target_link_libraries(test-l2-session-roundtrip PRIVATE
+    qinf-models
+    qinf-state
+    core
+    sampling
+    ggml
+)
+target_compile_features(test-l2-session-roundtrip PRIVATE cxx_std_17)
+
+# Prefix-library round-trip (Phase 4). Model-based standalone harness (GGUF
+# argv[1]). Gate 1 fidelity=byte (WARM==LIVE), Gate 2 substitutability=token-
+# stable (WARM==REF prefill-from-scratch), Gate 3 header mismatch fail-loud. Run
+# on Qwen35 (KV+recurrent) and Gemma3 (KV only).
+add_executable(test-prefix-library-roundtrip
+    integration/test_prefix_library_roundtrip.cpp
+)
+target_link_libraries(test-prefix-library-roundtrip PRIVATE
+    qinf-models
+    qinf-state
+    core
+    sampling
+    ggml
+)
+target_compile_features(test-prefix-library-roundtrip PRIVATE cxx_std_17)
+
+# Image-prefix round-trip (Vision V2). Model-based standalone harness; takes a
+# GGUF model AND an mmproj (argv[1], argv[2]). Captures the post-image-prefill
+# KV blob under the image-extended key, then proves WARM (load blob, skip
+# encode+image-prefill) == LIVE (chunked-from-scratch) BYTE. Links vision +
+# the consumer-compiled multimodal_prefill (same arrangement as the CLI). Run on
+# a Gemma3 (SigLIP) AND a Gemma4 (gemma4uv) image path.
+add_executable(test-image-prefix-roundtrip
+    integration/test_image_prefix_roundtrip.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+)
+target_link_libraries(test-image-prefix-roundtrip PRIVATE
+    qinf-models
+    qinf-vision
+    qinf-state
+    core
+    sampling
+    ggml
+)
+target_compile_features(test-image-prefix-roundtrip PRIVATE cxx_std_17)
+
 # Grammar regression tests (non-GTest standalone executables)
 add_subdirectory(grammar)
 
@@ -643,6 +776,19 @@ target_link_libraries(multimodal-check-tests PRIVATE
 
 target_compile_features(multimodal-check-tests PRIVATE cxx_std_17)
 gtest_discover_tests(multimodal-check-tests)
+
+# Gemma 4 channel-stream filter — pure string logic, no model file needed.
+add_executable(channel-filter-tests
+    unit/test_channel_filter.cpp
+)
+
+target_link_libraries(channel-filter-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+)
+
+target_compile_features(channel-filter-tests PRIVATE cxx_std_17)
+gtest_discover_tests(channel-filter-tests)
 
 # Vision loader (Phase 2.1) — requires ./mmproj-BF16.gguf to be present;
 # self-skips otherwise. See docs/plan-gemma-vision-impl.md.

@@ -68,6 +68,16 @@ struct ModelMetadata {
     
     std::unordered_map<std::string, TensorMetadata> tensor_inventory;
 
+    // Content identity of the model weights: a hash of the tensor inventory
+    // (name + ggml_type + shape + offset, name-sorted) folded with the
+    // architecture string. Captures arch + shape + quant + layout cheaply (no
+    // weight-data read). Feeds CompatHeader::weights_hash so a session / prefix
+    // blob built against different weights is refused fail-loud. NOTE: two
+    // finetunes with a byte-identical inventory hash the same — sufficient for
+    // the single-node local prefix library (same file reused); a sampled-byte
+    // digest is the cross-node hardening if ever needed. 0 = not computed.
+    uint64_t weights_hash = 0;
+
     // Raw GGUF KVs; family-specific fields read from here (typed members are universal-only).
     GGUFKVBag raw_kv;
 };

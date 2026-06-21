@@ -1,4 +1,5 @@
 #include "deltanet_state.h"
+#include "snapshot_io.h"
 
 #include "ggml-backend.h"
 
@@ -6,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
@@ -144,6 +146,55 @@ void DeltaNetState::set_conv(uint32_t dn_idx, uint32_t slot, const float* src) {
 }
 
 // ── clear_slot / clone_slot ───────────────────────────────────────────────────
+
+// --- L2 session snapshot (OverwriteRecurrent lane) -------------------------
+
+void DeltaNetState::serialize_slot(qinf::session::SnapshotWriter& w,
+                                   uint32_t slot) const {
+    validate_slot(slot, "serialize_slot");
+    w.put_u32(hp_.n_dn_layers);
+    w.put_u32(static_cast<uint32_t>(rec_slot_floats_));
+    w.put_u32(static_cast<uint32_t>(conv_slot_floats_));
+
+    std::vector<float> rec(rec_slot_floats_);
+    std::vector<float> conv(conv_slot_floats_);
+    for (uint32_t il = 0; il < hp_.n_dn_layers; ++il) {
+        get_recurrent(il, slot, rec.data());
+        w.put_bytes(rec.data(), rec_slot_floats_ * sizeof(float));
+        if (conv_slot_floats_ > 0) {
+            get_conv(il, slot, conv.data());
+            w.put_bytes(conv.data(), conv_slot_floats_ * sizeof(float));
+        }
+    }
+}
+
+void DeltaNetState::deserialize_slot(qinf::session::SnapshotReader& r,
+                                     uint32_t slot) {
+    validate_slot(slot, "deserialize_slot");
+    auto require = [](const char* field, uint64_t expected, uint64_t actual) {
+        if (expected != actual) {
+            throw std::runtime_error(
+                std::string("deltanet_state: field \"") + field + "\" expected " +
+                std::to_string(expected) + ", got " + std::to_string(actual));
+        }
+    };
+    require("n_dn_layers", hp_.n_dn_layers, r.get_u32());
+    require("rec_slot_floats", rec_slot_floats_, r.get_u32());
+    require("conv_slot_floats", conv_slot_floats_, r.get_u32());
+
+    std::vector<uint8_t> rec, conv;
+    for (uint32_t il = 0; il < hp_.n_dn_layers; ++il) {
+        r.get_bytes(rec);
+        require("rec_block_bytes", rec_slot_floats_ * sizeof(float), rec.size());
+        set_recurrent(il, slot, reinterpret_cast<const float*>(rec.data()));
+        if (conv_slot_floats_ > 0) {
+            r.get_bytes(conv);
+            require("conv_block_bytes", conv_slot_floats_ * sizeof(float),
+                    conv.size());
+            set_conv(il, slot, reinterpret_cast<const float*>(conv.data()));
+        }
+    }
+}
 
 void DeltaNetState::clear_slot(uint32_t slot) {
     validate_slot(slot, "clear_slot");

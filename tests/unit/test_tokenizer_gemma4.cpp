@@ -108,15 +108,15 @@ TEST(Gemma4Tokenizer, ConfigShape) {
     EXPECT_EQ(cfg.normalizer, NormalizerKind::SpaceToUnderscore);
     EXPECT_TRUE(cfg.byte_fallback);
     EXPECT_TRUE(cfg.add_bos_token);
-    // <start_of_turn> and <end_of_turn> must be force-promoted so the
+    // <|turn> and <turn|> must be force-promoted so the
     // encoder yields a single id per tag.
-    bool has_sot = false, has_eot = false;
+    bool has_turn = false, has_turn_end = false;
     for (const auto& s : cfg.extra_chat_specials) {
-        if (s == "<start_of_turn>") has_sot = true;
-        if (s == "<end_of_turn>")   has_eot = true;
+        if (s == "<|turn>") has_turn = true;
+        if (s == "<turn|>") has_turn_end = true;
     }
-    EXPECT_TRUE(has_sot) << "missing <start_of_turn> in extra_chat_specials";
-    EXPECT_TRUE(has_eot) << "missing <end_of_turn> in extra_chat_specials";
+    EXPECT_TRUE(has_turn) << "missing <|turn> in extra_chat_specials";
+    EXPECT_TRUE(has_turn_end) << "missing <turn|> in extra_chat_specials";
 }
 
 // 2. Construction from a Gemma 4 vocab succeeds and the special-token IDs

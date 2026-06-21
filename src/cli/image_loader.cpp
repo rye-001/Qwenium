@@ -114,24 +114,13 @@ ImagePreprocess gemma4uv_preprocess(int align, int min_tokens, int max_tokens) {
     return pp;
 }
 
-qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
-                                          const ImagePreprocess& pp) {
-    int w = 0, h = 0, src_channels = 0;
-    // Force 3 channels (RGB); stb drops alpha and expands grayscale.
-    unsigned char* data = stbi_load(path.c_str(), &w, &h, &src_channels, 3);
-    if (data == nullptr)
-        throw std::runtime_error(
-            std::string("image_loader: file '") + path +
-            "': expected a decodable JPEG/PNG/image, got: " +
-            (stbi_failure_reason() ? stbi_failure_reason() : "unknown stb error"));
-    if (w <= 0 || h <= 0) {
-        stbi_image_free(data);
-        throw std::runtime_error(
-            std::string("image_loader: file '") + path +
-            "': expected positive dimensions, got: " + std::to_string(w) +
-            "x" + std::to_string(h));
-    }
+namespace {
 
+// Shared core: turn an already-decoded interleaved 8-bit RGB buffer into the
+// preprocessed channel-planar Bitmap.The file- and memory-based entry points
+// differ only in how `data` is produced, so this is byte-identical between them.
+qinf::vision::Bitmap bitmap_from_rgb(const unsigned char* data, int w, int h,
+                                     const ImagePreprocess& pp) {
     // ── Target canvas dims (aspect ratio handled by the PAD_CEIL letterbox) ───
     int target_w, target_h;
     if (pp.sizing == ImagePreprocess::Sizing::FixedSquarePadCeil) {
@@ -166,8 +155,7 @@ qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
     const int new_h = std::min(static_cast<int>(std::ceil(h * scale)), target_h);
 
     std::vector<unsigned char> resized;
-    resize_bilinear_u8(data, w, h, resized, new_w, new_h);
-    stbi_image_free(data);
+    resize_bilinear_u8(data, w, h, resized, new_w, new_h);  // caller owns/frees `data`
 
     const int off_x = (target_w - new_w) / 2;
     const int off_y = (target_h - new_h) / 2;
@@ -185,6 +173,52 @@ qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
     }
 
     bmp.content_id = content_hash(bmp.pixels);
+    return bmp;
+}
+
+}  // namespace
+
+qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
+                                          const ImagePreprocess& pp) {
+    int w = 0, h = 0, src_channels = 0;
+    // Force 3 channels (RGB); stb drops alpha and expands grayscale.
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &src_channels, 3);
+    if (data == nullptr)
+        throw std::runtime_error(
+            std::string("image_loader: file '") + path +
+            "': expected a decodable JPEG/PNG/image, got: " +
+            (stbi_failure_reason() ? stbi_failure_reason() : "unknown stb error"));
+    if (w <= 0 || h <= 0) {
+        stbi_image_free(data);
+        throw std::runtime_error(
+            std::string("image_loader: file '") + path +
+            "': expected positive dimensions, got: " + std::to_string(w) +
+            "x" + std::to_string(h));
+    }
+    qinf::vision::Bitmap bmp = bitmap_from_rgb(data, w, h, pp);
+    stbi_image_free(data);
+    return bmp;
+}
+
+qinf::vision::Bitmap load_image_to_bitmap_from_memory(const uint8_t* data,
+                                                      size_t len,
+                                                      const ImagePreprocess& pp) {
+    int w = 0, h = 0, src_channels = 0;
+    unsigned char* rgb = stbi_load_from_memory(
+        data, static_cast<int>(len), &w, &h, &src_channels, 3);
+    if (rgb == nullptr)
+        throw std::runtime_error(
+            std::string("image_loader: parameter 'image bytes': expected a "
+            "decodable JPEG/PNG/image, got: ") +
+            (stbi_failure_reason() ? stbi_failure_reason() : "unknown stb error"));
+    if (w <= 0 || h <= 0) {
+        stbi_image_free(rgb);
+        throw std::runtime_error(
+            std::string("image_loader: parameter 'image bytes': expected positive "
+            "dimensions, got: ") + std::to_string(w) + "x" + std::to_string(h));
+    }
+    qinf::vision::Bitmap bmp = bitmap_from_rgb(rgb, w, h, pp);
+    stbi_image_free(rgb);
     return bmp;
 }
 

@@ -3,9 +3,16 @@
 #include "layer_state.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "session/section_ids.h"
+#include "session/snapshot_section.h"
 #include <vector>
 #include <memory>
 #include <cstdint>
+
+namespace qinf::session {
+class SnapshotWriter;
+class SnapshotReader;
+}  // namespace qinf::session
 
 class simple_kv_cache : public LayerState {
 public:
@@ -96,6 +103,24 @@ public:
     ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }
     ggml_tensor* get_v_cache_tensor(int layer) { return v_cache[layer]; }
 
+    // --- L2 session snapshot (AppendKV lane) ---
+    // Serialize / restore the [0, positions[slot]) K/V span for one slot. The
+    // span is a contiguous block per layer (slot rows are contiguous), so this
+    // is a per-layer ggml_backend_tensor_get/set — byte-exact on CPU and Metal.
+    // Reference (aliased) layers are skipped; their source carries the data and
+    // the alias is rebuilt at construction. deserialize validates shape/type
+    // fail-loud against this cache and sets the slot cursor. Co-located section:
+    // KvCacheSection below.
+    void serialize_slot(qinf::session::SnapshotWriter& w, uint32_t slot) const;
+    void deserialize_slot(qinf::session::SnapshotReader& r, uint32_t slot);
+
+    // Kernel-path identity of this cache: a hash of the backend (CPU / Metal —
+    // the decode kernel path), the K/V dtypes, and the context width. These are
+    // exactly the determinants of whether a frozen KV blob is valid to memcpy
+    // into and resume here. Feeds CompatHeader::build_path_tag so an L2 blob
+    // built under a different path is refused fail-loud rather than producing a
+    // divergent resume. See docs/plan-session-snapshot.md (build_path_tag).
+    uint64_t path_tag() const;
 
 private:
     const uint32_t n_layers;
@@ -123,4 +148,26 @@ private:
     std::vector<KvSharingSpec> sharing_;
 
     void init_cache();
+};
+
+// L2 AppendKV section: serializes one slot's KV span. Borrows the cache.
+class KvCacheSection : public qinf::session::SnapshotSection {
+public:
+    KvCacheSection(simple_kv_cache& kv, uint32_t slot) : kv_(kv), slot_(slot) {}
+    qinf::session::SectionId id() const override {
+        return qinf::session::kKvCacheSectionId;
+    }
+    qinf::session::StateLane lane() const override {
+        return qinf::session::StateLane::AppendKV;
+    }
+    void write(qinf::session::SnapshotWriter& w) const override {
+        kv_.serialize_slot(w, slot_);
+    }
+    void read(qinf::session::SnapshotReader& r) override {
+        kv_.deserialize_slot(r, slot_);
+    }
+
+private:
+    simple_kv_cache& kv_;
+    uint32_t         slot_;
 };

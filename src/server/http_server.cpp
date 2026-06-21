@@ -20,14 +20,33 @@
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "loader/chat_template.h"
+#include "loader/channel_filter.h"
 #include "sampling/sampling.h"
-#include "state/kv_cache_simple.h"
+#include "sampling/grammar_vocab.h"  // GBNF constrained output (per-slot grammar)
+
+// Vision (image input on /v1/chat/completions). The whole image pipeline lives
+// in ServerVision (server_vision.{h,cpp}) and is inert unless the server is
+// started with --mmproj: a text-only server never constructs one, and a
+// text-only request never touches it. http_server.cpp keeps only the data-URI
+// decode + capability gate it needs to route an image request.
+#include "image_data_uri.h"
+#include "server_vision.h"
+
+// Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
+// content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
+// system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
+#include "core/prefix_library.h"
+#include "core/slot_snapshot.h"
 
 #include <iostream>
 #include <thread>
 #include <csignal>
 #include <atomic>
 #include <ctime>
+#include <cstdint>
+#include <optional>
+#include <algorithm>
+#include <cstdlib>
 
 using json = nlohmann::json;
 
@@ -65,27 +84,45 @@ std::string normalize_output(const std::string& output) {
     // safe cross-family and keeps this free function model-agnostic. (F6)
     std::vector<std::string> end_tokens = {
         "<|im_end|>", "<|endoftext|>", "</s>",
-        "<end_of_turn>", "<eos>"};
+        "<end_of_turn>", "<eos>",
+        // Gemma 4 IT's native end-of-turn marker. It IS a stop token (so the
+        // slot halts before folding it into output_text), but the raw id is
+        // still pushed to the SSE stream before the stop fires — strip it so the
+        // streamed delta doesn't leak the literal marker.
+        "<turn|>"};
     for (const auto& token : end_tokens) {
         pos = normalized.find(token);
         if (pos != std::string::npos) {
             normalized = normalized.substr(0, pos);
         }
     }
-    
+
+    // NB: Gemma 4 channel framing (the <|channel>/<channel|> thought channel) is
+    // NOT stripped here. This function runs PER TOKEN (it backs detokenize_), and
+    // the ChannelFilter is a state machine that spans tokens — running it
+    // per-token resets its state every call, so the <|channel> marker is consumed
+    // but the following "thought" name + content leak through on the next token.
+    // Channel stripping is therefore applied at the RESPONSE BOUNDARY instead:
+    // one-shot ChannelFilter::strip over the full assembled output_text for
+    // non-streaming responses, and a single stateful ChannelFilter::feed() per
+    // request for SSE streaming (mirroring the CLI). The BPE char fixups and
+    // end-marker removal above ARE per-token-safe and stay here.
     return normalized;
 }
 
 // =============================================================================
 // Integration layer: Wire up InferenceServer to your Qwen implementation
 // =============================================================================
-class QwenServerIntegration {
+class QweniumServerIntegration {
     static constexpr int MAX_SLOTS = 10;
-    static constexpr int TEMPLATE_SLOT = 0;  // Reserved for system prompt cache
 
 public:
-    QwenServerIntegration(const std::string& model_path, int max_ctx_per_slot = 2048,
-                          int max_slots = MAX_SLOTS)
+    QweniumServerIntegration(const std::string& model_path, int max_ctx_per_slot = 2048,
+                          int max_slots = MAX_SLOTS,
+                          const std::string& mmproj_path = "",
+                          const std::string& image_embed_cache_dir = "",
+                          const std::string& image_prefix_cache_dir = "",
+                          const std::string& prefix_cache_dir = "")
         : max_ctx_per_slot_(max_ctx_per_slot),
           max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)) {
 
@@ -95,7 +132,10 @@ public:
         // registry must be populated first or every load fails with an empty
         // "expected one of:" list.
         register_builtin_models();
-        model_.load_metadata(model_path);
+        // --mmproj signals the vision pipeline: allow a checkpoint carrying
+        // image-placeholder tokens instead of refusing it as multimodal-only
+        // (mirrors the CLI; harmless for a text export, which still loads as text).
+        model_.load_metadata(model_path, /*allow_multimodal=*/!mmproj_path.empty());
         model_.load_tensors();
 
         // F6: build the tokenizer with the architecture's registered
@@ -106,7 +146,18 @@ public:
         const std::string& arch = model_.get_metadata().architecture;
         tokenizer_ = std::make_unique<Tokenizer>(&model_.get_metadata(),
                                                  lookup_tokenizer_config(arch));
-        sampler_ = std::make_unique<qwenium::GreedySampler>();
+        // One sampler + (optional) grammar per slot — control state is per-slot,
+        // like KV. Default each sampler to greedy; prepare_slot() rebuilds a
+        // slot's sampler/grammar from its request when that request is assigned.
+        slot_samplers_.resize(max_slots_);
+        for (auto& s : slot_samplers_)
+            s = std::make_unique<qwenium::GreedySampler>();
+        slot_grammars_.resize(max_slots_);  // null unless a request sets a grammar
+
+        // Cache the vocabulary once (id -> token string). Passed as token_strs to
+        // sample() so a slot's grammar can mask logits, and used to build each
+        // grammar slot's TokenTrie. ~vocab_size strings; fetched a single time.
+        vocab_ = tokenizer_->get_vocabulary();
 
         // F6: render prompts with the architecture's registered ChatTemplate
         // (Qwen <|im_start|> vs Gemma <start_of_turn> vs Gemma-4's own markers),
@@ -114,7 +165,7 @@ public:
         chat_template_ = lookup_chat_template(arch);
         if (!chat_template_)
             throw std::runtime_error(
-                "QwenServerIntegration: no chat template registered for arch '" +
+                "QweniumServerIntegration: no chat template registered for arch '" +
                 arch + "'");
         std::cout << "Tokenizer + chat template wired for arch=" << arch << std::endl;
 
@@ -129,31 +180,90 @@ public:
         
         // Reserve memory for the maximum batch size to prevent reallocation errors
         reserve_max_batch();
-        
+
+        // Vision projector (image input). Stays null for a text-only server; a
+        // successful construction is what `vision_enabled()` reports. Fail-loud
+        // ctor (no image hook / missing markers) propagates out of here.
+        if (!mmproj_path.empty()) {
+            vision_ = std::make_unique<ServerVision>(
+                model_, *forward_pass_, *tokenizer_, model_mutex_,
+                max_ctx_per_slot_, mmproj_path, image_embed_cache_dir,
+                image_prefix_cache_dir);
+        }
+
+        // Text prefix cache (--prefix-cache): opt-in, version-gated, transparent.
+        // Requires a recipe that exposes its KV cache(s); refuse loudly at setup
+        // if not (opt-in explicit, the F9 rule). Null => no text prefix caching.
+        if (!prefix_cache_dir.empty()) {
+            if (forward_pass_->snapshot_kv_caches().empty())
+                throw std::runtime_error(
+                    "QweniumServerIntegration: parameter '--prefix-cache': expected a "
+                    "recipe that exposes its KV cache(s) (snapshot_kv_caches "
+                    "non-empty), actual: a recipe without L2 snapshot support (" +
+                    model_label() + ")");
+            text_prefix_lib_ = std::make_unique<PrefixLibrary>(
+                prefix_cache_dir,
+                qinf::snapshot::make_snapshot_header(
+                    model_.get_metadata(), forward_pass_->snapshot_kv_caches()));
+            std::cout << "Text: prefix cache '" << prefix_cache_dir
+                      << "' (skip recurring system-prompt prefill)" << std::endl;
+        }
+
         std::cout << "Model loaded successfully" << std::endl;
     }
 
     void reserve_max_batch() {
         std::cout << "Reserving memory for max batch size: " << max_slots_ << " and max ctx: " << max_ctx_per_slot_ << std::endl;
 
-        // 1. Reserve for max decode batch
+        // 1. Reserve for max decode batch — at MAXIMUM KV depth.
+        //
+        // build_decoding_graph sizes its growing per-step inputs (gather_indices
+        // and the per-window attention masks) from get_cache_pos(slot), i.e. the
+        // CURRENT KV depth — NOT the `positions` argument. Reserving with a fresh
+        // cache (depth 0 → n_kv_len 1) therefore reserves the SMALLEST decode
+        // graph, so galloc must reallocate as the real conversation deepens. That
+        // mid-generation reallocation corrupts decode scratch → non-deterministic
+        // logits and premature mid-word stops on long generations. Advance every
+        // slot's cache to the context ceiling first so the reserved graph is the
+        // largest one decode will ever build; galloc is then sized once and never
+        // grows during a request. Positions/values are irrelevant here — only the
+        // graph topology/sizes matter for reservation — so the dummy 0s are fine.
         {
-            std::vector<int32_t> tokens(max_slots_, 0);      // Dummy tokens
-            std::vector<uint32_t> slot_ids(max_slots_);      // 0..max_slots_-1
-            std::vector<int32_t> positions(max_slots_, 0);   // Dummy positions
+            const int32_t max_depth =
+                max_ctx_per_slot_ > 0 ? max_ctx_per_slot_ - 1 : 0;
+
+            std::vector<int32_t>  tokens(max_slots_, 0);             // Dummy tokens
+            std::vector<uint32_t> slot_ids(max_slots_);             // 0..max_slots_-1
+            // Positions MUST equal the cache depth: build_decoding_graph sizes
+            // gather_indices from get_cache_pos, while build_batched_attention
+            // derives n_kv_len from this `positions` argument. Real decode keeps
+            // them equal (positions = get_cache_pos); the reserve must too, or the
+            // gather and the attention reshape disagree (GGML_ASSERT in reshape).
+            std::vector<int32_t>  positions(max_slots_, max_depth);
 
             for (int i = 0; i < max_slots_; ++i) {
                 slot_ids[i] = i;
             }
 
+            if (max_depth > 0) {
+                for (int i = 0; i < max_slots_; ++i) {
+                    forward_pass_->advance_cache(static_cast<uint32_t>(max_depth), i);
+                }
+            }
+
             ggml_backend_sched_reset(scheduler_);
-            
-            // Build the graph for the maximum possible workload
+
+            // Build the graph for the maximum possible workload (deepest KV)
             ggml_cgraph* gf = forward_pass_->build_decoding_graph(tokens, slot_ids, positions);
-            
+
             // Reserve memory in the scheduler
             if (!ggml_backend_sched_reserve(scheduler_, gf)) {
                 std::cerr << "WARNING: Failed to reserve memory for max decode batch!" << std::endl;
+            }
+
+            // Restore the caches to empty — the reserve only needed the topology.
+            for (int i = 0; i < max_slots_; ++i) {
+                forward_pass_->clear_slot(i);
             }
         }
 
@@ -182,46 +292,6 @@ public:
         std::cout << "Memory reservation complete." << std::endl;
     }
 
-    // Cache a system prompt - returns cache length, or 0 on failure
-    int cache_system_prompt(const std::string& system_prompt) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        
-        size_t hash = std::hash<std::string>{}(system_prompt);
-        
-        // Already cached?
-        if (hash == cached_system_hash_ && system_prompt_cache_len_ > 0) {
-            return system_prompt_cache_len_;
-        }
-        
-        // Format and tokenize system prompt (model-aware, F6).
-        std::string formatted = wrap_system(system_prompt);
-        std::vector<int32_t> tokens = tokenizer_->encode(formatted);
-        
-        if (tokens.empty()) {
-            return 0;
-        }
-        
-        // Clear template slot
-        forward_pass_->clear_slot(TEMPLATE_SLOT);
-        
-        // Prefill system prompt into template slot
-        ggml_backend_sched_reset(scheduler_);
-        ggml_cgraph* gf = forward_pass_->build_prefill_graph(tokens, 0, TEMPLATE_SLOT);
-        ggml_backend_sched_alloc_graph(scheduler_, gf);
-        forward_pass_->set_prefill_inputs(gf, tokens, 0);
-        ggml_backend_sched_graph_compute(scheduler_, gf);
-        forward_pass_->advance_cache(tokens.size(), TEMPLATE_SLOT);
-        
-        // Store cache info
-        cached_system_hash_ = hash;
-        system_prompt_cache_len_ = forward_pass_->get_cache_pos(TEMPLATE_SLOT);
-        
-        std::cout << "Cached system prompt: " << tokens.size() << " tokens, cache_pos=" 
-                  << system_prompt_cache_len_ << std::endl;
-        
-        return system_prompt_cache_len_;
-    }
-
     void configure_server(qwenium::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
             // Model-aware single user-turn template (F6). System prompt is
@@ -244,6 +314,42 @@ public:
             return run_prefill(slot_id, tokens, start_pos);
         });
 
+        // Build this slot's sampler (+ grammar) from the request before prefill.
+        server.set_prepare_slot([this](int slot_id, const qwenium::InferenceRequest& req) {
+            prepare_slot(slot_id, req);
+        });
+
+        // A slot with a constrained-output grammar is done once that grammar
+        // reaches an accepting state (the engine stops it after that token).
+        server.set_slot_complete([this](int slot_id) {
+            return slot_grammars_[slot_id] != nullptr &&
+                   slot_grammars_[slot_id]->is_accepting_state();
+        });
+
+        // Image input: only registered when a vision projector is loaded, so a
+        // text-only server leaves this callback null and rejects image requests.
+        // Delegated wholesale to ServerVision.
+        if (vision_) {
+            server.set_multimodal_prefill(
+                [this](int slot_id, const qwenium::InferenceRequest& req, int start_pos,
+                       std::vector<int32_t>& out_tokens) {
+                    return vision_->run_multimodal_prefill(slot_id, req, start_pos,
+                                                           out_tokens, *slot_samplers_[slot_id]);
+                });
+        }
+
+        // Text prefix cache: only registered when --prefix-cache is set, so a
+        // server without it always prefills text prompts whole (the stateless
+        // default). The engine routes a text request here only when its
+        // cacheable_prefix_text is non-empty.
+        if (text_prefix_lib_) {
+            server.set_cached_text_prefill(
+                [this](int slot_id, const qwenium::InferenceRequest& req, int start_pos,
+                       std::vector<int32_t>& out_tokens) {
+                    return run_cached_text_prefill(slot_id, req, start_pos, out_tokens);
+                });
+        }
+
         server.set_batched_decode([this](const std::vector<int32_t>& tokens,
                                          const std::vector<int>& slot_ids) {
             return run_batched_decode(tokens, slot_ids);
@@ -253,43 +359,39 @@ public:
             forward_pass_->clear_slot(slot_id);
         });
 
-        server.set_clone_slot([this](int from_slot, int to_slot) {
-            std::lock_guard<std::mutex> lock(model_mutex_);
-            if (system_prompt_cache_len_ > 0) {
-                forward_pass_->clone_slot(from_slot, to_slot, system_prompt_cache_len_);
-            }
-        });
-
-        server.set_get_eos_token([this]() {
-            return model_.get_metadata().eos_token_id;
+        // Stop on ANY of the model's end tokens, not just the primary EOS. The
+        // loader collects the family's end-of-turn markers (e.g. Gemma 4 IT's
+        // <turn|>, Qwen's <|im_end|>) into stop_token_ids; checking only
+        // eos_token_id let the model emit its turn-ender, have it ignored, and
+        // run past the turn boundary to the max_tokens cap (runaway generation).
+        server.set_is_stop_token([this](int token_id) {
+            const auto& ids = model_.get_metadata().stop_token_ids;
+            return std::find(ids.begin(), ids.end(), token_id) != ids.end();
         });
     }
     
-    // Check if system prompt matches cache, cache if new
-    // Returns start_pos for prefill (0 if no cache, cache_len if cached)
-    int prepare_system_prompt(const std::string& system_prompt) {
-        if (system_prompt.empty()) {
-            return 0;  // No caching
-        }
-        
-        size_t hash = std::hash<std::string>{}(system_prompt);
-        
-        // Check if matches current cache
-        if (hash == cached_system_hash_ && system_prompt_cache_len_ > 0) {
-            return system_prompt_cache_len_;
-        }
-        
-        // New system prompt - cache it
-        return cache_system_prompt(system_prompt);
-    }
-    
-    int get_system_prompt_cache_len() const {
-        return system_prompt_cache_len_;
-    }
-
     int max_ctx_per_slot() const { return max_ctx_per_slot_; }
     int max_slots() const { return max_slots_; }
     const ChatTemplate* chat_template() const { return chat_template_; }
+
+    // ── Vision (image input) capability surface, read by the chat route ──────
+    // All delegate to ServerVision; the accessors below image_marker_prefix /
+    // image_wants_thinking are only called after vision_enabled() gates true.
+    bool vision_enabled() const { return vision_ != nullptr; }
+    // The projector's image-marker string the route prepends to the user turn
+    // (e.g. "\n\n<start_of_image>\n\n" / "<|image>").
+    const std::string& image_marker_prefix() const { return vision_->image_marker_prefix(); }
+    // True when the image path must use the thinking branch (Gemma 4): a leading
+    // system <|think|> turn + a generation prompt ending at "model\n". Gemma 3
+    // keeps its no-think image path. See docs/server-image-multirequest-bug.md §5.
+    bool image_wants_thinking() const { return vision_->image_wants_thinking(); }
+    size_t max_image_bytes() const { return qwenium::kDefaultMaxImageBytes; }
+    // Human-readable identity for the fail-loud capability-gate error: the
+    // loaded model's architecture + name.
+    std::string model_label() const {
+        const auto& m = model_.get_metadata();
+        return "arch='" + m.architecture + "', name='" + m.model_name + "'";
+    }
 
     // ── F6: model-aware chat templating via the registered ChatTemplate ──────
     // A single user turn = a 1-message history with the assistant prompt opened.
@@ -297,34 +399,213 @@ public:
         return chat_template_->render({ChatMessage{"user", text}},
                                       /*add_assistant_prompt=*/true);
     }
-    // System prefix = a system turn with NO assistant prompt (the user turn is
-    // appended after, via set_tokenize, on top of the cached prefix). The
+    // A full (system, user) turn rendered together into one prompt — the
+    // stateless replacement for the deleted system-prompt prefix cache. The
     // ChatTemplate maps the system role per family (e.g. Gemma → user turn).
-    std::string wrap_system(const std::string& text) const {
-        return chat_template_->render({ChatMessage{"system", text}},
-                                      /*add_assistant_prompt=*/false);
+    std::string render_system_user_turn(const std::string& system, const std::string& user) const {
+        return chat_template_->render({ChatMessage{"system", system}, ChatMessage{"user", user}},
+                                      /*add_assistant_prompt=*/true);
+    }
+
+    // ── Text prefix cache capability surface, read by both routes ────────────
+    // True when --prefix-cache is wired. The route only populates a request's
+    // cacheable_prefix_text when this holds (no cost otherwise).
+    bool text_prefix_cache_enabled() const { return text_prefix_lib_ != nullptr; }
+    // Render JUST the leading system-turn block (no user turn, NO assistant
+    // prompt) — the cacheable prefix. It is a token-prefix of the matching
+    // render_system_user_turn / render_chat output because every family delimits
+    // each message as its own special-token-bounded turn. `enable_thinking` must
+    // match the full render's so the prefix stays byte-aligned (Gemma 4 injects
+    // <|think|> into the system turn when thinking is on).
+    std::string render_system_prefix(const std::string& system,
+                                     std::optional<bool> enable_thinking = std::nullopt) const {
+        return chat_template_->render({ChatMessage{"system", system}},
+                                      /*add_assistant_prompt=*/false, enable_thinking);
     }
 
 private:
+    // Build the per-slot sampler for a freshly assigned request. temperature 0
+    // (or negative) => GreedySampler with the engine's defaults — byte-identical
+    // to the pre-sampling server. temperature > 0 => TemperatureSampler honoring
+    // top_p/top_k; a non-negative `seed` makes the draw stream reproducible.
+    // Runs on the inference thread before this slot's prefill (no model_mutex_
+    // needed: pure object construction, single-threaded with all sampling).
+    void prepare_slot(int slot_id, const qwenium::InferenceRequest& req) {
+        // Sampler from temperature/top_p/seed.
+        std::unique_ptr<qwenium::Sampler> sampler;
+        if (req.temperature > 0.0f) {
+            auto ts = std::make_unique<qwenium::TemperatureSampler>(
+                req.temperature, /*repetition_penalty=*/1.1f,
+                /*repetition_lookback=*/64, req.top_k, req.top_p);
+            if (req.seed >= 0)
+                ts->seed(static_cast<uint32_t>(req.seed));
+            sampler = std::move(ts);
+        } else {
+            sampler = std::make_unique<qwenium::GreedySampler>();
+        }
+
+        // Optional GBNF grammar for constrained output (text requests only).
+        // Fail-loud (caught by the engine → named request error): a bad GBNF, or
+        // the unsupported grammar+image combo, rejects the request cleanly.
+        std::unique_ptr<qwenium::GrammarVocab> grammar;
+        if (!req.grammar.empty()) {
+            if (!req.image_bytes.empty())
+                throw std::runtime_error(
+                    "slot " + std::to_string(slot_id) + ": parameter 'grammar': "
+                    "structured output is not supported with image input (v1)");
+            grammar = qwenium::GrammarVocab::parse_impl(req.grammar);
+            if (!grammar)
+                throw std::runtime_error(
+                    "slot " + std::to_string(slot_id) + ": parameter 'grammar': "
+                    "failed to parse GBNF grammar");
+            sampler->set_grammar(grammar.get());
+            sampler->build_token_trie(vocab_);  // trie + cached vocab for accept_token
+            // Let the grammar terminate: an accepting state adds these to the
+            // valid set so the model may emit a stop token.
+            for (int32_t id : model_.get_metadata().stop_token_ids)
+                sampler->add_eos_token_id(id);
+        }
+
+        slot_samplers_[slot_id] = std::move(sampler);
+        slot_grammars_[slot_id] = std::move(grammar);  // null clears any prior grammar
+    }
+
     int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {
         std::lock_guard<std::mutex> lock(model_mutex_);
-        
+
+        // Gemma-family -it models go DEGENERATE (greedy repeats one token) when
+        // the sequence does not start with BOS — and encode() does not prepend
+        // it. Honor the model's add_bos_token contract at this single text-
+        // prefill entry point (both /v1/completions and /v1/chat/completions
+        // route here), gated on start_pos==0 so a user turn appended after a
+        // cached system prompt is not given a SECOND BOS. Mirrors the CLI
+        // (cli/complete.cpp) and the image path (run_multimodal_prefill). Qwen
+        // (add_bos_token=false) is unaffected.
+        const auto& md = model_.get_metadata();
+        const bool prepend_bos =
+            start_pos == 0 && md.add_bos_token && md.bos_token_id >= 0;
+        std::vector<int32_t> with_bos;
+        if (prepend_bos) {
+            with_bos.reserve(tokens.size() + 1);
+            with_bos.push_back(md.bos_token_id);
+            with_bos.insert(with_bos.end(), tokens.begin(), tokens.end());
+        }
+        const std::vector<int32_t>& seq = prepend_bos ? with_bos : tokens;
+
         ggml_backend_sched_reset(scheduler_);
-        
+
         // Use build_prefill_graph with slot_id
-        ggml_cgraph* gf = forward_pass_->build_prefill_graph(tokens, start_pos, slot_id);
+        ggml_cgraph* gf = forward_pass_->build_prefill_graph(seq, start_pos, slot_id);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
-        forward_pass_->set_prefill_inputs(gf, tokens, start_pos);
+        forward_pass_->set_prefill_inputs(gf, seq, start_pos);
         ggml_backend_sched_graph_compute(scheduler_, gf);
-        forward_pass_->advance_cache(tokens.size(), slot_id);
+        forward_pass_->advance_cache(seq.size(), slot_id);
 
         // Sample first token
         std::vector<float> logits = forward_pass_->get_output_logits(gf);
-        size_t vocab_size = model_.get_metadata().vocab_size;
+        size_t vocab_size = md.vocab_size;
         std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
-        
-        std::vector<int32_t> context(tokens);
-        return sampler_->sample(last_token_logits, context);
+
+        std::vector<int32_t> context(seq);
+        // Pass the vocab so a slot grammar can mask logits (no-op for non-grammar
+        // slots — sample() requires grammar_ AND non-empty token_strs, so this
+        // stays byte-identical to greedy). accept_token advances the grammar
+        // cursor (no-op when no grammar) so the next step and the accepting-state
+        // stop check see this token.
+        const int tok = slot_samplers_[slot_id]->sample(last_token_logits, context, vocab_);
+        slot_samplers_[slot_id]->accept_token(tok);
+        return tok;
+    }
+
+    // Text prefix-cache prefill (the CachedTextPrefillFunc body). Splits the
+    // prompt into [cacheable system-prefix | variable suffix]; on a cache HIT the
+    // prefix KV is restored (its prefill skipped) and only the suffix is
+    // prefilled; on a MISS the prefix is prefilled, captured, and stored. Either
+    // way the suffix prefill yields the first-token logits, so the result is
+    // byte-identical to a full cold prefill (transparent). Mirrors the vision V2
+    // image-prefix split and the CLI --prefix-cache path. Fail-loud: a foreign /
+    // stale cached blob is refused (never silently re-used — the F9 rule).
+    int run_cached_text_prefill(int slot_id, const qwenium::InferenceRequest& req,
+                                int start_pos, std::vector<int32_t>& out_tokens) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        const auto& md = model_.get_metadata();
+
+        // Tokenize the full (already-templated) prompt and the cacheable prefix.
+        // Both get the same BOS treatment at pos 0 (Gemma -it needs it; mirrors
+        // run_prefill), so the prefix stays a true token-prefix of the full seq.
+        const bool prepend_bos =
+            start_pos == 0 && md.add_bos_token && md.bos_token_id >= 0;
+        auto encode_seq = [&](const std::string& text) {
+            std::vector<int32_t> ids = tokenizer_->encode(text);
+            if (prepend_bos) ids.insert(ids.begin(), md.bos_token_id);
+            return ids;
+        };
+        std::vector<int32_t> full   = encode_seq(req.prompt);
+        std::vector<int32_t> prefix = encode_seq(req.cacheable_prefix_text);
+        out_tokens = full;
+
+        // Fail-loud ceiling guard (same shape as the text path), BEFORE touching
+        // the KV cache — an over-ceiling prompt would overflow it.
+        if (max_ctx_per_slot_ > 0 &&
+            static_cast<int>(full.size()) > max_ctx_per_slot_)
+            throw std::runtime_error(
+                "slot " + std::to_string(slot_id) + ": prompt too large; expected: "
+                "<= " + std::to_string(max_ctx_per_slot_) + " tokens, actual: " +
+                std::to_string(full.size()));
+
+        const uint32_t slot = static_cast<uint32_t>(slot_id);
+        ggml_backend_sched_t sched = model_.get_scheduler();
+        std::vector<float> logits;
+
+        // Self-protecting alignment check: the prefix must be a proper token-
+        // prefix of the full seq (it is, for every current family — each turn is
+        // special-token delimited). If a future template ever fused turns it
+        // would not be, and restoring its KV would corrupt the result; so fall
+        // back to a plain full prefill (transparent no-op, never a wrong restore).
+        const bool aligned =
+            !prefix.empty() && prefix.size() < full.size() &&
+            std::equal(prefix.begin(), prefix.end(), full.begin());
+        if (!aligned) {
+            logits = forward_pass_->run_prefill(full, start_pos, slot, sched);
+        } else {
+            const std::vector<int32_t> suffix(full.begin() + prefix.size(), full.end());
+            const int suffix_pos = start_pos + static_cast<int>(prefix.size());
+            const uint64_t pkey = PrefixLibrary::key_for(prefix);
+            const auto header = qinf::snapshot::make_snapshot_header(
+                md, forward_pass_->snapshot_kv_caches());
+
+            std::vector<uint8_t> blob;
+            bool hit = false;
+            try {
+                hit = text_prefix_lib_->try_load(pkey, blob);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(
+                    "slot " + std::to_string(slot_id) + ": '--prefix-cache': a "
+                    "stored blob for this system prefix was built under a different "
+                    "model / quant / backend and is refused (" + e.what() +
+                    "). Clear or re-point the prefix cache dir.");
+            }
+            if (hit) {
+                qinf::snapshot::restore_slot(*forward_pass_, slot, blob, header);
+                std::cout << "[prefix-cache] HIT: skipped prefill of "
+                          << prefix.size() << " system tokens" << std::endl;
+            } else {
+                forward_pass_->run_prefill(prefix, start_pos, slot, sched);
+                text_prefix_lib_->store(
+                    pkey, qinf::snapshot::capture_slot(*forward_pass_, slot, header));
+                std::cout << "[prefix-cache] MISS: prefilled + stored "
+                          << prefix.size() << " system tokens" << std::endl;
+            }
+            // The variable suffix rides the plain text path and yields logits.
+            logits = forward_pass_->run_prefill(suffix, suffix_pos, slot, sched);
+        }
+
+        const size_t vocab_size = md.vocab_size;
+        std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
+        std::vector<int32_t> context(out_tokens);
+        const int tok = slot_samplers_[slot_id]->sample(last_token_logits, context, vocab_);
+        slot_samplers_[slot_id]->accept_token(tok);  // advance grammar (no-op if none)
+        return tok;
     }
 
     // TODO: migrate to decode_step (src/core/decode_step.h) once the server
@@ -335,7 +616,7 @@ private:
     std::vector<int> run_batched_decode(const std::vector<int32_t>& tokens,
                                         const std::vector<int>& slot_ids) {
         std::lock_guard<std::mutex> lock(model_mutex_);
-        
+
         ggml_backend_sched_reset(scheduler_);
         
         size_t n_batch = slot_ids.size();
@@ -359,8 +640,16 @@ private:
         
         for (size_t i = 0; i < n_batch; ++i) {
             std::vector<float> slot_logits = forward_pass_->get_output_logits_for_slot(gf, i);
-            next_tokens.push_back(sampler_->sample(slot_logits, {}));
-            
+            // Each slot decodes through its OWN sampler (per-request temperature/
+            // RNG/grammar). last_tokens stays empty here, exactly as before —
+            // enabling the decode-time repetition penalty would change greedy
+            // output and is a separate, deliberate behavior change. The vocab is
+            // passed so a slot grammar can mask logits (no-op otherwise);
+            // accept_token then advances that grammar's cursor.
+            const int tok = slot_samplers_[slot_ids[i]]->sample(slot_logits, {}, vocab_);
+            slot_samplers_[slot_ids[i]]->accept_token(tok);
+            next_tokens.push_back(tok);
+
             // Advance cache for each slot in the batch
             forward_pass_->advance_cache(1, slot_ids[i]);
         }
@@ -371,16 +660,31 @@ private:
     Model model_;
     std::unique_ptr<ForwardPassBase> forward_pass_;
     std::unique_ptr<Tokenizer> tokenizer_;
-    std::unique_ptr<qwenium::GreedySampler> sampler_;
+    // Per-slot samplers (index = slot_id). Greedy by default; rebuilt per request
+    // by prepare_slot(). Each slot's TemperatureSampler owns its own RNG, so a
+    // seeded request is reproducible and concurrent slots never interleave draws.
+    std::vector<std::unique_ptr<qwenium::Sampler>> slot_samplers_;
+    // Per-slot grammars (index = slot_id; null unless the request set a GBNF
+    // grammar). Owns the cursor the slot's sampler points at via set_grammar; its
+    // accepting state drives the engine's grammar-completion stop. Text-only.
+    std::vector<std::unique_ptr<qwenium::GrammarVocab>> slot_grammars_;
+    // Cached vocabulary (id -> token string), built once. Passed to sample() as
+    // token_strs and used to build each grammar slot's trie.
+    std::vector<std::string> vocab_;
     ggml_backend_sched_t scheduler_;
     std::mutex model_mutex_;  // Protects all model operations
     const ChatTemplate* chat_template_ = nullptr;  // F6: arch-registered renderer
     int max_ctx_per_slot_;
     int max_slots_;
-    
-    // System prompt caching
-    size_t cached_system_hash_ = 0;
-    int system_prompt_cache_len_ = 0;
+
+    // Vision (image input). Null for a text-only server; non-null after a
+    // successful --mmproj load. Owns the entire image pipeline + image caches.
+    std::unique_ptr<ServerVision> vision_;
+
+    // Text prefix cache (--prefix-cache). Null unless wired. Opt-in, version-
+    // gated, transparent: a recurring system-prompt block skips its prefill on a
+    // HIT (content-keyed by the prefix tokens). §1 decision A follow-on.
+    std::unique_ptr<PrefixLibrary> text_prefix_lib_;
 };
 
 // =============================================================================
@@ -419,6 +723,43 @@ static std::string render_chat(const json& messages, const ChatTemplate* tmpl,
     return tmpl->render(history, /*add_assistant_prompt=*/true, enable_thinking);
 }
 
+// Image-aware variant of render_chat. For every message carrying an image_url
+// content part, the projector's image marker (`image_marker_prefix`, e.g.
+// "\n\n<start_of_image>\n\n") is prepended to that turn's text and the decoded
+// image bytes are appended to `out_images` in order — the marker is what the
+// integration's expand_image_markers later turns into the soft-token span.
+// Throws (named param) via extract_images_from_content on a malformed image part.
+static std::string render_chat_with_images(
+    const json& messages, const ChatTemplate* tmpl,
+    std::optional<bool> enable_thinking, const std::string& image_marker_prefix,
+    size_t max_image_bytes, std::vector<std::vector<uint8_t>>& out_images,
+    bool wants_thinking) {
+    std::vector<ChatMessage> history;
+    history.reserve(messages.size() + 1);
+    // Gemma 4 image input requires the thinking branch: force it on and ensure a
+    // leading system turn exists (the template injects <|think|> into it). Gemma 3
+    // image input is unaffected (its template ignores enable_thinking and emits no
+    // <|think|>). See docs/server-image-multirequest-bug.md §5.
+    bool has_system = !messages.empty() &&
+                      messages.front().value("role", "user") == "system";
+    if (wants_thinking) {
+        enable_thinking = true;
+        if (!has_system) history.push_back(ChatMessage{"system", ""});
+    }
+    for (const auto& msg : messages) {
+        const json content = msg.contains("content") ? msg["content"] : json();
+        std::string text = chat_content_to_text(content);
+        if (qwenium::content_has_image(content)) {
+            for (auto& img :
+                 qwenium::extract_images_from_content(content, max_image_bytes))
+                out_images.push_back(std::move(img.bytes));
+            text = image_marker_prefix + text;  // marker before the user's text
+        }
+        history.push_back(ChatMessage{msg.value("role", "user"), std::move(text)});
+    }
+    return tmpl->render(history, /*add_assistant_prompt=*/true, enable_thinking);
+}
+
 // Extract an explicit thinking toggle from an OpenAI-style request body.
 // Honors a top-level "enable_thinking" and the vLLM/Qwen
 // "chat_template_kwargs": {"enable_thinking": bool} convention; nullopt means
@@ -443,7 +784,7 @@ static std::string chat_finish_reason(const std::string& engine_reason) {
 // =============================================================================
 // HTTP Routes
 // =============================================================================
-void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, QwenServerIntegration& integration) {
+void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, QweniumServerIntegration& integration) {
     
     // Health check
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -477,11 +818,20 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         }
 
         std::cout << "Received prompt: " << prompt << std::endl;
+        std::cout << "Received prompt End" << std::endl;
 
         auto inf_req = std::make_shared<qwenium::InferenceRequest>();
         inf_req->prompt = prompt;
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
+        // Sampling controls (honored only when temperature > 0). Absent fields
+        // keep the request struct's defaults. `seed` (OpenAI) makes a stochastic
+        // run reproducible; omit for non-deterministic sampling.
+        inf_req->top_p = body.value("top_p", inf_req->top_p);
+        inf_req->top_k = body.value("top_k", inf_req->top_k);
+        inf_req->seed  = body.value("seed", static_cast<long long>(-1));
+        // Optional GBNF grammar for constrained (structured) output.
+        inf_req->grammar = body.value("grammar", "");
 
         // Stop sequences: OpenAI allows a single string or an array of strings.
         if (body.contains("stop")) {
@@ -500,12 +850,21 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             }
         }
 
-        // Handle system prompt caching
+        // A top-level system_prompt is rendered together with the user prompt
+        // into one fully-templated turn and prefilled whole. Requests without it
+        // are unchanged: the bare user prompt goes through set_tokenize's
+        // single-user-turn wrap.
         std::string system_prompt = body.value("system_prompt", "");
         if (!system_prompt.empty()) {
             std::cout << "Received system prompt: " << system_prompt << std::endl;
-            inf_req->system_prompt = system_prompt;
-            inf_req->start_pos = integration.prepare_system_prompt(system_prompt);
+            inf_req->prompt = integration.render_system_user_turn(system_prompt, prompt);
+            inf_req->skip_template = true;  // already fully templated
+            // Mark the system-turn block as the cacheable prefix (no-op unless
+            // --prefix-cache is wired). It is a token-prefix of the full render,
+            // so a recurring system_prompt skips its prefill on a cache HIT.
+            if (integration.text_prefix_cache_enabled())
+                inf_req->cacheable_prefix_text =
+                    integration.render_system_prefix(system_prompt);
         }
 
         bool stream = body.value("stream", false);
@@ -527,6 +886,11 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [inf_req, &inference](size_t /*offset*/, httplib::DataSink& sink) {
+                    // One stateful channel filter per stream (mirrors the CLI's
+                    // per-turn instance): the <|channel> thought-channel span lives
+                    // across tokens, so it must be fed token-by-token, not stripped
+                    // per token. Inert for non-Gemma-4 models.
+                    ChannelFilter channel_filter;
                     while (true) {
                         int token_id = inf_req->token_queue->pop_blocking();
 
@@ -541,8 +905,10 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                             return false;  // Stop
                         }
 
-                        std::string token_text = inference.decode_token(token_id);
-                        
+                        std::string token_text =
+                            channel_filter.feed(inference.decode_token(token_id));
+                        if (token_text.empty()) continue;  // suppressed (thought / marker)
+
                         json chunk = {
                             {"object", "text_completion"},
                             {"choices", {{
@@ -590,7 +956,10 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             json response = {
                 {"object", "text_completion"},
                 {"choices", {{
-                    {"text", inf_req->output_text},
+                    // Strip Gemma 4 channel framing once over the full assembled
+                    // text (stateful state machine; see normalize_output). Inert
+                    // for non-Gemma-4 models.
+                    {"text", ChannelFilter::strip(inf_req->output_text)},
                     {"index", 0},
                     {"finish_reason", inf_req->finish_reason}
                 }}},
@@ -627,13 +996,87 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             return;
         }
 
+        // Detect image content parts up front so the capability gate fires
+        // before we attempt to decode anything.
+        bool wants_image = false;
+        for (const auto& msg : body["messages"]) {
+            if (msg.contains("content") &&
+                qwenium::content_has_image(msg["content"])) {
+                wants_image = true;
+                break;
+            }
+        }
+
         auto inf_req = std::make_shared<qwenium::InferenceRequest>();
-        inf_req->prompt = render_chat(body["messages"], integration.chat_template(),
-                                      extract_enable_thinking(body));
+        if (wants_image) {
+            // Capability gate (fail-loud, CLAUDE.md): a text-only model cannot
+            // consume image input — name the field, the expected capability, and
+            // the actual model rather than silently dropping the image.
+            if (!integration.vision_enabled()) {
+                res.status = 400;
+                res.set_content(json({{"error",
+                    "field 'messages[].content[].image_url': image input requires "
+                    "a vision-capable model started with --mmproj (Gemma 3/4 "
+                    "vision); loaded model is text-only: " +
+                    integration.model_label()}}).dump(), "application/json");
+                return;
+            }
+            try {
+                inf_req->prompt = render_chat_with_images(
+                    body["messages"], integration.chat_template(),
+                    extract_enable_thinking(body), integration.image_marker_prefix(),
+                    integration.max_image_bytes(), inf_req->image_bytes,
+                    integration.image_wants_thinking());
+            } catch (const std::exception& e) {
+                // Malformed base64 / unsupported mime / oversize / non-data URI.
+                res.status = 400;
+                res.set_content(json({{"error", std::string(e.what())}}).dump(),
+                                "application/json");
+                return;
+            }
+            // v1 single-image scope: refuse >1 image fail-loud (the encoder arms
+            // one span) rather than encode only the first.
+            if (inf_req->image_bytes.size() != 1) {
+                res.status = 400;
+                res.set_content(json({{"error",
+                    "field 'messages[].content[].image_url': expected exactly 1 "
+                    "image per request (single-image scope), got: " +
+                    std::to_string(inf_req->image_bytes.size())}}).dump(),
+                    "application/json");
+                return;
+            }
+        } else {
+            const std::optional<bool> enable_thinking = extract_enable_thinking(body);
+            inf_req->prompt = render_chat(body["messages"],
+                                          integration.chat_template(),
+                                          enable_thinking);
+            // Mark a LEADING system message as the cacheable prefix (no-op unless
+            // --prefix-cache is wired). Rendered with the SAME thinking flag so it
+            // stays a byte-aligned token-prefix of the full render. Only a system
+            // message that opens the conversation is a clean leading prefix.
+            const auto& msgs = body["messages"];
+            if (integration.text_prefix_cache_enabled() && !msgs.empty() &&
+                msgs.front().value("role", "") == "system") {
+                const std::string system_content = chat_content_to_text(
+                    msgs.front().contains("content") ? msgs.front()["content"] : json());
+                if (!system_content.empty())
+                    inf_req->cacheable_prefix_text =
+                        integration.render_system_prefix(system_content, enable_thinking);
+            }
+        }
         std::cout << "Received prompt: " << inf_req->prompt << std::endl;
+        std::cout << "Received prompt End" << std::endl;
         inf_req->skip_template = true;  // already fully <|im_start|>-rendered
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
+        // Sampling controls (honored only when temperature > 0). Absent fields
+        // keep the request struct's defaults. `seed` (OpenAI) makes a stochastic
+        // run reproducible; omit for non-deterministic sampling.
+        inf_req->top_p = body.value("top_p", inf_req->top_p);
+        inf_req->top_k = body.value("top_k", inf_req->top_k);
+        inf_req->seed  = body.value("seed", static_cast<long long>(-1));
+        // Optional GBNF grammar for constrained (structured) output.
+        inf_req->grammar = body.value("grammar", "");
 
         // Stop sequences: OpenAI allows a single string or an array of strings.
         if (body.contains("stop")) {
@@ -671,6 +1114,11 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [inf_req, &inference, model_name, created](size_t /*offset*/, httplib::DataSink& sink) {
+                    // One stateful channel filter per stream (mirrors the CLI's
+                    // per-turn instance): the <|channel> thought-channel span lives
+                    // across tokens, so it must be fed token-by-token. Inert for
+                    // non-Gemma-4 models.
+                    ChannelFilter channel_filter;
                     // First chunk announces the assistant role (OpenAI convention).
                     json head = {
                         {"object", "chat.completion.chunk"},
@@ -722,7 +1170,9 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                             return false;
                         }
 
-                        std::string token_text = inference.decode_token(token_id);
+                        std::string token_text =
+                            channel_filter.feed(inference.decode_token(token_id));
+                        if (token_text.empty()) continue;  // suppressed (thought / marker)
                         json chunk = {
                             {"object", "chat.completion.chunk"},
                             {"created", created},
@@ -766,7 +1216,10 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                 {"model", model_name},
                 {"choices", {{
                     {"index", 0},
-                    {"message", {{"role", "assistant"}, {"content", inf_req->output_text}}},
+                    // Strip Gemma 4 channel framing once over the full assembled
+                    // text (stateful; see normalize_output). Inert otherwise.
+                    {"message", {{"role", "assistant"},
+                                 {"content", ChannelFilter::strip(inf_req->output_text)}}},
                     {"finish_reason", chat_finish_reason(inf_req->finish_reason)}
                 }}},
                 {"usage", {
@@ -800,6 +1253,10 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     int port = 8080;
     std::string model_path;
+    std::string mmproj_path;  // optional Gemma vision projector GGUF
+    std::string image_embed_cache_dir;   // V1: opt-in disk image-embed cache
+    std::string image_prefix_cache_dir;  // V2: opt-in disk image-prefix KV cache
+    std::string prefix_cache_dir;        // text: opt-in disk system-prefix KV cache
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -813,20 +1270,36 @@ int main(int argc, char* argv[]) {
             port = std::stoi(argv[++i]);
         } else if ((arg == "--model" || arg == "-m") && i + 1 < argc) {
             model_path = argv[++i];
+        } else if ((arg == "--mmproj" || arg == "-j") && i + 1 < argc) {
+            mmproj_path = argv[++i];
         } else if ((arg == "--ctx" || arg == "-c") && i + 1 < argc) {
             max_ctx = std::stoi(argv[++i]);
         } else if ((arg == "--slots" || arg == "-s") && i + 1 < argc) {
             max_slots = std::stoi(argv[++i]);
+        } else if (arg == "--image-embed-cache" && i + 1 < argc) {
+            image_embed_cache_dir = argv[++i];
+        } else if (arg == "--image-prefix-cache" && i + 1 < argc) {
+            image_prefix_cache_dir = argv[++i];
+        } else if (arg == "--prefix-cache" && i + 1 < argc) {
+            prefix_cache_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
-                      << "  --port,  -p PORT   Port to listen on (default: 8080)\n"
-                      << "  --model, -m PATH   Path to model file\n"
-                      << "  --ctx,   -c N      Per-slot context ceiling in tokens "
+                      << "  --port,   -p PORT  Port to listen on (default: 8080)\n"
+                      << "  --model,  -m PATH  Path to model file\n"
+                      << "  --mmproj, -j PATH  Gemma vision projector GGUF; enables "
+                         "image input on /v1/chat/completions\n"
+                      << "  --ctx,    -c N     Per-slot context ceiling in tokens "
                          "(default: 2048)\n"
-                      << "  --slots, -s N      Concurrent slots, 1..10 (default: 10). "
+                      << "  --slots,  -s N     Concurrent slots, 1..10 (default: 10). "
                          "Fewer slots = more context headroom.\n"
-                      << "  --help,  -h        Show this help\n";
+                      << "  --image-embed-cache DIR   Opt-in disk cache: encode each "
+                         "image once per node (V1, ViT skip)\n"
+                      << "  --image-prefix-cache DIR  Opt-in disk cache: skip ViT + "
+                         "image-position prefill for a recurring (context,image) (V2)\n"
+                      << "  --prefix-cache DIR        Opt-in disk cache: skip the "
+                         "prefill of a recurring system prompt (text path)\n"
+                      << "  --help,   -h       Show this help\n";
             return 0;
         }
     }
@@ -837,7 +1310,9 @@ int main(int argc, char* argv[]) {
 
     try {
         // Initialize model integration
-        QwenServerIntegration integration(model_path, max_ctx, max_slots);
+        QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
+                                          image_embed_cache_dir, image_prefix_cache_dir,
+                                          prefix_cache_dir);
 
         // Create inference server
         qwenium::InferenceServer::Config config;
@@ -871,7 +1346,12 @@ int main(int argc, char* argv[]) {
         std::cout << "Server starting on http://0.0.0.0:" << port << std::endl;
         std::cout << "Endpoints:" << std::endl;
         std::cout << "  GET  /health" << std::endl;
-        std::cout << "  POST /v1/completions" << std::endl;
+        std::cout << "  POST /v1/completions       (text-only)" << std::endl;
+        std::cout << "  POST /v1/chat/completions"
+                  << (integration.vision_enabled()
+                          ? "  (text + image_url image input)"
+                          : "  (text-only; start with --mmproj for images)")
+                  << std::endl;
         std::cout << "  GET  /v1/models" << std::endl;
         std::cout << "Press Ctrl+C to stop" << std::endl;
 

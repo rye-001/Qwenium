@@ -99,6 +99,10 @@ public:
     simple_kv_cache* get_kv_cache_ptr() { return kv_cache_.get(); }
     DeltaNetState*   get_dn_state_ptr() { return dn_state_.get(); }
 
+    // L2 snapshot reach-through (both lanes: hybrid attention + DeltaNet).
+    simple_kv_cache* snapshot_kv_cache() override { return kv_cache_.get(); }
+    DeltaNetState*   snapshot_recurrent() override { return dn_state_.get(); }
+
     // Physical layer → cache index mappings
     int32_t get_kv_layer_index(uint32_t physical_layer) const {
         return (physical_layer < kv_layer_map_.size()) ? kv_layer_map_[physical_layer] : -1;

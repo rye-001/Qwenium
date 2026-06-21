@@ -1,6 +1,8 @@
 # Qwen-3 Core Engine Library
 add_library(core STATIC
     model.cpp
+    persistent_image_embedding_store.cpp
+    prefix_library.cpp
 )
 
 target_include_directories(core PUBLIC
@@ -14,6 +16,7 @@ target_link_libraries(core PUBLIC
     qinf-layers
     qinf-state
     qinf-loader
+    qinf-graph-inputs
 )
 
 # Enable position-independent code for static library

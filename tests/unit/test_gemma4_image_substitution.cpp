@@ -145,6 +145,27 @@ TEST(Gemma4ImageSubstitution, RejectsWrongSizedPayload) {
                  std::runtime_error);
 }
 
+// ── Regression: the substituted residual is pinned as a graph output ─────────
+// Without ggml_set_output on inpL_image_subst, galloc reuses its buffer across
+// the server's alternating graph shapes and the 2nd+ image request degenerates
+// into token-soup (docs/server-image-multirequest-bug.md). The pin lives in the
+// shared ForwardPassBase::build_image_substitution; assert it directly so a
+// future "prune unused outputs" cleanup can't silently reintroduce the bug.
+TEST(Gemma4ImageSubstitution, SubstitutedResidualIsPinnedAsOutput) {
+    SKIP_IF_NO_MODEL();
+    Loaded L; load(L);
+    ASSERT_NE(L.g4, nullptr);
+
+    L.g4->set_image_embeddings(make_synthetic_embd(L.n_embd, 3), /*span_start=*/2, 3);
+    ggml_cgraph* gf = L.fp->build_prefill_graph(kTokens, 0, 0);
+    ggml_tensor* subst = ggml_graph_get_tensor(gf, "inpL_image_subst");
+    ASSERT_NE(subst, nullptr)
+        << "inpL_image_subst node absent — image substitution did not build";
+    EXPECT_TRUE(subst->flags & GGML_TENSOR_FLAG_OUTPUT)
+        << "inpL_image_subst is not pinned as a graph output — galloc may reuse "
+        << "its buffer and corrupt multi-request image prefill";
+}
+
 // ── Fail-loud: span runs past the sequence ───────────────────────────────────
 TEST(Gemma4ImageSubstitution, RejectsOutOfRangeSpan) {
     SKIP_IF_NO_MODEL();

@@ -12,6 +12,7 @@
 
 #include "grammar_vocab.h"
 #include "token-trie.h"
+#include "snapshot_io.h"
 
 #include <algorithm>
 #include <cctype>
@@ -818,6 +819,103 @@ void GrammarVocab::accept_token(int32_t token_id, const std::vector<std::string>
 
     impl_->stacks = std::move(new_stacks);
     ++state_version_;
+}
+
+// ============================================================================
+// L1 session snapshot: serialize / restore the grammar cursor (impl_->stacks).
+// Each Elem* is stored as a (rule_idx, elem_offset) coordinate into
+// impl_->rules; the rules are rebuilt by re-parsing the same GBNF before
+// read_cursor. A null sentinel (kNullRuleIdx) round-trips a null pos defensively.
+// ============================================================================
+namespace {
+constexpr uint32_t kNullRuleIdx = 0xFFFFFFFFu;
+}  // namespace
+
+void GrammarVocab::write_cursor(qinf::session::SnapshotWriter& w) const {
+    if (!impl_) {
+        throw std::runtime_error(
+            "grammar_cursor: write expected a parsed grammar, got null impl");
+    }
+    const Impl* impl = impl_.get();
+
+    auto coord = [&](const Elem* p, uint32_t& rule_idx, uint32_t& off) {
+        if (!p) { rule_idx = kNullRuleIdx; off = 0; return; }
+        for (size_t ri = 0; ri < impl->rules.size(); ++ri) {
+            const Elem* base = impl->rules[ri].data();
+            if (p >= base && p < base + impl->rules[ri].size()) {
+                rule_idx = static_cast<uint32_t>(ri);
+                off      = static_cast<uint32_t>(p - base);
+                return;
+            }
+        }
+        throw std::runtime_error(
+            "grammar_cursor: field \"pos\" expected a pointer within "
+            "impl_->rules, got an out-of-range pointer");
+    };
+
+    w.put_u64(state_version_);
+    w.put_u32(static_cast<uint32_t>(impl->stacks.size()));
+    for (const auto& s : impl->stacks) {
+        uint32_t ri, off;
+        coord(s.pos, ri, off);
+        w.put_u32(ri);
+        w.put_u32(off);
+        w.put_u64(static_cast<uint64_t>(s.char_idx));
+        w.put_u32(static_cast<uint32_t>(s.continuations.size()));
+        for (const Elem* c : s.continuations) {
+            uint32_t cri, coff;
+            coord(c, cri, coff);
+            w.put_u32(cri);
+            w.put_u32(coff);
+        }
+    }
+}
+
+void GrammarVocab::read_cursor(qinf::session::SnapshotReader& r) {
+    if (!impl_ || impl_->rules.empty()) {
+        throw std::runtime_error(
+            "grammar_cursor: read expected a re-parsed grammar (call parse_impl "
+            "with the same GBNF before restore), got empty rules");
+    }
+    Impl* impl = impl_.get();
+
+    auto to_ptr = [&](uint32_t rule_idx, uint32_t off) -> const Elem* {
+        if (rule_idx == kNullRuleIdx) return nullptr;
+        if (rule_idx >= impl->rules.size()) {
+            throw std::runtime_error(
+                "grammar_cursor: field \"rule_idx\" expected < " +
+                std::to_string(impl->rules.size()) + ", got " +
+                std::to_string(rule_idx));
+        }
+        const Rule& rule = impl->rules[rule_idx];
+        if (off >= rule.size()) {
+            throw std::runtime_error(
+                "grammar_cursor: field \"elem_offset\" expected < " +
+                std::to_string(rule.size()) + ", got " + std::to_string(off));
+        }
+        return rule.data() + off;
+    };
+
+    state_version_ = r.get_u64();
+    uint32_t n = r.get_u32();
+    std::vector<Impl::GrammarState> stacks;
+    stacks.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t ri = r.get_u32();
+        uint32_t off = r.get_u32();
+        const Elem* pos = to_ptr(ri, off);
+        uint64_t char_idx = r.get_u64();
+        uint32_t m = r.get_u32();
+        std::vector<const Elem*> conts;
+        conts.reserve(m);
+        for (uint32_t j = 0; j < m; ++j) {
+            uint32_t cri = r.get_u32();
+            uint32_t coff = r.get_u32();
+            conts.push_back(to_ptr(cri, coff));
+        }
+        stacks.push_back({pos, static_cast<size_t>(char_idx), std::move(conts)});
+    }
+    impl->stacks = std::move(stacks);
 }
 
 void GrammarVocab::dump_expected() const {

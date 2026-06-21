@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <sstream>
+#include <iostream>
 
 struct CliArgs {
     std::string model_path;
@@ -32,6 +33,24 @@ struct CliArgs {
     // must be set together; requires a Gemma multimodal-capable tokenizer.
     std::string image_path;    // --image: JPEG/PNG to attach to the first turn
     std::string mmproj_path;   // --mmproj: Gemma vision projector GGUF
+    // Vision V1 (docs/plan-session-snapshot.md): opt-in disk-backed embedding
+    // cache. A recurring image is encoded once per node ever (ViT skip);
+    // empty = no persistent cache (per-session in-memory reuse only).
+    std::string image_embed_cache_dir;  // --image-embed-cache: directory for cached embeddings
+    // L2 prefix library (docs/plan-session-snapshot.md, Phase 4). Opt-in,
+    // version-gated warm-prefix KV cache for a recurring system prompt: prefill
+    // it once, reuse the blob to skip the prefill on later runs. Empty = off.
+    std::string prefix_cache_dir;   // --prefix-cache: dir for warm system-prompt KV blobs
+    // Vision V2 (docs/plan-session-snapshot.md): opt-in image-prefix KV cache.
+    // The image turn's KV up to and including the image span is stored keyed by
+    // (preceding context + image content_id); a later run with the SAME image +
+    // context skips BOTH the ViT encode and the image-position prefill. Empty =
+    // off.
+    std::string image_prefix_cache_dir;  // --image-prefix-cache: dir for warm image-prefix KV blobs
+    // L1 portable session snapshot (docs/plan-session-snapshot.md, Phase 2).
+    std::string save_session_path;  // --save-session: write an L1 snapshot mid-decode
+    std::string load_session_path;  // --load-session: resume a saved L1 snapshot
+    int save_session_at = 4;        // --save-session-at: generated-token index to snapshot
 };
 
 inline std::string make_readable(std::string str) {
@@ -40,6 +59,9 @@ inline std::string make_readable(std::string str) {
         str.replace(pos, 2, " ");
         pos += 1;
     }
+    // NOTE: Gemma 4 channel/turn control markers are removed upstream by the
+    // ChannelFilter in run_chat (loader/channel_filter.h) before print_token is
+    // called, so no tag-stripping is needed here.
     return str;
 }
 

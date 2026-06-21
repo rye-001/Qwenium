@@ -13,6 +13,7 @@
 
 #include "complete.h"
 #include "chat.h"
+#include "session_mode.h"
 
 #include "../core/model.h"
 #include "../loader/gguf_loader.h"
@@ -58,6 +59,9 @@ void print_usage(const char* program_name) {
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
     std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
+    std::cout << "  --image-embed-cache DIR (chat) Disk cache for image embeddings; encode each image once per node (ViT skip)\n";
+    std::cout << "  --prefix-cache DIR      (chat) Opt-in warm-prefix KV cache; skips re-prefilling a recurring system prompt\n";
+    std::cout << "  --image-prefix-cache DIR (chat) Opt-in image-prefix KV cache; skips ViT encode + image-position prefill for a recurring image\n";
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";
@@ -132,6 +136,24 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--mmproj") {
             if (i + 1 >= argc) return false;
             args.mmproj_path = argv[++i];
+        } else if (arg == "--image-embed-cache") {
+            if (i + 1 >= argc) return false;
+            args.image_embed_cache_dir = argv[++i];
+        } else if (arg == "--prefix-cache") {
+            if (i + 1 >= argc) return false;
+            args.prefix_cache_dir = argv[++i];
+        } else if (arg == "--image-prefix-cache") {
+            if (i + 1 >= argc) return false;
+            args.image_prefix_cache_dir = argv[++i];
+        } else if (arg == "--save-session") {
+            if (i + 1 >= argc) return false;
+            args.save_session_path = argv[++i];
+        } else if (arg == "--load-session") {
+            if (i + 1 >= argc) return false;
+            args.load_session_path = argv[++i];
+        } else if (arg == "--save-session-at") {
+            if (i + 1 >= argc) return false;
+            args.save_session_at = std::stoi(argv[++i]);
         } else if (args.model_path.empty()) {
             args.model_path = arg;
         }
@@ -264,6 +286,11 @@ int main(int argc, char** argv) {
     }
     if (args.speculative && grammar) {
         std::cout << "Note: Speculative decoding disabled (incompatible with grammar constraints)" << std::endl;
+    }
+
+    // --- L1 portable session: save or resume a snapshot (Phase 2) ---
+    if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
+        return run_session(model, args, grammar, log_token);
     }
 
     // --- Start of Generation ---

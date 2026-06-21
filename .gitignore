@@ -58,3 +58,7 @@ docs/book
 docs/*.md
 *.jpg
 *.jpeg
+
+# Qemmi Files
+qemmi.config.*
+.qemmi/

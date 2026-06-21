@@ -26,7 +26,7 @@ stateless behavior (current code path, unchanged).
 
 ### 2. SessionManager
 
-New component, owned by `QwenServerIntegration`. Maps `session_id → SessionEntry`:
+New component, owned by `QweniumServerIntegration`. Maps `session_id → SessionEntry`:
 
 ```
 struct SessionEntry {

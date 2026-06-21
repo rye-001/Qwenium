@@ -41,6 +41,17 @@ target_link_libraries(inference_server INTERFACE
 # =============================================================================
 add_executable(http_server
     http_server.cpp
+    server_vision.cpp
+    image_data_uri.cpp
+    # Host-side image pipeline + multimodal orchestrator, compiled directly (these
+    # live in src/cli and src/core but are built into consumers, not a lib — same
+    # arrangement the CLI and multimodal-prefill-tests use). Enables image input
+    # on /v1/chat/completions when the server is started with --mmproj.
+    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/slot_snapshot.cpp
 )
 
 target_link_libraries(http_server PRIVATE
@@ -48,8 +59,10 @@ target_link_libraries(http_server PRIVATE
     httplib::httplib
     nlohmann_json::nlohmann_json
     qinf-models
+    qinf-vision
     core
     sampling
+    ggml
     Threads::Threads
 )
 
