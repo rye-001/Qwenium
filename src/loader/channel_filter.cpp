@@ -3,9 +3,9 @@
 #include <array>
 
 void ChannelFilter::reset() {
-    in_channel_header_     = false;
-    in_suppressed_channel_ = false;
-    strip_leading_ws_      = false;
+    in_channel_header_   = false;
+    in_thought_channel_  = false;
+    strip_leading_ws_    = false;
     channel_name_buf_.clear();
 }
 
@@ -51,8 +51,8 @@ std::string ChannelFilter::consume(const std::string& s) {
         return "";
     }
     if (s == "<channel|>") {
-        in_channel_header_     = false;
-        in_suppressed_channel_ = false;
+        in_channel_header_  = false;
+        in_thought_channel_ = false;
         return "";
     }
 
@@ -61,16 +61,19 @@ std::string ChannelFilter::consume(const std::string& s) {
         // classify once a known name appears. Chunk-safe: any text after the
         // name in this same piece is routed as channel content.
         channel_name_buf_ += s;
-        if (channel_name_buf_.find("thought") != std::string::npos) {
-            in_channel_header_     = false;
-            in_suppressed_channel_ = true;
-            return "";  // remainder of this piece is thought content → drop
+        const size_t tpos = channel_name_buf_.find("thought");
+        if (tpos != std::string::npos) {
+            in_channel_header_  = false;
+            in_thought_channel_ = true;
+            const std::string rest = channel_name_buf_.substr(tpos + 7);  // after "thought"
+            channel_name_buf_.clear();
+            return show_thought_ ? rest : "";  // remainder is thought content
         }
         const size_t pos = channel_name_buf_.find("model");
         if (pos != std::string::npos) {
-            in_channel_header_     = false;
-            in_suppressed_channel_ = false;
-            strip_leading_ws_      = true;
+            in_channel_header_  = false;
+            in_thought_channel_ = false;
+            strip_leading_ws_   = true;
             const std::string rest = channel_name_buf_.substr(pos + 5);  // after "model"
             channel_name_buf_.clear();
             return emit_normal(rest);
@@ -78,7 +81,7 @@ std::string ChannelFilter::consume(const std::string& s) {
         return "";  // name not yet complete
     }
 
-    if (in_suppressed_channel_) return "";
+    if (in_thought_channel_) return show_thought_ ? s : "";
     return emit_normal(s);
 }
 

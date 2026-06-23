@@ -25,6 +25,10 @@ struct CliArgs {
     std::string token_log_path;
     std::string grammar_file;
     std::string system_prompt;
+    // Gemma 4 channel stream: show the model's thought channel (reasoning) in
+    // chat, rendered dimmed, instead of suppressing it. On by default; the
+    // thought is shown but never saved into the assistant turn history.
+    bool show_thinking = true;  // --hide-thinking to suppress
     // PLD options
     bool speculative = false;
     int pld_ngram_size = 3;

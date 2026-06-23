@@ -511,10 +511,26 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             std::cout << "Assistant: " << std::flush;
 
             // Gemma 4 channel-stream filter (shared with the server — see
-            // loader/channel_filter.h). Per-turn instance: suppresses the
-            // thought channel and the <|channel>/<channel|>/<|turn> framing,
-            // robust to token-boundary splits. Inert for non-Gemma-4 models.
-            ChannelFilter channel_filter;
+            // loader/channel_filter.h). Per-turn instance: strips the
+            // <|channel>/<channel|>/<|turn> framing, robust to token-boundary
+            // splits. With --hide-thinking it also drops the thought channel
+            // (the server's behavior); by default thought is shown. Inert for
+            // non-Gemma-4 models.
+            ChannelFilter channel_filter(args.show_thinking);
+
+            // Emit one filtered chunk. Thought-channel text is rendered dimmed
+            // and deliberately NOT appended to assistant_response: reasoning is
+            // shown to the user but kept out of the saved turn history, so it is
+            // not fed back as the assistant's answer on the next turn.
+            auto emit_visible = [&](const std::string& vis) {
+                if (vis.empty()) return;
+                if (channel_filter.in_thought()) {
+                    std::cout << "\033[2m" << make_readable(vis) << "\033[0m" << std::flush;
+                } else {
+                    print_token(vis);
+                    assistant_response += vis;
+                }
+            };
 
             // generated_tokens = tokens generated in this assistant turn
             std::vector<int32_t> prompt_tokens_for_pld = all_tokens;
@@ -537,11 +553,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     break;
                 }
                 log_token(next_token_id);
-                std::string vis = channel_filter.feed(decoded_token);
-                if (!vis.empty()) {
-                    print_token(vis);
-                    assistant_response += vis;
-                }
+                emit_visible(channel_filter.feed(decoded_token));
                 all_tokens.push_back(next_token_id);
                 generated_tokens.push_back(next_token_id);
 
@@ -564,11 +576,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     }
                     std::string ft_str = tokenizer->decode(ft);
                     log_token(ft);
-                    std::string ft_vis = channel_filter.feed(ft_str);
-                    if (!ft_vis.empty()) {
-                        print_token(ft_vis);
-                        assistant_response += ft_vis;
-                    }
+                    emit_visible(channel_filter.feed(ft_str));
                     all_tokens.push_back(ft);
                     generated_tokens.push_back(ft);
                 }

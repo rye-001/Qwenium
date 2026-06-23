@@ -87,6 +87,47 @@ TEST(ChannelFilter, ResetClearsState) {
     EXPECT_EQ(f.feed("fresh turn"), "fresh turn");
 }
 
+// ── show_thought=true: thought content is emitted alongside the answer ───────
+TEST(ChannelFilter, ShowThoughtEmitsBoth) {
+    ChannelFilter f(/*show_thought=*/true);
+    std::string out = run(f, {
+        "<|channel>", "thought", "let me reason\n", "<channel|>",
+        "<|channel>", "model", "\n", "The answer is 42.", "<channel|>"});
+    EXPECT_EQ(out, "let me reason\nThe answer is 42.");
+}
+
+// ── show_thought=true: still strips all control markers (only content leaks) ──
+TEST(ChannelFilter, ShowThoughtNoMarkersLeak) {
+    ChannelFilter f(/*show_thought=*/true);
+    std::string out = run(f, {
+        "<|channel>", "thought", "reasoning", "<channel|>", "<|turn>"});
+    EXPECT_EQ(out, "reasoning");
+    EXPECT_EQ(out.find("<|channel>"), std::string::npos);
+    EXPECT_EQ(out.find("<channel|>"), std::string::npos);
+    EXPECT_EQ(out.find("<|turn>"),    std::string::npos);
+}
+
+// ── show_thought=true: split thought marker still routes content correctly ────
+TEST(ChannelFilter, ShowThoughtSplitMarker) {
+    ChannelFilter f(/*show_thought=*/true);
+    EXPECT_EQ(run(f, {"<|channel>", "thought", "\n", "secret reasoning"}),
+              "\nsecret reasoning");
+}
+
+// ── in_thought() tracks the channel so the caller can style reasoning ─────────
+TEST(ChannelFilter, InThoughtTracksChannel) {
+    ChannelFilter f(/*show_thought=*/true);
+    f.feed("<|channel>");
+    f.feed("thought");
+    f.feed("reasoning");
+    EXPECT_TRUE(f.in_thought());
+    f.feed("<channel|>");
+    f.feed("<|channel>");
+    f.feed("model");
+    f.feed("answer");
+    EXPECT_FALSE(f.in_thought());
+}
+
 // ── One-shot strip() over a complete string (server path) ────────────────────
 TEST(ChannelFilter, StripWholeString) {
     EXPECT_EQ(

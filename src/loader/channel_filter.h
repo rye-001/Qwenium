@@ -17,6 +17,14 @@
 
 class ChannelFilter {
 public:
+    // show_thought=false (default): the thought channel's content is dropped —
+    // the server's user-facing answer never includes internal reasoning. This
+    // is the original behavior; strip() and every default-constructed instance
+    // keep it, so the server path is unchanged. show_thought=true: thought
+    // content is emitted too (the CLI shows the model's reasoning). The
+    // <|channel>/<channel|>/<|turn> control markers are stripped in BOTH modes.
+    explicit ChannelFilter(bool show_thought = false) : show_thought_(show_thought) {}
+
     // Feed one decoded token's text; returns the text to emit ("" == suppress).
     // Stateful across calls within a single generation; call reset() per turn.
     // Chunk-safe: a piece carrying both a channel name and following content
@@ -24,10 +32,18 @@ public:
     std::string feed(const std::string& token_str);
 
     // Reset to the Normal state (call between turns when reusing an instance).
+    // Does not change the show_thought mode — that is configuration, not state.
     void reset();
 
-    // One-shot: run the same state machine over a complete string. For callers
-    // that already hold the full text (e.g. the server's assembled response).
+    // True while the filter is inside the thought channel, evaluated AFTER the
+    // most recent feed(). Lets a streaming caller style emitted reasoning
+    // differently from the answer. Only meaningful in show_thought mode (in
+    // suppress mode thought content is never emitted, so this is informational).
+    bool in_thought() const { return in_thought_channel_; }
+
+    // One-shot: run the same state machine over a complete string in suppress
+    // mode. For callers that already hold the full text (e.g. the server's
+    // assembled response) and want the thought channel dropped.
     static std::string strip(const std::string& full);
 
 private:
@@ -39,8 +55,9 @@ private:
     // follow a channel header so the answer never starts with a leading newline.
     std::string emit_normal(const std::string& s);
 
+    const bool show_thought_;             // emit thought-channel content instead of dropping it
     bool in_channel_header_     = false;  // saw <|channel>, reading the name
-    bool in_suppressed_channel_ = false;  // inside the thought channel
+    bool in_thought_channel_    = false;  // inside the thought channel
     bool strip_leading_ws_      = false;  // drop blank lines just after a header
     std::string channel_name_buf_;
 };

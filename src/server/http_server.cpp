@@ -1067,7 +1067,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         std::cout << "Received prompt: " << inf_req->prompt << std::endl;
         std::cout << "Received prompt End" << std::endl;
         inf_req->skip_template = true;  // already fully <|im_start|>-rendered
-        inf_req->max_tokens = body.value("max_tokens", 256);
+        inf_req->max_tokens = body.value("max_tokens", 1024);
         inf_req->temperature = body.value("temperature", 0.0f);
         // Sampling controls (honored only when temperature > 0). Absent fields
         // keep the request struct's defaults. `seed` (OpenAI) makes a stochastic
@@ -1319,7 +1319,7 @@ int main(int argc, char* argv[]) {
         config.max_slots = integration.max_slots();
         config.max_queue_depth = 100;
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
-        config.request_timeout = std::chrono::seconds(120);
+        config.request_timeout = std::chrono::seconds(300);
 
         qwenium::InferenceServer inference(config);
         integration.configure_server(inference);

@@ -53,6 +53,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --vocab-prune-list-path FILE Path to keep_list.bin for vocab pruning\n";
     std::cout << "  --system-prompt PROMPT  System prompt to guide the assistant's behavior in chat mode\n";
     std::cout << "  --grammar-file FILE     Path to a GBNF grammar file for constrained sampling\n";
+    std::cout << "  --hide-thinking         (chat) Suppress the Gemma 4 thought channel (shown dimmed by default)\n";
     std::cout << "  --log-tokens-to FILE    Append all processed token IDs to a file\n";
     std::cout << "  --speculative           Enable Prompt Lookup Decoding (speculative)\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
@@ -116,6 +117,8 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--grammar-file") {
             if (i + 1 >= argc) return false;
             args.grammar_file = argv[++i];
+        } else if (arg == "--hide-thinking") {
+            args.show_thinking = false;
         } else if (arg == "--log-tokens-to") {
             if (i + 1 >= argc) return false;
             args.token_log_path = argv[++i];
