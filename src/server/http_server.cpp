@@ -359,6 +359,15 @@ public:
             forward_pass_->clear_slot(slot_id);
         });
 
+        // Engine KV append position for a slot (= bos_count + materialized
+        // tokens). The warm chat-prefix path (--chat-prefix-cache) appends a
+        // turn's suffix here, so the leading BOS this integration prepends at
+        // pos 0 is accounted for without the (engine-agnostic) server reasoning
+        // about it. Wired unconditionally; consulted only when the cache is on.
+        server.set_get_cache_pos([this](int slot_id) {
+            return static_cast<int>(forward_pass_->get_cache_pos(slot_id));
+        });
+
         // Stop on ANY of the model's end tokens, not just the primary EOS. The
         // loader collects the family's end-of-turn markers (e.g. Gemma 4 IT's
         // <turn|>, Qwen's <|im_end|>) into stop_token_ids; checking only
@@ -1250,6 +1259,16 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
 // Main
 // =============================================================================
 int main(int argc, char* argv[]) {
+    // Quiet ggml's INFO/WARN chatter (e.g. the gallocr "cannot reallocate
+    // multi buffer graph" / sched "reserving" lines emitted on every image
+    // prefill); forward only errors. Same mechanism as the CLI (cli/main.cpp).
+    ggml_log_set([](ggml_log_level level, const char* text, void* user_data) {
+        if (level == GGML_LOG_LEVEL_ERROR) {
+            fprintf(stderr, "%s", text);
+        }
+        (void)user_data;
+    }, nullptr);
+
     // Parse arguments
     int port = 8080;
     std::string model_path;
@@ -1257,6 +1276,7 @@ int main(int argc, char* argv[]) {
     std::string image_embed_cache_dir;   // V1: opt-in disk image-embed cache
     std::string image_prefix_cache_dir;  // V2: opt-in disk image-prefix KV cache
     std::string prefix_cache_dir;        // text: opt-in disk system-prefix KV cache
+    bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -1282,6 +1302,8 @@ int main(int argc, char* argv[]) {
             image_prefix_cache_dir = argv[++i];
         } else if (arg == "--prefix-cache" && i + 1 < argc) {
             prefix_cache_dir = argv[++i];
+        } else if (arg == "--chat-prefix-cache") {
+            chat_prefix_cache = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -1299,6 +1321,9 @@ int main(int argc, char* argv[]) {
                          "image-position prefill for a recurring (context,image) (V2)\n"
                       << "  --prefix-cache DIR        Opt-in disk cache: skip the "
                          "prefill of a recurring system prompt (text path)\n"
+                      << "  --chat-prefix-cache       Opt-in: retain each slot's KV "
+                         "and prefill only the new turn of a growing conversation "
+                         "(transparent, token-identical; text path)\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
         }
@@ -1320,6 +1345,10 @@ int main(int argc, char* argv[]) {
         config.max_queue_depth = 100;
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
         config.request_timeout = std::chrono::seconds(300);
+        config.chat_prefix_cache = chat_prefix_cache;  // opt-in warm per-slot KV reuse
+        if (chat_prefix_cache)
+            std::cout << "Text: chat prefix cache ON (--chat-prefix-cache): warm "
+                         "per-slot KV reuse for growing conversations" << std::endl;
 
         qwenium::InferenceServer inference(config);
         integration.configure_server(inference);

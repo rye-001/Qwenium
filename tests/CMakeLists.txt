@@ -242,6 +242,19 @@ target_link_libraries(image-embedding-section-tests PRIVATE
 target_compile_features(image-embedding-section-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-embedding-section-tests)
 
+# Inference server warm chat-prefix routing (--chat-prefix-cache). Model-free —
+# inference_server.h is header-only (std + forward decls), so this links only
+# gtest. Pins warm_prefix_pick: strict-prefix-append, longest-match, free-slot
+# eligibility. The model-on-Metal transparency gate is server_chat_cache_smoke.sh.
+add_executable(inference-server-tests
+    unit/test_inference_server.cpp
+)
+target_link_libraries(inference-server-tests PRIVATE
+    GTest::gtest_main
+)
+target_compile_features(inference-server-tests PRIVATE cxx_std_17)
+gtest_discover_tests(inference-server-tests)
+
 # Prefix library (Phase 4 L2 service surface). Model-free — links core (pulls
 # qinf-session for CompatHeader + snapshot_io). Key stability, hit/miss, the
 # fail-loud header refusal (the Phase 4 non-negotiable), eviction, atomic store.
