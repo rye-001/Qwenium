@@ -359,6 +359,15 @@ public:
             forward_pass_->clear_slot(slot_id);
         });
 
+        // Engine KV append position for a slot (= bos_count + materialized
+        // tokens). The warm chat-prefix path (--chat-prefix-cache) appends a
+        // turn's suffix here, so the leading BOS this integration prepends at
+        // pos 0 is accounted for without the (engine-agnostic) server reasoning
+        // about it. Wired unconditionally; consulted only when the cache is on.
+        server.set_get_cache_pos([this](int slot_id) {
+            return static_cast<int>(forward_pass_->get_cache_pos(slot_id));
+        });
+
         // Stop on ANY of the model's end tokens, not just the primary EOS. The
         // loader collects the family's end-of-turn markers (e.g. Gemma 4 IT's
         // <turn|>, Qwen's <|im_end|>) into stop_token_ids; checking only
@@ -1067,7 +1076,12 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         std::cout << "Received prompt: " << inf_req->prompt << std::endl;
         std::cout << "Received prompt End" << std::endl;
         inf_req->skip_template = true;  // already fully <|im_start|>-rendered
-        inf_req->max_tokens = body.value("max_tokens", 256);
+        inf_req->max_tokens = body.value("max_tokens", 1024);
+        // Conversation continuation handle (--conversational). 'new' starts a
+        // conversation (server mints + returns a real id); a real id continues;
+        // absent/empty stays stateless. The engine rejects it fail-loud unless
+        // the server enabled the mode.
+        inf_req->conversation_id = body.value("conversation_id", "");
         inf_req->temperature = body.value("temperature", 0.0f);
         // Sampling controls (honored only when temperature > 0). Absent fields
         // keep the request struct's defaults. `seed` (OpenAI) makes a stochastic
@@ -1163,6 +1177,10 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                                         {"finish_reason", chat_finish_reason(inf_req->finish_reason)}
                                     }}}
                                 };
+                                // Echo the conversation handle on the terminal
+                                // chunk so a streaming client can continue.
+                                if (!inf_req->conversation_id.empty())
+                                    tail["conversation_id"] = inf_req->conversation_id;
                                 payload = "data: " + tail.dump() + "\n\ndata: [DONE]\n\n";
                             }
                             sink.write(payload.c_str(), payload.size());
@@ -1228,8 +1246,50 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                     {"total_tokens", inf_req->prompt_tokens + inf_req->completion_tokens}
                 }}
             };
+            // Echo the conversation handle (minted on create) so the client can
+            // continue; absent for stateless requests (--conversational off / no id).
+            if (!inf_req->conversation_id.empty())
+                response["conversation_id"] = inf_req->conversation_id;
             res.set_content(response.dump(), "application/json");
         }
+    });
+
+    // Conversation management (--conversational): clear one conversation or flush
+    // all. The registry lives on the inference thread, so these marshal the op and
+    // wait briefly for the result (fail-loud 503 if the engine is unresponsive).
+    // Clearing is always safe: a continue against a cleared id fails loud (recover
+    // → resend full history), never corruption.
+    auto await_clear = [](std::future<int>& fut, httplib::Response& res,
+                          const std::function<void(int)>& on_ok) {
+        if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            res.status = 503;
+            res.set_content(json({{"error", "conversation clear timed out"}}).dump(),
+                            "application/json");
+            return;
+        }
+        on_ok(fut.get());
+    };
+    http.Delete(R"(/v1/conversations/([^/]+))",
+                [&inference, await_clear](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.matches[1];
+        auto fut = inference.clear_conversation(id);
+        await_clear(fut, res, [&](int n) {
+            if (n < 0) {
+                res.status = 404;
+                res.set_content(json({{"error", "unknown conversation_id '" + id + "'"}}).dump(),
+                                "application/json");
+            } else {
+                res.set_content(json({{"deleted", id}, {"cleared", n}}).dump(),
+                                "application/json");
+            }
+        });
+    });
+    http.Delete("/v1/conversations",
+                [&inference, await_clear](const httplib::Request&, httplib::Response& res) {
+        auto fut = inference.clear_all_conversations();
+        await_clear(fut, res, [&](int n) {
+            res.set_content(json({{"flushed", n}}).dump(), "application/json");
+        });
     });
 
     // Models endpoint (for compatibility)
@@ -1250,6 +1310,16 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
 // Main
 // =============================================================================
 int main(int argc, char* argv[]) {
+    // Quiet ggml's INFO/WARN chatter (e.g. the gallocr "cannot reallocate
+    // multi buffer graph" / sched "reserving" lines emitted on every image
+    // prefill); forward only errors. Same mechanism as the CLI (cli/main.cpp).
+    ggml_log_set([](ggml_log_level level, const char* text, void* user_data) {
+        if (level == GGML_LOG_LEVEL_ERROR) {
+            fprintf(stderr, "%s", text);
+        }
+        (void)user_data;
+    }, nullptr);
+
     // Parse arguments
     int port = 8080;
     std::string model_path;
@@ -1257,6 +1327,8 @@ int main(int argc, char* argv[]) {
     std::string image_embed_cache_dir;   // V1: opt-in disk image-embed cache
     std::string image_prefix_cache_dir;  // V2: opt-in disk image-prefix KV cache
     std::string prefix_cache_dir;        // text: opt-in disk system-prefix KV cache
+    bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
+    bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -1282,6 +1354,10 @@ int main(int argc, char* argv[]) {
             image_prefix_cache_dir = argv[++i];
         } else if (arg == "--prefix-cache" && i + 1 < argc) {
             prefix_cache_dir = argv[++i];
+        } else if (arg == "--chat-prefix-cache") {
+            chat_prefix_cache = true;
+        } else if (arg == "--conversational") {
+            conversational = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -1299,6 +1375,13 @@ int main(int argc, char* argv[]) {
                          "image-position prefill for a recurring (context,image) (V2)\n"
                       << "  --prefix-cache DIR        Opt-in disk cache: skip the "
                          "prefill of a recurring system prompt (text path)\n"
+                      << "  --chat-prefix-cache       Opt-in: retain each slot's KV "
+                         "and prefill only the new turn of a growing conversation "
+                         "(transparent, token-identical; text path)\n"
+                      << "  --conversational          Opt-in: warm conversational "
+                         "server. A conversation_id ('new' to start) retains KV "
+                         "across turns and appends only the new turn (chat.cpp-grade; "
+                         "warm != cold). Excludes --chat-prefix-cache; text path\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
         }
@@ -1319,7 +1402,25 @@ int main(int argc, char* argv[]) {
         config.max_slots = integration.max_slots();
         config.max_queue_depth = 100;
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
-        config.request_timeout = std::chrono::seconds(120);
+        config.request_timeout = std::chrono::seconds(300);
+        config.chat_prefix_cache = chat_prefix_cache;  // opt-in warm per-slot KV reuse
+        if (chat_prefix_cache)
+            std::cout << "Text: chat prefix cache ON (--chat-prefix-cache): warm "
+                         "per-slot KV reuse for growing conversations" << std::endl;
+        // Warm conversational server (--conversational). Excludes
+        // --chat-prefix-cache: both manage warm prefix KV and would race over the
+        // same slots — pick one (the doc's consolidation-watch).
+        if (conversational && chat_prefix_cache) {
+            std::cerr << "Fatal error: --conversational and --chat-prefix-cache are "
+                         "mutually exclusive (both manage warm prefix KV; pick one)"
+                      << std::endl;
+            return 1;
+        }
+        config.conversational = conversational;
+        if (conversational)
+            std::cout << "Text: conversational server ON (--conversational): explicit "
+                         "conversation_id continuation, chat.cpp-grade reasoning "
+                         "retention (warm != cold)" << std::endl;
 
         qwenium::InferenceServer inference(config);
         integration.configure_server(inference);
