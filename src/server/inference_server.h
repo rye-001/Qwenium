@@ -6,7 +6,10 @@
 #include <memory>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <atomic>
+#include <random>
+#include <future>
 #include <chrono>
 #include <string>
 #include <functional>
@@ -121,6 +124,14 @@ struct InferenceRequest {
     // byte-identical to a full re-prefill, version-gated fail-loud.
     std::string cacheable_prefix_text;
 
+    // Conversation continuation handle (--conversational). INPUT: the client's
+    // conversation_id, or empty for a new/stateless request. OUTPUT: on a CREATE
+    // the engine writes the minted id here and the route returns it. A non-empty
+    // id means "continue this conversation" — the engine appends the rendered
+    // delta to the conversation's retained KV instead of prefilling whole. An
+    // unknown/closed id is fail-loud (resend full history). Text path only.
+    std::string conversation_id;
+
     std::shared_ptr<TokenQueue> token_queue = std::make_shared<TokenQueue>();
     std::atomic<bool> cancelled{false};
 
@@ -187,6 +198,9 @@ struct Slot {
     int last_token = 0;
     int tokens_generated = 0;
     bool active = false;
+    // The stop token this turn ended on (a clean turn closer for conversational
+    // continuation), or -1 if it ended on length / stop-string / grammar.
+    int end_token = -1;
 
     void reset() {
         request.reset();
@@ -194,6 +208,7 @@ struct Slot {
         last_token = 0;
         tokens_generated = 0;
         active = false;
+        end_token = -1;
     }
 };
 
@@ -226,6 +241,14 @@ public:
         // Default off: stateless, every prompt prefilled whole. See
         // docs/plan-chat-prefix-cache.md.
         bool chat_prefix_cache = false;
+        // Opt-in warm conversational server (--conversational). When on, a
+        // request may carry a conversation_id: the server retains that
+        // conversation's KV + token log across turns and appends only the new
+        // rendered turn (chat.cpp-grade reasoning retention — warm != cold by
+        // construction). Default off: §1 stateless stays the default and a
+        // conversation_id is rejected fail-loud. See
+        // docs/plan-warm-conversational-server.md.
+        bool conversational = false;
     };
 
     // Callback types for integration with your existing code
@@ -283,6 +306,7 @@ public:
     InferenceServer(const Config& config)
         : config_(config), slots_(config.max_slots),
           slot_resident_tokens_(config.max_slots) {
+        slot_conversation_.resize(config.max_slots);
         for (int i = 0; i < config.max_slots; ++i) {
             slots_[i].slot_id = i;
         }
@@ -344,6 +368,45 @@ public:
         return {any_free, 0};
     }
 
+    // ── Warm conversational server (--conversational) ────────────────────────
+    // The reserved conversation_id a client sends to START a conversation; the
+    // server replaces it with a real minted id in the response. An absent/empty
+    // id => stateless (invariant 1: no handle, zero state). A real id => continue.
+    static constexpr const char* kNewConversation = "new";
+
+    // Routing decision for a request carrying a conversation_id — the
+    // explicit-handle analog of warm_prefix_pick. See
+    // docs/plan-warm-conversational-server.md.
+    enum class ConvRoute {
+        Stateless,          // no create/continue intent → existing stateless path
+        Create,             // create sentinel → mint id, cold-prefill full at pos 0
+        ContinueWarm,       // known id, KV resident → append delta at get_cache_pos
+        ContinueRebuild,    // known id, KV evicted → prefill log++delta at pos 0
+        FailUnknown,        // continue id not in registry → resend full history
+        FailNotContinuable, // id known, last turn left no clean closer → resend full
+        FailModeOff,        // create/continue asked but --conversational is off
+    };
+
+    // Classify a conversational request from registry state. Pure & unit-tested.
+    //   mode_on         — Config::conversational
+    //   wants_create    — request carries the kNewConversation create sentinel
+    //   has_continue_id — request carries a real (non-sentinel) conversation_id
+    //   id_known        — that id is in the registry
+    //   kv_resident     — the conversation's slot still holds its KV (warm, idle)
+    //   continuable     — the conversation's last turn ended on a clean closer
+    // kv_resident / continuable are only meaningful when id_known.
+    static ConvRoute classify_conversation_request(
+            bool mode_on, bool wants_create, bool has_continue_id,
+            bool id_known, bool kv_resident, bool continuable) {
+        const bool wants_conv = wants_create || has_continue_id;
+        if (!mode_on) return wants_conv ? ConvRoute::FailModeOff : ConvRoute::Stateless;
+        if (wants_create) return ConvRoute::Create;
+        if (!has_continue_id) return ConvRoute::Stateless;
+        if (!id_known) return ConvRoute::FailUnknown;
+        if (!continuable) return ConvRoute::FailNotContinuable;
+        return kv_resident ? ConvRoute::ContinueWarm : ConvRoute::ContinueRebuild;
+    }
+
     // Submit a request (called from HTTP thread)
     bool submit(std::shared_ptr<InferenceRequest> req) {
         if (config_.max_queue_depth > 0 && request_queue_.size() >= (size_t)config_.max_queue_depth) {
@@ -361,6 +424,19 @@ public:
         return detokenize_(token_id);
     }
 
+    // Clear conversation state (called from HTTP threads). The registry + KV are
+    // owned by the inference thread, so the op is marshaled onto it; the returned
+    // future resolves to the number cleared (clear_conversation: 1, or -1 if the
+    // id is unknown; flush: the count). See process_control_ops().
+    std::future<int> clear_conversation(const std::string& id) {
+        return enqueue_control(
+            ControlOp{ControlOp::Type::ClearConversation, id, std::promise<int>()});
+    }
+    std::future<int> clear_all_conversations() {
+        return enqueue_control(
+            ControlOp{ControlOp::Type::ClearAll, std::string(), std::promise<int>()});
+    }
+
     // Get stats (thread-safe)
     const ServerStats& stats() const { return stats_; }
 
@@ -368,6 +444,9 @@ public:
     void run() {
         running_ = true;
         while (running_) {
+            // 0. Apply any queued clear/flush control ops (from HTTP threads).
+            process_control_ops();
+
             // 1. Assign pending requests to free slots
             assign_requests_to_slots();
 
@@ -426,6 +505,13 @@ private:
     // pointer stays put. Reads slot.context_tokens — call BEFORE slot.reset().
     void release_slot_kv(int slot_id) {
         Slot& slot = slots_[slot_id];
+        // Conversational slot (--conversational): snapshot the turn into the
+        // conversation log + closer and KEEP the KV live + bound (warm for the
+        // next turn) instead of the transparent retain/clear below.
+        if (!slot_conversation_[slot_id].empty()) {
+            release_conversation_turn(slot_id);
+            return;
+        }
         if (slot.request && is_warm_text_request(*slot.request)) {
             // Retain EXACTLY the tokens the KV materialized. context_tokens holds
             // the full prompt + every generated token, but the FINAL sampled
@@ -453,7 +539,16 @@ private:
     // previous warm turn retained KV here, drop it so the new prefill starts at
     // position 0 with no stale prefix underneath.
     void clear_retained_if_any(int slot_id) {
-        if (!slot_resident_tokens_[slot_id].empty()) {
+        // A conversation may own this slot's KV; unbind it (its log survives in
+        // the registry → it falls back to ContinueRebuild) before the pos-0
+        // prefill steals the slot.
+        const bool bound = !slot_conversation_[slot_id].empty();
+        if (bound) {
+            auto it = conversations_.find(slot_conversation_[slot_id]);
+            if (it != conversations_.end()) it->second.slot = -1;
+            slot_conversation_[slot_id].clear();
+        }
+        if (bound || !slot_resident_tokens_[slot_id].empty()) {
             if (clear_slot_) clear_slot_(slot_id);
             slot_resident_tokens_[slot_id].clear();
         }
@@ -494,7 +589,254 @@ private:
         return a;
     }
 
+    // ── Warm conversational server: execution (--conversational) ─────────────
+    // Fail a conversational request fail-loud: a named error, queue finished,
+    // slot NOT consumed. Void so callers can `return fail_request(...)`.
+    void fail_request(const std::shared_ptr<InferenceRequest>& req,
+                      const std::string& message) {
+        req->error_message = message;
+        req->finish_reason = "error";
+        req->token_queue->finish();
+    }
+
+    // Opaque conversation id, "conv_"-prefixed so it never collides with the
+    // kNewConversation create sentinel. Minted on the inference thread only.
+    std::string mint_conversation_id() {
+        return "conv_" + std::to_string(conv_rng_()) + "_" +
+               std::to_string(conv_rng_());
+    }
+
+    // Snapshot a completed conversational turn into its log + closer, KEEPING the
+    // slot's KV live and bound (warm for the next turn). Same off-by-one as
+    // release_slot_kv (resident == get_cache_pos - bos). Reads context_tokens, so
+    // it runs BEFORE slot.reset().
+    void release_conversation_turn(int slot_id) {
+        Slot& slot = slots_[slot_id];
+        auto it = conversations_.find(slot_conversation_[slot_id]);
+        if (it == conversations_.end()) return;  // shouldn't happen
+        Conversation& c = it->second;
+        const int mat = get_cache_pos_ ? get_cache_pos_(slot_id)
+                                       : static_cast<int>(slot.context_tokens.size());
+        const int bos = kv_bos_count_ >= 0 ? kv_bos_count_ : 0;
+        int keep = mat - bos;
+        if (keep < 0) keep = 0;
+        if (keep > static_cast<int>(slot.context_tokens.size()))
+            keep = static_cast<int>(slot.context_tokens.size());
+        c.log.assign(slot.context_tokens.begin(),
+                     slot.context_tokens.begin() + keep);
+        c.last_closer = slot.end_token;  // clean closer (stop token) or -1
+        c.slot = slot_id;                // stays bound; KV not cleared
+        c.last_used = std::chrono::steady_clock::now();
+    }
+
+    // A clear/flush op marshaled from an HTTP thread onto the inference thread;
+    // its result resolves the caller's future (clear: 1 / -1 unknown; flush: count).
+    struct ControlOp {
+        enum class Type { ClearConversation, ClearAll } type;
+        std::string id;
+        std::promise<int> result;
+    };
+
+    // Enqueue a control op (HTTP thread) and return the future its result lands on.
+    std::future<int> enqueue_control(ControlOp op) {
+        auto f = op.result.get_future();
+        { std::lock_guard<std::mutex> lock(control_mutex_); control_queue_.push(std::move(op)); }
+        return f;
+    }
+
+    // Drain queued clear ops (inference thread, top of the run loop). Safe to
+    // touch the registry + KV here — this thread solely owns them.
+    void process_control_ops() {
+        std::queue<ControlOp> ops;
+        { std::lock_guard<std::mutex> lock(control_mutex_); std::swap(ops, control_queue_); }
+        while (!ops.empty()) {
+            ControlOp op = std::move(ops.front()); ops.pop();
+            const int r = (op.type == ControlOp::Type::ClearAll)
+                ? do_clear_all_conversations() : do_clear_conversation(op.id);
+            op.result.set_value(r);
+        }
+    }
+
+    // Drop one conversation: its registry entry, its slot binding, and (if the
+    // slot is idle) its KV. If a turn is mid-flight on the slot, only unbind —
+    // that generation's release becomes a no-op and the KV is cleared when the
+    // slot is next reused. Returns 1, or -1 if the id is unknown.
+    int do_clear_conversation(const std::string& id) {
+        auto it = conversations_.find(id);
+        if (it == conversations_.end()) return -1;
+        const int slot = it->second.slot;
+        if (slot >= 0) {
+            if (!slots_[slot].active && clear_slot_) clear_slot_(slot);
+            slot_conversation_[slot].clear();
+        }
+        conversations_.erase(it);
+        return 1;
+    }
+
+    // Flush every conversation; returns the count cleared.
+    int do_clear_all_conversations() {
+        const int n = static_cast<int>(conversations_.size());
+        for (int i = 0; i < config_.max_slots; ++i) {
+            if (slot_conversation_[i].empty()) continue;
+            if (!slots_[i].active && clear_slot_) clear_slot_(i);
+            slot_conversation_[i].clear();
+        }
+        conversations_.clear();
+        return n;
+    }
+
+    // Choose a slot for a Create / Rebuild (pos-0) prefill. Prefer a truly idle,
+    // clean slot; else sacrifice an idle transparent resident; else evict the LRU
+    // idle conversation (its log survives → ContinueRebuild later). The chosen
+    // slot is unbound here; the caller's pos-0 prefill clears its KV. Returns -1
+    // only if every slot is active (the run loop assigns only when one is idle).
+    int pick_slot_for_conversation() {
+        int clean = -1, transparent = -1, lru_conv = -1;
+        std::chrono::steady_clock::time_point lru_time =
+            std::chrono::steady_clock::time_point::max();
+        for (int i = 0; i < config_.max_slots; ++i) {
+            if (slots_[i].active) continue;
+            const bool bound = !slot_conversation_[i].empty();
+            if (!bound && slot_resident_tokens_[i].empty()) { clean = i; break; }
+            if (!bound) { if (transparent < 0) transparent = i; continue; }
+            auto it = conversations_.find(slot_conversation_[i]);
+            const auto t = (it != conversations_.end())
+                ? it->second.last_used
+                : std::chrono::steady_clock::time_point::min();
+            if (t < lru_time) { lru_time = t; lru_conv = i; }
+        }
+        const int chosen = clean >= 0 ? clean
+                         : (transparent >= 0 ? transparent : lru_conv);
+        if (chosen < 0) return -1;
+        if (!slot_conversation_[chosen].empty()) {  // evict the prior owner
+            auto it = conversations_.find(slot_conversation_[chosen]);
+            if (it != conversations_.end()) it->second.slot = -1;
+            slot_conversation_[chosen].clear();
+        }
+        slot_resident_tokens_[chosen].clear();
+        return chosen;
+    }
+
+    // The conversational counterpart of assign_to_slot's text path: route a
+    // request carrying a conversation_id through the registry (create / continue-
+    // warm / rebuild / fail). Reuses prefill_ (append at get_cache_pos for warm;
+    // pos 0 for create/rebuild) and activate_slot. Text only — caller gates on no
+    // image. See docs/plan-warm-conversational-server.md.
+    void assign_conversational_slot(std::shared_ptr<InferenceRequest> req) {
+        const std::string cid = req->conversation_id;
+        const bool wants_create = (cid == kNewConversation);
+        const bool has_continue_id = !cid.empty() && !wants_create;
+
+        Conversation* conv = nullptr;
+        bool id_known = false, kv_resident = false, continuable = false;
+        if (has_continue_id) {
+            auto it = conversations_.find(cid);
+            if (it != conversations_.end()) {
+                conv = &it->second;
+                id_known = true;
+                kv_resident = (conv->slot >= 0 && !slots_[conv->slot].active);
+                continuable = (conv->last_closer >= 0);
+            }
+        }
+
+        const ConvRoute route = classify_conversation_request(
+            config_.conversational, wants_create, has_continue_id,
+            id_known, kv_resident, continuable);
+        switch (route) {
+            case ConvRoute::FailModeOff:
+                return fail_request(req, "field 'conversation_id': conversational "
+                    "mode is not enabled on this server (start it with "
+                    "--conversational)");
+            case ConvRoute::FailUnknown:
+                return fail_request(req, "field 'conversation_id': unknown "
+                    "conversation '" + cid + "'; resend the full history with no "
+                    "conversation_id to start a new one");
+            case ConvRoute::FailNotContinuable:
+                return fail_request(req, "field 'conversation_id': conversation '" +
+                    cid + "' did not end on a turn boundary (last turn hit a length "
+                    "or stop limit); resend the full history to continue");
+            case ConvRoute::Stateless:
+                return;  // unreachable: callers delegate only non-empty ids
+            case ConvRoute::Create:
+            case ConvRoute::ContinueWarm:
+            case ConvRoute::ContinueRebuild:
+                break;
+        }
+        const bool warm = (route == ConvRoute::ContinueWarm);
+
+        // Render → this turn's tokens (chat-completions is pre-templated).
+        std::vector<int32_t> turn_tokens = (req->skip_template && raw_tokenize_)
+            ? raw_tokenize_(req->prompt) : tokenize_(req->prompt);
+
+        const int slot_id = warm ? conv->slot : pick_slot_for_conversation();
+        if (slot_id < 0) return;  // every slot active (run loop shouldn't allow it)
+
+        req->started_at = std::chrono::steady_clock::now();
+        if (prepare_slot_) {
+            try { prepare_slot_(slot_id, *req); }
+            catch (const std::exception& e) { return fail_request(req, e.what()); }
+        }
+
+        // Build the prefill stream (fed now) and the full BOS-free stream the KV
+        // will hold. Warm appends [closer]+turn at the engine position; create and
+        // rebuild prefill the whole thing at pos 0.
+        std::vector<int32_t> prefill_tokens, tokens;
+        int prefill_pos = 0;
+        if (warm) {
+            if (!get_cache_pos_)
+                return fail_request(req, "slot " + std::to_string(slot_id) +
+                    ": '--conversational': expected a get_cache_pos callback, "
+                    "actual: none (server wiring error)");
+            if (conv->last_closer >= 0) prefill_tokens.push_back(conv->last_closer);
+            prefill_tokens.insert(prefill_tokens.end(),
+                                  turn_tokens.begin(), turn_tokens.end());
+            prefill_pos = get_cache_pos_(slot_id);
+            tokens = conv->log;
+            tokens.insert(tokens.end(), prefill_tokens.begin(), prefill_tokens.end());
+        } else {  // Create or ContinueRebuild
+            if (conv) {  // Rebuild: replay the log + its closer, then this turn
+                tokens = conv->log;
+                if (conv->last_closer >= 0) tokens.push_back(conv->last_closer);
+            }
+            tokens.insert(tokens.end(), turn_tokens.begin(), turn_tokens.end());
+            prefill_tokens = tokens;
+            prefill_pos = 0;
+        }
+
+        req->prompt_tokens = static_cast<int>(tokens.size());
+        if (config_.max_context > 0 && req->prompt_tokens > config_.max_context)
+            return fail_request(req, "slot " + std::to_string(slot_id) +
+                ": prompt too large; expected: <= " +
+                std::to_string(config_.max_context) + " tokens, actual: " +
+                std::to_string(req->prompt_tokens));
+
+        if (prefill_pos == 0 && clear_slot_) clear_slot_(slot_id);  // reset KV+recurrent
+        const int first_token = prefill_(slot_id, prefill_tokens, prefill_pos);
+        if (prefill_pos == 0 && get_cache_pos_ && kv_bos_count_ < 0)
+            kv_bos_count_ = get_cache_pos_(slot_id) -
+                            static_cast<int>(prefill_tokens.size());
+
+        // Bind the slot to the conversation (create mints + returns the id).
+        const std::string id = wants_create ? mint_conversation_id() : cid;
+        if (wants_create) req->conversation_id = id;  // OUTPUT: returned to client
+        Conversation& centry = conversations_[id];
+        centry.slot = slot_id;
+        centry.last_used = std::chrono::steady_clock::now();
+        slot_conversation_[slot_id] = id;
+
+        activate_slot(slot_id, req, std::move(tokens), first_token);
+    }
+
     void assign_to_slot(std::shared_ptr<InferenceRequest> req) {
+        // Warm conversational server: a request carrying a conversation_id routes
+        // through the registry (create/continue/fail), NOT the transparent
+        // chat-prefix path. An empty id => the stateless/transparent path below
+        // (invariant 1). Image requests ignore conversation_id in v1 (text only).
+        if (req->image_bytes.empty() && !req->conversation_id.empty()) {
+            assign_conversational_slot(std::move(req));
+            return;
+        }
+
         // Warm chat-prefix eligibility (a plain text request, cache on). Drives
         // both prefix-aware slot routing and KV retention. A warm request is
         // tokenized BEFORE slot choice so it can route to the slot whose
@@ -654,7 +996,10 @@ private:
             }
 
             // Stateless: every request prefills its full prompt fresh at
-            // position 0 (no system-prompt prefix cache).
+            // position 0 (no system-prompt prefix cache). Drop any retained KV /
+            // conversation binding first (no-op unless a cache/mode left some) so
+            // the pos-0 prefill — and hybrid recurrent state — starts clean.
+            clear_retained_if_any(slot_id);
             first_token = prefill_(slot_id, tokens, /*start_pos=*/0);
         }
 
@@ -675,6 +1020,7 @@ private:
 
         if (is_stop_token_(token)) {
             req.finish_reason = "stop";
+            slot.end_token = token;  // clean turn closer for conversational continue
             return true;
         }
 
@@ -826,6 +1172,40 @@ private:
     // materialized KV (resident) so a turn's suffix appends without a position
     // skip. -1 = not yet observed.
     int kv_bos_count_ = -1;
+
+    // ── Warm conversational server state (Config::conversational) ────────────
+    // Separate from slot_resident_tokens_ (the transparent handle-free path):
+    // different lifecycle (explicit handle, chat.cpp reasoning-retention,
+    // warm != cold), so NOT unified (CLAUDE.md parameterize-or-split). A
+    // conversation is an opaque minted id owning a token log + a slot binding.
+    struct Conversation {
+        // BOS-free materialized token stream of every COMPLETED turn so far
+        // (scaffolds retained), EXCLUDING the last turn's closer (see
+        // last_closer). prefill(log, 0) rebuilds the conversation's KV exactly.
+        std::vector<int32_t> log;
+        // Slot currently holding this conversation's warm KV, or -1 if evicted
+        // (the next turn rebuilds from log). A warm hit appends the delta here.
+        int slot = -1;
+        // The stop token the last turn ended on (the assistant turn's
+        // end-of-turn marker), re-fed as the FIRST delta token next turn so the
+        // KV closes the prior turn before the new one. -1 = the last turn had no
+        // clean closer (length / stop-string) → not delta-continuable, the next
+        // continue fails loud and the client resends full history.
+        int last_closer = -1;
+        std::chrono::steady_clock::time_point last_used;
+    };
+    std::unordered_map<std::string, Conversation> conversations_;
+    // Which conversation owns each slot's retained KV (empty = none /
+    // transparent-managed). Lets a slot-stealing request evict the prior owner.
+    std::vector<std::string> slot_conversation_;
+    // RNG for opaque conversation ids (inference-thread only).
+    std::mt19937_64 conv_rng_{std::random_device{}()};
+
+    // Control-op queue (ControlOp defined above) marshaling clear/flush from HTTP
+    // threads onto the inference thread, which solely owns the registry + KV.
+    // Drained in process_control_ops() at the top of the run loop.
+    std::queue<ControlOp> control_queue_;
+    std::mutex control_mutex_;
 };
 
 }  // namespace qwenium

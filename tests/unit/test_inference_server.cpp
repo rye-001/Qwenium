@@ -117,3 +117,79 @@ TEST(WarmPrefixPick, NoFreeMatchFallsBackToFirstFree) {
     EXPECT_EQ(p.slot_id, 1);  // first free, not the busy match
     EXPECT_EQ(p.lcp, 0u);
 }
+
+// ── Warm conversational server: the pure routing classifier ──────────────────
+// classify_conversation_request decides create / continue-warm / continue-rebuild
+// / fail from the registry state (docs/plan-warm-conversational-server.md). The
+// rest (mint id, delta append, rebuild-from-log, the warm==rebuild gate) is a
+// model-on-Metal concern in tests/smoke/server_conversational_smoke.sh.
+
+using Route = InferenceServer::ConvRoute;
+
+TEST(ClassifyConversation, ModeOnNoIntentIsStateless) {
+    // Mode on, but neither create sentinel nor a continue id → stateless
+    // (invariant 1: no handle, zero conversation state).
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, /*wants_create=*/false, /*has_continue_id=*/false,
+                  false, false, false),
+              Route::Stateless);
+}
+
+TEST(ClassifyConversation, ModeOffNoIntentIsStateless) {
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/false, false, false, false, false, false),
+              Route::Stateless);
+}
+
+TEST(ClassifyConversation, ModeOffWithCreateFailsLoud) {
+    // A client asks for a conversation on a server that did not enable the mode.
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/false, /*wants_create=*/true, false, false, false, false),
+              Route::FailModeOff);
+}
+
+TEST(ClassifyConversation, ModeOffWithContinueFailsLoud) {
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/false, false, /*has_continue_id=*/true, true, true, true),
+              Route::FailModeOff);
+}
+
+TEST(ClassifyConversation, CreateSentinelCreates) {
+    // First turn: the "new" sentinel mints a fresh conversation.
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, /*wants_create=*/true, false, false, false, false),
+              Route::Create);
+}
+
+TEST(ClassifyConversation, UnknownIdFailsLoud) {
+    // Continue id the server never minted (restart / TTL drop) → resend full.
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, false, /*has_continue_id=*/true,
+                  /*id_known=*/false, false, false),
+              Route::FailUnknown);
+}
+
+TEST(ClassifyConversation, KnownButNoCleanCloserFailsLoud) {
+    // Last turn ended on length/stop-string (no end-of-turn token) → cannot be
+    // delta-continued; the client resends full history (recover → create).
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, false, /*has_continue_id=*/true, /*id_known=*/true,
+                  /*kv_resident=*/true, /*continuable=*/false),
+              Route::FailNotContinuable);
+}
+
+TEST(ClassifyConversation, KnownContinuableResidentIsWarm) {
+    // The slot still holds the conversation's KV → append the delta (fast path).
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, false, /*has_continue_id=*/true, /*id_known=*/true,
+                  /*kv_resident=*/true, /*continuable=*/true),
+              Route::ContinueWarm);
+}
+
+TEST(ClassifyConversation, KnownContinuableEvictedRebuilds) {
+    // The KV was evicted but the log survives → rebuild from log, then append.
+    EXPECT_EQ(InferenceServer::classify_conversation_request(
+                  /*mode_on=*/true, false, /*has_continue_id=*/true, /*id_known=*/true,
+                  /*kv_resident=*/false, /*continuable=*/true),
+              Route::ContinueRebuild);
+}
