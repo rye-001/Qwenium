@@ -3,6 +3,23 @@
 A high-performance inference engine for Qwen-family models, running on Apple
 Silicon via Metal. Written in C++ using ggml as the tensor computation backend.
 
+## Architecture Doc Protocol (load-bearing)
+
+`docs/architecture.md` is the **as-built map** of the system — the context
+bootstrap for every session.
+
+- **Read it at the start of every session**, before proposing or making
+  changes. It orients faster and more accurately than re-deriving the system
+  from the tree.
+- **Architecture changes require user approval before they land.** Anything
+  that would alter what the doc describes — adding/removing a `src/`
+  directory, model recipe, server endpoint or flag, state kind; changing a
+  named seam (server callbacks, vision Seam A/B, snapshot header); settling a
+  §12 soft-spot item — must be surfaced to the user as an explicit decision
+  first. Once approved, update `architecture.md` in the same change (§13 of
+  the doc lists the triggers). An unapproved architecture drift or a stale doc
+  is a review-rejectable defect, same as a failing gate.
+
 ## Architecture Direction
 
 The engine is being refactored from a monolithic, model-specific design toward

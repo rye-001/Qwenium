@@ -20,10 +20,12 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 
 - **Multi-family support** — Qwen 2/2.5/3/3.5/3.6 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
 - **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
+- **Vision (multimodal)** — Image input for Gemma 3 (SigLIP encoder) and Gemma 4 (`gemma4uv` projector) via a `--mmproj` GGUF, in both the CLI (`--image`) and the server (OpenAI `image_url` content).
 - **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
-- **Prefix caching** — System prompt KV state cloned per slot. 2.25× faster wall time, 5.3× faster time-to-first-token.
-- **OpenAI-compatible API** — `/v1/completions` with SSE streaming. Drop-in for existing tools.
-- **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding.
+- **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.
+- **OpenAI-compatible API** — `/v1/completions` and `/v1/chat/completions` with SSE streaming, per-request sampling params, and a `grammar` field for constrained output. Drop-in for existing tools.
+- **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
+- **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
 - **Metal acceleration** — Apple Silicon via ggml's Metal backend, with custom fused DeltaNet kernels (`patches/`) for Qwen 3.5 / 3.6 decode.
 
@@ -37,8 +39,8 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 | Qwen 3.6 35B-A3B | DeltaNet + Attention + MoE | Q4 / Q8 | ~20 GB | ✅ |
 | Gemma 1 (2B / 7B) | Transformer | Q4 / Q8 | ~1.5 GB / ~5 GB | ✅ |
 | Gemma 2 (2B / 9B) | Transformer + logit soft-cap | Q4 / Q8 | ~1.5 GB / ~6 GB | ✅ |
-| Gemma 3 (4B text) | Transformer + sliding-window | Q4 / Q8 | ~3 GB | ✅ |
-| Gemma 4 (4B) | Transformer + PLE + pruned RoPE | Q4 / Q8 | ~3 GB | ✅ |
+| Gemma 3 (4B) | Transformer + sliding-window; vision via SigLIP mmproj | Q4 / Q8 | ~3 GB | ✅ |
+| Gemma 4 (4B / 12B) | Transformer + PLE + pruned RoPE (dense & MoE); vision via `gemma4uv` mmproj | Q4 / Q8 | ~3–8 GB | ✅ |
 
 ## Quick Start
 
@@ -58,6 +60,8 @@ make -j$(nproc)
 
 ```bash
 ./bin/http_server --model path/to/model.gguf --port 8080
+# optional: --mmproj vision.gguf (image input) · --slots N · --ctx N
+#           --prefix-cache DIR | --chat-prefix-cache | --conversational
 ```
 
 ```bash
@@ -71,10 +75,15 @@ curl -N http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain quicksort:", "max_tokens": 200, "stream": true}'
 
-# With cached system prompt (subsequent requests skip system prompt prefill)
-curl -s http://localhost:8080/v1/completions \
+# Chat (OpenAI messages format; add "grammar" for GBNF-constrained output,
+# or an image_url content part when the server was started with --mmproj)
+curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"system_prompt": "You are a coding assistant.", "prompt": "Fix this bug:", "max_tokens": 200}'
+  -d '{"messages": [{"role": "user", "content": "Fix this bug: ..."}], "max_tokens": 200}'
+
+# Warm conversation (server started with --conversational): pass
+# "conversation_id": "new" on the first turn, then reuse the returned id and
+# send only the new user turn. DELETE /v1/conversations/{id} to clear.
 ```
 
 ### Or use the CLI
@@ -83,6 +92,8 @@ curl -s http://localhost:8080/v1/completions \
 ./bin/qwenium model.gguf --chat                  # interactive
 ./bin/qwenium model.gguf --chat --speculative    # with speculative decoding
 ./bin/qwenium model.gguf -p "Hello, world!"      # single prompt
+./bin/qwenium model.gguf --chat \
+    --mmproj vision.gguf --image photo.jpg       # ask about an image (Gemma 3/4)
 ```
 
 ## Architecture
@@ -107,16 +118,20 @@ src/
 │   ├── qwen35.*                 #   Qwen3.5 (attention + SSM)
 │   ├── qwen36.*                 #   Qwen3.6 (DeltaNet + attention + MoE)
 │   └── gemma1-4.*               #   Gemma family (logit soft-cap, sliding-window, PLE, pruned RoPE)
-├── loader/                      # GGUF parsing, mmap tensor loading, tokenizer
+├── graph_inputs/                # Typed graph inputs (tokens, positions, masks, image embeddings)
+├── vision/                      # Image → soft-token encoders (SigLIP, gemma4uv)
+├── core/                        # Engine orchestration: model owner, decode plan, prefix library, caches
+├── session/                     # Portable session-snapshot file format
+├── loader/                      # GGUF parsing, mmap tensor loading, tokenizer, chat templates
 ├── sampling/                    # Sampling, grammar, token-trie, speculative decoding
 ├── server/                      # Inference server + OpenAI-compatible HTTP API
-├── cli/                         # Chat + single-prompt CLI
-└── metal/, quant/, telemetry/   # Backend dispatch, weight quant, observability
+├── cli/                         # Chat + single-prompt CLI, image preprocessing
+└── telemetry/                   # Observability
 ```
 
 One inference thread owns the model. HTTP threads push requests to a queue and block on per-request token queues. All active slots decode together in a single batched forward pass.
 
-For the architectural blueprint and rationale, see [`docs/modular-layer-architecture.md`](docs/modular-layer-architecture.md).
+For the full as-built map (codemap, dataflows, invariants), see [`docs/architecture.md`](docs/architecture.md); for the blueprint and rationale, see [`docs/modular-layer-architecture.md`](docs/modular-layer-architecture.md).
 
 ## Research & Experimentation
 
@@ -136,7 +151,7 @@ Measured on M1 MacBook Pro (32GB) with Qwen 2.5 Coder 14B Q4:
 | Metric | Value |
 |--------|-------|
 | Throughput (10 concurrent) | ~4× vs sequential |
-| System prompt cache hit | 2.25× wall time, 5.3× TTFT |
+| Warm chat prefix hit (`--chat-prefix-cache`) | 2.4× per turn at 4K context (flat vs quadratic re-prefill) |
 | DSL code generation | 100% pass rate (10 concurrent) |
 
 ## Build Options
