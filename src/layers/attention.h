@@ -109,6 +109,13 @@ ggml_tensor* build_attention(
 // applies a shared causal mask, then runs MHA.
 // Reads n_embd_head and n_head_kv from k->ne[0]/ne[1].
 // Extracted from Qwen3ForwardPass::_build_batched_attention_layer — identical logic.
+//
+// kv_write_indices (nullable): I64 [n_batch] graph input carrying the KV
+//   write destination rows (slot * n_ctx_max + pos). Non-null ⇒ the K/V write
+//   is one ggml_set_rows per cache (write position is a run-time VALUE — the
+//   persistent-decode-graph write path, docs/plan-persistent-decode-graph.md
+//   §2.1). Null ⇒ the legacy per-slot ggml_cpy at a build-time-baked offset,
+//   byte-identical to the pre-P1 path.
 ggml_tensor* build_batched_attention(
     ggml_context*                   ctx,
     ggml_cgraph*                    gf,
@@ -123,7 +130,8 @@ ggml_tensor* build_batched_attention(
     ggml_tensor*                    kq_mask,
     ggml_tensor*                    gather_indices,
     int                             il,
-    float                           softcap = 0.0f);
+    float                           softcap = 0.0f,
+    ggml_tensor*                    kv_write_indices = nullptr);
 
 // ── Gated attention variants (Qwen3.5, Qwen3.6) ─────────────────────────────
 // These models use a joint Q+Gate projection, Q/K RMS norms, partial RoPE, and
@@ -160,6 +168,8 @@ ggml_tensor* build_gated_attention(
 // Decode / batched multi-slot gated attention.
 // Same gated projections/norms/gating as above, but operates on a batch of
 // slots with pre-built kq_mask and gather_indices.
+// kv_write_indices: same contract as build_batched_attention above (nullable;
+//   non-null ⇒ set_rows write, null ⇒ legacy baked-offset cpy write).
 ggml_tensor* build_gated_batched_attention(
     ggml_context*                   ctx,
     ggml_cgraph*                    gf,
@@ -184,7 +194,8 @@ ggml_tensor* build_gated_batched_attention(
     int                             n_rot,
     float                           freq_base,
     int                             context_length,
-    float                           rms_norm_eps);
+    float                           rms_norm_eps,
+    ggml_tensor*                    kv_write_indices = nullptr);
 
 // ── AttentionLayer class (Phase 2 canonical interface) ────────────────────────
 //

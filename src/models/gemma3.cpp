@@ -8,6 +8,7 @@
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
 #include "../graph_inputs/gather_indices_input.h"
+#include "../graph_inputs/kv_write_indices_input.h"
 
 #include <cstdlib>
 #include "ggml.h"
@@ -367,13 +368,15 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
-    // KV gather window, sized from the deepest slot.
+    // KV gather window, sized from the deepest slot, then bucketed (padded
+    // tail −inf-masked, zero-init rows) so one decode graph shape survives a
+    // whole bucket of steps — plan-persistent-decode-graph.md.
     uint32_t max_pos = 0;
     for (uint32_t s : slots) {
         uint32_t p = get_cache_pos(s);
         if (p > max_pos) max_pos = p;
     }
-    uint32_t n_kv_len = max_pos + 1;
+    uint32_t n_kv_len = decode_kv_len(max_pos + 1, kv_cache_->get_n_ctx_max());
 
     // Per-layer attention windows: Gemma 3 runs five local (sliding-window)
     // layers per one global (config_.layer_window[il]; 0 = global). The 5:1
@@ -390,6 +393,16 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
+    // KV write rows as input VALUES (persistent-graph write path); Cpy mode
+    // is the byte-gate reference and builds no such tensor.
+    ggml_tensor* kv_write_idx = nullptr;
+    if (kv_write_mode_ == KvWriteMode::SetRows) {
+        kv_write_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I64,
+                                          static_cast<int64_t>(n_tokens));
+        ggml_set_input(kv_write_idx);
+        ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
+    }
+
     // Typed inputs: window-deduplicated masks (one AttnMaskInput per distinct
     // window) plus the shared gather indices. Text-only decode — the image bidi
     // span stays disabled (window-only masks), same as the text-only prefill path.
@@ -399,6 +412,9 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
         gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(kv_cache_->get_n_ctx_max()));
+    if (kv_write_idx)
+        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
+            kv_cache_->get_n_ctx_max()));
 
     // 2. Transformer stack — hand-rolled batched decode (mirrors Gemma 2
     //    decode). Gemma 3 deltas: per-layer RoPE base/scale (local 10K/1.0,
@@ -423,7 +439,7 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
         Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
         Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
         float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, layer_masks[il], gather_indices, il, 0.0f);
+        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, layer_masks[il], gather_indices, il, 0.0f, kv_write_idx);
         cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
         cur = build_norm(gf, cur, post_attn_norm_[il], il);
         ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);

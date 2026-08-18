@@ -125,6 +125,13 @@ void simple_kv_cache::init_cache() {
     // Allocate buffer and assign all tensors to it
     buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buffer_type));
 
+    // Zero-fill once: bucketed decode graphs (plan-persistent-decode-graph.md
+    // §2.2) gather rows beyond the written position; they are −inf-masked, but
+    // the mask is ADDED to the KQ scores, and NaN + (−inf) = NaN — so padded
+    // rows must be FINITE, not just masked. Zeros make that unconditional;
+    // stale rows left by truncation are finite by the same argument.
+    if (buf) ggml_backend_buffer_clear(buf.get(), 0);
+
     // now that the source layers' tensors are backed by real storage,
     // alias every reference layer's slot to its source.  Reads through
     // get_k / get_v on the reference layer hit the same backing memory the
@@ -222,6 +229,32 @@ ggml_tensor * simple_kv_cache::cpy_v(ggml_context * ctx_compute, ggml_tensor * v
         slot_idx * v_cache[il]->nb[2] + positions[slot_idx] * v_cache[il]->nb[1]);
 
     return ggml_cpy(ctx_compute, v_cur, v_dst);
+}
+
+ggml_tensor * simple_kv_cache::set_rows_k(ggml_context * ctx_compute, ggml_tensor * k_cur, int32_t il, ggml_tensor * row_indices) {
+    if (k_cur->ne[1] != row_indices->ne[0]) {
+        throw std::runtime_error(
+            "simple_kv_cache::set_rows_k: row_indices rows expected " +
+            std::to_string(k_cur->ne[1]) + " (k_cur batch), actual " +
+            std::to_string(row_indices->ne[0]));
+    }
+    // Whole cache as 2D rows [n_embd_k, n_ctx_max * n_batch_max]; destination
+    // row for batch element i is slot_i * n_ctx_max + pos_i (index VALUES).
+    ggml_tensor * k_rows = ggml_reshape_2d(ctx_compute, k_cache[il],
+        n_embd_k, static_cast<int64_t>(n_ctx_max) * n_batch_max);
+    return ggml_set_rows(ctx_compute, k_rows, k_cur, row_indices);
+}
+
+ggml_tensor * simple_kv_cache::set_rows_v(ggml_context * ctx_compute, ggml_tensor * v_cur, int32_t il, ggml_tensor * row_indices) {
+    if (v_cur->ne[1] != row_indices->ne[0]) {
+        throw std::runtime_error(
+            "simple_kv_cache::set_rows_v: row_indices rows expected " +
+            std::to_string(v_cur->ne[1]) + " (v_cur batch), actual " +
+            std::to_string(row_indices->ne[0]));
+    }
+    ggml_tensor * v_rows = ggml_reshape_2d(ctx_compute, v_cache[il],
+        n_embd_v, static_cast<int64_t>(n_ctx_max) * n_batch_max);
+    return ggml_set_rows(ctx_compute, v_rows, v_cur, row_indices);
 }
 
 void simple_kv_cache::advance(uint32_t n_tokens, uint32_t slot_idx) {
@@ -396,6 +429,19 @@ ggml_tensor* simple_kv_cache::gather_v(ggml_context* ctx_compute, ggml_cgraph* g
     ggml_tensor* gathered_flat = ggml_get_rows(ctx_compute, flat_cache, indices);
 
     ggml_tensor* dst = ggml_reshape_3d(ctx_compute, gathered_flat, n_embd_v, n_kv, n_active);
-    
+
     return dst;
+}
+
+// Gather from a caller-supplied rows-view (the set_rows write result) so the
+// read is a graph-DEPENDENT of the write — see header. src_rows must already be
+// [n_embd_k, n_ctx_max*n_batch_max]; we gather + reshape exactly as gather_k.
+ggml_tensor* simple_kv_cache::gather_k_from(ggml_context* ctx_compute, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv) {
+    ggml_tensor* gathered_flat = ggml_get_rows(ctx_compute, src_rows, indices);
+    return ggml_reshape_3d(ctx_compute, gathered_flat, n_embd_k, n_kv, n_active);
+}
+
+ggml_tensor* simple_kv_cache::gather_v_from(ggml_context* ctx_compute, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv) {
+    ggml_tensor* gathered_flat = ggml_get_rows(ctx_compute, src_rows, indices);
+    return ggml_reshape_3d(ctx_compute, gathered_flat, n_embd_v, n_kv, n_active);
 }

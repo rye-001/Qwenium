@@ -221,7 +221,8 @@ ggml_tensor* build_batched_attention(
     ggml_tensor*                 kq_mask,
     ggml_tensor*                 gather_indices,
     int                          il,
-    float                        softcap)
+    float                        softcap,
+    ggml_tensor*                 kv_write_indices)
 {
     const size_t n_batch    = slots.size();
     const int    n_embd_head = k->ne[0];
@@ -229,39 +230,60 @@ ggml_tensor* build_batched_attention(
     const int    n_embd_k    = n_embd_head * n_head_kv;
     const int    n_embd_v    = n_embd_head * n_head_kv;
 
-    // 1. Write new K/V per slot
-    ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, k, n_embd_k, 1, n_batch);
-    ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, v, n_embd_v, 1, n_batch);
+    // KV read width follows the mask the recipe built (single source of truth —
+    // re-deriving it from positions would silently diverge when the recipe
+    // buckets its decode n_kv, plan-persistent-decode-graph.md §2.2; padded
+    // columns are −inf-masked and read zero-initialized rows).
+    uint32_t n_kv_len = static_cast<uint32_t>(kq_mask->ne[0]);
 
-    for (size_t i = 0; i < n_batch; ++i) {
-        size_t k_offset = i * k_storage_fmt->nb[2];
-        ggml_tensor* k_slice = ggml_view_2d(ctx, k_storage_fmt, n_embd_k, 1,
-            k_storage_fmt->nb[1], k_offset);
+    // 1. Write new K/V per slot, then 2. gather for attention. In the set_rows
+    // path the gather reads THROUGH the write view, so the graph itself orders
+    // the read after the write; the cpy path keeps its separate
+    // write-then-gather-from-raw-cache shape (byte-identical).
+    ggml_tensor* k_gathered;
+    ggml_tensor* v_gathered;
+    if (kv_write_indices) {
+        // Value-driven write: destination rows are graph-input values, so the
+        // node survives graph reuse (persistent decode graph). One set_rows
+        // per cache replaces the n_batch cpy nodes.
+        ggml_tensor* k_rows = ggml_reshape_2d(ctx, k, n_embd_k, n_batch);
+        ggml_tensor* v_rows = ggml_reshape_2d(ctx, v, n_embd_v, n_batch);
 
-        size_t v_offset = i * v_storage_fmt->nb[2];
-        ggml_tensor* v_slice = ggml_view_2d(ctx, v_storage_fmt, n_embd_v, 1,
-            v_storage_fmt->nb[1], v_offset);
-
-        ggml_tensor* k_stored = kv_cache->cpy_k(ctx, k_slice, layer_idx, slots[i]);
+        ggml_tensor* k_stored = kv_cache->set_rows_k(ctx, k_rows, layer_idx, kv_write_indices);
         set_name(k_stored, "k_stored_b", il);
         ggml_build_forward_expand(gf, k_stored);
 
-        ggml_tensor* v_stored = kv_cache->cpy_v(ctx, v_slice, layer_idx, slots[i]);
+        ggml_tensor* v_stored = kv_cache->set_rows_v(ctx, v_rows, layer_idx, kv_write_indices);
         set_name(v_stored, "v_stored_b", il);
         ggml_build_forward_expand(gf, v_stored);
-    }
 
-    // 2. Gather KV cache for attention
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
-    }
-    uint32_t n_kv_len = max_pos + 1;
+        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+    } else {
+        ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, k, n_embd_k, 1, n_batch);
+        ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, v, n_embd_v, 1, n_batch);
 
-    ggml_tensor* k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices,
-        n_batch, n_kv_len);
-    ggml_tensor* v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices,
-        n_batch, n_kv_len);
+        for (size_t i = 0; i < n_batch; ++i) {
+            size_t k_offset = i * k_storage_fmt->nb[2];
+            ggml_tensor* k_slice = ggml_view_2d(ctx, k_storage_fmt, n_embd_k, 1,
+                k_storage_fmt->nb[1], k_offset);
+
+            size_t v_offset = i * v_storage_fmt->nb[2];
+            ggml_tensor* v_slice = ggml_view_2d(ctx, v_storage_fmt, n_embd_v, 1,
+                v_storage_fmt->nb[1], v_offset);
+
+            ggml_tensor* k_stored = kv_cache->cpy_k(ctx, k_slice, layer_idx, slots[i]);
+            set_name(k_stored, "k_stored_b", il);
+            ggml_build_forward_expand(gf, k_stored);
+
+            ggml_tensor* v_stored = kv_cache->cpy_v(ctx, v_slice, layer_idx, slots[i]);
+            set_name(v_stored, "v_stored_b", il);
+            ggml_build_forward_expand(gf, v_stored);
+        }
+
+        k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+        v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+    }
 
     // 3. Reshape for attention
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
@@ -415,7 +437,8 @@ ggml_tensor* build_gated_batched_attention(
     int                          n_rot,
     float                        freq_base,
     int                          context_length,
-    float                        rms_norm_eps)
+    float                        rms_norm_eps,
+    ggml_tensor*                 kv_write_indices)
 {
     const size_t n_batch = slots.size();
 
@@ -457,34 +480,45 @@ ggml_tensor* build_gated_batched_attention(
         context_length, freq_base,
         1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-    // F. Per-slot KV cache write
+    // F. Per-slot KV cache write + G. gather. Read width follows the recipe-
+    // built mask (keeps bucketed decode n_kv coherent). In the set_rows path
+    // the gather reads THROUGH the write view, so the graph itself orders the
+    // read after the write; the cpy path keeps its
+    // write-then-gather-from-raw-cache shape.
     const int n_embd_k = n_head_kv * n_embd_head;
     const int n_embd_v = n_head_kv * n_embd_head;
+    uint32_t n_kv_len = static_cast<uint32_t>(kq_mask->ne[0]);
 
-    ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, Kcur, n_embd_k, 1, n_batch);
-    ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, Vcur, n_embd_v, 1, n_batch);
+    ggml_tensor* k_gathered;
+    ggml_tensor* v_gathered;
+    if (kv_write_indices) {
+        // Value-driven write (see build_batched_attention): one set_rows per
+        // cache, destination rows supplied per step — survives graph reuse.
+        ggml_tensor* k_rows = ggml_reshape_2d(ctx, Kcur, n_embd_k, n_batch);
+        ggml_tensor* v_rows = ggml_reshape_2d(ctx, Vcur, n_embd_v, n_batch);
+        ggml_tensor* k_stored = kv_cache->set_rows_k(ctx, k_rows, kv_cache_layer, kv_write_indices);
+        ggml_tensor* v_stored = kv_cache->set_rows_v(ctx, v_rows, kv_cache_layer, kv_write_indices);
+        ggml_build_forward_expand(gf, k_stored);
+        ggml_build_forward_expand(gf, v_stored);
+        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+    } else {
+        ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, Kcur, n_embd_k, 1, n_batch);
+        ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, Vcur, n_embd_v, 1, n_batch);
 
-    for (size_t b = 0; b < n_batch; ++b) {
-        ggml_tensor* k_slice = ggml_view_2d(ctx, k_storage_fmt,
-            n_embd_k, 1, k_storage_fmt->nb[1], b * k_storage_fmt->nb[2]);
-        ggml_tensor* v_slice = ggml_view_2d(ctx, v_storage_fmt,
-            n_embd_v, 1, v_storage_fmt->nb[1], b * v_storage_fmt->nb[2]);
+        for (size_t b = 0; b < n_batch; ++b) {
+            ggml_tensor* k_slice = ggml_view_2d(ctx, k_storage_fmt,
+                n_embd_k, 1, k_storage_fmt->nb[1], b * k_storage_fmt->nb[2]);
+            ggml_tensor* v_slice = ggml_view_2d(ctx, v_storage_fmt,
+                n_embd_v, 1, v_storage_fmt->nb[1], b * v_storage_fmt->nb[2]);
 
-        ggml_build_forward_expand(gf, kv_cache->cpy_k(ctx, k_slice, kv_cache_layer, slots[b]));
-        ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx, v_slice, kv_cache_layer, slots[b]));
+            ggml_build_forward_expand(gf, kv_cache->cpy_k(ctx, k_slice, kv_cache_layer, slots[b]));
+            ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx, v_slice, kv_cache_layer, slots[b]));
+        }
+
+        k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+        v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
     }
-
-    // G. Gather KV for all slots
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
-    }
-    uint32_t n_kv_len = max_pos + 1;
-
-    ggml_tensor* k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer,
-        gather_indices, n_batch, n_kv_len);
-    ggml_tensor* v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer,
-        gather_indices, n_batch, n_kv_len);
 
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,

@@ -24,7 +24,8 @@ the tensor library and Metal as the GPU backend. It ships two front ends over
 one engine:
 
 - a **CLI** (`qwen3` binary): single-user chat/completion, with vision,
-  grammar-constrained output, speculative decoding, and session snapshots;
+  grammar-constrained output, speculative decoding, an opt-in persistent
+  decode graph (`--persistent-graph`, §5), and session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
   them into one forward pass.
@@ -152,7 +153,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `prompt_lookup` (draft-free speculative decoding), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap, metadata), `weight_binding` (fail-loud tensor inventory), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check` |
-| `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
+| `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `vision_loader`, `vision_model`, `bitmap` |
 | `src/session/` | Portable snapshot file format | `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `image_data_uri` |
@@ -197,6 +198,25 @@ token per active slot, runs it, and hands logits to sampling. The sampler
 applies repetition penalty, temperature/top-k/top-p (or argmax), constrained
 by the grammar mask if one is active. The chosen token is fed back as the next
 step's input. Exit on EOS, stop sequence, token budget, or (server) timeout.
+
+Rebuilding + reallocating that graph every step costs ~12 ms of galloc replan
+(26% of a step on M1 Pro). The opt-in **persistent decode graph** (CLI
+`--persistent-graph`, `core/decode_graph_cache`) removes it: the graph is
+built + allocated once per KV-width *bucket* on a dedicated scheduler and
+reused across steps — only the typed inputs (tokens, positions, mask, gather
+and set_rows write indices) are refilled and recomputed. Measured **1.32×**
+decode on Qwen 3.6 (§10). Two P1/P2 changes make this possible and are inert
+by default: the decode KV write became value-driven (`ggml_set_rows`, write
+row an input) instead of a build-time-baked `ggml_cpy` offset, and n_kv is
+padded to a bucket so one allocation stays valid across a run of steps.
+Bucketing re-blocks the attention reduction, so this path is **token-stable
+modulo ties, not byte-identical** to the default exact-n_kv decode — the same
+status as speculative decoding (§11) — which is why it is opt-in; the default
+decode path is unchanged. Sparse-head (grammar) steps and non-persistent-
+capable recipes fall back to the per-step rebuild. Qwen 3.5/3.6 + Gemma 3 are
+persistent-capable today; the write-mode/bucket are a differential seam gated
+byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
+`test_decode_graph_cache`).
 
 **Speculative decoding** (CLI `--speculative`, Prompt Lookup Decoding): no
 draft model — the draft is an n-gram match of recent output against the prompt.
@@ -383,6 +403,15 @@ doctrine, each rule earned by a measurement:
   deferred below the agreed µs bar.
 - **The head is skippable.** The sparse output head (§8) and prefill-head
   slicing are explicit caller switches, never silent engine choices.
+- **Kill per-step overhead, not per-step math.** The persistent decode graph
+  (§5) attacks the ~12 ms/step galloc replan `decode_breakdown` localized —
+  not the compute. Measured **1.32× decode on Qwen 3.6 35B-A3B Q2_K (20 → 27
+  tok/s), stable across 3 runs**, matching the standalone probe's 1.28×
+  per-step prediction (two signals). Provenance:
+  [`plan-persistent-decode-graph.md`](plan-persistent-decode-graph.md),
+  [`note-decode-overhead-probes.md`](note-decode-overhead-probes.md). It is
+  opt-in because the enabling bucketing is token-stable-not-byte-identical
+  (§11) — a case where a measured win deliberately did NOT become the default.
 
 The scoped-but-unbuilt frontier is the ANE output head
 ([`plan-ane-lm-head.md`](plan-ane-lm-head.md)): a new backend beside the GPU,
@@ -440,6 +469,20 @@ Current, verified against the tree at time of writing:
   documented 409.
 - No CORS/auth on the server — it is local-oriented by design, but that makes
   browser front ends a P2.
+- The KV cache has two write paths: baked-offset `ggml_cpy` (prefill, and
+  default decode) and value-driven `ggml_set_rows` (opt-in `--persistent-graph`
+  decode only — the write row an input, so the graph can be reused;
+  [`plan-persistent-decode-graph.md`](plan-persistent-decode-graph.md)).
+  Byte-identical at exact width by gate (`test_kv_write_setrows`). The set_rows
+  path is exercised only under the flag; unify (retire cpy on the decode side)
+  once the persistent path is the default — which awaits a decision, since
+  bucketing makes it token-stable-not-identical (a deliberate opt-in, §5/§11),
+  not a soft spot to silently fix.
+- qwen36's decode KV gather uses `Stride::NKvLen` (`slot*n_kv_len + t`)
+  against `gather_k`'s `n_ctx_max`-strided flat layout — correct only for
+  slot 0. Latent wrong-rows gather for multi-slot qwen36 decode (today only
+  the CLI/probes exercise qwen36, single-slot); must be fixed (→ `NCtxMax`,
+  as qwen35) before qwen36 serves multi-slot.
 
 ---
 

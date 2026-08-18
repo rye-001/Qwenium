@@ -9,6 +9,8 @@
 
 #include "ggml-backend.h"
 
+class DecodeGraphCache;
+
 // Perform one decode step for a single slot.
 //
 // Calls peek_valid_set before the forward pass; selects the sparse LM head
@@ -39,5 +41,6 @@ int32_t decode_step(
     const std::vector<std::string>& vocab,
     uint32_t               vocab_size,
     bool                   force_dense = false,  // diagnostic: skip sparse head selection
-    std::vector<int32_t>*  forced_run = nullptr  // Phase B: forced-token elision (opt-in)
+    std::vector<int32_t>*  forced_run = nullptr, // Phase B: forced-token elision (opt-in)
+    DecodeGraphCache*      graph_cache = nullptr // opt-in persistent decode graph (--persistent-graph)
 );

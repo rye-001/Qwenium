@@ -4,6 +4,7 @@
 
 #include "complete.h"
 #include "../core/decode_step.h"
+#include "../core/decode_graph_cache.h"
 #include "../models/model_registry.h"
 
 int run_complete(
@@ -117,7 +118,26 @@ int run_complete(
 
         // Speculative bridge for single-prompt mode (slot 0)
         SpeculativeBridge bridge{forward_pass.get(), scheduler};
-        
+
+        // Persistent decode graph (opt-in --persistent-graph). Reuses one
+        // built and allocated decode graph across steps on a dedicated
+        // scheduler (measured 1.32× on Qwen 3.6; token-stable, not
+        // byte-identical — docs/plan-persistent-decode-graph.md §0.1). Applies
+        // to the normal (non-speculative) decode step below; speculative verify
+        // shapes are out of scope for v1. Refused fail-loud on a recipe that is
+        // not persistent-capable, so the flag never silently no-ops.
+        std::unique_ptr<DecodeGraphCache> graph_cache;
+        if (args.persistent_graph) {
+            if (!forward_pass->supports_persistent_decode()) {
+                std::cerr << "--persistent-graph: architecture '"
+                          << cmp_meta.architecture << "' is not persistent-"
+                          << "capable (needs qwen35/qwen36/gemma3)\n";
+                return 1;
+            }
+            enable_persistent_decode(forward_pass.get());
+            graph_cache = std::make_unique<DecodeGraphCache>(model, forward_pass.get());
+        }
+
         auto t_decode_start = Clock::now();
         for (int i = 0; i < args.max_tokens; ++i) {
             std::string decoded_token = tokenizer->decode(next_token_id);
@@ -193,7 +213,9 @@ int run_complete(
             next_token_id = decode_step(
                 forward_pass.get(), scheduler, sampler.get(),
                 next_token_id, 0,
-                tokens, vocab, vocab_size);
+                tokens, vocab, vocab_size,
+                /*force_dense=*/false, /*forced_run=*/nullptr,
+                graph_cache.get());
         }
         end_single_generation:
         auto t_decode_end = Clock::now();

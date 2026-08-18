@@ -1,5 +1,6 @@
 #include "decode_step.h"
 #include "decode_plan.h"
+#include "decode_graph_cache.h"
 #include "ggml-backend.h"
 #include <algorithm>
 
@@ -18,7 +19,8 @@ int32_t decode_step(
     const std::vector<std::string>& vocab,
     uint32_t               vocab_size,
     bool                   force_dense,
-    std::vector<int32_t>*  forced_run
+    std::vector<int32_t>*  forced_run,
+    DecodeGraphCache*      graph_cache
 ) {
     if (forced_run) forced_run->clear();
 
@@ -61,6 +63,9 @@ int32_t decode_step(
             feed.reserve(run.size());
             feed.push_back(token);
             feed.insert(feed.end(), run.begin(), run.end() - 1);
+            // feed_tokens rebuilds a prefill graph → resets fp's context, so any
+            // retained persistent decode graph is now dangling.
+            if (graph_cache) graph_cache->invalidate();
             fp->feed_tokens(feed, slot, scheduler);
 
             forced_run->assign(run.begin(), run.end() - 1);
@@ -74,6 +79,7 @@ int32_t decode_step(
     // 0. BRIDGE route: single-token run_prefill
     // No sparse LM head here — run_prefill builds the full dense output;
     if (plan.route == DecodeRoute::Bridge) {
+        if (graph_cache) graph_cache->invalidate();  // run_prefill resets fp ctx
         const int32_t pos = static_cast<int32_t>(fp->get_cache_pos(slot));
         std::vector<float> logits =
             fp->run_prefill({token}, pos, slot, scheduler);
@@ -96,17 +102,30 @@ int32_t decode_step(
     fp->set_sparse_decode_ids(use_sparse ? valid_ids : std::vector<int32_t>{});
 
     // 3. Build -> alloc -> set inputs (sparse indices uploaded as part of
-    //    the typed input set via SparseHeadInput) -> compute
+    //    the typed input set via SparseHeadInput) -> compute.
+    //
+    // Persistent path (opt-in --persistent-graph): dense steps reuse one
+    // built+allocated graph across a bucket of positions on a dedicated
+    // scheduler (DecodeGraphCache), skipping the per-step ~12 ms galloc replan.
+    // Sparse steps have a per-step structure (grammar-narrowed head), so they
+    // always take the rebuild path — and MUST invalidate the retained graph,
+    // because build_decoding_graph resets fp's ggml_context out from under it.
     const int32_t           pos       = static_cast<int32_t>(fp->get_cache_pos(slot));
     const std::vector<int32_t>  tokens    = {token};
     const std::vector<uint32_t> slots     = {slot};
     const std::vector<int32_t>  positions = {pos};
 
-    ggml_backend_sched_reset(scheduler);
-    ggml_cgraph* gf = fp->build_decoding_graph(tokens, slots, positions);
-    ggml_backend_sched_alloc_graph(scheduler, gf);
-    fp->set_decode_inputs(gf, tokens, slots, positions);
-    ggml_backend_sched_graph_compute(scheduler, gf);
+    ggml_cgraph* gf;
+    if (graph_cache && !use_sparse) {
+        gf = graph_cache->step(tokens, slots, positions);  // dedicated scheduler
+    } else {
+        if (graph_cache) graph_cache->invalidate();
+        ggml_backend_sched_reset(scheduler);
+        gf = fp->build_decoding_graph(tokens, slots, positions);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        fp->set_decode_inputs(gf, tokens, slots, positions);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+    }
     fp->advance_cache(1, slot);
 
     // 4. Extract logits and sample.

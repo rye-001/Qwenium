@@ -307,6 +307,58 @@ public:
     void set_slice_prefill_head(bool on) { slice_prefill_head_ = on; }
     bool slice_prefill_head() const { return slice_prefill_head_; }
 
+    // ── Decode KV write mode ─────────────────────────────────────────────────
+    // Differential seam for the decode KV write, mirroring slice_prefill_head:
+    // Cpy (default) → the legacy baked-offset ggml_cpy write — today's decode,
+    // byte-reproducible; SetRows → the value-driven ggml_set_rows write whose
+    // position is a graph input; persistent-graph capable — see
+    // docs/plan-persistent-decode-graph.md §2.1. Byte-identical to Cpy at exact
+    // n_kv (P1 gate); the persistent path turns it ON together with bucketing.
+    // Only recipes that pass kv_write_indices into the batched attention
+    // helpers honor it; others are Cpy-only regardless. Explicit and
+    // caller-selected; not a fallback.
+    enum class KvWriteMode { SetRows, Cpy };
+    void set_kv_write_mode(KvWriteMode m) { kv_write_mode_ = m; }
+    KvWriteMode kv_write_mode() const { return kv_write_mode_; }
+
+    // True ⇒ this recipe's build_decoding_graph is persistent-graph capable:
+    // every step-varying quantity is a graph-input VALUE (tokens, positions,
+    // mask, gather indices, KV write rows), so a built+allocated decode graph
+    // can be recomputed across steps without rebuild. Consumed by the P3
+    // DecodeGraphCache; false keeps the recipe on the rebuild-per-step path.
+    virtual bool supports_persistent_decode() const { return false; }
+
+    // ── Decode n_kv bucketing ────────────────────────────────────────────────
+    // Bucket B ⇒ converted recipes size the decode graph's KV read width
+    // (mask / gather / gathered views) at the next multiple of B instead of
+    // exactly max_pos+1, capped at the cache's n_ctx_max — so one graph shape
+    // (hence one allocation) stays valid across a whole bucket of steps: the
+    // persistent-graph precondition (plan-persistent-decode-graph.md §2.2).
+    // Padded columns are −inf-masked and read zero-initialized cache rows.
+    // DEFAULT 0 = exact sizing (today's decode; byte-reproducible). Bucketing
+    // is NOT byte-identical to exact: widening n_kv re-blocks the softmax /
+    // scores·V reduction, so it is token-stable-modulo-ties, not bit-identical
+    // (test_decode_kv_bucket; same fork class as architecture.md §11). The
+    // persistent path opts IN to bucket 256; the default decode path stays
+    // exact. Only recipes that call decode_kv_len() honor it.
+    void set_decode_kv_bucket(uint32_t b) { decode_kv_bucket_ = b; }
+    uint32_t decode_kv_bucket() const { return decode_kv_bucket_; }
+
 protected:
+    // Bucketed decode KV width: max_pos_plus_1 rounded up to the bucket,
+    // capped at n_ctx_max. Bucket 0 ⇒ exact (max_pos_plus_1 unchanged).
+    uint32_t decode_kv_len(uint32_t max_pos_plus_1, uint32_t n_ctx_max) const {
+        if (decode_kv_bucket_ == 0) return max_pos_plus_1;
+        const uint64_t up =
+            (static_cast<uint64_t>(max_pos_plus_1) + decode_kv_bucket_ - 1) /
+            decode_kv_bucket_ * decode_kv_bucket_;
+        return up < n_ctx_max ? static_cast<uint32_t>(up) : n_ctx_max;
+    }
+
     bool slice_prefill_head_ = true;
+    // Defaults = today's decode: baked-offset cpy write, exact per-step n_kv.
+    // The opt-in persistent path (--persistent-graph) sets both to
+    // {SetRows, 256} together; nothing else changes them.
+    KvWriteMode kv_write_mode_ = KvWriteMode::Cpy;
+    uint32_t decode_kv_bucket_ = 0;
 };

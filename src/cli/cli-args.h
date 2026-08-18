@@ -33,6 +33,14 @@ struct CliArgs {
     bool speculative = false;
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
+    // Persistent decode graph (docs/plan-persistent-decode-graph.md). Opt-in:
+    // build+alloc the decode graph once per n_kv bucket and reuse it across
+    // steps, skipping the per-step galloc replan (measured 1.32× on Qwen 3.6,
+    // 20 → 27 tok/s). NOT byte-identical to the default exact-n_kv decode —
+    // bucketing re-blocks the attention reduction, so it is token-stable
+    // modulo ties (same status as speculative). Qwen3.5/3.6 + Gemma3 only
+    // (persistent-capable recipes).
+    bool persistent_graph = false;  // --persistent-graph
     // Vision: a single image applied to the first user turn. Both
     // must be set together; requires a Gemma multimodal-capable tokenizer.
     std::string image_path;    // --image: JPEG/PNG to attach to the first turn

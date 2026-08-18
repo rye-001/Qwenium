@@ -72,6 +72,10 @@ public:
     // build_prefill_graph.
     bool feed_tokens_supported() const override { return true; }
 
+    // Decode graph is persistent-capable: every step-varying quantity is a
+    // graph-input value (P1, docs/plan-persistent-decode-graph.md).
+    bool supports_persistent_decode() const override { return true; }
+
     // --- Cache management (delegates to KV and SSM caches) ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);

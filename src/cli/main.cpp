@@ -58,6 +58,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --speculative           Enable Prompt Lookup Decoding (speculative)\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
+    std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
     std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
     std::cout << "  --image-embed-cache DIR (chat) Disk cache for image embeddings; encode each image once per node (ViT skip)\n";
@@ -127,6 +128,8 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
             args.context_length = std::stoi(argv[++i]);
         } else if (arg == "--speculative") {
             args.speculative = true;
+        } else if (arg == "--persistent-graph") {
+            args.persistent_graph = true;
         } else if (arg == "--pld-ngram") {
             if (i + 1 >= argc) return false;
             args.pld_ngram_size = std::stoi(argv[++i]);

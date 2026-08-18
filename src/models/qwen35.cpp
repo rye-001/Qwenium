@@ -7,6 +7,7 @@
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
 #include "../graph_inputs/gather_indices_input.h"
+#include "../graph_inputs/kv_write_indices_input.h"
 
 #include <memory>
 
@@ -282,13 +283,16 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
-    // 3. Attention mask + gather indices (used by attention layers only)
+    // 3. Attention mask + gather indices (used by attention layers only).
+    // Width is bucketed (padded tail −inf-masked, zero-init rows) so one
+    // decode graph shape survives a whole bucket of steps —
+    // plan-persistent-decode-graph.md.
     uint32_t max_pos = 0;
     for (uint32_t s : slots) {
         uint32_t p = get_cache_pos(s);
         if (p > max_pos) max_pos = p;
     }
-    uint32_t n_kv_len = max_pos + 1;
+    uint32_t n_kv_len = decode_kv_len(max_pos + 1, kv_cache_->get_n_ctx_max());
 
     ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
         n_kv_len, 1, 1, n_batch);
@@ -301,6 +305,15 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
+    // KV write rows as input VALUES (persistent-graph write path); Cpy mode
+    // is the byte-gate reference and builds no such tensor.
+    ggml_tensor* kv_write_idx = nullptr;
+    if (kv_write_mode_ == KvWriteMode::SetRows) {
+        kv_write_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I64, n_batch);
+        ggml_set_input(kv_write_idx);
+        ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
+    }
+
     // Typed inputs for the decode graph (replaces set_batched_inputs).
     // Single shared causal mask + KV gather; build_output_head appends
     // SparseHeadInput when the grammar sparse path is armed.
@@ -310,6 +323,9 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         kv_cache_->get_n_ctx_max()));
+    if (kv_write_idx)
+        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
+            kv_cache_->get_n_ctx_max()));
 
     // 4. Layer loop
     ggml_tensor* cur;
@@ -361,7 +377,8 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
                     n_rot,
                     meta_.rope_freq_base,
                     static_cast<int>(meta_.context_length),
-                    meta_.rms_norm_eps);
+                    meta_.rms_norm_eps,
+                    kv_write_idx);
             }
         }
 

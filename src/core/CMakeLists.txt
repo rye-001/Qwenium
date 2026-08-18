@@ -3,6 +3,7 @@ add_library(core STATIC
     model.cpp
     persistent_image_embedding_store.cpp
     prefix_library.cpp
+    decode_graph_cache.cpp
 )
 
 target_include_directories(core PUBLIC
