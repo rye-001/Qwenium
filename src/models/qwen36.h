@@ -78,6 +78,10 @@ public:
 
     bool feed_tokens_supported() const override { return true; }
 
+    // Decode graph is persistent-capable: every step-varying quantity is a
+    // graph-input value (P1, docs/plan-persistent-decode-graph.md).
+    bool supports_persistent_decode() const override { return true; }
+
     ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,

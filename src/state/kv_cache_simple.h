@@ -71,6 +71,17 @@ public:
     // Copy v_cur into cache for slot_idx at current position
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx = 0);
 
+    // Value-driven batched write (decode path): scatter k_cur's rows into the
+    // cache via ggml_set_rows. Destination row indices arrive as a graph INPUT
+    // (I64, one entry per batch row, row = slot_idx * n_ctx_max + position) so
+    // the write position is a run-time value, not a baked view offset — unlike
+    // cpy_k/cpy_v this write survives graph reuse (persistent decode graph,
+    // docs/plan-persistent-decode-graph.md §2.1). Range enforcement lives in
+    // the index setter (KvWriteIndicesInput), fail-loud per step.
+    // k_cur/v_cur: F32 [n_embd, n_batch]. row_indices: I64 [n_batch].
+    ggml_tensor * set_rows_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, ggml_tensor * row_indices);
+    ggml_tensor * set_rows_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, ggml_tensor * row_indices);
+
     // LayerState interface.
     void   reset_sequence(int seq_id) override { clear_slot(static_cast<uint32_t>(seq_id)); }
     size_t memory_bytes() const override;
@@ -98,7 +109,18 @@ public:
     ggml_tensor* gather_k(ggml_context* ctx, ggml_cgraph* gf, int32_t il, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
     ggml_tensor* gather_v(ggml_context* ctx, ggml_cgraph* gf, int32_t il, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
 
+    // Gather from an EXPLICIT rows-view source instead of the raw cache tensor.
+    // The set_rows write returns a view of the whole cache (rows shape); passing
+    // that view here makes the gather a data-DEPENDENT of the write, so the
+    // scheduler orders write-before-read (read-after-write edge). Gathering from
+    // the raw cache tensor omits that edge — safe only when node insertion order
+    // happens to serialize them, which bucketed decode graphs break. Used by the
+    // set_rows decode write path. src_rows: [n_embd, n_ctx_max*n_batch_max].
+    ggml_tensor* gather_k_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
+    ggml_tensor* gather_v_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
+
     uint32_t get_n_ctx_max() const { return n_ctx_max; }
+    uint32_t get_n_layers() const { return n_layers; }
 
     ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }
     ggml_tensor* get_v_cache_tensor(int layer) { return v_cache[layer]; }

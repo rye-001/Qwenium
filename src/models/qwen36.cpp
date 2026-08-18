@@ -8,6 +8,7 @@
 #include "../graph_inputs/positions_input.h"
 #include "../graph_inputs/attn_mask_input.h"
 #include "../graph_inputs/gather_indices_input.h"
+#include "../graph_inputs/kv_write_indices_input.h"
 
 #include "ggml.h"
 
@@ -378,13 +379,16 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
-    // 3. KV gather mask — shared across all attention layers.
+    // 3. KV gather mask — shared across all attention layers. Width is
+    // bucketed (padded tail −inf-masked, zero-init rows) so one decode graph
+    // shape survives a whole bucket of steps — plan-persistent-decode-graph.md.
     uint32_t max_pos = 0;
     for (uint32_t s : slots) {
         uint32_t p = get_cache_pos(s);
         if (p > max_pos) max_pos = p;
     }
-    const uint32_t n_kv_len = max_pos + 1;
+    const uint32_t n_kv_len =
+        decode_kv_len(max_pos + 1, kv_cache_->get_n_ctx_max());
 
     ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
                                                n_kv_len, 1, 1, n_batch);
@@ -397,6 +401,15 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
+    // KV write rows as input VALUES (persistent-graph write path); Cpy mode
+    // is the byte-gate reference and builds no such tensor.
+    ggml_tensor* kv_write_idx = nullptr;
+    if (kv_write_mode_ == KvWriteMode::SetRows) {
+        kv_write_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I64, n_batch);
+        ggml_set_input(kv_write_idx);
+        ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
+    }
+
     // Typed inputs (replaces set_batched_inputs). qwen36 KV gather uses an
     // n_kv_len per-slot stride (not n_ctx_max).
     graph_inputs_.clear();
@@ -405,6 +418,9 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         GatherIndicesInput::Stride::NKvLen));
+    if (kv_write_idx)
+        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
+            kv_cache_->get_n_ctx_max()));
 
     // 4. Transformer loop
     for (uint32_t il = 0; il < m.block_count; ++il) {
@@ -426,7 +442,8 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
                 n_embd_head_, n_head_, n_head_kv_,
                 n_rot_, m.rope_freq_base,
                 static_cast<int>(m.context_length),
-                m.rms_norm_eps);
+                m.rms_norm_eps,
+                kv_write_idx);
         } else {
             uint32_t dn_idx = static_cast<uint32_t>(dn_layer_map_[il]);
             // One token per slot: pass slots vector to DeltaNet decode path.

@@ -6,6 +6,7 @@
 
 #include "chat.h"
 #include "../core/decode_step.h"
+#include "../core/decode_graph_cache.h"
 #include "../core/multimodal_prefill.h"
 #include "../core/image_embedding_cache.h"
 #include "../core/persistent_image_embedding_store.h"
@@ -336,6 +337,25 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         // Speculative bridge for chat mode (slot 1)
         SpeculativeBridge bridge{forward_pass.get(), scheduler};
 
+        // Persistent decode graph (opt-in --persistent-graph): one built and
+        // allocated decode graph reused across steps on a dedicated scheduler
+        // (measured 1.32× on Qwen 3.6; token-stable, not byte-identical —
+        // docs/plan-persistent-decode-graph.md §0.1).
+        // Constructed once; invalidated before each turn's decode loop because
+        // every turn's prefill (run_prefill) resets fp's context out from under
+        // the retained graph. Refused fail-loud on a non-persistent recipe.
+        std::unique_ptr<DecodeGraphCache> graph_cache;
+        if (args.persistent_graph) {
+            if (!forward_pass->supports_persistent_decode()) {
+                std::cerr << "--persistent-graph: architecture '"
+                          << model.get_metadata().architecture << "' is not "
+                          << "persistent-capable (needs qwen35/qwen36/gemma3)\n";
+                return 1;
+            }
+            enable_persistent_decode(forward_pass.get());
+            graph_cache = std::make_unique<DecodeGraphCache>(model, forward_pass.get());
+        }
+
         while (true) {
             std::cout << "\nUser: ";
             std::string user_input;
@@ -541,6 +561,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             using Clock = std::chrono::steady_clock;
             auto t_decode_start = Clock::now();
 
+            // This turn's prefill (above) reset fp's context, so any retained
+            // persistent decode graph is dangling — force a rebuild on the
+            // first decode step of the turn.
+            if (graph_cache) graph_cache->invalidate();
+
             // Phase B: tokens decode_step emitted via forced-token elision
             // (grammar-determined, no forward pass). Drained below in the
             // same order, with the same stop/print/history handling the
@@ -566,7 +591,8 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     forward_pass.get(), scheduler, sampler.get(),
                     next_token_id, session_slot,
                     all_tokens, decoded_vocab, vocab_size,
-                    /*force_dense=*/false, &forced_run);
+                    /*force_dense=*/false, &forced_run,
+                    graph_cache.get());
 
                 // Drain forced-elided tokens (chronologically before the
                 // returned one), same handling as the loop-top emission.

@@ -521,6 +521,59 @@ target_link_libraries(batched-decode-tests-gemma PRIVATE
 target_compile_features(batched-decode-tests-gemma PRIVATE cxx_std_17)
 gtest_discover_tests(batched-decode-tests-gemma)
 
+# Decode KV write: Cpy vs SetRows differential — P1 gate of
+# docs/plan-persistent-decode-graph.md. Pure-unit KvWriteIndicesInput tests
+# run unconditionally; the Qwen3.5 + Gemma3 bitwise model differentials
+# self-skip when their model is absent.
+add_executable(kv-write-setrows-tests
+    unit/test_kv_write_setrows.cpp
+)
+
+target_link_libraries(kv-write-setrows-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-graph-inputs
+    core
+    ggml
+)
+
+target_compile_features(kv-write-setrows-tests PRIVATE cxx_std_17)
+gtest_discover_tests(kv-write-setrows-tests)
+
+# Decode n_kv bucketing: exact vs bucketed (8 / 256) — P2 gate of
+# docs/plan-persistent-decode-graph.md. Bitwise per-step logits, Qwen3.5 +
+# Gemma3; self-skips when the model is absent.
+add_executable(decode-kv-bucket-tests
+    unit/test_decode_kv_bucket.cpp
+)
+
+target_link_libraries(decode-kv-bucket-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(decode-kv-bucket-tests PRIVATE cxx_std_17)
+gtest_discover_tests(decode-kv-bucket-tests)
+
+# Persistent decode graph reuse — P3 gate of docs/plan-persistent-decode-graph.md.
+# Reused graph == same-shape rebuilt graph, bitwise (isolates reuse from the
+# bucketing fork); + reuse/rebuild counters cross a bucket boundary. Self-skips.
+add_executable(decode-graph-cache-tests
+    unit/test_decode_graph_cache.cpp
+)
+
+target_link_libraries(decode-graph-cache-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(decode-graph-cache-tests PRIVATE cxx_std_17)
+gtest_discover_tests(decode-graph-cache-tests)
+
 # Prefill output-ID slice (last-token LM-head elision). No-model fail-loud
 # unit tests run unconditionally; the qwen35 + gemma1 bit-identical /
 # composition differentials self-skip when their model is absent.
@@ -1148,6 +1201,45 @@ target_link_libraries(perf-baseline PRIVATE
 )
 
 target_compile_features(perf-baseline PRIVATE cxx_std_17)
+
+# Batch-scaling probe — decode wall-clock at B = 1..10 (the "empty seats" test).
+add_executable(batch-scaling
+    perf/batch_scaling.cpp
+)
+target_link_libraries(batch-scaling PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    ggml
+)
+target_compile_features(batch-scaling PRIVATE cxx_std_17)
+
+# Decode-step phase decomposition — locate the ~20ms fixed intercept.
+add_executable(decode-breakdown
+    perf/decode_breakdown.cpp
+)
+target_link_libraries(decode-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    ggml
+)
+target_compile_features(decode-breakdown PRIVATE cxx_std_17)
+
+# Alloc-reuse confirmation — is the galloc replan defeated by KV shape growth?
+add_executable(alloc-reuse
+    perf/alloc_reuse.cpp
+)
+target_link_libraries(alloc-reuse PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    ggml
+)
+target_compile_features(alloc-reuse PRIVATE cxx_std_17)
 
 # PR 4.1 investigation — per-stage MoE timing.
 # Disposable: once the breakdown identifies the right fusion shape, this binary

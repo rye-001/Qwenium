@@ -108,6 +108,10 @@ public:
     // KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
+    // Decode graph is persistent-capable: every step-varying quantity is a
+    // graph-input value (P1, docs/plan-persistent-decode-graph.md).
+    bool supports_persistent_decode() const override { return true; }
+
     // has_decode_graph() inherits the default (true): build_decoding_graph is
     // implemented (Phase 3 of docs/plan-gemma-batched-decode.md).
 

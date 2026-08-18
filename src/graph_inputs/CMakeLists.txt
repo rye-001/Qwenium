@@ -7,6 +7,7 @@ add_library(qinf-graph-inputs STATIC
     positions_input.cpp
     attn_mask_input.cpp
     gather_indices_input.cpp
+    kv_write_indices_input.cpp
     sparse_head_input.cpp
     output_ids_input.cpp
     image_embeddings_input.cpp
