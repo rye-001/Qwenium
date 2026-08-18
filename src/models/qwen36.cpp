@@ -31,6 +31,8 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
     const uint32_t expert_feed_forward_length = meta.raw_kv.get_uint32("qwen35moe.expert_feed_forward_length");
     const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32("qwen35moe.rope.dimension_count");
     const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+    // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
+    const uint32_t nextn_predict_layers    = meta.raw_kv.get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
 
     QINF_ASSERT(ssm_state_size > 0,
         "Qwen35MoEConfig: field \"ssm_state_size\" expected > 0, got 0 "
@@ -63,6 +65,11 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
     QINF_ASSERT(full_attention_interval > 0,
         "Qwen35MoEConfig: field \"full_attention_interval\" expected > 0, got 0 "
         "(GGUF key: qwen35moe.full_attention_interval)");
+    QINF_ASSERT(nextn_predict_layers < meta.block_count,
+        "Qwen35MoEConfig: field \"nextn_predict_layers\" expected < block_count (" +
+        std::to_string(meta.block_count) + "), got " +
+        std::to_string(nextn_predict_layers) +
+        " (GGUF key: qwen35moe.nextn_predict_layers)");
 
     return Qwen35MoEConfig{
         ssm_conv_kernel,
@@ -75,6 +82,7 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
         expert_feed_forward_length,
         rope_dimension_count,
         full_attention_interval,
+        nextn_predict_layers,
     };
 }
 
@@ -106,11 +114,15 @@ Qwen36ForwardPass::Qwen36ForwardPass(
         true                                             // has_shared_expert
     };
 
-    // Build physical→logical layer index maps.
-    kv_layer_map_.assign(m.block_count, -1);
-    dn_layer_map_.assign(m.block_count, -1);
+    // Main decode stack excludes the trailing NextN/MTP head block(s), which
+    // are bound (model.cpp) but not executed here (docs/plan-mtp-decode.md §4).
+    n_main_layers_ = m.block_count - cfg_.nextn_predict_layers;
+
+    // Build physical→logical layer index maps over the main stack only.
+    kv_layer_map_.assign(n_main_layers_, -1);
+    dn_layer_map_.assign(n_main_layers_, -1);
     int kv_idx = 0, dn_idx = 0;
-    for (uint32_t il = 0; il < m.block_count; ++il) {
+    for (uint32_t il = 0; il < n_main_layers_; ++il) {
         if (cfg_.is_full_attention_layer(il))
             kv_layer_map_[il] = kv_idx++;
         else
@@ -157,6 +169,19 @@ Qwen36ForwardPass::Qwen36ForwardPass(
         cache_backend
     };
     dn_state_ = std::make_unique<DeltaNetState>(dn_state_hp);
+
+    // NextN/MTP head's private KV: 1 layer, 1 slot, draft-window context only
+    // (reset per mtp_draft call — §4.4). ~128 KB; allocated only when the GGUF
+    // carries the head.
+    if (cfg_.has_mtp_head()) {
+        mtp_kv_ = std::make_unique<simple_kv_cache>(
+            /*n_layers=*/1, /*n_ctx_max=*/32, /*n_batch_max=*/1,
+            n_embd_k, n_embd_v,
+            GGML_TYPE_F32, GGML_TYPE_F32,
+            cache_backend);
+        std::cout << "[qwen36] MTP/NextN head present (block "
+                  << n_main_layers_ << ") — draft capability on" << std::endl;
+    }
 }
 
 // ── Private helpers ──────────────────────────────────────────────────────────
@@ -269,13 +294,13 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
-    for (uint32_t il = 0; il < m.block_count; ++il)
+    for (uint32_t il = 0; il < n_main_layers_; ++il)
         if (cfg_.is_full_attention_layer(il))
             graph_inputs_.add(std::make_unique<AttnMaskInput>(
                 "kq_mask." + std::to_string(il), 0u));
 
-    // 3. Transformer loop
-    for (uint32_t il = 0; il < m.block_count; ++il) {
+    // 3. Transformer loop (main stack only; NextN head held out — §4)
+    for (uint32_t il = 0; il < n_main_layers_; ++il) {
         const auto& blk = model_.get_block(il);
         ggml_tensor* inpSA = inpL;
 
@@ -335,6 +360,16 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // The else-branch anchors the residual tip as a graph output (the pruned
     // logits node used to be the scheduler's backend-propagation anchor;
     // without it ggml_gallocr aborts on buffer_id < 0). Numerically inert.
+    // D3: expose the pre-final-norm hidden (all positions) so the MTP head can
+    // condition on it. Marking an existing node as output adds no compute ⇒
+    // off-path is byte-identical; the verify pass needs all K positions, which
+    // is exactly inpL before the head slice. Named before the head builds.
+    if (output_hidden_) {
+        set_tensor_name(gf, inpL, "hidden_out");
+        ggml_set_output(inpL);
+        ggml_build_forward_expand(gf, inpL);
+    }
+
     if (want_logits) {
         build_output_head(gf, build_out_ids_slice(gf, inpL));
     } else {
@@ -422,8 +457,8 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
         graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
             kv_cache_->get_n_ctx_max()));
 
-    // 4. Transformer loop
-    for (uint32_t il = 0; il < m.block_count; ++il) {
+    // 4. Transformer loop (main stack only; NextN head held out — §4)
+    for (uint32_t il = 0; il < n_main_layers_; ++il) {
         const auto& blk = model_.get_block(il);
         ggml_tensor* inpSA = inpL;
 
@@ -490,8 +525,186 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
         inpL = cur;
     }
 
+    // D3: expose the pre-final-norm hidden (all active slots) on the decode
+    // graph too (Phase-3 "prefill + batched decode" scope). Off ⇒ byte-identical.
+    if (output_hidden_) {
+        set_tensor_name(gf, inpL, "hidden_out");
+        ggml_set_output(inpL);
+        ggml_build_forward_expand(gf, inpL);
+    }
+
     build_output_head(gf, inpL);
     return gf;
+}
+
+// ── MTP / NextN head (docs/plan-mtp-decode.md §4, Phase 3) ───────────────────
+// One draft step. Mirrors llama.cpp qwen35moe graph_mtp node-for-node:
+//   concat( enorm(embed(tok)), hnorm(h) ) → eh_proj → gated-attn(private KV)
+//   → +residual → post_attention_norm → MoE(+shared expert) → +residual
+//   → shared_head_norm → { "mtp_h_next" (chained hidden), "mtp_logits" }.
+// enorm/hnorm are plain RMS·w per the reference (NOT the Gemma (1+w) form —
+// Phase 0's inference from the weight means was corrected by the reference
+// impl; the differential fixture is the arbiter if this ever mismatches).
+// Inputs are bespoke named tensors filled manually by mtp_draft — this graph
+// deliberately does not use the typed GraphInputSet machinery, because it is
+// private to the recipe and never flows through run_prefill/decode_step.
+ggml_cgraph* Qwen36ForwardPass::build_mtp_graph(uint32_t n_past)
+{
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    const auto&    m  = meta_;
+    const uint32_t il = n_main_layers_;           // 40 — the NextN block
+    const auto&   blk = model_.get_block(il);
+
+    // Inputs: the token being extended (1), and the hidden it rides on.
+    ggml_tensor* t_tok = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_set_input(t_tok);
+    set_tensor_name(gf, t_tok, "mtp_tokens");
+    ggml_build_forward_expand(gf, t_tok);
+
+    ggml_tensor* t_h = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, m.embedding_length, 1);
+    ggml_set_input(t_h);
+    set_tensor_name(gf, t_h, "mtp_h");
+    ggml_build_forward_expand(gf, t_h);
+
+    ggml_tensor* t_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_set_input(t_pos);
+    set_tensor_name(gf, t_pos, "mtp_pos");
+    ggml_build_forward_expand(gf, t_pos);
+
+    // enorm(embed) ‖ hnorm(hidden) → eh_proj. Concat order [embed; hidden]
+    // matches the reference ggml_concat(e_norm, h_norm, 0) — reversing it is
+    // the classic silent bug (§4.3).
+    ggml_tensor* e  = ggml_get_rows(ctx_, model_.get_token_embedding_weight(), t_tok);
+    e               = build_norm(gf, e, blk.nextn_enorm, il);
+    ggml_tensor* hn = build_norm(gf, t_h, blk.nextn_hnorm, il);
+    ggml_tensor* cur = ggml_concat(ctx_, e, hn, 0);            // [2*n_embd, 1]
+    cur = ggml_mul_mat(ctx_, blk.nextn_eh_proj, cur);          // [n_embd, 1]
+    set_tensor_name(gf, cur, "mtp_eh_proj");
+
+    // The NextN block proper — same gated attention + MoE as a main attention
+    // layer, on the private single-slot KV (layer 0, slot 0).
+    ggml_tensor* inpSA = cur;
+    cur = build_norm(gf, cur, blk.attn_norm_weight, il);
+    cur = build_gated_attention(
+        ctx_, gf, mtp_kv_.get(), cur, t_pos,
+        /*kv_cache_layer=*/0, /*n_tokens=*/1, /*slot_idx=*/0, static_cast<int>(il),
+        blk.attn_q_weight, blk.attn_q_norm_weight,
+        blk.attn_k_weight, blk.attn_k_norm_weight,
+        blk.attn_v_weight, blk.attn_output_weight,
+        n_embd_head_, n_head_, n_head_kv_,
+        n_rot_, m.rope_freq_base,
+        static_cast<int>(m.context_length),
+        m.rms_norm_eps);
+    cur = ggml_add(ctx_, cur, inpSA);
+
+    ggml_tensor* ffn_inp = cur;
+    cur = build_norm(gf, cur, blk.ffn_norm_weight, il);
+    cur = build_moe_layer(ctx_, gf, cur, blk, moe_hp_, static_cast<int>(il));
+    cur = ggml_add(ctx_, cur, ffn_inp);
+
+    // shared_head_norm → chained hidden out; then the SHARED output head.
+    cur = build_norm(gf, cur, blk.nextn_shared_head_norm, -1);
+    set_tensor_name(gf, cur, "mtp_h_next");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_tensor* head_w = model_.get_output_weight()
+        ? model_.get_output_weight()
+        : model_.get_token_embedding_weight();   // tied-embeddings fallback (reference does the same)
+    ggml_tensor* logits = ggml_mul_mat(ctx_, head_w, cur);     // [n_vocab, 1]
+    set_tensor_name(gf, logits, "mtp_logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    (void)n_past;  // shape is n_past-independent; the KV views read get_pos()
+    return gf;
+}
+
+std::vector<int32_t> Qwen36ForwardPass::mtp_draft(
+    uint32_t                  slot,
+    const std::vector<float>& hidden,
+    int32_t                   last_token,
+    int                       pos,
+    uint32_t                  k,
+    ggml_backend_sched_t      sched)
+{
+    (void)slot;  // private KV is single-slot: reset per call, so slots never mix
+    if (!mtp_supported())
+        throw std::runtime_error(
+            "mtp_draft: mtp_supported expected=true, actual=false — "
+            "this GGUF carries no NextN head (qwen35moe.nextn_predict_layers=0)");
+    if (hidden.size() != meta_.embedding_length)
+        throw std::runtime_error(
+            "mtp_draft: hidden size expected=" +
+            std::to_string(meta_.embedding_length) + ", actual=" +
+            std::to_string(hidden.size()));
+    if (k == 0) return {};
+    if (k >= 32)
+        throw std::runtime_error(
+            "mtp_draft: k expected < 32 (private head KV window), actual=" +
+            std::to_string(k));
+
+    const int n_vocab = static_cast<int>(meta_.vocab_size);
+    const std::string mask_name = "kq_mask." + std::to_string(n_main_layers_);
+
+    // Stateless across decode steps (§4.6): every draft attempt starts from an
+    // empty head KV and re-seeds from (hidden, last_token).
+    mtp_kv_->set_pos(0, 0);
+
+    std::vector<int32_t> drafted;
+    std::vector<float>   h = hidden;
+    std::vector<float>   logits(n_vocab);
+    int32_t              tok = last_token;
+
+    for (uint32_t i = 0; i < k; ++i) {
+        ggml_backend_sched_reset(sched);
+        ggml_cgraph* gf = build_mtp_graph(/*n_past=*/i);
+        ggml_backend_sched_alloc_graph(sched, gf);
+
+        ggml_tensor* t_tok  = ggml_graph_get_tensor(gf, "mtp_tokens");
+        ggml_tensor* t_h    = ggml_graph_get_tensor(gf, "mtp_h");
+        ggml_tensor* t_pos  = ggml_graph_get_tensor(gf, "mtp_pos");
+        ggml_tensor* t_mask = ggml_graph_get_tensor(gf, mask_name.c_str());
+        if (!t_tok || !t_h || !t_pos || !t_mask)
+            throw std::runtime_error(
+                "mtp_draft: graph input expected present, actual missing: " +
+                std::string(!t_tok ? "mtp_tokens" : !t_h ? "mtp_h"
+                          : !t_pos ? "mtp_pos" : mask_name));
+
+        const int32_t p = pos + static_cast<int32_t>(i);
+        ggml_backend_tensor_set(t_tok, &tok, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(t_h,   h.data(), 0, ggml_nbytes(t_h));
+        ggml_backend_tensor_set(t_pos, &p,   0, sizeof(int32_t));
+        // Single query token attending to all i+1 KV entries: no masking.
+        const std::vector<float> mask_zeros(i + 1, 0.0f);
+        ggml_backend_tensor_set(t_mask, mask_zeros.data(), 0,
+                                mask_zeros.size() * sizeof(float));
+
+        ggml_backend_sched_graph_compute(sched, gf);
+
+        ggml_tensor* t_logits = ggml_graph_get_tensor(gf, "mtp_logits");
+        ggml_tensor* t_hn     = ggml_graph_get_tensor(gf, "mtp_h_next");
+        if (!t_logits || !t_hn)
+            throw std::runtime_error(
+                "mtp_draft: graph output expected present, actual missing: " +
+                std::string(!t_logits ? "mtp_logits" : "mtp_h_next"));
+        ggml_backend_tensor_get(t_logits, logits.data(), 0,
+                                n_vocab * sizeof(float));
+        ggml_backend_tensor_get(t_hn, h.data(), 0, h.size() * sizeof(float));
+
+        mtp_kv_->advance(1, 0);
+
+        // Greedy: draft tokens are model-verified downstream (§5 D4).
+        int best = 0;
+        for (int j = 1; j < n_vocab; ++j)
+            if (logits[j] > logits[best]) best = j;
+        drafted.push_back(best);
+        tok = best;
+    }
+
+    return drafted;
 }
 
 // set_inputs / set_batched_inputs removed: inputs are now populated by the
@@ -529,17 +742,38 @@ void validate_qwen36_inventory(const ModelMetadata& meta)
         "ssm_norm.weight", "ssm_out.weight"
     };
 
-    const uint32_t fai = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+    // NextN / MTP head: the four tensors that turn the trailing block(s) into a
+    // multi-token-prediction head (docs/plan-mtp-decode.md §4). Optional group:
+    //   nextn_predict_layers == 0            → no head, capability off (fine).
+    //   nextn_predict_layers  > 0, all found → capability on.
+    //   nextn_predict_layers  > 0, any missing → fail-loud naming it (below).
+    static const std::vector<std::string> nextn_tensors = {
+        "nextn.eh_proj.weight", "nextn.enorm.weight",
+        "nextn.hnorm.weight",   "nextn.shared_head_norm.weight"
+    };
+
+    const uint32_t fai   = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
+    const uint32_t nextn = meta.raw_kv.get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
+    if (nextn >= meta.block_count)
+        throw std::runtime_error(
+            "qwen35moe: field 'nextn_predict_layers' expected < block_count (" +
+            std::to_string(meta.block_count) + "), got " + std::to_string(nextn));
+    const uint32_t n_main = meta.block_count - nextn;
+
     for (uint32_t i = 0; i < meta.block_count; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
+        const bool is_nextn = (i >= n_main);
         require(p + "attn_norm.weight");
         require(p + "post_attention_norm.weight");
         for (const auto& t : moe_tensors) require(p + t);
         // Inline arithmetic: validator runs at load time, before Qwen35MoEConfig is constructed.
-        const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+        // NextN blocks are attention-typed regardless of position.
+        const bool is_full = is_nextn || ((fai > 0) && ((i % fai) == (fai - 1)));
         if (is_full)
             for (const auto& t : attn_tensors) require(p + t);
         else
             for (const auto& t : dn_tensors)   require(p + t);
+        if (is_nextn)
+            for (const auto& t : nextn_tensors) require(p + t);
     }
 }

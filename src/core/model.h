@@ -133,6 +133,16 @@ struct TransformerBlock {
     struct ggml_tensor* moe_shexp_gate_w      = nullptr; // ffn_gate_shexp.weight     [n_embd, d_ffn]
     struct ggml_tensor* moe_shexp_up_weight   = nullptr; // ffn_up_shexp.weight       [n_embd, d_ffn]
     struct ggml_tensor* moe_shexp_down_weight = nullptr; // ffn_down_shexp.weight     [d_ffn, n_embd]
+
+    // === NextN / MTP head tensors (qwen35moe MTP GGUFs only) ===
+    // Present on the last `nextn_predict_layers` blocks. The NextN block is a
+    // full attention+MoE block (the attn/MoE fields above) *plus* these four.
+    // The head predicts token t+1 from the main model's last hidden state; see
+    // docs/plan-mtp-decode.md §4. enorm/hnorm are Gemma-style (1+w) RMSNorms.
+    struct ggml_tensor* nextn_eh_proj           = nullptr; // nextn.eh_proj.weight          [2*n_embd, n_embd]
+    struct ggml_tensor* nextn_enorm             = nullptr; // nextn.enorm.weight            [n_embd]
+    struct ggml_tensor* nextn_hnorm             = nullptr; // nextn.hnorm.weight            [n_embd]
+    struct ggml_tensor* nextn_shared_head_norm  = nullptr; // nextn.shared_head_norm.weight [n_embd]
 };
 class Model {
 public:

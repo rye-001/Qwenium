@@ -61,12 +61,25 @@ public:
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx,
         ggml_backend_sched_t scheduler) {
+        return run_prefill(tokens, pos, slot_idx, scheduler, nullptr);
+    }
+
+    // Same pipeline, additionally capturing the D3 "hidden_out" output (all
+    // positions) when the caller wants it. hidden_out non-null requires
+    // set_output_hidden(true) before the call — get_output_hidden fails loud
+    // otherwise. The MTP drafting loop is the consumer.
+    std::vector<float> run_prefill(
+        const std::vector<int32_t>& tokens,
+        int pos, uint32_t slot_idx,
+        ggml_backend_sched_t scheduler,
+        std::vector<float>* hidden_out) {
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
         ggml_backend_sched_graph_compute(scheduler, gf);
         advance_cache(tokens.size(), slot_idx);
+        if (hidden_out) *hidden_out = get_output_hidden(gf);
         return get_output_logits(gf);
     }
 
@@ -176,6 +189,19 @@ public:
     // --- Output extraction (shared by all architectures) ---
     std::vector<float> get_output_logits(ggml_cgraph* gf);
     std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
+
+    // ── D3: opt-in hidden-state output (docs/plan-mtp-decode.md §5 D3) ────────
+    // When on, the recipe marks the pre-final-norm residual tip (all positions)
+    // as a graph output named "hidden_out" — the input the MTP head conditions
+    // on. Default OFF ⇒ the graph is node-for-node what it is today (marking an
+    // existing node as an output adds no compute), so the MTP-off byte-identity
+    // gate holds. Turned on only when the active draft source
+    // needs_hidden_state(). A no-op on recipes that don't read it (Gemma), so
+    // their byte gate is unaffected. Honoured by qwen36's prefill AND decode
+    // graphs (the Phase-3 "prefill + batched decode" scope decision).
+    void set_output_hidden(bool on) { output_hidden_ = on; }
+    bool output_hidden() const { return output_hidden_; }
+    std::vector<float> get_output_hidden(ggml_cgraph* gf);
 
 protected:
     const ModelMetadata& meta_;
@@ -356,6 +382,7 @@ protected:
     }
 
     bool slice_prefill_head_ = true;
+    bool output_hidden_ = false;   // D3 opt-in; see set_output_hidden
     // Defaults = today's decode: baked-offset cpy write, exact per-step n_kv.
     // The opt-in persistent path (--persistent-graph) sets both to
     // {SetRows, 256} together; nothing else changes them.

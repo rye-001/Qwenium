@@ -271,7 +271,16 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 // Typed configs (Qwen35MoEConfig) are constructed by recipes after this runs —
                 // chicken/egg. Use the same one-line formula the recipe and validators use.
                 const uint32_t fai = metadata_.raw_kv.get_uint32("qwen35moe.full_attention_interval");
-                const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+                // The last `nextn_predict_layers` blocks are the MTP/NextN head
+                // (docs/plan-mtp-decode.md §4): a full attention+MoE block plus the
+                // four nextn.* tensors, held out of the main decode stack by the
+                // recipe. 0 for a standard (non-MTP) GGUF ⇒ n_main == block_count.
+                const uint32_t nextn = metadata_.raw_kv
+                    .get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
+                const uint32_t n_main = metadata_.block_count - nextn;
+                const bool is_nextn = (i >= n_main);
+                // NextN blocks are attention-typed regardless of position.
+                const bool is_full = is_nextn || ((fai > 0) && ((i % fai) == (fai - 1)));
                 if (is_full) {
                     blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
                     blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
@@ -289,6 +298,12 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                     blocks_[i].attn_gate_weight   = require(prefix + "attn_gate.weight");
                     blocks_[i].ssm_norm_weight    = require(prefix + "ssm_norm.weight");
                     blocks_[i].ssm_out_weight     = require(prefix + "ssm_out.weight");
+                }
+                if (is_nextn) {
+                    blocks_[i].nextn_eh_proj          = require(prefix + "nextn.eh_proj.weight");
+                    blocks_[i].nextn_enorm            = require(prefix + "nextn.enorm.weight");
+                    blocks_[i].nextn_hnorm            = require(prefix + "nextn.hnorm.weight");
+                    blocks_[i].nextn_shared_head_norm = require(prefix + "nextn.shared_head_norm.weight");
                 }
                 continue;
             }

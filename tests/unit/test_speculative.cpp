@@ -223,11 +223,12 @@ void test_speculative_partial_accept() {
     assert(result.has_bonus);
     assert(result.bonus_token == 99);  // The correct token at rejection point
     assert(result.total_tokens() == 3);
-    // Rewind: current_pos(3) + accepted(2) + bonus(1) = 6
-    // Cache was advanced by 3 (draft size), so rewind from 6 to 6... 
-    // Actually: keep = 2 + 1 = 3 = K, no rewind needed
-    // Wait: keep=3, K=3, so no rewind
-    assert(rewind_pos == -1);
+    // keep = accepted = 2 < K = 3 → rewind to current_pos + 2. The bonus has
+    // no KV entry (it was never fed); the caller feeds it next step at
+    // current_pos+2, its true stream position. Draft[2]'s rejected entry is
+    // dropped — retaining it (the old keep=accepted+bonus arithmetic) left a
+    // junk K/V standing in for the bonus and shifted every later position.
+    assert(rewind_pos == 3 + 2);
     PASS();
 }
 
@@ -265,8 +266,9 @@ void test_speculative_reject_first() {
     assert(result.has_bonus);
     assert(result.bonus_token == 88);
     assert(result.total_tokens() == 2);
-    // keep = 1 + 1 = 2, K = 3, need rewind
-    assert(rewind_pos == 3 + 2);  // current_pos + keep
+    // keep = accepted = 1, K = 3 → rewind to current_pos + 1 (bonus has no
+    // KV entry; it is fed next step at current_pos+1)
+    assert(rewind_pos == 3 + 1);
     PASS();
 }
 
@@ -337,6 +339,44 @@ void test_speculative_eos_in_draft() {
     PASS();
 }
 
+void test_speculative_first_token_guard() {
+    TEST("Speculative: first-token guard rejects contradicting draft");
+
+    const int VOCAB = 100;
+    SpeculativeDecoder spec({.ngram_size = 2, .max_draft = 3}, VOCAB);
+
+    std::vector<int32_t> prompt = {1, 2, 10, 20, 30, 40, 50, 60};
+    std::vector<int32_t> generated = {99, 10, 20};
+    // PLD will propose [30, 40, 50]; draft[0]=30.
+
+    bool verify_called = false;
+    auto verify = [&](int, const std::vector<int32_t>& draft, int) {
+        verify_called = true;
+        std::vector<float> logits(draft.size() * VOCAB, 0.0f);
+        logits[0 * VOCAB + 40] = 10.0f;
+        logits[1 * VOCAB + 50] = 10.0f;
+        logits[2 * VOCAB + 77] = 10.0f;
+        return logits;
+    };
+    auto rewind = [](int, int) {};
+
+    // Caller sampled 55 for draft[0]'s position — the draft (30) contradicts
+    // it, so no verify runs and the caller falls back to the normal step.
+    auto r1 = spec.try_speculative_step(prompt, generated, 0, 3, verify,
+                                        rewind, -1, {}, /*expected_first=*/55);
+    assert(!r1.attempted());
+    assert(!verify_called);
+
+    // Caller sampled 30 — matches draft[0], speculation proceeds as usual.
+    auto r2 = spec.try_speculative_step(prompt, generated, 0, 3, verify,
+                                        rewind, -1, {}, /*expected_first=*/30);
+    assert(verify_called);
+    assert(r2.attempted());
+    assert(r2.accepted_tokens.size() == 3);
+    assert(r2.has_bonus && r2.bonus_token == 77);
+    PASS();
+}
+
 void test_speculative_stats() {
     TEST("Speculative: stats tracking");
 
@@ -386,6 +426,7 @@ int main() {
     test_speculative_reject_first();
     test_speculative_no_draft_found();
     test_speculative_eos_in_draft();
+    test_speculative_first_token_guard();
     test_speculative_stats();
 
     std::cout << "\n=== Results: " << tests_passed << "/" << tests_total

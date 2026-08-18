@@ -77,6 +77,17 @@ target_link_libraries(speculative-tests PRIVATE
 target_compile_features(speculative-tests PRIVATE cxx_std_17)
 add_test(NAME speculative-tests COMMAND speculative-tests)
 
+# Draft-source seam (Phase 1 of the MTP plan). Header-only under src/sampling,
+# same standalone-harness style as speculative-tests.
+add_executable(draft-source-tests
+    unit/test_draft_source.cpp
+)
+target_link_libraries(draft-source-tests PRIVATE
+    sampling
+)
+target_compile_features(draft-source-tests PRIVATE cxx_std_17)
+add_test(NAME draft-source-tests COMMAND draft-source-tests)
+
 # Define the integration test executable
 add_executable(integration-tests
     integration/test_e2e_generation.cpp
@@ -638,6 +649,32 @@ target_link_libraries(config-tests-qwen36 PRIVATE
 
 target_compile_features(config-tests-qwen36 PRIVATE cxx_std_17)
 gtest_discover_tests(config-tests-qwen36)
+
+# MTP/NextN inventory validation (Phase 2 of the MTP plan) — synthetic metadata.
+add_executable(mtp-inventory-tests
+    unit/test_mtp_inventory.cpp
+)
+target_link_libraries(mtp-inventory-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+)
+target_compile_features(mtp-inventory-tests PRIVATE cxx_std_17)
+gtest_discover_tests(mtp-inventory-tests)
+
+# MTP/NextN head graph (Phase 3) — needs the real MTP GGUF in models/;
+# skips when absent. Run from the repo root (relative model path).
+add_executable(mtp-head-tests
+    unit/test_mtp_head.cpp
+)
+target_link_libraries(mtp-head-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+target_compile_features(mtp-head-tests PRIVATE cxx_std_17)
+gtest_discover_tests(mtp-head-tests)
 
 # Norm helper unit tests — no model file needed.
 add_executable(norm-tests

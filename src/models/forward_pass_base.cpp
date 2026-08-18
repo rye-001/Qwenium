@@ -270,8 +270,21 @@ std::vector<float> ForwardPassBase::get_output_logits(ggml_cgraph* gf) {
     size_t logits_size = ggml_nbytes(logits_gpu);
     std::vector<float> logits_cpu(logits_size / sizeof(float));
     ggml_backend_tensor_get(logits_gpu, logits_cpu.data(), 0, logits_size);
-    
+
     return logits_cpu;
+}
+
+std::vector<float> ForwardPassBase::get_output_hidden(ggml_cgraph* gf) {
+    ggml_tensor* h = ggml_graph_get_tensor(gf, "hidden_out");
+    if (!h) {
+        throw std::runtime_error(
+            "get_output_hidden: 'hidden_out' tensor not found in graph — "
+            "expected set_output_hidden(true) before build, actual absent");
+    }
+    size_t n = ggml_nbytes(h);
+    std::vector<float> out(n / sizeof(float));
+    ggml_backend_tensor_get(h, out.data(), 0, n);
+    return out;
 }
 
 // Get output logits for a specific batch slot

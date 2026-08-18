@@ -148,10 +148,10 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly), `moe_residency` (routing-skew telemetry) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids), `i_image_embeddable` (Seam B, §7) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
-| `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `prompt_lookup` (draft-free speculative decoding), `sampling_snapshot` |
+| `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap, metadata), `weight_binding` (fail-loud tensor inventory), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check` |
 | `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `vision_loader`, `vision_model`, `bitmap` |
@@ -218,11 +218,27 @@ persistent-capable today; the write-mode/bucket are a differential seam gated
 byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
 `test_decode_graph_cache`).
 
-**Speculative decoding** (CLI `--speculative`, Prompt Lookup Decoding): no
-draft model — the draft is an n-gram match of recent output against the prompt.
-Drafted tokens are verified in one batched pass; on mismatch the KV cache
-truncates (O(1) pointer move) and the recurrent state restores a checkpoint
-(a copy — overwrite semantics can't rewind, see §9).
+**Speculative decoding** (CLI `--speculative [pld|mtp]`): drafts come from an
+`IDraftSource` (`sampling/draft_source.h`) and are verified in one batched
+pass (head slice off — verification needs logits at every draft position); a
+first-token guard ensures draft[0] matches the token the sampler actually
+chose. On mismatch the KV cache truncates (O(1) pointer move) and, on
+hybrids, the recurrent state restores a pre-verify checkpoint and the
+accepted prefix is re-fed (`feed_tokens`) — overwrite semantics can't rewind
+(§9). Two draft sources: **PLD** (bare `--speculative`; no model — the draft
+is an n-gram match of recent output against the prompt) and the **MTP head**
+(`--speculative mtp`, depth `--mtp-max-draft`; Qwen 3.6 NextN: an extra
+trained attention+MoE block held out of the main stack, drafting recursively
+from the last position's hidden state via `models/i_mtp_draftable.h` on a
+private KV + dedicated scheduler; the hidden is exposed by an opt-in,
+default-off graph output). MTP is a capability of MTP-converted GGUFs,
+mirroring how vision is a capability of `--mmproj` — Qwen-only, as vision is
+Gemma-only. Status: **experimental** — 74–92% acceptance, ~3.3 tokens/step,
+but end-to-end ≈ baseline on M1 Pro until the per-head-step dispatch overhead
+is attacked; measurements and the five speculative-machinery bugs fixed en
+route live in `plan-mtp-decode.md` §7/§9. Emitted tokens are model-verified
+under the kernel path that computed them; batch-shape numerical forks (§11)
+mean speculative-on is token-stable, not byte-identical, vs speculative-off.
 
 ---
 
