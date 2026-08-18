@@ -13,6 +13,7 @@
 //   well within the 16 384-node budget).
 
 #include "forward_pass_base.h"
+#include "i_mtp_draftable.h"
 #include "../state/kv_cache_simple.h"
 #include "../state/deltanet_state.h"
 #include "../layers/moe.h"
@@ -49,6 +50,16 @@ struct Qwen35MoEConfig {
     uint32_t rope_dimension_count;
     uint32_t full_attention_interval;
 
+    // MTP / NextN head: number of trailing blocks that are the multi-token
+    // prediction head rather than main decode layers (docs/plan-mtp-decode.md).
+    // 0 for a standard GGUF. The head's tensors are bound (§4) but not executed
+    // until Phase 3/4; here it only shortens the main decode stack.
+    uint32_t nextn_predict_layers;
+
+    // Capability query (mirrors i_image_embeddable's presence check): does this
+    // model carry a trained MTP head?
+    bool has_mtp_head() const { return nextn_predict_layers > 0; }
+
     // Layer-kind helpers — identical semantics to ModelMetadata::is_*_layer
     // for the qwen35moe architecture, but self-contained on the config so the
     // recipe does not read through ModelMetadata at graph-building time.
@@ -63,7 +74,7 @@ struct Qwen35MoEConfig {
     static Qwen35MoEConfig from_metadata(const ModelMetadata& meta);
 };
 
-class Qwen36ForwardPass : public ForwardPassBase {
+class Qwen36ForwardPass : public ForwardPassBase, public IMtpDraftable {
 public:
     Qwen36ForwardPass(const Model&     model,
                       const ModelMetadata*  metadata,
@@ -111,16 +122,55 @@ public:
         if (dn_state_) dn_state_->clone_slot(src_slot, dst_slot);
     }
 
+    // State reach-through (mirrors qwen35): L2 snapshots and the speculative
+    // rollback path (checkpoint before verify, restore on partial reject) both
+    // need these. qwen36 lacked them, which silently disabled the hybrid
+    // rollback — snapshot_recurrent() fell through to the nullptr default.
+    simple_kv_cache* snapshot_kv_cache() override { return kv_cache_.get(); }
+    DeltaNetState*   snapshot_recurrent() override { return dn_state_.get(); }
+
+    // ── IMtpDraftable (docs/plan-mtp-decode.md §4, Phase 3) ─────────────────
+    // The NextN head: one gated-attention + MoE block (blk.40) seeded from the
+    // main model's pre-final-norm hidden. Private single-slot KV, reset per
+    // call — drafting is stateless across decode steps (§4.6). Pass a
+    // DEDICATED scheduler: the head graph is a new shape, and scheduler/galloc
+    // reuse across graph shapes is the known corruption mode
+    // (docs/server-image-multirequest-bug.md).
+    bool mtp_supported() const override { return cfg_.has_mtp_head(); }
+
+    std::vector<int32_t> mtp_draft(
+        uint32_t                  slot,
+        const std::vector<float>& hidden,
+        int32_t                   last_token,
+        int                       pos,
+        uint32_t                  k,
+        ggml_backend_sched_t      sched) override;
+
 private:
+    // One NextN draft step: embed(token) + hidden → eh_proj → block 40 →
+    // shared_head_norm → logits ("mtp_logits") + chained hidden ("mtp_h_next").
+    // n_past = entries already in the private head KV this draft attempt.
+    ggml_cgraph* build_mtp_graph(uint32_t n_past);
+
+
     Qwen35MoEConfig cfg_;  // family-specific config, derived from ModelMetadata at construction
 
     std::unique_ptr<simple_kv_cache> kv_cache_;  // 10 attention layers
     std::unique_ptr<DeltaNetState>   dn_state_;   // 30 DeltaNet layers
 
+    // NextN head's private KV — 1 layer, 1 slot, tiny context (draft window
+    // only; reset per mtp_draft call). NOT a new engine state kind: an
+    // ordinary append-KV object private to the drafting path (§4.4).
+    std::unique_ptr<simple_kv_cache> mtp_kv_;
+
     // kv_layer_map_[il] = KV cache index (0‥9)  if attention layer, else -1.
     // dn_layer_map_[il] = DeltaNet index (0‥29) if DeltaNet layer,  else -1.
     std::vector<int32_t> kv_layer_map_;
     std::vector<int32_t> dn_layer_map_;
+
+    // Main decode layers = block_count − nextn_predict_layers. The trailing
+    // NextN block(s) are held out of every main-stack loop below.
+    uint32_t n_main_layers_ = 0;
 
     // Attention hparams cached from metadata (used in both prefill + decode).
     int   n_embd_head_;  // 256

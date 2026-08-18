@@ -55,9 +55,11 @@ void print_usage(const char* program_name) {
     std::cout << "  --grammar-file FILE     Path to a GBNF grammar file for constrained sampling\n";
     std::cout << "  --hide-thinking         (chat) Suppress the Gemma 4 thought channel (shown dimmed by default)\n";
     std::cout << "  --log-tokens-to FILE    Append all processed token IDs to a file\n";
-    std::cout << "  --speculative           Enable Prompt Lookup Decoding (speculative)\n";
+    std::cout << "  --speculative [pld|mtp] Speculative decoding; bare/pld = Prompt Lookup,\n";
+    std::cout << "                          mtp = trained NextN head (MTP GGUFs only)\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
+    std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
     std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
@@ -128,8 +130,16 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
             args.context_length = std::stoi(argv[++i]);
         } else if (arg == "--speculative") {
             args.speculative = true;
+            // Optional mode argument: bare --speculative == pld (back-compat).
+            if (i + 1 < argc && (std::string(argv[i + 1]) == "pld" ||
+                                 std::string(argv[i + 1]) == "mtp")) {
+                args.speculative_mode = argv[++i];
+            }
         } else if (arg == "--persistent-graph") {
             args.persistent_graph = true;
+        } else if (arg == "--mtp-max-draft") {
+            if (i + 1 >= argc) { std::cerr << "--mtp-max-draft needs a value\n"; return false; }
+            args.mtp_max_draft = std::stoi(argv[++i]);
         } else if (arg == "--pld-ngram") {
             if (i + 1 >= argc) return false;
             args.pld_ngram_size = std::stoi(argv[++i]);
@@ -281,7 +291,7 @@ int main(int argc, char** argv) {
     // PLD is disabled when grammar is active (grammar needs per-token validation)
     bool use_speculative = args.speculative && !grammar;
     std::unique_ptr<qwenium::SpeculativeDecoder> spec;
-    if (use_speculative) {
+    if (use_speculative && args.speculative_mode == "pld") {
         qwenium::PromptLookupConfig pld_config;
         pld_config.ngram_size = args.pld_ngram_size;
         pld_config.max_draft = args.pld_max_draft;
@@ -290,6 +300,9 @@ int main(int argc, char** argv) {
         std::cout << "Prompt Lookup Decoding enabled (ngram=" << pld_config.ngram_size
                   << ", max_draft=" << pld_config.max_draft << ")" << std::endl;
     }
+    // --speculative mtp: the MtpDraft source needs the forward pass (the head
+    // lives on the recipe), which run_complete constructs — so the MTP-backed
+    // SpeculativeDecoder is built there, not here. spec stays null.
     if (args.speculative && grammar) {
         std::cout << "Note: Speculative decoding disabled (incompatible with grammar constraints)" << std::endl;
     }

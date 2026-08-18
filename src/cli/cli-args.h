@@ -29,10 +29,16 @@ struct CliArgs {
     // chat, rendered dimmed, instead of suppressing it. On by default; the
     // thought is shown but never saved into the assistant turn history.
     bool show_thinking = true;  // --hide-thinking to suppress
-    // PLD options
+    // Speculative decoding (docs/plan-mtp-decode.md D5). Bare `--speculative`
+    // and `--speculative pld` mean PLD (back-compat); `--speculative mtp`
+    // drafts with the model's trained NextN head (MTP-converted GGUFs only).
     bool speculative = false;
+    std::string speculative_mode = "pld";  // "pld" | "mtp"
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
+    // --mtp-max-draft: tokens drafted BY THE HEAD per step (the sampled token
+    // rides the verify batch in addition); upstream guidance: start at 2.
+    int mtp_max_draft = 2;
     // Persistent decode graph (docs/plan-persistent-decode-graph.md). Opt-in:
     // build+alloc the decode graph once per n_kv bucket and reuse it across
     // steps, skipping the per-step galloc replan (measured 1.32× on Qwen 3.6,

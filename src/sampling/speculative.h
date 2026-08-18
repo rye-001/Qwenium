@@ -5,8 +5,12 @@
 #include <functional>
 #include <algorithm>
 #include <cassert>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 #include "prompt_lookup.h"
+#include "draft_source.h"
 
 namespace qwenium {
 
@@ -91,14 +95,28 @@ public:
     // Set a slot's KV cache position (for rewind after partial acceptance)
     using RewindCacheFunc = std::function<void(int slot_id, int new_pos)>;
 
+    // Back-compat ctor: PLD is the default draft source, built from the same
+    // PromptLookupConfig callers passed before the seam existed.
     explicit SpeculativeDecoder(
         PromptLookupConfig config = {},
         int vocab_size = 0)
-        : lookup_(config)
+        : draft_source_(std::make_unique<PromptLookupDraft>(config))
+        , vocab_size_(vocab_size)
+    {}
+
+    // Injection ctor: any draft source (PLD through the seam, MTP in Phase 4).
+    explicit SpeculativeDecoder(
+        std::unique_ptr<IDraftSource> draft_source,
+        int vocab_size = 0)
+        : draft_source_(std::move(draft_source))
         , vocab_size_(vocab_size)
     {}
 
     void set_vocab_size(int vs) { vocab_size_ = vs; }
+
+    // Does the active draft source require the last hidden state to be fed in?
+    // (Drives D3's opt-in hidden-state output in the decode loop.)
+    bool needs_hidden_state() const { return draft_source_->needs_hidden_state(); }
 
     // ========================================================================
     // try_speculative_step: The main entry point
@@ -131,19 +149,37 @@ public:
         int current_pos,
         VerifyFunc verify,
         RewindCacheFunc rewind,
-        int eos_token = -1)
+        int eos_token = -1,
+        const std::vector<float>& last_hidden = {},
+        int32_t expected_first = -1)
     {
         assert(vocab_size_ > 0 && "Must set vocab_size before calling");
 
         SpeculativeResult result;
         stats_.drafts_attempted++;
 
-        // 1. Try to find draft tokens via n-gram lookup
-        std::vector<int32_t> draft = lookup_.find_draft(prompt_tokens, generated_tokens);
+        // 1. Ask the draft source for a continuation. PLD reads the token
+        //    vectors and ignores last_hidden; a model-backed source (MTP) reads
+        //    last_hidden. Verification below is identical regardless of source.
+        DraftContext ctx{prompt_tokens, generated_tokens, last_hidden,
+                         (uint32_t)slot_id, current_pos, expected_first};
+        std::vector<int32_t> draft = draft_source_->propose(ctx);
 
         if (draft.empty()) {
             stats_.normal_decodes++;
             return result;  // No draft found, caller does normal decode
+        }
+
+        // First-token guard: draft[0] occupies the position the caller already
+        // sampled for (from the normal decode's logits). Verification below
+        // checks draft[i+1] against logits[i] but never draft[0] itself — so
+        // unless draft[0] equals the sampled token, accepting it would emit a
+        // token the model never chose. Guard active only when the caller
+        // supplies expected_first (the CLI does; legacy callers/tests that
+        // pass -1 keep the old unguarded semantics).
+        if (expected_first >= 0 && draft[0] != expected_first) {
+            stats_.normal_decodes++;
+            return result;  // draft contradicts the sampled token — fall back
         }
 
         stats_.drafts_found++;
@@ -155,13 +191,18 @@ public:
         //    KV cache advances by draft.size()
         std::vector<float> all_logits = verify(slot_id, draft, current_pos);
 
-        // Sanity check: expect [K * vocab_size] logits
+        // Shape contract: [K * vocab_size] logits, one row per draft position.
+        // Fail loud — a silent fallback here masked a broken verify path (the
+        // prefill head slice) for months by quietly rejecting every draft.
         int K = (int)draft.size();
         if ((int)all_logits.size() != K * vocab_size_) {
-            // Verification returned unexpected shape — bail out safely
-            rewind(slot_id, current_pos);
-            stats_.normal_decodes++;
-            return result;
+            throw std::runtime_error(
+                "try_speculative_step: verify logits size expected " +
+                std::to_string((size_t)K * vocab_size_) + " (K=" +
+                std::to_string(K) + " * vocab=" + std::to_string(vocab_size_) +
+                "), actual " + std::to_string(all_logits.size()) +
+                " — verify must return logits for ALL draft positions "
+                "(is the prefill head slice still on?)");
         }
 
         // 3. Greedy verification: check argmax(logits[i]) == draft[i]
@@ -225,9 +266,15 @@ public:
             result.has_bonus = (result.bonus_token != eos_token);
         }
 
-        // 4. Rewind KV cache to discard unverified positions
-        //    Cache was advanced by K tokens. We keep: accepted + (has_bonus ? 1 : 0)
-        int keep = accepted + (result.has_bonus ? 1 : 0);
+        // 4. Rewind KV cache to discard unverified positions.
+        //    Verify wrote exactly K entries: entry i = draft[i] at position
+        //    current_pos+i. Keep only the ACCEPTED entries. The bonus token has
+        //    no KV entry here — it was never fed; the caller feeds it on the
+        //    next loop iteration at current_pos+accepted, which is exactly its
+        //    stream position. (Counting the bonus in `keep`, as this code once
+        //    did, retained the REJECTED draft[accepted]'s K/V as a silent
+        //    stand-in for the bonus and shifted every later position by one.)
+        int keep = accepted;
         if (keep < K) {
             rewind(slot_id, current_pos + keep);
         }
@@ -242,7 +289,6 @@ public:
 
     const SpeculativeStats& stats() const { return stats_; }
     void reset_stats() { stats_.reset(); }
-    const PromptLookup& lookup() const { return lookup_; }
 
 private:
     static int argmax(const float* data, int size) {
@@ -257,7 +303,7 @@ private:
         return best;
     }
 
-    PromptLookup lookup_;
+    std::unique_ptr<IDraftSource> draft_source_;
     int vocab_size_ = 0;
     SpeculativeStats stats_;
 };
