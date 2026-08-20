@@ -42,6 +42,7 @@ target_link_libraries(inference_server INTERFACE
 add_executable(http_server
     http_server.cpp
     server_vision.cpp
+    server_lens.cpp
     image_data_uri.cpp
     # Host-side image pipeline + multimodal orchestrator, compiled directly (these
     # live in src/cli and src/core but are built into consumers, not a lib — same

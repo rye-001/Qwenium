@@ -287,6 +287,50 @@ std::vector<float> ForwardPassBase::get_output_hidden(ggml_cgraph* gf) {
     return out;
 }
 
+// ── Lens tap (docs/plan-qemmi-lens.md P1/A1) ─────────────────────────────────
+// Mark each armed attention layer's post-softmax row as a retained graph output.
+// The tap tensors are named `kq_soft.<il>` by layers/attention.cpp on every
+// recipe; marking an existing node as an output adds no compute, so the tap-off
+// path (empty layer set → this is a no-op) is byte-identical to today.
+void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
+    for (int il : attention_taps_) {
+        std::string nm = "kq_soft." + std::to_string(il);
+        ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
+        if (!ts)
+            throw std::runtime_error(
+                "mark_attention_taps: attention-tap tensor '" + nm +
+                "' expected in graph, actual absent — layer " +
+                std::to_string(il) + " is not an attention layer of this "
+                "recipe (or the graph has no such block).");
+        ggml_set_output(ts);
+        ggml_build_forward_expand(gf, ts);
+    }
+}
+
+std::vector<ForwardPassBase::AttentionTap>
+ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
+    std::vector<AttentionTap> out;
+    out.reserve(attention_taps_.size());
+    for (int il : attention_taps_) {
+        std::string nm = "kq_soft." + std::to_string(il);
+        ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
+        if (!ts)
+            throw std::runtime_error(
+                "get_attention_taps: attention-tap tensor '" + nm +
+                "' expected in graph, actual absent — call "
+                "mark_attention_taps(gf) after build_decoding_graph and before "
+                "graph alloc.");
+        AttentionTap tap;
+        tap.layer  = il;
+        tap.n_kv   = (int)ts->ne[0];
+        tap.n_head = (int)ts->ne[2];   // shape [n_kv, 1, n_head, 1] at decode
+        tap.rows.resize((size_t)tap.n_kv * tap.n_head);
+        ggml_backend_tensor_get(ts, tap.rows.data(), 0, ggml_nbytes(ts));
+        out.push_back(std::move(tap));
+    }
+    return out;
+}
+
 // Get output logits for a specific batch slot
 std::vector<float> ForwardPassBase::get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index) {
     ggml_tensor* logits_gpu = ggml_graph_get_tensor(gf, "logits");

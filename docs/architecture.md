@@ -38,6 +38,19 @@ were built, measured, and then deleted. Decode-time *latency* is the constraint,
 so the optimization surface is kernel launches, grammar-step cost, and prefill
 reuse (caching).
 
+**The receipts identity (2026-07-19).** Beyond serving answers, the engine
+treats its own computation as a product surface — *"where it looked, what
+decided it, and proof it happened"*: **attention** (materialized decode rows,
+tapped and calibrated into citations/coverage — the lens, §6), **determinism**
+(byte-reproducible greedy decode with forkable state — counterfactual re-runs),
+and **integrity** (weights-hash, version-gated snapshots, fail-loud replay).
+This is a doctrine-level commitment with named engineering constraints — see
+§11's *receipts constraints* bullet before optimizing anything on these paths.
+Receipts are **per-model calibrated capabilities** (like vision or MTP), not a
+blanket property; the claim boundary is fixed by measurement: receipts show
+what the model *consulted*, never why it *chose* (consideration, not
+commitment — the non-claims contract in [`lens-format.md`](lens-format.md)).
+
 Supported architectures (registered in
 [`src/models/model_registry.cpp`](../src/models/model_registry.cpp)):
 `qwen2`, `qwen3` (pure transformer), `qwen35` (attention + SSM hybrid),
@@ -148,7 +161,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly), `moe_residency` (routing-skew telemetry) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
@@ -156,7 +169,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `vision_loader`, `vision_model`, `bitmap` |
 | `src/session/` | Portable snapshot file format | `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `image_data_uri` |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `image_loader` (preprocessing lives here — the encoder is content-blind), `image_prompt`, `speculative-bridge` |
 | `src/telemetry/` | Metrics | `metrics.h` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | |
@@ -285,6 +298,50 @@ warm reuse there is honest only as an explicit opt-in handle. Details:
 Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text + OpenAI `image_url` when `--mmproj` is loaded),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
+
+**Attention Lens (opt-in `--attention-lens`, `POST /v1/extract`).** A dedicated
+endpoint — separate from the OpenAI surface by design (its inputs are a
+document + a complete key vocabulary of `{key, gloss}` concepts, not chat
+messages; its output is the lens format, not a completion). It runs **one free
+tapped decode, in one prefill** (`run_lens_extract` → `run_lens_tapped_decode`):
+argmax over the full vocabulary with the P1 attention tap armed on the two frozen
+lens layers, then `compute_lens_report` derives citations (L3H13, N3), the
+grounded/ungrounded badge (body_mass, N3b), the tier (A5.3) and the coverage
+report (COV1). All signals are document-relative. A pure `apply_absent_by_omission`
+orders fields by the hinted concepts and marks the ones the model did not state
+`value:null`/`badge:"absent"`.
+
+**No grammar.** The lens once constrained this decode with ONE fixed KV grammar,
+and ran a two-pass grounded presence gate on top of it. Both are **gone** (Stage 2,
+2026-07-17). The grammar was refuted by measurement: on the Leg C corpus it lost
+on every axis *including* the guaranteed parse it existed for (14/15 vs free's
+15/15), and its `value ::= (…)+` forced a non-empty value for every hinted key —
+the sole cause of the absent-concept collapse, and therefore of the presence gate
+built to contain it. Freed of it the model declines natively (absent handled 30/30
+vs the grammar's 10/30) — so the gate had nothing left to do, and its **N+1
+prefills collapsed to 1**. `lens_grammar_gbnf()` survives *only* as the QDOCS_S1
+probe's control arm (`run_lens_extract`'s `control_arm_grammar`, a probe-only
+seam), so the comparison stays reproducible on shipped code; it is unreachable
+from the endpoint. **This says nothing about the engine's GBNF machinery or the
+per-request `grammar` field on `/v1/completions` and `/v1/chat/completions`** —
+that is a separate, shipped, unaffected feature.
+
+**The shape contract** replaces the grammar's (false) parse guarantee: *tolerant*
+on shape — `lens_find_json_object` skips a ``` fence and takes the outermost
+object by string-aware brace depth — and *loud* on failure —
+`LensUnparseableError` ⇒ **`422 unparseable_extraction`**, split from `400
+bad_request` and carrying the model's `raw`. Never a partial extraction: a refusal
+and "the document has none of these concepts" are different facts.
+
+**Single-slot and exclusive**: `extract_lens_json` holds the model lock for the
+whole tapped decode and uses slot 0 (the only correct qwen36 decode KV gather,
+§12); do not drive concurrent OpenAI traffic on slot 0 while extracting.
+Qwen3.6-pinned constants; fail-loud on empty concepts or an oversized document.
+Off ⇒ the route 404s and no lens code runs.
+[`plan-qemmi-lens.md`](plan-qemmi-lens.md), [`lens-format.md`](lens-format.md),
+[`note-nogrammar-refutation.md`](note-nogrammar-refutation.md),
+[`note-lens-absent-attempt.md`](note-lens-absent-attempt.md); gates
+`tests/smoke/server_extract_smoke.sh` + `QDOCS_S1=1 bin/attn-provenance`.
 
 ---
 
@@ -459,6 +516,22 @@ used only for the output-head matmul, overlapping with the next token's body.
   The success metric for hosting a new variant: zero logic edits to modules
   other recipes depend on — if it needed them, that's an interface defect to
   fix, not a feature to celebrate.
+- **The receipts constraints (§1 identity — check before optimizing these
+  paths).** (a) The attention module's **`kq_soft.<il>` tensor names are a
+  public seam** — the lens tap locates rows by name; renaming is a breaking
+  change (§13 trigger). (b) **Materialized decode attention is load-bearing on
+  tapped layers**: any future fused/flash-style attention must keep tapped
+  layers materialized or export their rows (decode is one query row × ≤4K
+  keys, so fusion buys nothing there — the conflict is theoretical inside the
+  envelope, named so it stays theoretical). (c) **Receipts-grade determinism
+  is per-config AND single-slot**: the batch-shape fork (above) means a
+  generation that ran batched cannot be byte-replayed without its batch;
+  byte-replay claims (witnesses, counterfactual diffs) hold at B=1 — the lens
+  path is single-slot for this reason too, not only the qwen36 gather bug
+  (§12). (d) **Nondeterministic kernels are inadmissible on the receipts
+  path** — a Metal kernel using atomics/async reduction ordering may be fast,
+  but it forfeits every replay claim; it needs an explicit decision, not a
+  benchmark win.
 
 ---
 
@@ -498,7 +571,16 @@ Current, verified against the tree at time of writing:
   against `gather_k`'s `n_ctx_max`-strided flat layout — correct only for
   slot 0. Latent wrong-rows gather for multi-slot qwen36 decode (today only
   the CLI/probes exercise qwen36, single-slot); must be fixed (→ `NCtxMax`,
-  as qwen35) before qwen36 serves multi-slot.
+  as qwen35) before qwen36 serves multi-slot. The Qemmi-Lens attention tap
+  (`forward_pass_base` `set_attention_taps`/`mark_attention_taps`/
+  `get_attention_taps`, [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads
+  the frozen `kq_soft.<il>` rows on this same qwen36 decode path, so it inherits
+  the single-slot limit — V1 serves single-slot by construction. The seam is
+  opt-in and byte-inert when disarmed (default empty layer set marks no node —
+  same liveness-only argument as `set_output_hidden`; gated by
+  `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the
+  tensor name is the seam, so any recipe that names `kq_soft` hosts it — no lens
+  *claims* for Gemma yet, its constants are unprobed).
 
 ---
 

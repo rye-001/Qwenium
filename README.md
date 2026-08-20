@@ -6,6 +6,16 @@ A from-scratch LLM inference engine in C++ for the Qwen and Gemma families, usin
 
 Qwenium is built so you can read it, change it, and trust it. One directory per layer type. One file per model recipe. Adding a new model is a recipe, not a refactor.
 
+## Answers, with receipts
+
+**Other engines return what the model said. Qwenium also returns where it looked, what decided it, and proof it happened.**
+
+- **Where it looked — attention.** Every decode step's attention is materialized in the graph (not fused away) and tappable at zero extra compute. Calibrated, it becomes receipts: per-value **source citations**, a whole-document **coverage audit** ("this line was never consulted"), and an **ungrounded-value flag** — served today via `/v1/extract` with `--attention-lens`, the engine side of [Qemmi-Lens](docs/plan-qemmi-lens.md).
+- **What decided it — determinism.** Greedy decode is byte-deterministic, with forkable state (warm prefix restore + recurrent-state checkpoints). Remove one line of the input, re-run, and the diff is fact, not sampling noise — counterfactual "prove it" experiments per field (Qemmi-Proof, in design).
+- **Proof it happened — integrity.** A weights hash computed at load, version-gated snapshots, kernel-path tags, and fail-loud replay refusal: a generation can carry a kilobyte witness and re-run byte-identical on demand (Qemmi-Seal, in design).
+
+One boundary, measured rather than asserted: these receipts show what the model **consulted** and let you **test and replay** what it did — they never claim to explain *why* it chose. Attention marks consideration, not commitment.
+
 ## Why not just use llama.cpp?
 
 You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) supports more models, more hardware, and more features. Qwenium exists because:
@@ -24,6 +34,7 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 - **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
 - **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.
 - **OpenAI-compatible API** — `/v1/completions` and `/v1/chat/completions` with SSE streaming, per-request sampling params, and a `grammar` field for constrained output. Drop-in for existing tools.
+- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute (see [`docs/lens-format.md`](docs/lens-format.md)).
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
 - **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
