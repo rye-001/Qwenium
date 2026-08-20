@@ -32,6 +32,12 @@
 #include "image_data_uri.h"
 #include "server_vision.h"
 
+// Attention Lens extraction (--attention-lens): the dedicated /v1/extract
+// endpoint. Document + complete key vocabulary → audited key-value JSON on the
+// attention trust layer. Inert unless the flag is set; the OpenAI endpoints are
+// untouched (docs/plan-qemmi-lens.md P2/A2).
+#include "server_lens.h"
+
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
@@ -290,6 +296,45 @@ public:
         }
         
         std::cout << "Memory reservation complete." << std::endl;
+    }
+
+    // ── Attention Lens (--attention-lens) ────────────────────────────────────
+    // Opt-in; arms the /v1/extract route. Inert otherwise — no lens code runs and
+    // the engine is byte-inert. Builds NO grammar: the lens decodes free (Stage 2,
+    // docs/note-nogrammar-refutation.md). This does not touch the per-request
+    // `grammar` field on /v1/completions and /v1/chat/completions, which is a
+    // separate shipped feature and still works exactly as before.
+    void enable_attention_lens() {
+        attention_lens_enabled_ = true;
+        std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
+                     "(single-slot; document → audited key-value JSON; free decode, "
+                     "tolerant parse, 422 on unparseable output)" << std::endl;
+    }
+    bool attention_lens_enabled() const { return attention_lens_enabled_; }
+
+    // Run one extraction and return the lens-format JSON. EXCLUSIVE: holds the
+    // model lock for the whole tapped decode and uses slot 0 (the only slot with
+    // a correct qwen36 decode KV gather — architecture.md §12 / plan A3), so it
+    // serializes against the inference thread's batched steps. Single-slot V1:
+    // do not drive concurrent OpenAI traffic on slot 0 while extracting.
+    //
+    // Throws std::runtime_error on bad input (empty concepts, oversized doc) ⇒ the
+    // route maps that to 400; qwenium::LensUnparseableError when the MODEL's output
+    // holds no parseable object ⇒ 422. Those are different events and the route
+    // must keep them apart (docs/lens-format.md §"The shape contract").
+    std::string extract_lens_json(const std::string& document,
+                                  const std::vector<qwenium::LensConcept>& concepts,
+                                  int max_new_tokens) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        qwenium::LensExtractOptions opts;
+        opts.max_new_tokens = max_new_tokens;
+        // One prefill, one pass, no grammar. Absent concepts come back
+        // value:null/badge:"absent" by omission — the model declines natively
+        // (30/30 on Leg C) once nothing forces it to fill every key.
+        qwenium::LensReport rep = qwenium::run_lens_extract(
+            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
+            (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts);
+        return qwenium::lens_report_to_json(rep);
     }
 
     void configure_server(qwenium::InferenceServer& server) {
@@ -694,6 +739,12 @@ private:
     // gated, transparent: a recurring system-prompt block skips its prefill on a
     // HIT (content-keyed by the prefix tokens). §1 decision A follow-on.
     std::unique_ptr<PrefixLibrary> text_prefix_lib_;
+
+    // Attention Lens (--attention-lens). Drives /v1/extract only; free decode.
+    // Stage 2 deleted both GrammarVocabs that used to live here — the fixed KV
+    // extraction grammar and the yes/no presence grammar — with the presence gate.
+    // The lens holds no grammar state at all now.
+    bool attention_lens_enabled_ = false;
 };
 
 // =============================================================================
@@ -1292,6 +1343,78 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         });
     });
 
+    // Attention Lens extraction endpoint (--attention-lens). Dedicated shape:
+    // inputs are (document, key_vocabulary), not chat messages; output is the
+    // lens format, not a completion. The OpenAI endpoints are untouched (A2).
+    // Single-slot, exclusive (integration.extract_lens_json holds the model
+    // lock). Returns 404 when the feature is off, 400 on bad input (fail-loud).
+    http.Post("/v1/extract", [&integration](const httplib::Request& req, httplib::Response& res) {
+        if (!integration.attention_lens_enabled()) {
+            res.status = 404;
+            res.set_content(json({{"error", "attention lens disabled — start the "
+                                            "server with --attention-lens"}}).dump(),
+                            "application/json");
+            return;
+        }
+        std::string document;
+        std::vector<qwenium::LensConcept> concepts;
+        int max_tokens = 512;
+        try {
+            json body = json::parse(req.body);
+            document = body.at("document").get<std::string>();
+            // key_vocabulary is an array of {key, gloss} objects. `gloss` is
+            // accepted but CURRENTLY UNUSED — its consumer, the presence gate,
+            // was deleted in Stage 2 (see LensConcept in server_lens.h). A bare
+            // string element is tolerated as {key, gloss:""} so string-array
+            // callers still work; the object form is canonical.
+            for (const auto& kv : body.at("key_vocabulary")) {
+                if (kv.is_string()) {
+                    concepts.push_back({kv.get<std::string>(), ""});
+                } else if (kv.is_object()) {
+                    qwenium::LensConcept c;
+                    c.key   = kv.at("key").get<std::string>();
+                    c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
+                    concepts.push_back(std::move(c));
+                } else {
+                    throw std::runtime_error("key_vocabulary element expected a "
+                                             "string or {\"key\",\"gloss\"} object");
+                }
+            }
+            if (body.contains("max_tokens")) max_tokens = body.at("max_tokens").get<int>();
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", std::string("bad request — expected "
+                "{\"document\": string, \"key_vocabulary\": [{\"key\",\"gloss\"}|string,...], "
+                "\"max_tokens\"?: int}: ") + e.what()},
+                {"code", "bad_request"}}).dump(), "application/json");
+            return;
+        }
+        try {
+            std::string lens_json =
+                integration.extract_lens_json(document, concepts, max_tokens);
+            res.set_content(lens_json, "application/json");
+        } catch (const qwenium::LensUnparseableError& e) {
+            // The shape contract (docs/lens-format.md): the REQUEST was fine —
+            // the model's output for THIS document could not be parsed. That is
+            // not a bad request, and an importer must be able to tell the two
+            // apart without string-matching a message: 400 means "fix your
+            // call", 422 means "route this document to a human". Carries `raw`
+            // so the failure is inspectable. Never a partial extraction, never
+            // an empty one — a refusal and "the document has none of these
+            // concepts" are different facts, and collapsing them would
+            // re-introduce the silent data loss the grammar used to cause, one
+            // layer up.
+            res.status = 422;
+            res.set_content(json({{"error", e.what()},
+                                  {"code", "unparseable_extraction"},
+                                  {"raw", e.raw}}).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", e.what()},
+                                  {"code", "bad_request"}}).dump(), "application/json");
+        }
+    });
+
     // Models endpoint (for compatibility)
     http.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json response = {
@@ -1329,6 +1452,7 @@ int main(int argc, char* argv[]) {
     std::string prefix_cache_dir;        // text: opt-in disk system-prefix KV cache
     bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
+    bool attention_lens = false;         // opt-in: enable POST /v1/extract (Qemmi-Lens)
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -1358,6 +1482,8 @@ int main(int argc, char* argv[]) {
             chat_prefix_cache = true;
         } else if (arg == "--conversational") {
             conversational = true;
+        } else if (arg == "--attention-lens") {
+            attention_lens = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -1382,6 +1508,10 @@ int main(int argc, char* argv[]) {
                          "server. A conversation_id ('new' to start) retains KV "
                          "across turns and appends only the new turn (chat.cpp-grade; "
                          "warm != cold). Excludes --chat-prefix-cache; text path\n"
+                      << "  --attention-lens          Opt-in: enable POST "
+                         "/v1/extract — document + complete key vocabulary → "
+                         "audited key-value JSON on the attention trust layer "
+                         "(single-slot; Qwen3.6). OpenAI endpoints untouched\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
         }
@@ -1396,6 +1526,7 @@ int main(int argc, char* argv[]) {
         QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
                                           image_embed_cache_dir, image_prefix_cache_dir,
                                           prefix_cache_dir);
+        if (attention_lens) integration.enable_attention_lens();
 
         // Create inference server
         qwenium::InferenceServer::Config config;

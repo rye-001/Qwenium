@@ -465,6 +465,44 @@ target_link_libraries(forward-tests-qwen36 PRIVATE
 target_compile_features(forward-tests-qwen36 PRIVATE cxx_std_17)
 gtest_discover_tests(forward-tests-qwen36)
 
+# Qemmi-Lens attention tap (docs/plan-qemmi-lens.md P1/A1) — the ForwardPassBase
+# tap seam gated off-path byte-identical, on-path live-softmax, fail-loud.
+# Hosted on qwen36 (the pinned lens model); self-skips when QWEN36_MODEL_PATH unset.
+add_executable(forward-pass-base-tests
+    unit/test_forward_pass_base.cpp
+)
+
+target_link_libraries(forward-pass-base-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+    ggml
+)
+
+target_compile_features(forward-pass-base-tests PRIVATE cxx_std_17)
+gtest_discover_tests(forward-pass-base-tests)
+
+# Qemmi-Lens pure computation (docs/plan-qemmi-lens.md P2) — compute_lens_report
+# / lens_report_to_json exercised with synthetic tap rows (no model). Compiles
+# server_lens.cpp directly; the driver half links the model/grammar libs.
+add_executable(server-lens-tests
+    unit/test_server_lens.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/server_lens.cpp
+)
+
+target_link_libraries(server-lens-tests PRIVATE
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
+    qinf-models
+    qinf-loader
+    sampling
+    core
+    ggml
+)
+
+target_compile_features(server-lens-tests PRIVATE cxx_std_17)
+gtest_discover_tests(server-lens-tests)
+
 # feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
 # differential (docs/plan-feed-tokens.md). Self-skips when model absent.
 add_executable(feed-tokens-tests-qwen36
@@ -1277,6 +1315,26 @@ target_link_libraries(alloc-reuse PRIVATE
     ggml
 )
 target_compile_features(alloc-reuse PRIVATE cxx_std_17)
+
+# Attention-provenance probe (N3) — does the decode attention row point at the
+# value's source span? Reads back the post-softmax kq_soft.<il> tensors.
+# Compiles server_lens.cpp so the QDOCS_S1 Stage 1 gate measures the SHIPPED
+# lens math (run_lens_extract / compute_lens_report / the A5.4 predicates),
+# not this file's older inline copy — the gate would be worthless against a
+# lookalike. Same source-in-target pattern as server-lens-tests, same libs.
+add_executable(attn-provenance
+    perf/attn_provenance.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/server_lens.cpp
+)
+target_link_libraries(attn-provenance PRIVATE
+    nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    ggml
+)
+target_compile_features(attn-provenance PRIVATE cxx_std_17)
 
 # PR 4.1 investigation — per-stage MoE timing.
 # Disposable: once the breakdown identifies the right fusion shape, this binary

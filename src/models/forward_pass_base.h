@@ -203,6 +203,38 @@ public:
     bool output_hidden() const { return output_hidden_; }
     std::vector<float> get_output_hidden(ggml_cgraph* gf);
 
+    // ── Lens tap: opt-in attention-row output (docs/plan-qemmi-lens.md P1/A1) ─
+    // The Qemmi-Lens trust layer reads each tapped attention layer's
+    // post-softmax row `kq_soft.<il>` (the distribution over KV positions for
+    // the query token). Those tensors are already NAMED by layers/attention.cpp
+    // on every recipe, so this seam is recipe-agnostic (Gemma hosts it inert)
+    // and requires zero layer/recipe edits — the same "mark an existing node as
+    // an output" trick as D3 set_output_hidden above. Default (empty layer set)
+    // ⇒ nothing is marked ⇒ the graph is node-for-node what it is today, so the
+    // tap-off byte-identity gate holds.
+    //
+    // Usage mirrors the QDOCS probe sequence, caller-driven so no recipe method
+    // changes: build_decoding_graph(...) → mark_attention_taps(gf) → alloc →
+    // set_decode_inputs → compute → get_attention_taps(gf). Marking must happen
+    // after build and before graph alloc (galloc would otherwise reuse the
+    // buffer). Single query token per call (decode); the row is [n_kv, n_head].
+    struct AttentionTap {
+        int layer;                 // attention layer index (il), as requested
+        int n_kv;                  // KV positions in the row (= tensor ne[0])
+        int n_head;                // attention heads (= tensor ne[2])
+        std::vector<float> rows;   // row-major [n_head][n_kv]; row h sums to ~1
+    };
+    void set_attention_taps(std::vector<int> layers) { attention_taps_ = std::move(layers); }
+    const std::vector<int>& attention_taps() const { return attention_taps_; }
+    // Mark each armed layer's `kq_soft.<il>` as a graph output on `gf`. No-op
+    // when the layer set is empty (byte-inert). Fail-loud if an armed layer's
+    // tap tensor is absent from the graph (names the layer, expected, actual).
+    void mark_attention_taps(ggml_cgraph* gf);
+    // Read the marked rows back after compute. Result[i] corresponds to
+    // attention_taps()[i]. Fail-loud if a tap tensor is missing (the caller
+    // forgot mark_attention_taps before alloc).
+    std::vector<AttentionTap> get_attention_taps(ggml_cgraph* gf);
+
 protected:
     const ModelMetadata& meta_;
     const Model& model_;
@@ -383,6 +415,7 @@ protected:
 
     bool slice_prefill_head_ = true;
     bool output_hidden_ = false;   // D3 opt-in; see set_output_hidden
+    std::vector<int> attention_taps_;  // lens-tap opt-in; see set_attention_taps
     // Defaults = today's decode: baked-offset cpy write, exact per-step n_kv.
     // The opt-in persistent path (--persistent-graph) sets both to
     // {SetRows, 256} together; nothing else changes them.
