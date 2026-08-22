@@ -95,7 +95,8 @@ int run_complete(
         const auto& cmp_meta = model.get_metadata();
         register_builtin_models();
         std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
-            model, &cmp_meta, args.context_length, 1);
+            model, &cmp_meta, args.context_length, 1,
+            args.kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
 
         // --speculative mtp: build the MtpDraft-backed decoder here — the head
         // lives on the recipe, which only now exists. Fail-loud if the loaded

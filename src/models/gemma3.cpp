@@ -106,7 +106,7 @@ constexpr size_t GEMMA3_GRAPH_SIZE = 16384;
 
 Gemma3ForwardPass::Gemma3ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, ggml_type kv_type)
     : ForwardPassBase(model, metadata),
       config_(Gemma3Config::from_metadata(*metadata))
 {
@@ -123,8 +123,8 @@ Gemma3ForwardPass::Gemma3ForwardPass(
         max_batch_size,
         n_embd_k,
         n_embd_v,
-        GGML_TYPE_F32,
-        GGML_TYPE_F32,
+        kv_type,
+        kv_type,
         cache_backend);
 
     // Sandwich norm weights (G2-inherited).

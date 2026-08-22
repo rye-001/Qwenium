@@ -759,6 +759,7 @@ target_link_libraries(layer-tests PRIVATE
     GTest::gtest_main
     qinf-layers
     qinf-state
+    qinf-session
     ggml
 )
 

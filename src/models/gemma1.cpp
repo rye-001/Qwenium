@@ -33,7 +33,7 @@ constexpr size_t GEMMA1_GRAPH_SIZE = 16384;
 
 Gemma1ForwardPass::Gemma1ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, ggml_type kv_type)
     : ForwardPassBase(model, metadata)
 {
     ggml_backend_t cache_backend = model_.has_metal_backend()
@@ -49,8 +49,8 @@ Gemma1ForwardPass::Gemma1ForwardPass(
         max_batch_size,
         n_embd_k,
         n_embd_v,
-        GGML_TYPE_F32,
-        GGML_TYPE_F32,
+        kv_type,
+        kv_type,
         cache_backend
     );
 }

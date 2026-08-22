@@ -59,7 +59,8 @@ int run_session(Model& model, const CliArgs& args,
 
     register_builtin_models();
     std::unique_ptr<ForwardPassBase> fp =
-        create_forward_pass(model, &meta, args.context_length, /*max_batch=*/1);
+        create_forward_pass(model, &meta, args.context_length, /*max_batch=*/1,
+                            args.kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
     if (!fp->feed_tokens_supported()) {
         std::cerr << "run_session: recipe \"" << meta.architecture
                   << "\" expected feed_tokens support (L1 restore is "

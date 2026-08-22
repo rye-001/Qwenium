@@ -144,7 +144,8 @@ TokenizerConfig gemma4_tokenizer_config();
 class Gemma4ForwardPass : public ForwardPassBase, public IImageEmbeddable {
 public:
     Gemma4ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1);
+                      uint32_t context_len, uint32_t max_batch_size = 1,
+                      ggml_type kv_type = GGML_TYPE_F32);
     ~Gemma4ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,

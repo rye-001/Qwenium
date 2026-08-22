@@ -33,7 +33,8 @@ TokenizerConfig gemma1_tokenizer_config();
 class Gemma1ForwardPass : public ForwardPassBase {
 public:
     Gemma1ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1);
+                      uint32_t context_len, uint32_t max_batch_size = 1,
+                      ggml_type kv_type = GGML_TYPE_F32);
     ~Gemma1ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,

@@ -215,6 +215,15 @@ void Model::load_tensors()
 
     std::cout << "All tensors loaded and assigned successfully." << std::endl;
 
+    // Weights now live in the backend buffer (Metal unified memory, or the
+    // CPU-path ggml context). The GGUF mapping has been fully faulted in by
+    // the copy above, so leaving it open costs a second resident copy of every
+    // weight for the life of the process -- measured 1.4 GB on Qwen3.5-0.8B,
+    // and ~13 GB on a 27B. Nothing reads it after this point: metadata was
+    // extracted into owning structures, tensor pointers address the backend
+    // buffer, and the tokenizer builds from metadata_. Release it.
+    loader_->release_file_mapping();
+
     // Tokenizer config comes from the model registry, not the GGUF.  The
     // architecture knows its invariants (e.g. Gemma always needs BOS); GGUF
     // fields like tokenizer.ggml.add_bos_token can disagree (Unsloth exports

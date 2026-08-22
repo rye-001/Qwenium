@@ -547,6 +547,11 @@ void GGUFLoader::cleanup_resources()
     file_mapper_.reset();
 }
 
+void GGUFLoader::release_file_mapping()
+{
+    file_mapper_.reset();
+}
+
 void GGUFLoader::is_valid_utf8(const std::string &str) const
 {
     int i = 0;
@@ -719,6 +724,11 @@ const void* GGUFLoader::get_tensor_data(const std::string& name) const
 {
     if (!is_loaded_) {
         throw GGUFLoadError("Model not loaded");
+    }
+    if (!file_mapper_) {
+        throw GGUFLoadError(
+            "get_tensor_data: file mapping expected to be live, got released "
+            "(release_file_mapping() already ran) for tensor \"" + name + "\"");
     }
     
     auto it = metadata_.tensor_inventory.find(name);

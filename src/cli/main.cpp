@@ -61,6 +61,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
     std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
+    std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
     std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
     std::cout << "  --image-embed-cache DIR (chat) Disk cache for image embeddings; encode each image once per node (ViT skip)\n";
@@ -137,6 +138,8 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
             }
         } else if (arg == "--persistent-graph") {
             args.persistent_graph = true;
+        } else if (arg == "--kv-f16") {
+            args.kv_f16 = true;
         } else if (arg == "--mtp-max-draft") {
             if (i + 1 >= argc) { std::cerr << "--mtp-max-draft needs a value\n"; return false; }
             args.mtp_max_draft = std::stoi(argv[++i]);

@@ -71,7 +71,7 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
 
 Qwen35ForwardPass::Qwen35ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, ggml_type kv_type)
     : ForwardPassBase(model, metadata)
 {
     // Construct the typed config; validates qwen35-specific invariants.
@@ -115,7 +115,7 @@ Qwen35ForwardPass::Qwen35ForwardPass(
     kv_cache_ = std::make_unique<simple_kv_cache>(
         n_attn_layers, context_len, max_batch_size,
         n_embd_k, n_embd_v,
-        GGML_TYPE_F32, GGML_TYPE_F32,
+        kv_type, kv_type,
         cache_backend
     );
 

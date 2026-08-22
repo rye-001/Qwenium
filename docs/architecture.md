@@ -202,7 +202,22 @@ maps the GGUF `general.architecture` string to a recipe factory and a tensor
 *inventory validator* — the load fails loudly if a tensor the recipe needs is
 missing or mis-shaped, before any graph is built. `core/model` then allocates
 one backend buffer for all weights and copies them in (the copy is the SSD
-read; unified memory removes the PCIe hop, not the disk).
+read; unified memory removes the PCIe hop, not the disk), and **then releases
+the mapping** (`release_file_mapping`). That release is load-bearing, not
+tidiness: the copy faults in every page, so holding the mapping open keeps a
+second full copy of the weights resident for the process lifetime — measured
+5.31 → 1.75 GB steady-state RSS on Qwen3.5-0.8B (9B: ~10.4 → 5.83 GB), and
+~13 GB of avoidable residency on a 27B. After it, the loader's tensor-data
+accessors throw rather than dereference a released mapping. `vision_loader`
+has always done the equivalent (`unload_model`) for the projector.
+
+This fixes *steady-state* residency, not the **load-time peak**: the copy
+still needs the source mapping and the destination buffer live at the same
+instant, so peak stays ≈ 2× model size for any model large enough that the
+copy dominates (measured: 9B peak unchanged at ~10.6 GB). Capacity-plan
+loading against 2× and serving against 1×. Removing the peak means removing
+the copy — backing the backend buffer with the mmap'd pages — which is not
+done here.
 
 **Prefill.** The prompt is tokenized and rendered through the family's
 `chat_template`. The recipe builds the *prefill graph* — all prompt tokens in
@@ -438,6 +453,21 @@ The single most load-bearing distinction in the engine:
 | Update | **append** a column per token | **overwrite** one fixed-size matrix |
 | Size | grows with context | constant |
 | Rollback | move the position pointer (O(1) truncate) | restore a checkpoint (copy) |
+| Element type | F32, or F16 via `--kv-f16` | always F32 |
+
+**KV element type.** `simple_kv_cache` takes `type_k`/`type_v`; every recipe
+passes what `create_forward_pass` was given, defaulting to **F32** (the
+historical, byte-identical behaviour). `--kv-f16` halves KV bytes and is
+token-stable but *not* byte-identical, so it carries the same status as
+`--persistent-graph` (§10). Recurrent state is unaffected — always F32.
+Measured on both families at ctx 4096: Qwen3.5-0.8B 96 -> 48 MB, Gemma 3 1B
+208 -> 104 MB, Qwen 3.6 160 -> 80 MB, with the greedy token sequence and the
+top-5 ordering unchanged. Attention reads the cache through views whose
+strides are derived from the tensor's own type, never `sizeof(float)`;
+hardcoding the stride silently mis-reads a non-F32 cache instead of failing.
+The dtype is part of `path_tag()` and of each slot's serialized header, so a
+snapshot or prefix blob captured under one KV dtype is refused fail-loud
+rather than resumed under another.
 
 They are **never unified** behind a shared base class — a common interface
 would force no-ops on one side and hide the rewind asymmetry that matters for
@@ -531,7 +561,10 @@ used only for the output-head matmul, overlapping with the next token's body.
   generation that ran batched cannot be byte-replayed without its batch;
   byte-replay claims (witnesses, counterfactual diffs) hold at B=1 — the lens
   path is single-slot for this reason too, not only the qwen36 gather bug
-  (§12). (d) **Nondeterministic kernels are inadmissible on the receipts
+  (§12). **KV element type is part of "config"**: an F16-cache generation
+  replays byte-identically only under F16, and the lens calibration numbers
+  were measured under F32, so F16 is not a calibrated receipts path until
+  re-measured. This is why `--kv-f16` is opt-in and F32 stays the default. (d) **Nondeterministic kernels are inadmissible on the receipts
   path** — a Metal kernel using atomics/async reduction ordering may be fast,
   but it forfeits every replay claim; it needs an explicit decision, not a
   benchmark win.
@@ -543,6 +576,17 @@ used only for the output-head matmul, overlapping with the next token's body.
 Current, verified against the tree at time of writing:
 
 - `src/core/` naming/admission is unsettled (§4 flag).
+- **`--kv-f16` on Gemma 4 MoE is unexplained and ungated.** F32→F16 shifts the
+  step-0 top-1 logit by 0.93 on `gemma-4-26B-A4B-it-Q2_K` (later steps drift
+  0.06–0.3), against 0.0007–0.0387 on every other recipe including Gemma 4
+  *dense* at Q8_0 and Qwen 3.6 MoE. Ruled out by measurement: it is not
+  nondeterminism (F32-vs-F32 and F16-vs-F16 are both bit-identical), not the
+  Gemma 4 recipe's KV plumbing (dense is 0.0387), not MoE as such (Qwen 3.6 is
+  0.0021), and not nominal quant level (both are `file_type=10`, and the Gemma
+  checkpoint carries *more* bits/param). Greedy tokens still matched at 4
+  steps, but that is thin evidence on a checkpoint whose output is already
+  incoherent on the probe prompt. Treat Gemma 4 MoE + `--kv-f16` as unvalidated
+  until the amplification is explained.
 - `forward_pass_base` remains a shared base class; the blueprint's direction
   is composition-over-inheritance and it is a known eventual deletion target.
 - The chat endpoint flattens engine finish reasons (`timeout`, `cancelled`,

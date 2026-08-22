@@ -220,7 +220,7 @@ constexpr size_t GEMMA4_GRAPH_SIZE = 32768;  // larger than G3 — dual FFN + Mo
 
 Gemma4ForwardPass::Gemma4ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, ggml_type kv_type)
     : ForwardPassBase(model, metadata),
       config_(Gemma4Config::from_metadata(*metadata))
 {
@@ -235,14 +235,14 @@ Gemma4ForwardPass::Gemma4ForwardPass(
         const uint32_t n_embd_v = n_embd_k;  // sliding has separate V same shape
         kv_cache_swa_ = std::make_unique<simple_kv_cache>(
             config_.n_swa_layers, context_len, max_batch_size,
-            n_embd_k, n_embd_v, GGML_TYPE_F32, GGML_TYPE_F32, cache_backend);
+            n_embd_k, n_embd_v, kv_type, kv_type, cache_backend);
     }
     if (config_.n_global_layers > 0) {
         const uint32_t n_embd_k = config_.n_kv_heads_global * config_.head_dim_global;
         const uint32_t n_embd_v = n_embd_k;  // V == K for global; same shape
         kv_cache_global_ = std::make_unique<simple_kv_cache>(
             config_.n_global_layers, context_len, max_batch_size,
-            n_embd_k, n_embd_v, GGML_TYPE_F32, GGML_TYPE_F32, cache_backend);
+            n_embd_k, n_embd_v, kv_type, kv_type, cache_backend);
     }
 
     // Pre-resolve all per-block tensor pointers — string lookups on the

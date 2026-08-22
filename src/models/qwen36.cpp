@@ -92,7 +92,8 @@ Qwen36ForwardPass::Qwen36ForwardPass(
     const Model&    model,
     const ModelMetadata* metadata,
     uint32_t             context_len,
-    uint32_t             max_batch_size)
+    uint32_t             max_batch_size,
+    ggml_type            kv_type)
     : ForwardPassBase(model, metadata)
 {
     const auto& m = *metadata;
@@ -148,7 +149,7 @@ Qwen36ForwardPass::Qwen36ForwardPass(
         context_len,
         max_batch_size,
         n_embd_k, n_embd_v,
-        GGML_TYPE_F32, GGML_TYPE_F32,
+        kv_type, kv_type,
         cache_backend);
 
     // DeltaNet state — 30 DeltaNet layers, backend-backed.
@@ -177,7 +178,7 @@ Qwen36ForwardPass::Qwen36ForwardPass(
         mtp_kv_ = std::make_unique<simple_kv_cache>(
             /*n_layers=*/1, /*n_ctx_max=*/32, /*n_batch_max=*/1,
             n_embd_k, n_embd_v,
-            GGML_TYPE_F32, GGML_TYPE_F32,
+            kv_type, kv_type,
             cache_backend);
         std::cout << "[qwen36] MTP/NextN head present (block "
                   << n_main_layers_ << ") — draft capability on" << std::endl;

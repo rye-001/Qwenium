@@ -23,7 +23,8 @@ using ForwardPassFactory = std::function<std::unique_ptr<ForwardPassBase>(
     const Model&        model,
     const ModelMetadata*     metadata,
     uint32_t                 context_len,
-    uint32_t                 max_batch_size)>;
+    uint32_t                 max_batch_size,
+    ggml_type                kv_type)>;
 
 // Per-architecture tensor-inventory validator.
 // Throws std::runtime_error (naming slot, expected, actual) on failure.
@@ -65,11 +66,16 @@ const ChatTemplate* lookup_chat_template(const std::string& architecture);
 
 // Create a forward pass for the architecture in `metadata`. Throws
 // std::runtime_error if the architecture is not registered.
+// `kv_type` selects the attention KV cache element type (GGML_TYPE_F32 or
+// GGML_TYPE_F16). It defaults to F32, which is byte-identical to the
+// behaviour before the type became selectable; F16 halves KV memory and is
+// opt-in per --kv-f16. Recurrent (DeltaNet/SSM) state is unaffected.
 std::unique_ptr<ForwardPassBase> create_forward_pass(
     const Model&    model,
     const ModelMetadata* metadata,
     uint32_t             context_len,
-    uint32_t             max_batch_size);
+    uint32_t             max_batch_size,
+    ggml_type            kv_type = GGML_TYPE_F32);
 
 // Register all built-in model recipes (qwen2/3, qwen35, qwen35moe, gemma).
 // Idempotent — safe to call multiple times. Call once from CLI startup.
