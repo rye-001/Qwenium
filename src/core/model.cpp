@@ -238,6 +238,21 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
         }
 
         blocks_.resize(metadata_.block_count);
+
+        // Fail-loud tensor lookup: names the architecture and the missing
+        // tensor.  Used by the qwen35-family branches below; the older
+        // branches still use tensors.at(), which throws an unnamed
+        // std::out_of_range.
+        auto require = [&](const std::string& key) -> ggml_tensor* {
+            auto it = tensors.find(key);
+            if (it == tensors.end()) {
+                throw GGUFLoadError(
+                    metadata_.architecture + ": missing tensor '" + key +
+                    "': expected in block weights, got absent");
+            }
+            return it->second;
+        };
+
         for (uint32_t i = 0; i < metadata_.block_count; ++i) {
             std::string prefix = "blk." + std::to_string(i) + ".";
 
@@ -249,15 +264,6 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
 
                 // MoE FFN tensors present in every layer
-                auto require = [&](const std::string& key) -> ggml_tensor* {
-                    auto it = tensors.find(key);
-                    if (it == tensors.end()) {
-                        throw GGUFLoadError(
-                            "qwen35moe: missing tensor '" + key +
-                            "': expected in block weights, got absent");
-                    }
-                    return it->second;
-                };
                 blocks_[i].moe_router_weight     = require(prefix + "ffn_gate_inp.weight");
                 blocks_[i].moe_shexp_gate        = require(prefix + "ffn_gate_inp_shexp.weight");
                 blocks_[i].moe_exp_gate_weight   = require(prefix + "ffn_gate_exps.weight");
@@ -275,8 +281,7 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 // (docs/plan-mtp-decode.md §4): a full attention+MoE block plus the
                 // four nextn.* tensors, held out of the main decode stack by the
                 // recipe. 0 for a standard (non-MTP) GGUF ⇒ n_main == block_count.
-                const uint32_t nextn = metadata_.raw_kv
-                    .get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
+                const uint32_t nextn  = metadata_.nextn_predict_layers();
                 const uint32_t n_main = metadata_.block_count - nextn;
                 const bool is_nextn = (i >= n_main);
                 // NextN blocks are attention-typed regardless of position.
@@ -317,27 +322,45 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 // qwen35: FFN norm is called "post_attention_norm"
                 blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
 
+                // Inline arithmetic: tensor binding runs at load time, before any recipe
+                // exists.  Typed configs (Qwen35Config) are constructed by recipes after
+                // this runs — chicken/egg.  Use the same formula the recipe and validator use.
                 const uint32_t fai = metadata_.raw_kv.get_uint32("qwen35.full_attention_interval");
-                const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+                // The last `nextn_predict_layers` blocks are the MTP/NextN head
+                // (docs/plan-mtp-decode.md §4): a full gated-attention + dense-FFN block
+                // plus the four nextn.* tensors, held out of the main decode stack by the
+                // recipe.  0 for a standard (non-MTP) GGUF ⇒ n_main == block_count.
+                // Qwen3.8-27B ships one (block_count 65 = 64 main + 1 NextN).
+                const uint32_t nextn  = metadata_.nextn_predict_layers();
+                const uint32_t n_main = metadata_.block_count - nextn;
+                const bool is_nextn = (i >= n_main);
+                // NextN blocks are attention-typed regardless of position.
+                const bool is_full = is_nextn || ((fai > 0) && ((i % fai) == (fai - 1)));
                 if (is_full) {
-                    // Full softmax attention layer (layers 3,7,11,15,19,23)
-                    blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                    blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                    blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                    blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
-                    blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
-                    blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+                    // Full softmax attention layer (every fai-th layer), or a NextN head block
+                    blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                    blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                    blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                    blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
+                    blocks_[i].attn_q_norm_weight = require(prefix + "attn_q_norm.weight");
+                    blocks_[i].attn_k_norm_weight = require(prefix + "attn_k_norm.weight");
                 } else {
                     // SSM (GatedDeltaNet) layer
-                    blocks_[i].ssm_a              = tensors.at(prefix + "ssm_a");
-                    blocks_[i].ssm_conv1d_weight  = tensors.at(prefix + "ssm_conv1d.weight");
-                    blocks_[i].ssm_dt_bias        = tensors.at(prefix + "ssm_dt.bias");
-                    blocks_[i].ssm_alpha_weight   = tensors.at(prefix + "ssm_alpha.weight");
-                    blocks_[i].ssm_beta_weight    = tensors.at(prefix + "ssm_beta.weight");
-                    blocks_[i].attn_qkv_weight    = tensors.at(prefix + "attn_qkv.weight");
-                    blocks_[i].attn_gate_weight   = tensors.at(prefix + "attn_gate.weight");
-                    blocks_[i].ssm_norm_weight    = tensors.at(prefix + "ssm_norm.weight");
-                    blocks_[i].ssm_out_weight     = tensors.at(prefix + "ssm_out.weight");
+                    blocks_[i].ssm_a              = require(prefix + "ssm_a");
+                    blocks_[i].ssm_conv1d_weight  = require(prefix + "ssm_conv1d.weight");
+                    blocks_[i].ssm_dt_bias        = require(prefix + "ssm_dt.bias");
+                    blocks_[i].ssm_alpha_weight   = require(prefix + "ssm_alpha.weight");
+                    blocks_[i].ssm_beta_weight    = require(prefix + "ssm_beta.weight");
+                    blocks_[i].attn_qkv_weight    = require(prefix + "attn_qkv.weight");
+                    blocks_[i].attn_gate_weight   = require(prefix + "attn_gate.weight");
+                    blocks_[i].ssm_norm_weight    = require(prefix + "ssm_norm.weight");
+                    blocks_[i].ssm_out_weight     = require(prefix + "ssm_out.weight");
+                }
+                if (is_nextn) {
+                    blocks_[i].nextn_eh_proj          = require(prefix + "nextn.eh_proj.weight");
+                    blocks_[i].nextn_enorm            = require(prefix + "nextn.enorm.weight");
+                    blocks_[i].nextn_hnorm            = require(prefix + "nextn.hnorm.weight");
+                    blocks_[i].nextn_shared_head_norm = require(prefix + "nextn.shared_head_norm.weight");
                 }
 
             } else if (metadata_.architecture == "qwen3") {

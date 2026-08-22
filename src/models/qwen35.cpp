@@ -26,6 +26,8 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
     const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32("qwen35.ssm.conv_kernel");
     const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
     const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32_opt("qwen35.rope.dimension_count").value_or(0u);
+    // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
+    const uint32_t nextn_predict_layers    = meta.nextn_predict_layers();
 
     QINF_ASSERT(ssm_state_size > 0,
         "Qwen35Config: field \"ssm_state_size\" expected > 0, got 0 "
@@ -45,6 +47,11 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
     QINF_ASSERT(full_attention_interval > 0,
         "Qwen35Config: field \"full_attention_interval\" expected > 0, got 0 "
         "(GGUF key: qwen35.full_attention_interval)");
+    QINF_ASSERT(nextn_predict_layers < meta.block_count,
+        "Qwen35Config: field \"nextn_predict_layers\" expected < block_count (" +
+        std::to_string(meta.block_count) + "), got " +
+        std::to_string(nextn_predict_layers) +
+        " (GGUF key: qwen35.nextn_predict_layers)");
 
     return Qwen35Config{
         ssm_conv_kernel,
@@ -54,6 +61,7 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
         ssm_inner_size,
         rope_dimension_count,
         full_attention_interval,
+        nextn_predict_layers,
     };
 }
 
@@ -77,10 +85,14 @@ Qwen35ForwardPass::Qwen35ForwardPass(
     uint32_t n_attn_layers = 0;
     uint32_t n_ssm_layers = 0;
 
-    kv_layer_map_.resize(meta_.block_count, -1);
-    ssm_layer_map_.resize(meta_.block_count, -1);
+    // Trailing NextN / MTP head blocks are loaded but are not part of the
+    // residual stream; the decode stack is n_main_layers_ deep.
+    n_main_layers_ = meta_.block_count - cfg_.nextn_predict_layers;
 
-    for (uint32_t il = 0; il < meta_.block_count; ++il) {
+    kv_layer_map_.resize(n_main_layers_, -1);
+    ssm_layer_map_.resize(n_main_layers_, -1);
+
+    for (uint32_t il = 0; il < n_main_layers_; ++il) {
         if (cfg_.is_full_attention_layer(il)) {
             kv_layer_map_[il] = static_cast<int32_t>(n_attn_layers++);
         } else {
@@ -90,7 +102,11 @@ Qwen35ForwardPass::Qwen35ForwardPass(
 
     std::cout << "[qwen35] Hybrid cache: " << n_attn_layers
               << " attention layers (KV), " << n_ssm_layers
-              << " SSM layers (recurrent state)" << std::endl;
+              << " SSM layers (recurrent state)";
+    if (cfg_.has_mtp_head())
+        std::cout << " (+" << cfg_.nextn_predict_layers
+                  << " NextN head block, excluded from the decode stack)";
+    std::cout << std::endl;
 
     // KV cache — attention layers only.
     uint32_t n_embd_k = meta_.attention_key_length * meta_.attention_head_count_kv;
@@ -136,7 +152,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     reset_context();
     ggml_cgraph* gf = new_graph();
 
-    const uint32_t n_layers = meta_.block_count;
+    const uint32_t n_layers = n_main_layers_;   // excludes any NextN head block
     const size_t n_tokens   = tokens.size();
 
     // Typed inputs for this graph (replaces set_inputs). Cleared here so
@@ -269,7 +285,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     reset_context();
     ggml_cgraph* gf = ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
 
-    const uint32_t n_layers = meta_.block_count;
+    const uint32_t n_layers = n_main_layers_;   // excludes any NextN head block
     const size_t n_batch    = tokens.size();
     const int64_t n_embd    = meta_.embedding_length;
 
@@ -437,13 +453,33 @@ void validate_qwen35_inventory(const ModelMetadata& meta)
         "attn_qkv.weight", "attn_gate.weight",
         "ssm_norm.weight", "ssm_out.weight"
     };
-    const uint32_t fai = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    // NextN / MTP head: the four tensors that turn the trailing block(s) into a
+    // multi-token-prediction head (docs/plan-mtp-decode.md §4).  Optional group:
+    //   nextn_predict_layers == 0            → no head, capability off (fine).
+    //   nextn_predict_layers  > 0, all found → capability on.
+    //   nextn_predict_layers  > 0, any missing → fail-loud naming it (below).
+    static const std::vector<std::string> nextn_tensors = {
+        "nextn.eh_proj.weight", "nextn.enorm.weight",
+        "nextn.hnorm.weight",   "nextn.shared_head_norm.weight"
+    };
+
+    const uint32_t fai   = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
+    const uint32_t nextn = meta.nextn_predict_layers();
+    if (nextn >= meta.block_count)
+        throw std::runtime_error(
+            "qwen35: field 'nextn_predict_layers' expected < block_count (" +
+            std::to_string(meta.block_count) + "), got " + std::to_string(nextn));
+    const uint32_t n_main = meta.block_count - nextn;
+
     for (uint32_t i = 0; i < meta.block_count; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
+        const bool is_nextn = (i >= n_main);
         for (const auto& t : shared) require(p + t, "block " + std::to_string(i));
-        const bool is_full = (fai > 0) && ((i % fai) == (fai - 1));
+        // Inline arithmetic: the validator runs at load time, before Qwen35Config
+        // is constructed.  NextN blocks are attention-typed regardless of position.
+        const bool is_full = is_nextn || ((fai > 0) && ((i % fai) == (fai - 1)));
         const auto& chosen = is_full ? attn_tensors : ssm_tensors;
-        const std::string kind = is_full ? "attention" : "SSM";
+        const std::string kind = is_nextn ? "NextN" : (is_full ? "attention" : "SSM");
         for (const auto& t : chosen) {
             if (inv.find(p + t) == inv.end())
                 throw std::runtime_error(
@@ -451,5 +487,8 @@ void validate_qwen35_inventory(const ModelMetadata& meta)
                     "': expected in " + kind + " layer " + std::to_string(i) +
                     ", got absent");
         }
+        if (is_nextn)
+            for (const auto& t : nextn_tensors)
+                require(p + t, "NextN layer " + std::to_string(i));
     }
 }

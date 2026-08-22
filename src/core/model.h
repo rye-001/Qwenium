@@ -80,6 +80,17 @@ struct ModelMetadata {
 
     // Raw GGUF KVs; family-specific fields read from here (typed members are universal-only).
     GGUFKVBag raw_kv;
+
+    // How many trailing blocks are an MTP draft head rather than real decode
+    // layers (docs/plan-mtp-decode.md §4).  Qwen3.8 ships one — block_count 65
+    // is 64 layers plus the head; Qwen3.5 ships none, and 0 just means "decode
+    // all block_count blocks".  Validators reject a head bigger than the model.
+    //
+    // Each family spells the key with its own arch prefix, so compose it
+    // ("qwen35.nextn_predict_layers", "qwen35moe.nextn_predict_layers", ...).
+    uint32_t nextn_predict_layers() const {
+        return raw_kv.get_uint32_opt(architecture + ".nextn_predict_layers").value_or(0);
+    }
 };
 
 enum class Qwen3ModelSize {
@@ -134,9 +145,10 @@ struct TransformerBlock {
     struct ggml_tensor* moe_shexp_up_weight   = nullptr; // ffn_up_shexp.weight       [n_embd, d_ffn]
     struct ggml_tensor* moe_shexp_down_weight = nullptr; // ffn_down_shexp.weight     [d_ffn, n_embd]
 
-    // === NextN / MTP head tensors (qwen35moe MTP GGUFs only) ===
-    // Present on the last `nextn_predict_layers` blocks. The NextN block is a
-    // full attention+MoE block (the attn/MoE fields above) *plus* these four.
+    // === NextN / MTP head tensors (MTP GGUFs only — qwen35moe, qwen35) ===
+    // Present on the last `nextn_predict_layers` blocks. A NextN block is an
+    // ordinary full-attention block (the fields above — with MoE FFN on
+    // qwen35moe, dense FFN on qwen35) *plus* these four.
     // The head predicts token t+1 from the main model's last hidden state; see
     // docs/plan-mtp-decode.md §4. enorm/hnorm are Gemma-style (1+w) RMSNorms.
     struct ggml_tensor* nextn_eh_proj           = nullptr; // nextn.eh_proj.weight          [2*n_embd, n_embd]

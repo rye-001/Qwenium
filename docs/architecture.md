@@ -53,7 +53,10 @@ commitment — the non-claims contract in [`lens-format.md`](lens-format.md)).
 
 Supported architectures (registered in
 [`src/models/model_registry.cpp`](../src/models/model_registry.cpp)):
-`qwen2`, `qwen3` (pure transformer), `qwen35` (attention + SSM hybrid),
+`qwen2`, `qwen3` (pure transformer), `qwen35` (DeltaNet + attention hybrid —
+hosts both the Qwen 3.5 and Qwen 3.8 releases; layer counts and the DeltaNet
+V:K head ratio come from metadata, and a trailing NextN/MTP head block is held
+out of the decode stack when present),
 `qwen35moe` (Qwen 3.6: DeltaNet + attention + MoE hybrid), `gemma`, `gemma2`,
 `gemma3`, `gemma4` (dense and MoE variants; Gemma 3 and 4 with vision).
 Gemma is not a courtesy port — it is the designated **cross-family forcing
@@ -161,7 +164,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly), `moe_residency` (routing-skew telemetry) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
