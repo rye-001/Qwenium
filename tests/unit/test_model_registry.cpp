@@ -51,7 +51,7 @@ TEST(ModelRegistry, RegisterAndLookupFakeFactory) {
     FakeForwardPass::construction_count = 0;
 
     register_model("fake_arch_test_only",
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, ggml_type) {
             ++FakeForwardPass::construction_count;
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
@@ -109,7 +109,7 @@ TEST(ModelRegistry, FakeValidatorIsCalledWithCorrectMetadata) {
     std::string captured_arch;
 
     register_model(arch,
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, ggml_type) {
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
         [&](const ModelMetadata& meta) {
@@ -125,7 +125,7 @@ TEST(ModelRegistry, FakeValidatorIsCalledWithCorrectMetadata) {
 
     // Verify that a validator error propagates verbatim as GGUFLoadError.
     register_model(arch,
-        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t) {
+        [](const Model& m, const ModelMetadata* meta, uint32_t, uint32_t, ggml_type) {
             return std::unique_ptr<ForwardPassBase>(new FakeForwardPass(m, meta));
         },
         [](const ModelMetadata&) {

@@ -79,7 +79,8 @@ public:
     Qwen36ForwardPass(const Model&     model,
                       const ModelMetadata*  metadata,
                       uint32_t              context_len,
-                      uint32_t              max_batch_size = 1);
+                      uint32_t              max_batch_size = 1,
+                      ggml_type             kv_type = GGML_TYPE_F32);
     ~Qwen36ForwardPass() override = default;
 
     // ── Graph building ───────────────────────────────────────────────────────

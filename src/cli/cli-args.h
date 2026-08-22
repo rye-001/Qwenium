@@ -47,6 +47,11 @@ struct CliArgs {
     // modulo ties (same status as speculative). Qwen3.5/3.6 + Gemma3 only
     // (persistent-capable recipes).
     bool persistent_graph = false;  // --persistent-graph
+    // Attention KV cache element type. F32 (default) is the byte-identical
+    // historical behaviour; F16 halves KV memory and is token-stable but not
+    // byte-identical, so receipts baselines are per-kv-type. Recurrent
+    // (DeltaNet/SSM) state is unaffected -- it is always F32.
+    bool kv_f16 = false;            // --kv-f16
     // Vision: a single image applied to the first user turn. Both
     // must be set together; requires a Gemma multimodal-capable tokenizer.
     std::string image_path;    // --image: JPEG/PNG to attach to the first turn

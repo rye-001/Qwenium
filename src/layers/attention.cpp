@@ -180,16 +180,16 @@ ggml_tensor* build_attention(
         head_dim_k,
         n_head_kv,
         n_kv,
-        head_dim_k * sizeof(float),
-        n_embd_k   * sizeof(float),
+        ggml_row_size(k_full->type, head_dim_k),
+        ggml_row_size(k_full->type, n_embd_k),
         0);
 
     v = ggml_view_3d(ctx, v_full,
         head_dim_v,
         n_head_kv,
         n_kv,
-        head_dim_v * sizeof(float),
-        n_embd_v   * sizeof(float),
+        ggml_row_size(v_full->type, head_dim_v),
+        ggml_row_size(v_full->type, n_embd_v),
         0);
 
     set_name(k, "k_view", il);
@@ -388,10 +388,10 @@ ggml_tensor* build_gated_attention(
     const int n_embd_kv = n_head_kv * n_embd_head;
     ggml_tensor* k_view = ggml_view_3d(ctx, k_full,
         n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
+        ggml_row_size(k_full->type, n_embd_head), ggml_row_size(k_full->type, n_embd_kv), 0);
     ggml_tensor* v_view = ggml_view_3d(ctx, v_full,
         n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
+        ggml_row_size(v_full->type, n_embd_head), ggml_row_size(v_full->type, n_embd_kv), 0);
 
     ggml_tensor* kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
     set_name(kq_mask, "kq_mask", il);

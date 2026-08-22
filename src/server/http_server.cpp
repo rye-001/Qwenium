@@ -128,9 +128,11 @@ public:
                           const std::string& mmproj_path = "",
                           const std::string& image_embed_cache_dir = "",
                           const std::string& image_prefix_cache_dir = "",
-                          const std::string& prefix_cache_dir = "")
+                          const std::string& prefix_cache_dir = "",
+                          bool kv_f16 = false)
         : max_ctx_per_slot_(max_ctx_per_slot),
-          max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)) {
+          max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)),
+          kv_type_(kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32) {
 
         std::cout << "Loading model from: " << model_path << std::endl;
         // Register architectures BEFORE load_metadata: the GGUF loader validates
@@ -176,11 +178,15 @@ public:
         std::cout << "Tokenizer + chat template wired for arch=" << arch << std::endl;
 
         // Initialize forward pass with max_slots_ slots (KV cache is sized
-        // ctx × slots × F32, so fewer slots frees context headroom — the right
-        // trade for one-request-at-a-time delegation).
+        // ctx × slots × kv_type_, so fewer slots frees context headroom — the
+        // right trade for one-request-at-a-time delegation). --kv-f16 halves
+        // that term; recurrent state is unaffected.
         const auto& srv_meta = model_.get_metadata();
+        std::cout << "KV cache type: "
+                  << (kv_type_ == GGML_TYPE_F16 ? "F16 (--kv-f16)" : "F32 (default)")
+                  << std::endl;
         forward_pass_ = create_forward_pass(
-            model_, &srv_meta, max_ctx_per_slot_, max_slots_);
+            model_, &srv_meta, max_ctx_per_slot_, max_slots_, kv_type_);
         
         scheduler_ = model_.get_scheduler();
         
@@ -745,6 +751,7 @@ private:
     // extraction grammar and the yes/no presence grammar — with the presence gate.
     // The lens holds no grammar state at all now.
     bool attention_lens_enabled_ = false;
+    ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-f16 selects F16
 };
 
 // =============================================================================
@@ -1453,6 +1460,7 @@ int main(int argc, char* argv[]) {
     bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
     bool attention_lens = false;         // opt-in: enable POST /v1/extract (Qemmi-Lens)
+    bool kv_f16 = false;                 // opt-in: F16 attention KV cache (halves KV memory)
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -1484,6 +1492,8 @@ int main(int argc, char* argv[]) {
             conversational = true;
         } else if (arg == "--attention-lens") {
             attention_lens = true;
+        } else if (arg == "--kv-f16") {
+            kv_f16 = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -1501,6 +1511,9 @@ int main(int argc, char* argv[]) {
                          "image-position prefill for a recurring (context,image) (V2)\n"
                       << "  --prefix-cache DIR        Opt-in disk cache: skip the "
                          "prefill of a recurring system prompt (text path)\n"
+                      << "  --kv-f16                  Opt-in: store the attention KV "
+                         "cache as F16 instead of F32 (halves KV memory). Token-stable, "
+                         "not byte-identical; recurrent state stays F32\n"
                       << "  --chat-prefix-cache       Opt-in: retain each slot's KV "
                          "and prefill only the new turn of a growing conversation "
                          "(transparent, token-identical; text path)\n"
@@ -1525,7 +1538,7 @@ int main(int argc, char* argv[]) {
         // Initialize model integration
         QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
                                           image_embed_cache_dir, image_prefix_cache_dir,
-                                          prefix_cache_dir);
+                                          prefix_cache_dir, kv_f16);
         if (attention_lens) integration.enable_attention_lens();
 
         // Create inference server

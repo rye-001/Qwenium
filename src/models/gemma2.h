@@ -56,7 +56,8 @@ void validate_gemma2_inventory(const ModelMetadata& meta);
 class Gemma2ForwardPass : public ForwardPassBase {
 public:
     Gemma2ForwardPass(const Model& model, const ModelMetadata* metadata,
-                      uint32_t context_len, uint32_t max_batch_size = 1);
+                      uint32_t context_len, uint32_t max_batch_size = 1,
+                      ggml_type kv_type = GGML_TYPE_F32);
     ~Gemma2ForwardPass() override = default;
 
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens,

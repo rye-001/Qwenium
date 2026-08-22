@@ -68,6 +68,16 @@ public:
     // NEW: Get raw tensor data pointer (for backend copying)
     const void* get_tensor_data(const std::string& name) const;
 
+    // Release the mmap of the GGUF once its tensor data has been copied to the
+    // backend buffer. Until this is called the whole file stays resident
+    // alongside the backend copy -- two full copies of the weights, which on a
+    // 27B is ~13 GB of avoidable residency. Metadata is already extracted into
+    // owning structures, so nothing else needs the mapping.
+    //
+    // After this, get_tensor_data / load_all_tensors / load_tensor_metadata
+    // throw fail-loud rather than dereferencing a released mapping. Idempotent.
+    void release_file_mapping();
+
     void validate_tensor_shape(struct ggml_tensor* tensor, const std::vector<int64_t>& expected_dims);
 
     void validate_architecture(const ModelMetadata& meta) const;

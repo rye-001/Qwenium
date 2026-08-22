@@ -13,6 +13,7 @@
 
 #include "../../src/state/kv_cache_simple.h"
 #include "../../src/state/layer_state.h"
+#include "../../src/session/snapshot_io.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -110,4 +111,65 @@ TEST_F(KVCacheTest, GetKAndVTensorsAreNonNull) {
     RecordProperty("memory_bytes", static_cast<int64_t>(cache_->memory_bytes()));
 
     ggml_free(ctx);
+}
+
+
+// ── KV element type is selectable (--kv-f16) ─────────────────────────────────
+// simple_kv_cache has always taken type_k/type_v; these pin the two properties
+// the F16 option depends on, so a future change cannot silently break the
+// opt-in path or, worse, let an F16 blob resume into an F32 cache.
+
+TEST(KVCacheTypeTest, F16HalvesCacheBytes) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    simple_kv_cache f32(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F32, GGML_TYPE_F32, backend);
+    simple_kv_cache f16(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F16, GGML_TYPE_F16, backend);
+    EXPECT_GT(f32.memory_bytes(), 0u);
+    EXPECT_EQ(f16.memory_bytes() * 2, f32.memory_bytes());
+    ggml_backend_free(backend);
+}
+
+TEST(KVCacheTypeTest, PathTagSeparatesKvTypes) {
+    // path_tag feeds CompatHeader::build_path_tag, which is what stops an L2
+    // prefix blob captured under one KV dtype from being reused under another.
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    simple_kv_cache f32(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F32, GGML_TYPE_F32, backend);
+    simple_kv_cache f16(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F16, GGML_TYPE_F16, backend);
+    EXPECT_NE(f32.path_tag(), f16.path_tag());
+    ggml_backend_free(backend);
+}
+
+TEST(KVCacheTypeTest, RestoreAcrossKvTypesFailsLoud) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    simple_kv_cache f32(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F32, GGML_TYPE_F32, backend);
+    simple_kv_cache f16(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                        GGML_TYPE_F16, GGML_TYPE_F16, backend);
+
+    f32.advance(4, 0);
+    qinf::session::SnapshotWriter w;
+    f32.serialize_slot(w, 0);
+
+    qinf::session::SnapshotReader r(w.buffer().data(), w.buffer().size());
+    // Must throw naming type_k — a silent accept would resume a divergent slot.
+    EXPECT_THROW(f16.deserialize_slot(r, 0), std::runtime_error);
+    ggml_backend_free(backend);
+}
+
+TEST(KVCacheTypeTest, RestoreSameKvTypeRoundTrips) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    simple_kv_cache a(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                      GGML_TYPE_F16, GGML_TYPE_F16, backend);
+    simple_kv_cache b(N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV, N_EMBD_KV,
+                      GGML_TYPE_F16, GGML_TYPE_F16, backend);
+    a.advance(4, 0);
+    qinf::session::SnapshotWriter w;
+    a.serialize_slot(w, 0);
+    qinf::session::SnapshotReader r(w.buffer().data(), w.buffer().size());
+    EXPECT_NO_THROW(b.deserialize_slot(r, 0));
+    EXPECT_EQ(b.get_pos(0), 4u);
+    ggml_backend_free(backend);
 }

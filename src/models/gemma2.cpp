@@ -84,7 +84,7 @@ constexpr size_t GEMMA2_GRAPH_SIZE = 16384;
 
 Gemma2ForwardPass::Gemma2ForwardPass(
     const Model& model, const ModelMetadata* metadata,
-    uint32_t context_len, uint32_t max_batch_size)
+    uint32_t context_len, uint32_t max_batch_size, ggml_type kv_type)
     : ForwardPassBase(model, metadata),
       config_(Gemma2Config::from_metadata(*metadata))
 {
@@ -101,8 +101,8 @@ Gemma2ForwardPass::Gemma2ForwardPass(
         max_batch_size,
         n_embd_k,
         n_embd_v,
-        GGML_TYPE_F32,
-        GGML_TYPE_F32,
+        kv_type,
+        kv_type,
         cache_backend);
 
     // Pre-load the G2-specific post-norm weight pointers.
