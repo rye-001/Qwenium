@@ -32,7 +32,7 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
     const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32("qwen35moe.rope.dimension_count");
     const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
     // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
-    const uint32_t nextn_predict_layers    = meta.raw_kv.get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
+    const uint32_t nextn_predict_layers    = meta.nextn_predict_layers();
 
     QINF_ASSERT(ssm_state_size > 0,
         "Qwen35MoEConfig: field \"ssm_state_size\" expected > 0, got 0 "
@@ -753,7 +753,7 @@ void validate_qwen36_inventory(const ModelMetadata& meta)
     };
 
     const uint32_t fai   = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
-    const uint32_t nextn = meta.raw_kv.get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
+    const uint32_t nextn = meta.nextn_predict_layers();
     if (nextn >= meta.block_count)
         throw std::runtime_error(
             "qwen35moe: field 'nextn_predict_layers' expected < block_count (" +

@@ -700,6 +700,19 @@ target_link_libraries(mtp-inventory-tests PRIVATE
 target_compile_features(mtp-inventory-tests PRIVATE cxx_std_17)
 gtest_discover_tests(mtp-inventory-tests)
 
+# qwen35 NextN / MTP head recognition (Qwen3.8 ships one, Qwen3.5 does not)
+# — synthetic metadata, no GGUF needed.
+add_executable(qwen35-nextn-tests
+    unit/test_qwen35_nextn.cpp
+)
+target_link_libraries(qwen35-nextn-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    core
+)
+target_compile_features(qwen35-nextn-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen35-nextn-tests)
+
 # MTP/NextN head graph (Phase 3) — needs the real MTP GGUF in models/;
 # skips when absent. Run from the repo root (relative model path).
 add_executable(mtp-head-tests

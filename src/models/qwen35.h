@@ -28,6 +28,13 @@ struct Qwen35Config {
     // Hybrid-attention scheduling
     uint32_t full_attention_interval;
 
+    // Depth of the trailing NextN / MTP head (0 = none).  Qwen3.5-9B ships 0;
+    // Qwen3.8-27B ships 1, i.e. block_count 65 = 64 main + 1 NextN.  The head
+    // is held out of the main decode stack — see n_main_layers_.
+    uint32_t nextn_predict_layers;
+
+    bool has_mtp_head() const { return nextn_predict_layers > 0; }
+
     bool is_full_attention_layer(uint32_t il) const {
         if (full_attention_interval == 0) return true;
         return (il % full_attention_interval) == (full_attention_interval - 1);
@@ -40,19 +47,23 @@ struct Qwen35Config {
 };
 
 /**
- * Forward pass for Qwen3.5 hybrid SSM/attention architecture.
+ * Forward pass for the Qwen3.5 hybrid DeltaNet/attention architecture.
  *
- * 24 layers: 18 GatedDeltaNet (SSM) + 6 full softmax attention.
- * Full attention at every 4th layer (3, 7, 11, 15, 19, 23).
+ * Hosts every model whose GGUF declares arch "qwen35" — the Qwen3.5 and
+ * Qwen3.8 releases alike.  Layer counts are read from metadata, never
+ * assumed: Qwen3.5-9B is 32 layers (24 DeltaNet + 8 attention), Qwen3.8-27B
+ * is 64 (48 + 16) plus one NextN head block.  Full attention lands on every
+ * `full_attention_interval`-th layer (3, 7, 11, ...).
  *
  * Key differences from Qwen2/3:
  *   - Joint Q+Gate projection in attention layers (strided view extraction)
  *   - Gate sigmoid gating after attention output
  *   - Partial RoPE (64 of 256 dims)
- *   - KV cache only for 6 attention layers (not 24)
- *   - Fixed-size SSM recurrent state + conv state for 18 SSM layers
- *   - Weight tying (no output.weight — LM head reuses token_embd)
+ *   - KV cache only for the attention layers, not every layer
+ *   - Fixed-size DeltaNet recurrent state + conv state for the SSM layers
  *   - post_attention_norm instead of ffn_norm
+ *   - Optional trailing NextN / MTP head block, excluded from the decode
+ *     stack: the stack is n_main_layers_ deep, not meta_.block_count.
  */
 class Qwen35ForwardPass : public ForwardPassBase {
 public:
@@ -118,10 +129,18 @@ public:
 private:
     Qwen35Config cfg_;  // family-specific config, derived from ModelMetadata at construction
 
+    // Depth of the main decode stack: meta_.block_count minus the trailing
+    // NextN / MTP head blocks.  Every graph-building loop and every layer map
+    // is sized to this, NOT to block_count — the head is loaded but not run
+    // as part of the residual stream.
+    uint32_t n_main_layers_ = 0;
+
     std::unique_ptr<simple_kv_cache> kv_cache_;       // attention layers
     std::unique_ptr<DeltaNetState>   dn_state_;       // DeltaNet recurrent state (always present)
 
     // Physical layer index → cache layer index (-1 = not this cache type)
-    std::vector<int32_t> kv_layer_map_;    // [24] → 0..5 or -1
-    std::vector<int32_t> ssm_layer_map_;   // [24] → 0..17 or -1
+    // Sized to n_main_layers_; entry is the index into the corresponding
+    // cache, or -1 when the physical layer is not of that kind.
+    std::vector<int32_t> kv_layer_map_;    // physical layer → KV cache index
+    std::vector<int32_t> ssm_layer_map_;   // physical layer → DeltaNet state index
 };
