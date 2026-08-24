@@ -93,12 +93,6 @@ struct ModelMetadata {
     }
 };
 
-enum class Qwen3ModelSize {
-    QWEN3_0_6B,
-    QWEN3_8B,
-    QWEN3_32B
-};
-
 // Structs to hold the model's tensors
 struct TransformerBlock {
     // Attention (used by full attention layers in all architectures)
@@ -170,8 +164,16 @@ public:
     void load_tensors();
 
     bool validate_architecture() const;
-    Qwen3ModelSize detect_model_size() const;
-    std::string get_model_size_string() const;
+
+    // Total trainable parameters, summed from the tensor inventory (every
+    // tensor the GGUF ships, MoE experts and any NextN head included). This is
+    // the real count for whatever file was loaded -- it does not guess from
+    // block_count, and it needs no per-model table to keep current.
+    uint64_t parameter_count() const;
+    // parameter_count() rendered as a human label ("9.0B", "595M"). Returns
+    // "unknown" only when the inventory is empty, which cannot happen after a
+    // successful load.
+    std::string get_parameter_count_string() const;
     void print_metadata() const;
     
     const ModelMetadata& get_metadata() const { return metadata_; }

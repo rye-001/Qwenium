@@ -485,8 +485,12 @@ public:
 
 private:
     // Build the per-slot sampler for a freshly assigned request. temperature 0
-    // (or negative) => GreedySampler with the engine's defaults — byte-identical
-    // to the pre-sampling server. temperature > 0 => TemperatureSampler honoring
+    // (or negative) => GreedySampler, a true argmax — which is what
+    // inference_server.h has always promised this path does. (It did not until
+    // GreedySampler's 1.2 repetition-penalty default was removed; a
+    // temperature-0 request is now genuinely the model's argmax, and no longer
+    // matches the pre-2026-08 server byte-for-byte.) temperature > 0 =>
+    // TemperatureSampler honoring
     // top_p/top_k; a non-negative `seed` makes the draw stream reproducible.
     // Runs on the inference thread before this slot's prefill (no model_mutex_
     // needed: pure object construction, single-threaded with all sampling).

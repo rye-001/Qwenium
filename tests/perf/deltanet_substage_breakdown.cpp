@@ -105,13 +105,16 @@ struct DnWeights {
 
 static DnConfig read_dn_config(const ModelMetadata& meta) {
     DnConfig c{};
-    c.d_inner       = meta.raw_kv.get_uint32("qwen35moe.ssm.inner_size");
-    c.num_v_heads   = meta.raw_kv.get_uint32("qwen35moe.ssm.time_step_rank");
-    c.num_k_heads   = meta.raw_kv.get_uint32("qwen35moe.ssm.group_count");
+    // Read under the loaded model's architecture prefix -- qwen35 and qwen35moe
+    // both carry DeltaNet and must both be probeable.
+    const std::string A = meta.architecture;
+    c.d_inner       = meta.raw_kv.get_uint32(A + ".ssm.inner_size");
+    c.num_v_heads   = meta.raw_kv.get_uint32(A + ".ssm.time_step_rank");
+    c.num_k_heads   = meta.raw_kv.get_uint32(A + ".ssm.group_count");
     c.head_v_dim    = c.d_inner / c.num_v_heads;
-    c.head_k_dim    = meta.raw_kv.get_uint32("qwen35moe.ssm.state_size");
+    c.head_k_dim    = meta.raw_kv.get_uint32(A + ".ssm.state_size");
     c.conv_channels = c.d_inner + 2 * c.num_k_heads * c.head_k_dim;
-    c.conv_kernel   = meta.raw_kv.get_uint32("qwen35moe.ssm.conv_kernel");
+    c.conv_kernel   = meta.raw_kv.get_uint32(A + ".ssm.conv_kernel");
     c.rms_norm_eps  = meta.rms_norm_eps;
     return c;
 }
@@ -256,8 +259,10 @@ static BuiltGraph build_subgraph(
         rec_slot_floats, static_cast<size_t>(slot_idx) * rec_all->nb[1]);
     S = ggml_reshape_4d(ctx, S, head_v_dim, head_k_dim, num_v_heads, n_seqs);
 
+    // K = 1 state snapshot, matching src/layers/deltanet.cpp — see the comment
+    // there for why. ggml b10582 made K explicit; K=1 is the pre-b10582 layout.
     ggml_tensor* result = ggml_gated_delta_net(ctx,
-        q_conv, k_conv, v_conv, decay_gate, beta, S);
+        q_conv, k_conv, v_conv, decay_gate, beta, S, /*K=*/1);
 
     ggml_tensor* output = ggml_view_4d(ctx, result,
         head_v_dim, num_v_heads, n_seq_tokens, n_seqs,

@@ -7,6 +7,7 @@
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -462,31 +463,37 @@ bool Model::validate_architecture() const
            metadata_.architecture == "gemma3";
 }
 
-Qwen3ModelSize Model::detect_model_size() const
+uint64_t Model::parameter_count() const
 {
-    if (!is_loaded_) {
-        return Qwen3ModelSize::QWEN3_0_6B;
+    uint64_t total = 0;
+    for (const auto& [name, meta] : metadata_.tensor_inventory) {
+        uint64_t elements = 1;
+        for (uint64_t dim : meta.shape) {
+            elements *= dim;
+        }
+        total += elements;
     }
-
-    if (metadata_.block_count == 28) {
-        return Qwen3ModelSize::QWEN3_0_6B;
-    } else if (metadata_.block_count == 36) {
-        return Qwen3ModelSize::QWEN3_8B;
-    } else if (metadata_.block_count == 64) {
-        return Qwen3ModelSize::QWEN3_32B;
-    }
-
-    return Qwen3ModelSize::QWEN3_0_6B;
+    return total;
 }
 
-std::string Model::get_model_size_string() const
+std::string Model::get_parameter_count_string() const
 {
-    switch (detect_model_size()) {
-        case Qwen3ModelSize::QWEN3_0_6B: return "0.6B";
-        case Qwen3ModelSize::QWEN3_8B: return "8B";
-        case Qwen3ModelSize::QWEN3_32B: return "32B";
-        default: return "Unknown";
+    const uint64_t params = parameter_count();
+    if (params == 0) {
+        return "unknown";
     }
+
+    // Switch to "B" at the point where the "M" rendering would round to 1000
+    // or more, so a 999.9M-parameter Gemma 3 1B reads "1.0B" and not "1000M".
+    char buf[32];
+    if (params >= 999500000ull) {
+        std::snprintf(buf, sizeof(buf), "%.1fB", params / 1e9);
+    } else if (params >= 1000ull * 1000) {
+        std::snprintf(buf, sizeof(buf), "%.0fM", params / 1e6);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(params));
+    }
+    return std::string(buf);
 }
 
 void Model::print_metadata() const
@@ -505,6 +512,8 @@ void Model::print_metadata() const
         std::cout << "  Basename: " << *v << std::endl;
     if (auto v = metadata_.raw_kv.get_string_opt("general.finetune"); v)
         std::cout << "  Finetune: " << *v << std::endl;
+    if (auto v = metadata_.raw_kv.get_string_opt("general.size_label"); v)
+        std::cout << "  Size Label: " << *v << std::endl;
 
     std::cout << "  Block Count: " << metadata_.block_count << std::endl;
     std::cout << "  Embedding Length: " << metadata_.embedding_length << std::endl;
@@ -516,5 +525,6 @@ void Model::print_metadata() const
     std::cout << "  BOS token id: " << metadata_.bos_token_id
               << "  add_bos_token: " << (metadata_.add_bos_token ? "true" : "false") << std::endl;
     std::cout << "  EOS token id: " << metadata_.eos_token_id << std::endl;
-    std::cout << "  Detected Model Size: " << get_model_size_string() << std::endl;
+    std::cout << "  Parameters: " << get_parameter_count_string()
+              << " (" << parameter_count() << ")" << std::endl;
 }

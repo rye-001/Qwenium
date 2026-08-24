@@ -227,7 +227,14 @@ hybrids, advancing the recurrent state). Output: logits for the last position.
 **Decode loop.** Each step builds the (much smaller) *decode graph* for one
 token per active slot, runs it, and hands logits to sampling. The sampler
 applies repetition penalty, temperature/top-k/top-p (or argmax), constrained
-by the grammar mask if one is active. The chosen token is fed back as the next
+by the grammar mask if one is active. **Greedy means argmax**: `GreedySampler`
+applies no repetition penalty unless a caller passes one explicitly, so
+temperature 0 is the model's actual argmax — the precondition for §1's
+byte-reproducible-greedy-decode claim. It defaulted to a 1.2 penalty until
+2026-08, which silently steered every temperature-0 generation and was the
+sole cause of an apparent forward-pass divergence from llama.cpp and HF that
+did not exist
+([`engine-divergence-probe-results.md`](engine-divergence-probe-results.md)). The chosen token is fed back as the next
 step's input. Exit on EOS, stop sequence, token budget, or (server) timeout.
 
 Rebuilding + reallocating that graph every step costs ~12 ms of galloc replan

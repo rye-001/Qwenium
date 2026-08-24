@@ -75,7 +75,10 @@ int run_session(Model& model, const CliArgs& args,
         sampler = std::make_unique<qwenium::TemperatureSampler>(
             args.temperature, args.repetition_penalty, 64, args.top_k, args.top_p);
     } else {
-        sampler = std::make_unique<qwenium::GreedySampler>();
+        // Greedy is a true argmax unless --repeat-penalty was explicitly
+        // given (see complete.cpp).
+        sampler = std::make_unique<qwenium::GreedySampler>(
+            args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
     }
     if (grammar) sampler->set_grammar(grammar.get());
     sampler->build_token_trie(vocab);

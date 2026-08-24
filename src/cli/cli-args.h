@@ -14,6 +14,11 @@ struct CliArgs {
     int max_tokens = 100;
     float temperature = 0.7f;
     float repetition_penalty = 1.1f;
+    // Whether --repeat-penalty was actually passed. The greedy path needs to
+    // tell "user asked for 1.1" from "nobody said anything": greedy defaults to
+    // a true argmax, but an explicit --repeat-penalty must still be honored
+    // rather than silently dropped (it used to be).
+    bool repetition_penalty_set = false;
     int top_k = 40;
     float top_p = 0.95f;
     bool verbose = false;

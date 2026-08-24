@@ -88,6 +88,18 @@ target_link_libraries(draft-source-tests PRIVATE
 target_compile_features(draft-source-tests PRIVATE cxx_std_17)
 add_test(NAME draft-source-tests COMMAND draft-source-tests)
 
+# Sampler semantics, co-located with src/sampling/sampling.cpp. Pins "greedy
+# means argmax" -- see the comment at the top of the test file.
+add_executable(sampling-tests
+    unit/test_sampling.cpp
+)
+target_link_libraries(sampling-tests PRIVATE
+    GTest::gtest_main
+    sampling
+)
+target_compile_features(sampling-tests PRIVATE cxx_std_17)
+gtest_discover_tests(sampling-tests)
+
 # Define the integration test executable
 add_executable(integration-tests
     integration/test_e2e_generation.cpp

@@ -247,11 +247,27 @@ int TemperatureSampler::sample(std::vector<float>& logits,
     sorted.reserve(vocab_size);
     for (size_t i = 0; i < vocab_size; ++i)
         sorted.emplace_back(static_cast<int>(i), logits[i]);
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    if (top_k_ > 0 && top_k_ < static_cast<int>(vocab_size))
-        sorted.resize(top_k_);
+    // Total order: logit descending, token id ascending on exact ties. The tie
+    // break is explicit because the sampler supports a caller-chosen seed
+    // (OpenAI `seed`) and a reproducible draw stream needs a reproducible
+    // candidate list; a logit-only comparator leaves ties unspecified.
+    const auto by_logit = [](const std::pair<int, float>& a,
+                             const std::pair<int, float>& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    };
+
+    // Only the top-k candidates can survive, so rank only that many. Fully
+    // sorting the vocabulary is O(V log V) every step, and at Qwen 3.5's
+    // 248 320-token vocabulary that cost 15 ms/token -- about as much as the
+    // entire forward pass. nth_element makes the selection O(V) and leaves
+    // only the k survivors to sort.
+    if (top_k_ > 0 && top_k_ < static_cast<int>(vocab_size)) {
+        const size_t keep = static_cast<size_t>(top_k_);
+        std::nth_element(sorted.begin(), sorted.begin() + keep, sorted.end(), by_logit);
+        sorted.resize(keep);
+    }
+    std::sort(sorted.begin(), sorted.end(), by_logit);
 
     if (top_p_ > 0.0f && top_p_ < 1.0f) {
         const float max_l = sorted[0].second;

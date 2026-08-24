@@ -9,17 +9,20 @@ subsequent reconfigures.
 Real fused-op patches (PR 4.2.A onward — ggml_deltanet_post_state, etc.)
 land alongside this sentinel as separate numbered patch files.
 
----
- ggml/include/ggml.h | 2 ++
- 1 file changed, 2 insertions(+)
+Ported 2026-08-23 from ggml b6c83aad5 (libggml-metal 0.9.7) to b10582 /
+e85caa81e (libggml-metal 0.21.0). The added content is unchanged
+line-for-line; only anchor positions moved, plus the GGML_OP_COUNT
+static_assert (upstream added 4 ops after GATED_DELTA_NET, so the two
+qinf ops now follow DSV4_HC_POST in the enum and in both string tables).
 
+---
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 0000000..0000000 100644
+index 32462d79a..4c00b250b 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -1,3 +1,5 @@
 +// QINF_PATCH_SENTINEL: this header is patched at FetchContent time by qwen-inference;
 +// see patches/ in the qwen-inference repo for the patch series.
  #pragma once
-
+ 
  //

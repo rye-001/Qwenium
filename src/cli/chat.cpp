@@ -61,7 +61,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             sampler = std::make_unique<qwenium::TemperatureSampler>(
                 args.temperature, args.repetition_penalty, 64, args.top_k, args.top_p);
         } else {
-            sampler = std::make_unique<qwenium::GreedySampler>();
+            // Greedy is a true argmax unless --repeat-penalty was explicitly
+            // given. Passing it here is what makes the flag mean something on
+            // this path; it used to be silently dropped.
+            sampler = std::make_unique<qwenium::GreedySampler>(
+                args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
         }
         if (grammar) {
             sampler->set_grammar(grammar.get());

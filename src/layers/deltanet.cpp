@@ -164,9 +164,15 @@ ggml_tensor* build_deltanet_layer(
     // Returns a tensor that packs both the per-token output AND the final state:
     //   output:    [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]   (first part)
     //   new_state: [head_v_dim, head_k_dim,  num_v_heads,  n_seqs]  (second part)
+    //
+    // K is the number of trailing state snapshots the op writes, most-recent
+    // first. We keep only the final state, so K = 1 — which reproduces the
+    // single-state layout the op had before ggml b10582 made K explicit. Any
+    // K > 1 would grow the result tensor and shift the state view below.
+    constexpr int64_t kStateSnapshots = 1;
 
     ggml_tensor* result = ggml_gated_delta_net(ctx,
-        q_conv, k_conv, v_conv, decay_gate, beta, S);
+        q_conv, k_conv, v_conv, decay_gate, beta, S, kStateSnapshots);
     dn_set_name(gf, result, "dn_gdn_result", il);
 
     // Extract per-token output view

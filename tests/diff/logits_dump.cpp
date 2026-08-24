@@ -24,6 +24,10 @@
 //   --kv-f16         build the attention KV cache as F16 instead of F32
 //   --mem            report per-slot KV and recurrent-state bytes (the figure
 //                    that actually bounds the server's slot count)
+//   --slots N        forward-pass slot count (max_batch_size, default 1).
+//                    Decode still runs a single token in slot 0 — the knob is
+//                    for slot-count-fair comparisons against engines that
+//                    default to several slots (llama.cpp: -np 4).
 //   --bench          time prefill and N argmax decode steps separately and
 //                    report tok/s (no sampler heuristics in the loop)
 //   --tf             teacher-forced sweep: re-prefill every growing prefix of
@@ -93,7 +97,7 @@ void print_topk(const float* row, uint32_t vocab_size, int k,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <model.gguf> <out.bin> [--tokens a,b,c] [--text S] [--topk N] [--steps N] [--bos] [--tf]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model.gguf> <out.bin> [--tokens a,b,c] [--text S] [--topk N] [--steps N] [--bos] [--tf] [--bench] [--slots N]\n", argv[0]);
         return 2;
     }
     const std::string model_path = argv[1];
@@ -108,6 +112,10 @@ int main(int argc, char** argv) {
     bool want_bench = false;
     bool want_mem   = false;
     bool want_kv_f16= false;
+    int  n_slots    = 1;    // --slots N: forward-pass max_batch_size (slot count).
+                            // Decode still runs one token in slot 0; the knob
+                            // exists to test whether slot count alone moves the
+                            // number (fair comparison vs llama's default -np 4).
 
     for (int a = 3; a < argc; ++a) {
         const std::string opt = argv[a];
@@ -128,8 +136,9 @@ int main(int argc, char** argv) {
         else if (opt == "--bench")  want_bench = true;
         else if (opt == "--mem")    want_mem   = true;
         else if (opt == "--kv-f16") want_kv_f16= true;
+        else if (opt == "--slots")  n_slots    = std::atoi(need("--slots"));
         else {
-            std::fprintf(stderr, "error: argv[%d]: expected one of --tokens/--text/--topk/--steps/--bos/--tf/--dtopk/--bench/--mem/--kv-f16, got '%s'\n",
+            std::fprintf(stderr, "error: argv[%d]: expected one of --tokens/--text/--topk/--steps/--bos/--tf/--dtopk/--bench/--mem/--kv-f16/--slots, got '%s'\n",
                          a, opt.c_str());
             return 2;
         }
@@ -149,7 +158,11 @@ int main(int argc, char** argv) {
     const auto& meta = model.get_metadata();
     const uint32_t vocab_size = meta.vocab_size;
 
-    auto fp = create_forward_pass(model, &meta, 4096, 1,
+    if (n_slots < 1) {
+        std::fprintf(stderr, "error: --slots: expected >= 1, got %d\n", n_slots);
+        return 2;
+    }
+    auto fp = create_forward_pass(model, &meta, 4096, static_cast<uint32_t>(n_slots),
                                   want_kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
     ggml_backend_sched_t sched = model.get_scheduler();
 
@@ -315,6 +328,7 @@ int main(int argc, char** argv) {
         const double decode_s = std::chrono::duration<double>(t3 - t2).count();
 
         std::printf("\n# ---- bench ----\n");
+        std::printf("# slots           : %d\n", n_slots);
         std::printf("# prompt_tokens   : %zu\n", tokens.size());
         std::printf("# prefill_s       : %.4f\n", prefill_s);
         std::printf("# prefill_tok_s   : %.2f\n", tokens.size() / prefill_s);
