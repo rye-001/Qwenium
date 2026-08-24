@@ -51,7 +51,11 @@ int run_complete(
                 args.top_p
             );
         } else {
-            sampler = std::make_unique<qwenium::GreedySampler>();
+            // Greedy is a true argmax unless --repeat-penalty was explicitly
+            // given. Passing it here is what makes the flag mean something on
+            // this path; it used to be silently dropped.
+            sampler = std::make_unique<qwenium::GreedySampler>(
+                args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
         }
         if (grammar) {
             sampler->set_grammar(grammar.get());
@@ -108,12 +112,34 @@ int run_complete(
         ggml_backend_sched_t mtp_sched = nullptr;
         if (mtp_mode) {
             auto* mtp_cap = dynamic_cast<IMtpDraftable*>(forward_pass.get());
-            if (!mtp_cap || !mtp_cap->mtp_supported()) {
+            const uint32_t nextn = cmp_meta.nextn_predict_layers();
+            // Two distinct failures that used to share one (wrong) message:
+            // the recipe cannot draft at all, versus the recipe can draft but
+            // this GGUF ships no head. Telling a Qwen3.8 user to go find "an
+            // MTP-converted GGUF" sends them after a file they already have --
+            // their checkpoint carries the head, the qwen35 recipe just does
+            // not implement IMtpDraftable yet.
+            if (!mtp_cap) {
+                std::string msg =
+                    "--speculative mtp: MTP drafting expected implemented by "
+                    "the recipe for architecture '" + cmp_meta.architecture +
+                    "', actual not implemented (no IMtpDraftable)";
+                if (nextn > 0) {
+                    msg += " — note this GGUF does carry a NextN head (" +
+                           cmp_meta.architecture + ".nextn_predict_layers=" +
+                           std::to_string(nextn) + "): the head is loaded and "
+                           "held out of the decode stack, but no recipe-side "
+                           "draft path exists to use it";
+                }
+                throw std::runtime_error(msg);
+            }
+            if (!mtp_cap->mtp_supported()) {
                 throw std::runtime_error(
-                    "--speculative mtp: MTP capability expected present, actual "
-                    "absent — architecture '" + cmp_meta.architecture +
-                    "' has no NextN head (needs an MTP-converted GGUF with "
-                    "qwen35moe.nextn_predict_layers > 0)");
+                    "--speculative mtp: field '" + cmp_meta.architecture +
+                    ".nextn_predict_layers' expected > 0, actual " +
+                    std::to_string(nextn) +
+                    " — this GGUF carries no NextN head; use an MTP-converted "
+                    "GGUF for architecture '" + cmp_meta.architecture + "'");
             }
             forward_pass->set_output_hidden(true);
             if (model.has_metal_backend()) {

@@ -1,30 +1,73 @@
 # Qwenium
 
-A from-scratch LLM inference engine in C++ for the Qwen and Gemma families, using [ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml). Serve 10 concurrent users from a single 32GB Mac.
+**The inference engine that shows its work.**
 
-**Small codebase, modular architecture, clear boundaries.** Pure transformers, hybrid SSM+attention, MoE, and Gemma's per-layer-embedding variants, all in a codebase you can read in an afternoon.
+A self-contained C++ engine for the Qwen and Gemma families on
+[ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml), serving 10
+concurrent users from a single 32 GB Mac. Two model families on one
+cross-family architecture. Vision. Speculative decoding with a trained MTP
+head. Grammar-leashed output. Portable session snapshots. Warm conversational
+serving. Metal throughout, with custom fused DeltaNet kernels.
 
-Qwenium is built so you can read it, change it, and trust it. One directory per layer type. One file per model recipe. Adding a new model is a recipe, not a refactor.
+Every answer comes with the working notes behind it: which parts of your input
+it used, which parts it never touched, and a byte-identical re-run whenever you
+want to check. No other local engine does this.
+
+Prefill throughput and memory footprint match llama.cpp on the same file, and
+the forward pass agrees token-for-token with HuggingFace `transformers` — the
+model's own definition — not merely with another engine.
+
+Three things it is built to be:
+
+**Fast where it counts.** Metal throughout, batched multi-slot decode, three
+tiers of KV reuse. See [Performance](#performance) for the numbers, ours and
+theirs.
+
+**Readable and changeable.** One directory per layer type, one file per model
+recipe, tests co-located with their module. Adding a model is a recipe, not a
+refactor; adding a layer type is a file, not a factory. The architecture is a
+written contract ([`CLAUDE.md`](CLAUDE.md),
+[`docs/architecture.md`](docs/architecture.md)), enforced by a cross-family
+rule: no forward-pass interface is done until it hosts both a Qwen *and* a
+Gemma recipe without bending.
+
+**Auditable.** The part below.
 
 ## Answers, with receipts
 
-**Other engines return what the model said. Qwenium also returns where it looked, what decided it, and proof it happened.**
+Hand a contract to an assistant and ask: *"What's the penalty if we cancel
+late?"*
 
-- **Where it looked — attention.** Every decode step's attention is materialized in the graph (not fused away) and tappable at zero extra compute. Calibrated, it becomes receipts: per-value **source citations**, a whole-document **coverage audit** ("this line was never consulted"), and an **ungrounded-value flag** — served today via `/v1/extract` with `--attention-lens`, the engine side of [Qemmi-Lens](docs/plan-qemmi-lens.md).
-- **What decided it — determinism.** Greedy decode is byte-deterministic, with forkable state (warm prefix restore + recurrent-state checkpoints). Remove one line of the input, re-run, and the diff is fact, not sampling noise — counterfactual "prove it" experiments per field (Qemmi-Proof, in design).
-- **Proof it happened — integrity.** A weights hash computed at load, version-gated snapshots, kernel-path tags, and fail-loud replay refusal: a generation can carry a kilobyte witness and re-run byte-identical on demand (Qemmi-Seal, in design).
+A normal engine gives you an answer. It sounds confident. You have no idea
+whether it actually read page 7, where the exception is buried.
 
-One boundary, measured rather than asserted: these receipts show what the model **consulted** and let you **test and replay** what it did — they never claim to explain *why* it chose. Attention marks consideration, not commitment.
+Qwenium gives you the answer **plus the three things a careful assistant would
+volunteer:**
 
-## Why not just use llama.cpp?
+1. **"Here's where I got it."** The exact spans the answer drew on, as
+   per-value source citations.
+2. **"Here's what I never read."** Page 7 was never consulted. *This is the one
+   nobody else hands you, and it is the difference between trusting an answer
+   and trusting a guess.*
+3. **"Check me if you like."** Ask again and get the identical answer, byte for
+   byte. It cannot quietly change its story.
 
-You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) supports more models, more hardware, and more features. Qwenium exists because:
+### How that is actually done
 
-**If you need a small, self-contained inference server** — for an internal tool, a small team, a startup that wants to stop paying per-token API costs, or an on-prem deployment where data can't leave the building — this gives you exactly that with nothing extra.
+- **Where it looked — attention.** Every decode step's attention is
+  materialized in the graph (not fused away) and tappable at zero extra
+  compute. Calibrated, it becomes receipts: per-value **source citations**, a
+  whole-document **coverage audit** ("this line was never consulted"), and an
+  **ungrounded-value flag** — served via `/v1/extract` with
+  `--attention-lens`.
+- **What decided it — determinism.** Greedy decode is byte-deterministic, with
+  forkable state (warm prefix restore + recurrent-state checkpoints). Remove
+  one line of the input, re-run, and the diff is fact, not sampling noise —
+  counterfactual "prove it" experiments per field.
+- **Proof it happened — integrity.** A weights hash computed at load,
+  version-gated snapshots, kernel-path tags, and fail-loud replay refusal: a
+  generation can carry a kilobyte witness and re-run byte-identical on demand.
 
-**If you want to understand how LLM inference works** — llama.cpp is ~300K lines. Qwenium is an order of magnitude smaller, organized by concept with clear module boundaries (one directory per layer type, one file per model recipe). You can trace a request from HTTP to tensor op without getting lost.
-
-**If you want to hack on the model itself** — adding a new layer type means one new file under `src/layers/`. Adding a new model means one new recipe under `src/models/`. Swap layers, add probes, prune attention heads, tap intermediate hidden states for [logit lens](https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens) experiments. The kind of model surgery that's painful in a 300K-line codebase is straightforward here.
 
 ## What it does
 
@@ -34,7 +77,7 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 - **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
 - **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.
 - **OpenAI-compatible API** — `/v1/completions` and `/v1/chat/completions` with SSE streaming, per-request sampling params, and a `grammar` field for constrained output. Drop-in for existing tools.
-- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute (see [`docs/lens-format.md`](docs/lens-format.md)).
+- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute.
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
 - **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
@@ -157,12 +200,25 @@ The small, modular codebase makes this useful for research that's painful in lar
 
 ## Performance
 
-Measured on M1 MacBook Pro (32GB) with Qwen 2.5 Coder 14B Q4:
+Head-to-head against llama.cpp, both Release + Metal, same GGUF file, same
+token IDs, one engine resident at a time. M1 Pro (32 GB), Qwen3.5-0.8B BF16,
+756-token prompt, 128 decode steps, 3–6 runs per leg, run-to-run spread ~8%
+(2026-08-23; llama.cpp `e85caa81e`, ours on the same ggml revision):
+
+| Metric | Qwenium | llama.cpp |
+|---|---|---|
+| Prefill | ~2096 tok/s | ~2157 tok/s |
+| Decode (batch 1) | ~55.8 tok/s | ~73.7 tok/s |
+| Steady-state RSS | 1.75 GB | 1.72 GB |
+
+
+Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
 
 | Metric | Value |
 |--------|-------|
 | Throughput (10 concurrent) | ~4× vs sequential |
 | Warm chat prefix hit (`--chat-prefix-cache`) | 2.4× per turn at 4K context (flat vs quadratic re-prefill) |
+| Persistent decode graph (`--persistent-graph`) | 1.32× on Qwen 3.6 35B-A3B; ~1.0× on small models — the win is model-specific |
 | DSL code generation | 100% pass rate (10 concurrent) |
 
 ## Build Options

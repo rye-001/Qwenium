@@ -47,7 +47,7 @@ void print_usage(const char* program_name) {
     std::cout << "  -t, --temperature F     Sampling temperature (default: 0.7)\n";
     std::cout << "  --top-k K               Top-K sampling (default: 40)\n";
     std::cout << "  --top-p P               Top-P (nucleus) sampling (default: 0.95)\n";
-    std::cout << "  --repeat-penalty F      Repetition penalty (default: 1.1)\n";
+    std::cout << "  --repeat-penalty F      Repetition penalty (default: 1.1 when sampling; greedy/-t 0 is a true argmax unless this is set)\n";
     std::cout << "  --chat                  Enter interactive chat mode\n";
     std::cout << "  --ctx-size N            KV cache context size in tokens (default: 4096)\n";
     std::cout << "  --vocab-prune-list-path FILE Path to keep_list.bin for vocab pruning\n";
@@ -107,6 +107,7 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--repeat-penalty") {
             if (i + 1 >= argc) return false;
             args.repetition_penalty = std::stof(argv[++i]);
+            args.repetition_penalty_set = true;
         } else if (arg == "-p" || arg == "--prompt") {
             if (i + 1 >= argc) return false;
             args.prompt = argv[++i];

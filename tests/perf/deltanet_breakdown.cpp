@@ -19,7 +19,10 @@
 //   ./bin/deltanet-breakdown > tests/fixtures/deltanet_breakdown.json
 //
 // Env knobs: DN_WARMUP (default 10), DN_ITERS (default 200),
-// DN_LAYER (default 0 — first DeltaNet layer in qwen35moe layout).
+// DN_LAYER (default 0 — first DeltaNet layer in the recipe's layout).
+//
+// Keys are read under the model's OWN architecture prefix, so this runs on any
+// DeltaNet-carrying recipe (qwen35 and qwen35moe), not just Qwen 3.6.
 
 #include <chrono>
 #include <cstdint>
@@ -63,13 +66,16 @@ struct DnConfig {
 
 static DnConfig read_dn_config(const ModelMetadata& meta) {
     DnConfig c{};
-    c.d_inner       = meta.raw_kv.get_uint32("qwen35moe.ssm.inner_size");
-    c.num_v_heads   = meta.raw_kv.get_uint32("qwen35moe.ssm.time_step_rank");
-    c.num_k_heads   = meta.raw_kv.get_uint32("qwen35moe.ssm.group_count");
+    // Read under the loaded model's architecture prefix rather than a hardcoded
+    // one -- qwen35 and qwen35moe both carry DeltaNet and must both be probeable.
+    const std::string A = meta.architecture;
+    c.d_inner       = meta.raw_kv.get_uint32(A + ".ssm.inner_size");
+    c.num_v_heads   = meta.raw_kv.get_uint32(A + ".ssm.time_step_rank");
+    c.num_k_heads   = meta.raw_kv.get_uint32(A + ".ssm.group_count");
     c.head_v_dim    = c.d_inner / c.num_v_heads;
-    c.head_k_dim    = meta.raw_kv.get_uint32("qwen35moe.ssm.state_size");
+    c.head_k_dim    = meta.raw_kv.get_uint32(A + ".ssm.state_size");
     c.conv_channels = c.d_inner + 2 * c.num_k_heads * c.head_k_dim;
-    c.conv_kernel   = meta.raw_kv.get_uint32("qwen35moe.ssm.conv_kernel");
+    c.conv_kernel   = meta.raw_kv.get_uint32(A + ".ssm.conv_kernel");
     c.rms_norm_eps  = meta.rms_norm_eps;
     return c;
 }

@@ -117,9 +117,21 @@ protected:
     uint64_t             cached_valid_ids_version_ = 0;
 };
 
+// Argmax over the (optionally grammar-masked) logits.
+//
+// The default is a TRUE argmax: repetition_penalty 1.0, i.e. no penalty. This
+// is what "greedy" means everywhere else, and it is what §1's byte-reproducible
+// greedy-decode claim rests on. It used to default to 1.2, which silently
+// steered every temperature-0 generation away from the model's actual argmax
+// and made us look like we diverged from other engines when we did not --
+// see docs/engine-divergence-probe-results.md.
+//
+// A caller that wants penalized argmax must now ask for it explicitly at the
+// construction site, where it is visible, rather than inheriting it from a
+// default.
 class GreedySampler : public Sampler {
 public:
-    explicit GreedySampler(float repetition_penalty = 1.2f,
+    explicit GreedySampler(float repetition_penalty = 1.0f,
                            int   repetition_lookback = 32)
         : repetition_penalty_(repetition_penalty),
           repetition_lookback_(repetition_lookback) {}
