@@ -1063,6 +1063,22 @@ target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-loader-tests)
 
+# Per-slot rows-vs-positions bookkeeping on ForwardPassBase (pure arithmetic —
+# a stub recipe that only counts KV rows; no ggml graph, no model file).
+add_executable(rope-divergence-tests
+    unit/test_rope_divergence.cpp
+)
+target_link_libraries(rope-divergence-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-graph-inputs
+    core
+    sampling
+    ggml
+)
+target_compile_features(rope-divergence-tests PRIVATE cxx_std_17)
+gtest_discover_tests(rope-divergence-tests)
+
 # Preprocessing recipes (pure data — no ggml, no IO, no model file).
 add_executable(image-preprocess-tests
     unit/test_image_preprocess.cpp

@@ -125,19 +125,8 @@ public:
     // decision 3); until they do, VL sessions are single-turn-safe only.
     int32_t get_rope_pos(uint32_t slot) const {
         const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
-        const auto it = rope_row_delta_.find(slot);
-        if (it == rope_row_delta_.end()) return rows;
-        // The record describes a specific stretch of history. If the slot has
-        // since been cleared or rewound to before that stretch, the delta no
-        // longer applies — and applying it anyway would hand back a position
-        // BELOW where the slot actually is (negative, after a clear). Drop it
-        // and fall back to rows == positions, which is exactly right for a
-        // freshly cleared slot and is the pre-M-RoPE behaviour otherwise.
-        if (rows < it->second.rows_after) {
-            rope_row_delta_.erase(it);
-            return rows;
-        }
-        return rows - it->second.delta;
+        const RopeDivergence* rec = live_rope_record(slot);
+        return rec ? rows - rec->delta : rows;
     }
 
     // Record that a span just written to `slot` occupied `n_rows` KV rows while
@@ -150,7 +139,14 @@ public:
                 "note_span_rows_vs_positions: slot 'n_pos': expected <= n_rows ("
                 + std::to_string(n_rows) + "), got: " + std::to_string(n_pos));
         if (n_rows == n_pos) return;  // scalar-position recipe: nothing to track
-        auto& rec = rope_row_delta_[slot];
+        // Drop a record the slot has already outlived BEFORE accumulating onto
+        // it. The writer must apply the same staleness test as the readers: a
+        // server slot is cleared between image requests, so without this the
+        // second image's delta lands on top of the first image's and every
+        // decode position after it is ~n_rows too low — coherent request #1,
+        // token soup from request #2 on. `+=` is still right within one live
+        // history (a future multi-image turn accumulates span by span).
+        RopeDivergence& rec = mutable_rope_record(slot);
         rec.delta += static_cast<int32_t>(n_rows) - static_cast<int32_t>(n_pos);
         rec.rows_after = static_cast<int32_t>(get_cache_pos(slot)) +
                          static_cast<int32_t>(n_rows);
@@ -161,14 +157,7 @@ public:
     // or restoring: the blob format carries a row count and no rope coordinate,
     // so a diverged slot cannot be round-tripped faithfully (plan §4 decision 3).
     bool has_rope_divergence(uint32_t slot) const {
-        const auto it = rope_row_delta_.find(slot);
-        if (it == rope_row_delta_.end()) return false;
-        // Honour the same self-invalidation get_rope_pos applies.
-        if (static_cast<int32_t>(get_cache_pos(slot)) < it->second.rows_after) {
-            rope_row_delta_.erase(it);
-            return false;
-        }
-        return true;
+        return live_rope_record(slot) != nullptr;
     }
 
     // Drop a slot's divergence record explicitly. get_rope_pos also self-heals
@@ -449,6 +438,31 @@ protected:
         int32_t rows_after = 0;  // row count the delta was recorded at
     };
     mutable std::unordered_map<uint32_t, RopeDivergence> rope_row_delta_;
+
+    // The ONE staleness test, so no reader or writer can apply a record the
+    // slot has already outlived. A record describes a specific stretch of
+    // history; if the slot has since been cleared or rewound to before
+    // `rows_after`, that history is gone. Applying the delta anyway hands back
+    // a position BELOW where the slot actually is (negative, after a clear),
+    // and accumulating onto it doubles the divergence. Returns null once the
+    // record is dropped — rows == positions, exactly right for a freshly
+    // cleared slot and the pre-M-RoPE behaviour otherwise.
+    const RopeDivergence* live_rope_record(uint32_t slot) const {
+        const auto it = rope_row_delta_.find(slot);
+        if (it == rope_row_delta_.end()) return nullptr;
+        if (static_cast<int32_t>(get_cache_pos(slot)) < it->second.rows_after) {
+            rope_row_delta_.erase(it);
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    // Writer-side counterpart: the live record for this slot, or a fresh zeroed
+    // one if there is none (or the previous one was stale and just dropped).
+    RopeDivergence& mutable_rope_record(uint32_t slot) {
+        live_rope_record(slot);          // drops a stale record if present
+        return rope_row_delta_[slot];    // live one, or a fresh zeroed one
+    }
 
     // Set by build_image_substitution, consumed by set_prefill_inputs, cleared
     // by reset_context. Exists only so the guard above can tell "this graph

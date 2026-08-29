@@ -16,6 +16,18 @@
 #   MMPROJ=models/mmproj-gemma-4-12B-it-Q8_0.gguf \
 #   IMAGE=IMG_4210.jpg PROMPT="Describe this image." \
 #   tests/smoke/server_image_smoke.sh
+#
+# Qwen 3.5-family leg (P6 of docs/plan-qwen35-vision-impl.md) — the same script,
+# a different projector; nothing here is Gemma-specific:
+#   MODEL=models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
+#   MMPROJ=models/Qwen3.6-mtp-mmproj-BF16.gguf \
+#   IMAGE=Qwenium2.png CTX=2048 \
+#   tests/smoke/server_image_smoke.sh
+# Keep the image near ~1024 soft tokens (a 1024x1024 input is exactly that) and
+# CTX at 2048: a full-budget 4096-token image prefill next to a 16 GB model
+# exceeds GPU memory on a 32 GB host, and a Metal command-buffer OOM does NOT
+# fail loud (architecture.md §12) — it keeps decoding and emits plausible text.
+# Watch the server log for 'Insufficient Memory' before trusting a bad answer.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
