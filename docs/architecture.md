@@ -190,7 +190,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
-| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT` (live); `QINF_SLOT_ERROR` has no caller since `weight_binding` was deleted — see §12 |
+| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
 
 Test tiers under `tests/`: `unit/` (co-located per module, includes bitwise
 recipe gates), `integration/`, `smoke/` (end-to-end shell gates against real
@@ -702,7 +702,7 @@ Current, verified against the tree at time of writing:
   still two recipe classes.** They differ in exactly one call — dense SwiGLU vs
   routed experts — so the FFN is now a PARAMETER (`Qwen35Config::is_moe()`,
   `Qwen35LayerCommon::moe_hp`), settling the inconsistency with Gemma 4, which
-  had always parameterized its own dense/MoE split. `models/qwen35_layer.h`
+  had always parameterized its own dense/MoE split. `models/qwen35_family.h`
   holds the shared body; `Qwen35MoEConfig` is an alias of `Qwen35Config`. The
   duplication was not theoretical: 11 of the 20 most recent commits touching
   either recipe had to touch both, and it produced the `Stride::NKvLen` gather
