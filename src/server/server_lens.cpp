@@ -603,7 +603,14 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     run.model              = "Qwen3.6 (attention lens)";
     run.n_head             = (int)meta.attention_head_count;
     run.document           = document;   // value-source lookups resolve against the doc
-    run.validated_envelope = prompt_tokens.size() <= 4096;  // 4K = validated floor (plan §1.5)
+    // 4096 is the CALIBRATION floor, not the workload envelope (that is 10 K as
+    // of 2026-08-24). The lens constants — L3H13 citations, the body_mass
+    // grounded/ungrounded threshold, the coverage bar — were all measured on
+    // prompts at or below 4 K, so beyond it the signals still compute but are
+    // extrapolated. The flag is a DISCLOSURE on the report, not a refusal; an
+    // oversized document is rejected separately, above. Raising this number
+    // means re-measuring, not editing it (plan-qemmi-lens.md §1.5).
+    run.validated_envelope = prompt_tokens.size() <= 4096;
 
     // Locate the document's token range within the ChatML-wrapped prompt: the
     // chat header precedes it and the instruction follows, so the document is an

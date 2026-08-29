@@ -1,4 +1,15 @@
 #pragma once
+// platform.h — read-only file mapping, one wrapper over mmap / MapViewOfFile.
+//
+// Responsibility: the single OS-portability seam in the load path. FileMapper
+//   maps a file read-only and exposes {data, size}; everything above it treats a
+//   GGUF as a flat byte span and never sees a platform difference.
+// State owned: the mapping and its handles; released in the destructor, or
+//   earlier when the loader explicitly drops it (see model.h — releasing the
+//   mapping after the weight copy is load-bearing for steady-state RSS).
+// Lives in loader/ because mapping a model file is the load path's job; it moved
+//   here from the old src/core/ on 2026-08-29, which loader/ had depended on.
+// No unit test of its own: exercised by every model-file test through the loader.
 
 #include <string>
 #include <cstddef>

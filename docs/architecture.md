@@ -23,7 +23,8 @@ weights) on Apple Silicon, using [ggml](https://github.com/ggml-org/ggml) as
 the tensor library and Metal as the GPU backend. It ships two front ends over
 one engine:
 
-- a **CLI** (`qwen3` binary): single-user chat/completion, with vision,
+- a **CLI** (`qwenium` binary, CMake target `qwenium-cli`): single-user
+  chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
   decode graph (`--persistent-graph`, §5), and session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
@@ -189,12 +190,21 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
-| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | |
+| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT` (live); `QINF_SLOT_ERROR` has no caller since `weight_binding` was deleted — see §12 |
 
 Test tiers under `tests/`: `unit/` (co-located per module, includes bitwise
 recipe gates), `integration/`, `smoke/` (end-to-end shell gates against real
 models — server caching, conversational mode, image coherence), `perf/`,
 `grammar/`, `diff/` (differential fixtures, e.g. captured llama.cpp tensors).
+
+Read the co-location invariant (`src/<m>.cpp` ⇒ `tests/unit/test_<m>.cpp`) as
+the rule for *modules*, not recipes. Recipes and the front ends are covered by
+**aspect** tests instead — `test_qwen35_forward_attn`, `test_gemma3_config`,
+`test_qwen36_hparams`, `test_gemma_batched_decode` — which is better testing
+than one file per recipe would be, but it means "no `test_qwen35.cpp`" does not
+mean "qwen35 is untested". Model-file tests self-skip when their model is
+absent (`QWEN3_MODEL_PATH` and friends), so a green run with skips is normal;
+check the reported total, not only the failure list.
 
 > **Directory admission — settled and still open.** `src/core/` was a flagged
 > smell: a concept-free name hosting the engine owner, decode orchestration and

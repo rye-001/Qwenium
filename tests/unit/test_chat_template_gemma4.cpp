@@ -15,6 +15,7 @@
 // content.
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -52,20 +53,35 @@ TEST(Gemma4ChatTemplateRegistry, EnableThinkingTrueOmitsThoughtChannel) {
               "<|turn>model\n");
 }
 
-// 2. Tokenizer config registry lookup unchanged.
+// 2. Tokenizer config registry lookup — the specials promoted must be Gemma 4's
+//    NATIVE markers. This test used to assert <start_of_turn>/<end_of_turn>,
+//    the G1/2/3 pair, contradicting this file's own header: rendering Gemma 4
+//    with those makes the model hallucinate <tool_call|> tokens (observed live),
+//    which is why the recipe moved to <|turn>/<turn|> in the first place. The
+//    assertion was never updated with the renderer, so it failed permanently.
 TEST(Gemma4TokenizerConfigRegistry, GemmaFourLookupYieldsGemmaShape) {
     register_builtin_models();
     TokenizerConfig cfg = lookup_tokenizer_config("gemma4");
     EXPECT_EQ(cfg.normalizer, NormalizerKind::SpaceToUnderscore);
     EXPECT_TRUE(cfg.byte_fallback);
     EXPECT_TRUE(cfg.add_bos_token);
-    bool has_sot = false, has_eot = false;
-    for (const auto& s : cfg.extra_chat_specials) {
-        if (s == "<start_of_turn>") has_sot = true;
-        if (s == "<end_of_turn>")   has_eot = true;
+
+    // Turn delimiters and the thinking-channel delimiters must all be promoted
+    // to single ids; a split <|turn> is what produced the live regression.
+    for (const char* want : {"<|turn>", "<turn|>", "<|channel>", "<channel|>"}) {
+        EXPECT_NE(std::find(cfg.extra_chat_specials.begin(),
+                            cfg.extra_chat_specials.end(), want),
+                  cfg.extra_chat_specials.end())
+            << "gemma4 tokenizer config is missing special: " << want;
     }
-    EXPECT_TRUE(has_sot);
-    EXPECT_TRUE(has_eot);
+
+    // And must NOT carry the Gemma 1/2/3 markers.
+    for (const char* unwanted : {"<start_of_turn>", "<end_of_turn>"}) {
+        EXPECT_EQ(std::find(cfg.extra_chat_specials.begin(),
+                            cfg.extra_chat_specials.end(), unwanted),
+                  cfg.extra_chat_specials.end())
+            << "gemma4 must not promote the G1/2/3 marker: " << unwanted;
+    }
 }
 
 // 3. Multi-turn rendering preserves role mapping (assistant → model) so

@@ -62,11 +62,16 @@ void print_usage(const char* program_name) {
     std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
-    std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
-    std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
+    std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";
+    std::cout << "  --mmproj FILE           Vision projector GGUF (required with --image);\n";
+    std::cout << "                          gemma3, gemma4uv or qwen3vl_merger\n";
     std::cout << "  --image-embed-cache DIR (chat) Disk cache for image embeddings; encode each image once per node (ViT skip)\n";
     std::cout << "  --prefix-cache DIR      (chat) Opt-in warm-prefix KV cache; skips re-prefilling a recurring system prompt\n";
     std::cout << "  --image-prefix-cache DIR (chat) Opt-in image-prefix KV cache; skips ViT encode + image-position prefill for a recurring image\n";
+    std::cout << "  --save-session FILE     Write a portable session snapshot at the end of the run\n";
+    std::cout << "  --save-session-at N     Write the snapshot after N generated tokens instead\n";
+    std::cout << "  --load-session FILE     Resume from a snapshot (refused fail-loud on a\n";
+    std::cout << "                          model/quant/kernel-path or KV-dtype mismatch)\n";
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";

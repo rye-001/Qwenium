@@ -1,17 +1,23 @@
 #pragma once
-// image_prompt.h — Gemma 3 image-marker expansion / chunk-list step (Phase 6).
+// image_prompt.h — image-marker expansion at the token level.
 //
-// The chat template renders the user turn with a single `<start_of_image>`
-// marker where the image goes (string interface preserved — markers live in
-// the rendered string). This step expands that marker at the TOKEN level into
-// the Gemma 3 image block and reports the soft-token span the orchestrator must
-// fill with encoded image embeddings:
+// The chat template renders the user turn with a single begin-image marker
+// where the image goes (string interface preserved — markers live in the
+// rendered string). This step expands that ONE marker into the family's image
+// block and reports the soft-token span the orchestrator must fill with encoded
+// image embeddings:
 //
-//   ... <start_of_image> <image_soft_token>×N <end_of_image> ...
-//                        └────────── span ──────────┘
+//   ... <begin_image> <image_soft_token>×N <end_image> ...
+//                     └────────── span ──────────┘
+//
+// FAMILY-GENERIC: the three marker ids are parameters, resolved once per
+// projector by vision/vision_profile (Gemma 3's <start_of_image>, Gemma 4's and
+// Qwen-VL's own). This file knows nothing about which family it is serving —
+// which is why it is not in cli/ and carries no family name.
 //
 // One image per turn in v1 (single-tile). Pure function over token ids — no
 // model, no tokenizer, no bitmap — so it is unit-gated directly.
+// Unit test: tests/unit/test_image_prompt.cpp
 
 #include <cstdint>
 #include <vector>

@@ -97,7 +97,9 @@ struct LensRun {
     int  n_head = 0;
     std::vector<LensStep> steps;            // one per gen token; steps.size() == G
     std::string model;                      // passthrough for the report header
-    bool validated_envelope = true;         // false ⇒ prompt exceeded the 4K floor (disclosure)
+    // false ⇒ prompt exceeded the 4 K CALIBRATION floor (a disclosure on the
+    // report, not an error). Unrelated to the 10 K workload envelope.
+    bool validated_envelope = true;
 };
 
 // ── Lens report (the interchange format; P3 versions/documents it) ───────────

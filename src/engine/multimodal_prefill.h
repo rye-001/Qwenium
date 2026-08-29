@@ -1,22 +1,32 @@
 #pragma once
-// multimodal_prefill.h — Phase 5 prefill orchestrator (docs/plan-gemma-vision-impl.md).
+// multimodal_prefill.h — the vision/text prefill orchestrator.
 //
-// THE single top-level call site that bridges the vision subsystem and the
-// gemma3 text recipe. Recipes do not orchestrate vision; this does. The flow:
-//   1. Encode each image once (VisionEncoder — its own graph, its own
-//      scheduler, shared backend; C3 boundary).
-//   2. Arm the recipe's image-embedding substitution + bidirectional mask
-//      (Gemma3ForwardPass::set_image_embeddings — Phases 3 & 4).
-//   3. Run the text prefill (the encoded soft-tokens substitute into the
-//      residual stream at the placeholder span).
+// THE single top-level call site that bridges the vision subsystem and a text
+// recipe. Recipes do not orchestrate vision; this does. The flow:
+//   1. Encode the image once through Seam A (IVisionEncoder — its own graph and
+//      scheduler, sharing the device backend), or reuse a cached encoding.
+//   2. Arm the recipe's image-embedding substitution through Seam B
+//      (IImageEmbeddable::set_image_embeddings). Family differences are
+//      parameters there, not branches here: Gemma 3 asks for a bidirectional
+//      mask over the span, Gemma 4 is plain causal, and the two Qwen recipes
+//      additionally pass the 2-D grid M-RoPE needs.
+//   3. Drive the prefill as a chunk sequence over one shared KV — every chunk
+//      but the last advances state only (feed_tokens), the last produces logits.
+//      The image is its own chunk so matmul widths match the reference
+//      implementation and the single-vs-chunked Metal precision divergence
+//      cannot arise.
+// Recipe-agnostic: gemma3, gemma4, qwen36 and qwen35 all host images through it
+//   unchanged. It requires feed_tokens support and says so fail-loud.
 //
-// Lives in src/engine/ but is compiled into consumers (tests, cli), not the
-// `core` static lib — same arrangement as decode_step.cpp, because it depends
-// on BOTH qinf-vision and qinf-models while `core` sits below qinf-models.
+// Lives in src/engine/ but is compiled into consumers (tests, cli, server), not
+// the qinf-engine static lib — same arrangement as decode_step.cpp, because it
+// depends on BOTH qinf-vision and qinf-models while qinf-engine sits below
+// qinf-models.
 //
-// v1 scope (Phase 5): single image, single turn, single tile. Image-embedding
-// reuse across turns and multiple images per prompt are Phase 7; >1 image here
-// throws fail-loud rather than silently encoding only the first.
+// Scope: ONE image per prompt, single turn, single tile. Encoding is reused
+// across turns and processes (session/image_embedding_cache and
+// persistent_image_embedding_store); multi-image fan-out is not built — >1
+// image throws fail-loud rather than silently encoding only the first.
 
 #include <cstdint>
 #include <vector>

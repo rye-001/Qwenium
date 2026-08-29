@@ -19,16 +19,40 @@ class DeltaNetState;  // L2 snapshot reach-through (OverwriteRecurrent lane)
 constexpr size_t FP_GRAPH_SIZE_METADATA = 128 * 1024 * 1024;
 constexpr size_t FP_GRAPH_SIZE = 16384;
 
-/**
- * Base class for forward pass implementations.
- * 
- * Owns the shared ggml context and buffer. Provides utility methods
- * used by all architectures: embedding lookup, RMS norm, SwiGLU FFN,
- * multi-head attention kernel, output logits extraction.
- *
- * Each architecture subclass owns its own cache(s) and implements
- * its own graph building logic.
- */
+// forward_pass_base.h — the base every model recipe derives from.
+//
+// Responsibility: own the per-forward-pass ggml context and buffer, provide the
+//   graph-building scaffolding every recipe shares (embedding lookup, output
+//   head, the Seam B image splice), and declare the interface the engine drives
+//   a recipe through. Recipes own their own state (KV cache, recurrent state)
+//   and their own layer composition; this class owns neither.
+// Public surface, in four groups:
+//   (1) the recipe interface — build_prefill_graph / build_decoding_graph /
+//       advance_cache / clear_slot / set_cache_pos / clone_slot, plus the
+//       run_prefill and feed_tokens drivers built on them;
+//   (2) per-slot rope coordinate (get_rope_pos) — NOT the KV row count; an
+//       M-RoPE image span consumes nx*ny rows while advancing position by
+//       max(nx, ny), so the two diverge and every decode site wants the former;
+//   (3) opt-in, default-off output seams — hidden state (MTP, plan-mtp-decode.md
+//       §5 D3), attention rows (the lens tap, plan-qemmi-lens.md P1/A1), sparse
+//       LM head ids, and the L2 snapshot reach-through;
+//   (4) decode-path policy the engine sets — KV write mode (baked-offset cpy vs
+//       value-driven set_rows) and n_kv bucketing, which move together and only
+//       under --persistent-graph.
+// Invariants:
+//   - The opt-in seams are byte-inert when disarmed: an empty tap set marks no
+//     node, output_hidden_ adds no graph output. Gated by
+//     tests/unit/test_forward_pass_base.cpp (TapOffByteIdentical).
+//   - graph_inputs_ must be cleared BEFORE build_image_substitution, never
+//     after — clearing after discards the ImageEmbeddingsInput that uploads the
+//     encoder output while leaving the splice in place, so the image span
+//     carries stale buffer contents and the model describes noise. That was the
+//     qwen36 vision bug; set_prefill_inputs now refuses it fail-loud
+//     (GraphInputSet::has_slot).
+//   - Architecture direction: this is a shared base class, and the blueprint
+//     wants composition over inheritance — a known eventual deletion target
+//     (architecture.md §12).
+// Unit test: tests/unit/test_forward_pass_base.cpp
 class ForwardPassBase {
 public:
     ForwardPassBase(const Model& model, const ModelMetadata* metadata);

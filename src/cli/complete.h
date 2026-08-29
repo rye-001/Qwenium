@@ -1,4 +1,12 @@
 #pragma once
+// complete.h — single-prompt, non-interactive generation.
+//
+// Responsibility: the -p/--prompt path. One prefill, decode to a token budget or
+//   stop condition, print, exit. Same engine seams as chat.h with no history and
+//   no turn rendering, which makes it the path the byte-identical text gates use
+//   (greedy -t 0 + --log-tokens-to; see docs/architecture.md §11).
+// No unit test: exercised by the integration tests under tests/integration/ and
+//   by the release text gates.
 
 #include <string>
 #include <vector>

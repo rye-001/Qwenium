@@ -1,4 +1,21 @@
 #pragma once
+// gguf_loader.h — GGUF file -> ModelMetadata.
+//
+// Responsibility: mmap a GGUF file, parse its header/metadata/tensor directory,
+//   and populate ModelMetadata — including the two fail-loud validators that
+//   decide whether this build can run the file at all:
+//     validate_architecture            — is general.architecture in the registry's
+//                                        allow-list? (throws if not)
+//     validate_inventory_for_architecture — does the file carry every tensor the
+//                                        recipe needs, correctly shaped?
+//   Both run during load_metadata, so a completed load IS acceptance. This is
+//   the engine's only architecture/inventory gate; there is no second copy.
+// State owned: the file mapping and the parsed directory. The mapping is handed
+//   to Model and released once weights are copied to the backend (see model.h).
+// Note: the big tokenizer arrays (vocab, merges, scores, token types) are
+//   intercepted by key here and placed on ModelMetadata's typed members; only
+//   scalar/small-array family keys reach the generic GGUFValue bag (gguf_value.h).
+// Unit tests: tests/unit/test_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
 
 #include "engine/model.h"
 #include "ggml.h"

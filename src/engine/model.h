@@ -1,4 +1,29 @@
 #pragma once
+// model.h — the loaded model: metadata, tokenizer vocabulary, and weights.
+//
+// Responsibility: hold everything a GGUF file turns into — ModelMetadata (arch
+//   hyperparameters, the tokenizer's vocab/merges/scores, special-token ids, the
+//   raw KV bag for family-specific keys, the weights hash) and the bound
+//   ggml_tensor* weights, laid out per layer in TransformerBlock. Owns the
+//   backend and the load path; does NOT build graphs — recipes in src/models/
+//   do that, reading their weights from here.
+// State owned: the backend buffer holding all weights, and the metadata.
+// Invariants:
+//   - The file mapping is RELEASED after the weights are copied into the backend
+//     buffer (release_file_mapping). Not tidiness: the copy faults in every page,
+//     so holding the mapping keeps a second full copy of the weights resident for
+//     the process lifetime — measured 5.31 -> 1.75 GB steady-state RSS on
+//     Qwen3.5-0.8B. Afterwards the loader's tensor-data accessors throw rather
+//     than dereference a released mapping. Load-time PEAK is unaffected (source
+//     and destination are both live during the copy): plan loading against 2x
+//     model size, serving against 1x.
+//   - TransformerBlock is a union of every family's slots; a recipe reads only
+//     the ones its architecture defines, and nullptr means "this family has no
+//     such tensor", not "missing".
+// Fail-loud gap (architecture.md §12): assign_tensor_pointers' newer branches
+//   use require(), which names the architecture and the tensor; the older ones
+//   still use tensors.at() and throw an unnamed std::out_of_range.
+// Unit tests: tests/unit/test_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
 
 #include <cstdint>
 #include <string>

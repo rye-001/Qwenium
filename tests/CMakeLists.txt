@@ -25,6 +25,12 @@ add_executable(unit-tests
     unit/test_sparse_head_input.cpp
 )
 
+# Absolute path to the repo's model directory, so model-file tests can find a
+# default checkout-local model instead of a relative path that never resolves
+# from ctest's working directory. Env vars (QWEN3_MODEL_PATH, ...) still win.
+target_compile_definitions(unit-tests PRIVATE
+    QINF_MODELS_DIR="${CMAKE_SOURCE_DIR}/models")
+
 # Link libraries for unit tests
 target_link_libraries(unit-tests PRIVATE
     GTest::gtest_main

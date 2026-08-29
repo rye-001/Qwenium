@@ -1,27 +1,35 @@
 #pragma once
-// image_loader.h — host-side Bitmap producer (Gemma 3 + Gemma 4 vision).
+// image_loader.h — host-side Bitmap producer for every vision family.
 //
 // Decodes a JPEG/PNG/etc. file (via vendored stb_image), resizes, applies the
 // projector's normalization, and emits the channel-planar float32 Bitmap that an
-// IVisionEncoder consumes. Image IO lives OUTSIDE src/vision/ by design — that
-// directory is the encoder subsystem, not the image pipeline.
+// IVisionEncoder consumes. This is IO, and it lives in src/image/ rather than
+// src/vision/ (the encoder subsystem, not the image pipeline) and rather than
+// src/cli/ — both front ends need it, and the server compiles it directly.
 //
-// The RECIPE this file applies (qinf::vision::ImagePreprocess and the two
-// projector factories) moved to vision/image_preprocess.h — a recipe is
-// projector knowledge, not CLI code. This file kept the IO, which is what the
-// paragraph above was always about.
+// The RECIPE this file applies (qinf::vision::ImagePreprocess and its projector
+// factories) lives in vision/image_preprocess.h — a recipe is projector
+// knowledge. This file kept the IO. One function parameterized by
+// ImagePreprocess, never forked per family (plan §5: "parameterize
+// image_loader rather than fork it"); the recipe is chosen once, by projector
+// type, in vision/vision_profile.
 //
-// Two projector preprocessings, ONE function parameterized by ImagePreprocess
-// (plan §5: "parameterize image_loader rather than fork it"):
-//   - Gemma 3 (gemma3_preprocess): fixed 896 square, aspect-preserving PAD_CEIL
-//     letterbox, SigLIP normalize (v/255 − 0.5)/0.5 → [-1, 1]; black pad → -1.0.
-//   - Gemma 4 (gemma4uv_preprocess): Qwen-VL "smart_resize" to variable dims
-//     (multiples of the effective patch 48, within a [min,max]-token budget),
-//     same PAD_CEIL letterbox, normalize v/255 → [0, 1]; black pad → 0.0.
+// Three recipes today, along two sizing branches:
+//   - FixedSquarePadCeil — gemma3_preprocess: fixed 896 square, aspect-
+//     preserving PAD_CEIL letterbox, SigLIP normalize (v/255 − 0.5)/0.5 →
+//     [-1, 1]; black pad → -1.0.
+//   - DynSmartResize — gemma4uv_preprocess (align 48) and qwen3vl_preprocess
+//     (align 32): Qwen-VL "smart_resize" to variable dims that are multiples of
+//     the effective patch, within a [min,max]-TOKEN budget converted to pixels
+//     by align²; same PAD_CEIL letterbox; normalize v/255 → [0, 1], black pad
+//     → 0.0.
 //
-// Both use the byte-faithful llama.cpp resampler: ALIGN-CORNERS bilinear with a
-// uint8 intermediate. The Gemma 3 path is gated byte-faithful by
-// image-loader-tests::MatchesLlamaCppGemma3Reference (kEps 2e-3).
+// All use the byte-faithful llama.cpp resampler: ALIGN-CORNERS bilinear with a
+// uint8 intermediate — the encoder must see exactly what it saw in training.
+// Both sizing branches are gated bit-exact against captured mtmd references:
+// image-loader-tests::MatchesLlamaCppGemma3Reference (kEps 2e-3) and
+// ::MatchesLlamaCppQwen3VlReference{,Upscaled}.
+// Unit test: tests/unit/test_image_loader.cpp
 
 #include <cstdint>
 #include <string>

@@ -1,3 +1,13 @@
+#pragma once
+// tensor_tracer.h — debug-only tensor inspection for graph bring-up.
+//
+// Responsibility: print tensor shapes/ops/values while walking a built
+//   ggml_cgraph, so a new recipe's graph can be eyeballed against a reference.
+//   A DIAGNOSTIC, not part of any decode path: cli/main.cpp is the only
+//   consumer, and nothing in the engine calls it.
+// Header-only and self-contained so it can be dropped into a scratch harness.
+// No unit test by design — it exists to help write the tests.
+
 #include "ggml.h"
 
 #include <iomanip>
@@ -5,8 +15,8 @@
 #include <string>
 #include <unordered_set>
 
-// Forward declarations to use ggml types
-// In a real project, these would come from the ggml header
+// Redundant with ggml.h above, kept so this header can also be included in a
+// scratch translation unit that has only the ggml forward declarations.
 struct ggml_tensor;
 enum ggml_op;
 

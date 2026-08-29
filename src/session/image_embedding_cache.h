@@ -16,9 +16,13 @@
 // all collide to one slot; see bitmap.h).
 //
 // C4 workload envelope: at most `max_images` DISTINCT images per session
-// (default 2 — single-tile, 2×256 = 512 image tokens ≈ 13% of the 4 K
-// envelope). A (cap+1)th distinct image is refused fail-loud, not silently
-// dropped — the workload-envelope boundary is a stated contract, not a surprise.
+// (default 2). The sizing rationale was written against Gemma 3's fixed 256
+// soft tokens — 2×256 = 512 — when the context ceiling was 4 K, so ~13% of it.
+// The ceiling is 10 K as of 2026-08-24 and a Qwen-VL-class encoder emits 2 K–8 K
+// tokens for one document page, so the cap is far more load-bearing on a VL
+// model than this default suggests: two large images will not fit.
+// A (cap+1)th distinct image is refused fail-loud, not silently dropped — the
+// workload-envelope boundary is a stated contract, not a surprise.
 
 #include <cstdint>
 #include <functional>

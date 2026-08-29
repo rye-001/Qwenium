@@ -1,4 +1,13 @@
 #pragma once
+// cli-args.h — the parsed command line, one struct.
+//
+// Responsibility: hold every CLI flag's resolved value so chat/complete/
+//   session_mode read fields instead of re-parsing argv. Parsing itself and the
+//   --help text live in cli/main.cpp; this is only the shape.
+// Defaults here are user-visible contract (context_length, sampling params), so
+//   changing one changes behaviour for every invocation that omits the flag.
+// No unit test: a plain aggregate; the flags it carries are covered where they
+//   take effect.
 
 #include "../loader/chat_template.h"
 
