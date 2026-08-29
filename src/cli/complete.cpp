@@ -239,13 +239,23 @@ int run_complete(
                 // Normal decode for current token. MTP additionally captures
                 // the pre-final-norm hidden (D3) — the head's conditioning.
                 std::vector<int32_t> current_token_vec = { next_token_id };
-                int decode_pos = forward_pass->get_cache_pos(slot);
+                int decode_pos = forward_pass->get_rope_pos(slot);
 
                 std::vector<float> last_hidden;
                 std::vector<float> decode_logits = forward_pass->run_prefill(
                     current_token_vec, decode_pos, slot, scheduler,
                     mtp_mode ? &last_hidden : nullptr);
-                int after_decode_pos = forward_pass->get_cache_pos(slot);
+
+                // Two different numbers, and they stopped being equal when
+                // M-RoPE landed: an image span writes nx*ny KV rows while
+                // advancing the position by only max(nx, ny). Verify/refeed
+                // need the ROPE POSITION (they build a graph and rotate);
+                // rewind needs the KV ROW COUNT (it truncates the cache). This
+                // was one variable serving both, correct only while the two
+                // coincided.
+                int after_decode_pos  = forward_pass->get_rope_pos(slot);
+                int after_decode_rows = static_cast<int>(
+                    forward_pass->get_cache_pos(slot));
 
                 // Sample FIRST: y is both the fallback token and the
                 // first-token guard — draft[0] occupies y's position, so a
@@ -280,7 +290,8 @@ int run_complete(
                     bridge.make_rewind(slot),
                     eos_token_id,
                     last_hidden,
-                    /*expected_first=*/y);
+                    /*expected_first=*/y,
+                    /*current_rows=*/after_decode_rows);
 
                 if (result.attempted() && result.total_tokens() > 0) {
                     const int accepted_n = (int)result.accepted_tokens.size();
@@ -290,11 +301,14 @@ int run_complete(
                             // rewind KV to pre-verify, restore the checkpoint,
                             // re-advance over the accepted prefix only.
                             auto t0 = Clock::now();
-                            forward_pass->set_cache_pos(after_decode_pos, slot);
+                            forward_pass->set_cache_pos(after_decode_rows, slot);
                             dn->restore(dn_cp);
                             if (accepted_n > 0)
+                                // Explicit position: feed_tokens would otherwise
+                                // derive it from the rewound ROW count.
                                 forward_pass->feed_tokens(
-                                    result.accepted_tokens, slot, scheduler);
+                                    result.accepted_tokens, slot, scheduler,
+                                    after_decode_pos);
                             dn_refeed_ms += std::chrono::duration<double, std::milli>(
                                 Clock::now() - t0).count();
                             dn_restores++;

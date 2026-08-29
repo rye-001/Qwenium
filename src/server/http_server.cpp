@@ -691,7 +691,8 @@ private:
 
         for (int slot_id : slot_ids) {
             slot_ids_u32.push_back(static_cast<uint32_t>(slot_id));
-            positions.push_back(forward_pass_->get_cache_pos(slot_id));
+            // Rope position, not the KV row count (they diverge after an image).
+            positions.push_back(forward_pass_->get_rope_pos(slot_id));
         }
 
         ggml_cgraph* gf = forward_pass_->build_decoding_graph(tokens, slot_ids_u32, positions);

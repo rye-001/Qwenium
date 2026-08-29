@@ -19,10 +19,10 @@
 #include "vision/vision_model.h"
 #include "vision/vision_loader.h"
 #include "vision/i_vision_encoder.h"
-#include "vision/siglip_encoder.h"
-#include "vision/gemma4uv_encoder.h"
 #include "vision/bitmap.h"
+#include "cli/image_loader.h"   // load_image_to_bitmap_from_memory (IO)
 #include "cli/image_prompt.h"
+#include "vision/vision_profile.h"
 
 #include "ggml-backend.h"
 
@@ -49,7 +49,8 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
     if (dynamic_cast<IImageEmbeddable*>(&forward_pass_) == nullptr)
         throw std::runtime_error(
             "ServerVision: parameter '--mmproj': expected a recipe "
-            "implementing IImageEmbeddable (Gemma 3 or Gemma 4 vision), "
+            "implementing IImageEmbeddable (Gemma 3, Gemma 4, or "
+            "Qwen 3.5-family vision), "
             "actual: the loaded model (" + model_label() + ") has no image hook");
 
     ggml_backend_t backend = model_.has_metal_backend()
@@ -60,52 +61,21 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
     vloader_->parse_metadata(mmproj_path, *vmodel_);
     vloader_->load_tensors(*vmodel_, backend);
 
-    const auto& id_to_token = tokenizer_.get_vocabulary();
-    auto find_id = [&](const std::string& s) -> int32_t {
-        for (size_t i = 0; i < id_to_token.size(); ++i)
-            if (id_to_token[i] == s) return static_cast<int32_t>(i);
-        return -1;
-    };
+    // Projector-specific setup lives in ONE place (P0) — shared verbatim with
+    // the CLI path, so the two can no longer drift. An unhandled projector
+    // throws here instead of silently falling through to Gemma4Uv.
+    qinf::vision::VisionProfile vprofile = qinf::vision::make_vision_profile(
+        *vmodel_, backend, tokenizer_.get_vocabulary(),
+        "ServerVision: parameter '--mmproj'");
 
-    using PT = qinf::vision::VisionProjectorType;
-    if (vmodel_->config().projector_type == PT::Gemma3Siglip) {
-        vencoder_ = std::make_unique<qinf::vision::SiglipEncoder>(
-            *vmodel_, backend, vmodel_->config().projection_dim);
-        boi_id_  = find_id("<start_of_image>");
-        eoi_id_  = find_id("<end_of_image>");
-        soft_id_ = find_id("<image_soft_token>");
-        if (boi_id_ < 0 || eoi_id_ < 0 || soft_id_ < 0)
-            throw std::runtime_error(
-                "ServerVision: parameter '--mmproj': expected the "
-                "model's tokenizer to define <start_of_image>/"
-                "<image_soft_token>/<end_of_image>, actual: a text-only vocab");
-        image_marker_prefix_ = "\n\n<start_of_image>\n\n";
-        preprocess_ = qinf::cli::gemma3_preprocess(
-            static_cast<int>(vmodel_->config().image_size));
-    } else {  // VisionProjectorType::Gemma4Uv
-        vencoder_ = std::make_unique<qinf::vision::Gemma4UvEncoder>(
-            *vmodel_, backend, vmodel_->config().projection_dim);
-        boi_id_  = find_id("<|image>");
-        eoi_id_  = find_id("<image|>");
-        soft_id_ = find_id("<|image|>");  // per-position filler (overwritten)
-        if (boi_id_ < 0 || eoi_id_ < 0 || soft_id_ < 0)
-            throw std::runtime_error(
-                "ServerVision: parameter '--mmproj': expected the "
-                "model's tokenizer to define <|image>/<|image|>/<image|>, "
-                "actual: a text-only vocab");
-        // Inline image framing (NO surrounding newlines) per llama.cpp mtmd;
-        // the gemma3-style "\n\n…\n\n" makes Gemma 4 misread the image. And
-        // Gemma 4 image input requires the thinking branch (see §5).
-        image_marker_prefix_ = "<|image>";
-        image_wants_thinking_ = true;
-        const int eff_patch = static_cast<int>(
-            vmodel_->config().patch_size * vmodel_->config().n_merge);
-        preprocess_ = qinf::cli::gemma4uv_preprocess(eff_patch);
-    }
-
-    const std::string projector_tag =
-        vmodel_->config().projector_type == PT::Gemma3Siglip ? "gemma3-siglip"
-                                                             : "gemma4uv";
+    const std::string projector_tag = vprofile.projector_tag;
+    vencoder_             = std::move(vprofile.encoder);
+    boi_id_               = vprofile.boi_id;
+    eoi_id_               = vprofile.eoi_id;
+    soft_id_              = vprofile.soft_id;
+    image_marker_prefix_  = vprofile.marker_prefix;
+    image_wants_thinking_ = vprofile.wants_thinking;
+    preprocess_           = vprofile.preprocess;
 
     // V1 — opt-in disk-backed image-embedding cache (--image-embed-cache):
     // a recurring image is encoded once per node ever (ViT skip). Keyed by

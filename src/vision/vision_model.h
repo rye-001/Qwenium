@@ -37,8 +37,11 @@ namespace qinf::vision {
 // requires. (Parameterize-don't-split: one config, a type knob — NOT a parallel
 // config struct per projector.)
 enum class VisionProjectorType {
-    Gemma3Siglip,  // 27-layer SigLIP ViT + 4×4 pool + projection + soft-emb-norm
-    Gemma4Uv,      // blockless im2col projector (gemma4uv); variable token count
+    Gemma3Siglip,   // 27-layer SigLIP ViT + 4×4 pool + projection + soft-emb-norm
+    Gemma4Uv,       // blockless im2col projector (gemma4uv); variable token count
+    Qwen3VlMerger,  // Qwen 3.5-family ViT + 2×2 merger (qwen3vl_merger);
+                    // variable token count. P1 parses it; no encoder until P3,
+                    // so constructing one still refuses fail-loud.
 };
 
 // SigLIP / Gemma mmproj config. Fields named after the upstream GGUF
@@ -70,6 +73,15 @@ struct SigLIPConfig {
     uint32_t projection_dim       = 0;    // = text_embed_dim of the host text
                                           // model. Filled from the mmproj's
                                           // projection-weight column count.
+
+    // ── Normalization, read from clip.vision.image_{mean,std} ────────────────
+    // Defaults are the SigLIP values. Populated by VisionLoader for every
+    // projector now that GGUFKVBag can read float arrays (P1). The
+    // preprocessing recipes still hardcode their own copies — wiring these
+    // through is P5, and doing it here would change pixels outside a
+    // byte-gated step.
+    float image_mean[3] = {0.5f, 0.5f, 0.5f};
+    float image_std[3]  = {0.5f, 0.5f, 0.5f};
 
     // ── Token markers (informational; the text-side tokenizer owns them) ─────
     int32_t image_soft_token_id = -1;

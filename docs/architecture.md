@@ -31,12 +31,25 @@ one engine:
   them into one forward pass.
 
 The **workload envelope** is load-bearing and explains many "missing" features:
-≤10 concurrent slots, ≤4K-context order-management-style prompts, ~12 GB
-quantized models on unified memory. KV-cache *memory* is not the constraint in
-this regime — which is why KV compression (TurboQuant) and KV eviction (SnapKV)
-were built, measured, and then deleted. Decode-time *latency* is the constraint,
-so the optimization surface is kernel launches, grammar-step cost, and prefill
-reuse (caching).
+≤10 concurrent slots, ≤10K context, ~12 GB quantized models on unified memory.
+KV-cache *memory* is not the constraint in this regime — which is why KV
+compression (TurboQuant) and KV eviction (SnapKV) were built, measured, and
+then deleted. Decode-time *latency* is the constraint, so the optimization
+surface is kernel launches, grammar-step cost, and prefill reuse (caching).
+
+The context ceiling was **raised from 4K to 10K on 2026-08-24**. The old figure
+described order-management text prompts and predated any image whose token
+count scales with resolution: Gemma 3 vision is always 256 soft tokens and
+Gemma 4 is 40–280, but a Qwen-VL-class encoder emits 2K–8K for a document page,
+which did not fit. 10K is the smallest ceiling that holds one high-resolution
+document plus its prompt and answer. Two consequences worth stating plainly:
+KV bytes scale as **ctx × slots**, so this is a 2.4× multiplier on the very
+axis the TurboQuant/SnapKV deletion declared non-binding — that rationale now
+rests on a measurement taken at 4K and should be re-checked rather than assumed
+if a 10-slot host runs tight (`--kv-f16` is the first lever). And the measured
+figures elsewhere in this document that name "ctx 4096" (§KV element type) are
+historical measurements, not envelope statements; they stay as recorded until
+re-measured.
 
 **The receipts identity (2026-07-19).** Beyond serving answers, the engine
 treats its own computation as a product surface — *"where it looked, what
@@ -164,16 +177,16 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly), `moe_residency` (routing-skew telemetry) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
-| `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap, metadata), `weight_binding` (fail-loud tensor inventory), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check` |
 | `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
-| `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `vision_loader`, `vision_model`, `bitmap` |
+| `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Portable snapshot file format | `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
-| `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `image_loader` (preprocessing lives here — the encoder is content-blind), `image_prompt`, `speculative-bridge` |
+| `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `image_loader` (image **IO**: decode/resample/normalize — the encoder is content-blind; the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt`, `speculative-bridge` |
 | `src/telemetry/` | Metrics | `metrics.h` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | |
 
@@ -394,12 +407,36 @@ Two interfaces carry the whole boundary, and both have two implementations
   reserved placeholder span, *after* Gemma's √d embedding scale (image rows
   enter unscaled). Gemma 3's span attends bidirectionally (a mask parameter);
   Gemma 4's is plain causal — hosting it *removed* an interface parameter,
-  which is the pressure test passing.
+  which is the pressure test passing. Four implementations now: `gemma3`,
+  `gemma4`, `qwen36` (`qwen35moe`) and `qwen35`. The two Qwen recipes add 2-D
+  positions via `image_span_is_2d()` and the optional `grid_w`/`grid_h`
+  parameters — additive, so the Gemma recipes ignore them unchanged.
 
-Preprocessing (resize/normalize) lives in `cli/image_loader`, parameterized
-per family and byte-gated against captured llama.cpp references — the encoder
-must see exactly what it saw in training (aspect-preserving letterbox,
-align-corners bilinear, uint8 intermediate).
+  **Ordering contract (load-bearing).** `build_image_substitution` both splices
+  the span *and* registers the `ImageEmbeddingsInput` that uploads the encoder
+  output, so a recipe MUST call `graph_inputs_.clear()` **before** the splice.
+  Clearing after it discards the upload silently: the graph keeps the tensor and
+  the splice still overwrites the residual stream with it, but nothing fills it,
+  so the image span carries stale buffer contents and the model confidently
+  describes noise. That was the qwen36 vision bug, and it survived weeks of
+  investigation because every component was correct in isolation.
+  `ForwardPassBase::set_prefill_inputs` now refuses it fail-loud
+  (`GraphInputSet::has_slot`, pinned by `test_graph_input`).
+
+Preprocessing splits along the same grain as the seams. The **recipe** —
+`vision/image_preprocess.h`, `ImagePreprocess` plus one factory per projector —
+is projector knowledge and lives with the encoders. The **pipeline** —
+`cli/image_loader` — is IO: decode, resample, normalize, emit a Bitmap. It is
+byte-gated against captured llama.cpp references, because the encoder must see
+exactly what it saw in training (aspect-preserving letterbox, align-corners
+bilinear, uint8 intermediate).
+
+Which recipe and which encoder a given mmproj gets is **one** decision, made in
+`vision/vision_profile`: projector type → `{encoder, cache tag, marker token
+ids, framing string, thinking flag, preprocessing recipe}`, as an exhaustive
+switch that throws on an unregistered projector. Both front ends (CLI and
+server) consume that profile rather than branching themselves, so a new
+projector is taught to the system in exactly one place.
 
 Server-side, `ServerVision` routes `image_url` content through the same seams,
 with an embedding cache (`--image-embed-cache`) and an image-prefix KV cache
@@ -561,7 +598,7 @@ used only for the output-head matmul, overlapping with the next token's body.
   public seam** — the lens tap locates rows by name; renaming is a breaking
   change (§13 trigger). (b) **Materialized decode attention is load-bearing on
   tapped layers**: any future fused/flash-style attention must keep tapped
-  layers materialized or export their rows (decode is one query row × ≤4K
+  layers materialized or export their rows (decode is one query row × ≤10K
   keys, so fusion buys nothing there — the conflict is theoretical inside the
   envelope, named so it stays theoretical). (c) **Receipts-grade determinism
   is per-config AND single-slot**: the batch-shape fork (above) means a
@@ -637,6 +674,27 @@ Current, verified against the tree at time of writing:
   *claims* for Gemma yet, its constants are unprobed).
 
 ---
+
+- **Qwen 3.5-family vision is gated by coherence smokes, not by an automated
+  test.** The ViT (`qwen3vl_encoder`) *does* have a numeric reference now —
+  captured encoder-only via `clip_init`/`clip_image_encode` against the vendored
+  mtmd source, cosine 0.999875 whole-block and 0.9999 per-token at two sizes and
+  both grid parities — but that differential lives in a scratch harness, not in
+  `tests/`. End to end, both Qwen recipes are verified only by manual CLI smokes
+  on single images. See `plan-qwen35-vision-impl.md` §8.6.
+- **VL sessions are not snapshottable or prefix-cacheable.** An M-RoPE image
+  span occupies nx·ny KV rows while advancing the sequence position by only
+  max(nx, ny), and the snapshot blob records a row count with no rope
+  coordinate — so such a slot cannot be round-tripped. `capture_slot` refuses a
+  slot with a recorded divergence, and the CLI refuses `--image-prefix-cache` on
+  an M-RoPE recipe at setup. Gemma (one position per row) is unaffected.
+  Lifting this needs the snapshot header bump described in
+  `plan-qwen35-vision-impl.md` §4 decision 3.
+- **A Metal command-buffer OOM does not fail loud.** The backend reports
+  `error state from a previous command buffer failure` and the engine keeps
+  decoding, emitting plausible text. A full-budget (4096-token) image prefill
+  exceeds GPU memory next to a 13–17 GB model on a 32 GB host, so this is
+  reachable from ordinary use, and it has already caused one misdiagnosis.
 
 ## 13. Keeping this document alive
 

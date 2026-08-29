@@ -1,6 +1,10 @@
 #pragma once
 
 #include "forward_pass_base.h"
+#include "i_image_embeddable.h"   // Seam B
+#include "../layers/attention.h"  // MRopeSections
+#include "../graph_inputs/mrope_positions_input.h"
+#include "../graph_inputs/positions_input.h"
 #include "../layers/deltanet.h"
 #include "../state/deltanet_state.h"
 #include "../state/kv_cache_simple.h"
@@ -24,6 +28,13 @@ struct Qwen35Config {
 
     // Partial-RoPE dimension (0 -> fall back to full head dimension at use sites)
     uint32_t rope_dimension_count;
+
+    // M-RoPE section widths from qwen35.rope.dimension_sections (P2 of
+    // docs/plan-qwen35-vision-impl.md). Every Qwen 3.5-family GGUF declares
+    // [11, 11, 10, 0]; absent ⇒ inactive ⇒ plain NEOX, which is what this
+    // engine did before P2. Text-only output is identical either way — the
+    // four components carry the same position until an image splits them.
+    MRopeSections mrope_sections;
 
     // Hybrid-attention scheduling
     uint32_t full_attention_interval;
@@ -65,8 +76,23 @@ struct Qwen35Config {
  *   - Optional trailing NextN / MTP head block, excluded from the decode
  *     stack: the stack is n_main_layers_ deep, not meta_.block_count.
  */
-class Qwen35ForwardPass : public ForwardPassBase {
+class Qwen35ForwardPass : public ForwardPassBase,
+                          public IImageEmbeddable {
 public:
+    // ── M-RoPE plumbing (P2 of docs/plan-qwen35-vision-impl.md) ──────────────
+    // Position components per token: 4 when the GGUF declares
+    // rope.dimension_sections, else 1. inp_pos is sized by this and filled by
+    // the matching graph input, so the two can never disagree.
+    int n_pos_per_token() const {
+        return cfg_.mrope_sections.active ? MRopePositionsInput::kComponents : 1;
+    }
+    void add_positions_input() {
+        if (cfg_.mrope_sections.active)
+            graph_inputs_.add(std::make_unique<MRopePositionsInput>());
+        else
+            graph_inputs_.add(std::make_unique<PositionsInput>());
+    }
+
     Qwen35ForwardPass(const Model& model, const ModelMetadata* metadata,
                       uint32_t context_len, uint32_t max_batch_size = 1,
                       ggml_type kv_type = GGML_TYPE_F32);
@@ -87,6 +113,37 @@ public:
     // Decode graph is persistent-capable: every step-varying quantity is a
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
     bool supports_persistent_decode() const override { return true; }
+
+    // ── Seam B (docs/plan-qwen35-vision-impl.md) ─────────────────────────────
+    // Identical in shape to Qwen36ForwardPass: both host the same projector
+    // (qwen3vl_merger) and the same M-RoPE position construction, and differ
+    // only in the layer stack the substituted residual stream then flows
+    // through. Qwen 3.8-27B is the target that made this recipe multimodal.
+    //
+    // grid_w/grid_h are load-bearing here, as on qwen36: under M-RoPE an image
+    // token's components are (t=pos, h=pos+row, w=pos+col, e=0), so the grid
+    // width decides the row/column of every token. An image armed with
+    // grid_w == 0 is refused at the splice rather than silently encoded as a
+    // 1-D run.
+    void set_image_embeddings(std::vector<float> embd,
+                              int32_t span_start,
+                              uint32_t n_tokens,
+                              uint32_t grid_w = 0,
+                              uint32_t grid_h = 0) override {
+        image_embd_       = std::move(embd);
+        image_span_start_ = span_start;
+        image_n_tokens_   = n_tokens;
+        image_grid_w_     = grid_w;
+        image_grid_h_     = grid_h;
+    }
+
+    // M-RoPE puts an image on a 2-D position grid, so the span advances the
+    // sequence position by max(nx, ny), not by its token count. Without the
+    // sections declared this recipe is on scalar NEOX positions and the image
+    // is a plain 1-D run, same as Gemma.
+    bool image_span_is_2d() const override {
+        return cfg_.mrope_sections.active;
+    }
 
     // --- Cache management (delegates to KV and SSM caches) ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
@@ -128,6 +185,14 @@ public:
     }
 
 private:
+    // Armed image-token embeddings for the next prefill (empty => text-only).
+    // Consumed (moved) by build_prefill_graph. See set_image_embeddings.
+    std::vector<float> image_embd_;
+    int32_t            image_span_start_ = -1;
+    uint32_t           image_n_tokens_   = 0;
+    uint32_t           image_grid_w_     = 0;
+    uint32_t           image_grid_h_     = 0;
+
     Qwen35Config cfg_;  // family-specific config, derived from ModelMetadata at construction
 
     // Depth of the main decode stack: meta_.block_count minus the trailing

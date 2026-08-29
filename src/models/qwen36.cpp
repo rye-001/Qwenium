@@ -30,6 +30,15 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
     const uint32_t expert_used_count       = meta.raw_kv.get_uint32("qwen35moe.expert_used_count");
     const uint32_t expert_feed_forward_length = meta.raw_kv.get_uint32("qwen35moe.expert_feed_forward_length");
     const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32("qwen35moe.rope.dimension_count");
+    // M-RoPE sections (P2). rope_dimension_count is asserted > 0 below, so the
+    // effective n_rot is always the declared value here.
+    MRopeSections mrope_sections;
+    {
+        static constexpr const char* kSectionsKey = "qwen35moe.rope.dimension_sections";
+        if (auto widths = meta.raw_kv.get_int32_array_opt(kSectionsKey))
+            mrope_sections = MRopeSections::from_widths(
+                *widths, kSectionsKey, static_cast<int>(rope_dimension_count));
+    }
     const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
     // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
     const uint32_t nextn_predict_layers    = meta.nextn_predict_layers();
@@ -81,6 +90,7 @@ Qwen35MoEConfig Qwen35MoEConfig::from_metadata(const ModelMetadata& meta) {
         expert_used_count,
         expert_feed_forward_length,
         rope_dimension_count,
+        mrope_sections,
         full_attention_interval,
         nextn_predict_layers,
     };
@@ -279,26 +289,77 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
         nullptr
     };
 
-    // 1. Token embedding
-    ggml_tensor* inpL = embedding(gf, tokens);
-    set_tensor_name(gf, inpL, "inpL");
-
-    // 2. Position tensor (shared by all attention layers)
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tok);
-    ggml_set_input(inp_pos);
-    set_tensor_name(gf, inp_pos, "inp_pos");
-    ggml_build_forward_expand(gf, inp_pos);
-
     // Typed inputs (replaces set_inputs). One uniform causal mask per
     // attention layer; DeltaNet layers have none. build_output_head appends
     // SparseHeadInput on the sparse path.
+    //
+    // MUST be cleared BEFORE the image splice below: build_image_substitution
+    // registers the ImageEmbeddingsInput that uploads the encoder output, so a
+    // clear() after the splice silently discards it and the image span keeps
+    // whatever the buffer held — the model then sees periodic noise rather than
+    // the image. gemma3, gemma4 and qwen35 all order it this way.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
-    graph_inputs_.add(std::make_unique<PositionsInput>());
+    add_positions_input();
     for (uint32_t il = 0; il < n_main_layers_; ++il)
         if (cfg_.is_full_attention_layer(il))
             graph_inputs_.add(std::make_unique<AttnMaskInput>(
                 "kq_mask." + std::to_string(il), 0u));
+
+    // 1. Token embedding
+    ggml_tensor* inpL = embedding(gf, tokens);
+    set_tensor_name(gf, inpL, "inpL");
+
+    // 1b. Image-token substitution (Seam B — the one C3 boundary site between
+    //     this recipe and the vision subsystem, P4). Qwen3.6 has no embedding
+    //     scale, so the image rows go in directly. Image-span attention stays
+    //     CAUSAL: Qwen-VL is causal over image tokens, unlike Gemma 3's nominal
+    //     bidi — so there is no mask parameter here at all.
+    //
+    //     The grid width is handed to set_prefill_inputs via the base's
+    //     mrope_img_grid_w_, where MRopePositionsInput turns it into per-token
+    //     (t, h, w, e) components. Refuse a spatially-unstructured image rather
+    //     than encode it as a 1-D run.
+    if (!image_embd_.empty()) {
+        if (cfg_.mrope_sections.active && image_grid_w_ == 0)
+            throw std::runtime_error(
+                "Qwen36ForwardPass: slot \"set_image_embeddings.grid_w\" "
+                "expected > 0 (this recipe uses M-RoPE and needs the image's "
+                "soft-token grid), actual: 0");
+        if (image_grid_w_ != 0 &&
+            image_n_tokens_ % image_grid_w_ != 0)
+            throw std::runtime_error(
+                "Qwen36ForwardPass: slot \"set_image_embeddings\" expected "
+                "n_tokens divisible by grid_w, actual: " +
+                std::to_string(image_n_tokens_) + " % " +
+                std::to_string(image_grid_w_));
+
+        inpL = build_image_substitution(
+            gf, inpL, std::move(image_embd_), image_span_start_,
+            image_n_tokens_, static_cast<int>(m.embedding_length), n_tok);
+        mrope_img_grid_w_ = cfg_.mrope_sections.active ? image_grid_w_ : 0u;
+        image_span_start_ = -1;   // consume-on-use (image_embd_ moved out)
+        image_n_tokens_   = 0;
+        image_grid_w_     = 0;
+        image_grid_h_     = 0;
+    }
+
+    // Under M-RoPE the rope position and the KV row count diverge once an image
+    // has been written (an image writes nx·ny rows but advances the position by
+    // max(nx, ny)). The mask indexes KV rows, so tell it where this batch's rows
+    // start; without it the causal test silently hides most of the image.
+    if (cfg_.mrope_sections.active)
+        mrope_kv_base_ = static_cast<int>(get_cache_pos(slot_idx));
+
+    // 2. Position tensor (shared by all attention layers)
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(
+        ctx_, GGML_TYPE_I32, n_tok * n_pos_per_token());
+    ggml_set_input(inp_pos);
+    set_tensor_name(gf, inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    // (Typed inputs are set up above, before the image splice — see the note
+    //  there on why the ordering is load-bearing.)
 
     // 3. Transformer loop (main stack only; NextN head held out — §4)
     for (uint32_t il = 0; il < n_main_layers_; ++il) {
@@ -323,7 +384,8 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
                 n_embd_head_, n_head_, n_head_kv_,
                 n_rot_, m.rope_freq_base,
                 static_cast<int>(m.context_length),
-                m.rms_norm_eps);
+                m.rms_norm_eps,
+                cfg_.mrope_sections);
         } else {
             // DeltaNet layer
             uint32_t dn_idx = static_cast<uint32_t>(dn_layer_map_[il]);
@@ -410,7 +472,8 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inpL, "inpL");
 
     // 2. Position tensor (one per batch element)
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_batch);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(
+        ctx_, GGML_TYPE_I32, n_batch * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -450,7 +513,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     // n_kv_len per-slot stride (not n_ctx_max).
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
-    graph_inputs_.add(std::make_unique<PositionsInput>());
+    add_positions_input();
     graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         GatherIndicesInput::Stride::NKvLen));
@@ -479,7 +542,8 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
                 n_rot_, m.rope_freq_base,
                 static_cast<int>(m.context_length),
                 m.rms_norm_eps,
-                kv_write_idx);
+                kv_write_idx,
+                cfg_.mrope_sections);
         } else {
             uint32_t dn_idx = static_cast<uint32_t>(dn_layer_map_[il]);
             // One token per slot: pass slots vector to DeltaNet decode path.
@@ -569,7 +633,9 @@ ggml_cgraph* Qwen36ForwardPass::build_mtp_graph(uint32_t n_past)
     set_tensor_name(gf, t_h, "mtp_h");
     ggml_build_forward_expand(gf, t_h);
 
-    ggml_tensor* t_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    // One drafted token, but M-RoPE still wants its four position components.
+    ggml_tensor* t_pos = ggml_new_tensor_1d(
+        ctx_, GGML_TYPE_I32, 1 * n_pos_per_token());
     ggml_set_input(t_pos);
     set_tensor_name(gf, t_pos, "mtp_pos");
     ggml_build_forward_expand(gf, t_pos);
@@ -597,7 +663,8 @@ ggml_cgraph* Qwen36ForwardPass::build_mtp_graph(uint32_t n_past)
         n_embd_head_, n_head_, n_head_kv_,
         n_rot_, m.rope_freq_base,
         static_cast<int>(m.context_length),
-        m.rms_norm_eps);
+        m.rms_norm_eps,
+        cfg_.mrope_sections);
     cur = ggml_add(ctx_, cur, inpSA);
 
     ggml_tensor* ffn_inp = cur;
@@ -677,7 +744,13 @@ std::vector<int32_t> Qwen36ForwardPass::mtp_draft(
         const int32_t p = pos + static_cast<int32_t>(i);
         ggml_backend_tensor_set(t_tok, &tok, 0, sizeof(int32_t));
         ggml_backend_tensor_set(t_h,   h.data(), 0, ggml_nbytes(t_h));
-        ggml_backend_tensor_set(t_pos, &p,   0, sizeof(int32_t));
+        // Under M-RoPE this tensor holds four components for the single
+        // drafted row; text drafting gives them all the same position, which
+        // is what MRopePositionsInput does for the main graphs.
+        const std::vector<int32_t> p_components(
+            static_cast<size_t>(n_pos_per_token()), p);
+        ggml_backend_tensor_set(t_pos, p_components.data(), 0,
+                                p_components.size() * sizeof(int32_t));
         // Single query token attending to all i+1 KV entries: no masking.
         const std::vector<float> mask_zeros(i + 1, 0.0f);
         ggml_backend_tensor_set(t_mask, mask_zeros.data(), 0,

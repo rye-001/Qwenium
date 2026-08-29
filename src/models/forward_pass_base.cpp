@@ -38,6 +38,7 @@ ForwardPassBase::~ForwardPassBase() {
 }
 
 void ForwardPassBase::reset_context() {
+    image_spliced_ = false;
     if (ctx_) {
         ggml_free(ctx_);
     }
@@ -217,6 +218,7 @@ ggml_tensor* ForwardPassBase::build_image_substitution(
     ggml_build_forward_expand(gf, inpL);
 
     graph_inputs_.add(std::make_unique<ImageEmbeddingsInput>(std::move(embd)));
+    image_spliced_ = true;  // guarded in set_prefill_inputs
     return inpL;
 }
 

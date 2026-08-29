@@ -683,7 +683,9 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
             std::vector<int32_t>  tks       = {cur};
             std::vector<uint32_t> slots     = {0};
-            std::vector<int32_t>  positions = {(int)fp->get_cache_pos(0)};
+            // Rope position, not the KV row count (they diverge after an
+            // image). Identical on this text-only path; kept honest.
+            std::vector<int32_t>  positions = {fp->get_rope_pos(0)};
             ggml_cgraph* gf = fp->build_decoding_graph(tks, slots, positions);
             fp->mark_attention_taps(gf);
             ggml_backend_sched_reset(sched);

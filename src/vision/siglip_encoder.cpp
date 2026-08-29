@@ -389,6 +389,17 @@ uint32_t SiglipEncoder::mm_tokens_for(const Bitmap& /*bitmap*/) const {
     return model_.config().mm_tokens_per_image;
 }
 
+void SiglipEncoder::mm_grid_for(const Bitmap& /*bitmap*/,
+                                uint32_t& nx, uint32_t& ny) const {
+    // Constant, like mm_tokens_for: the 896 tile always pools to 16×16.
+    const auto& cfg = model_.config();
+    const uint32_t per_side =
+        (cfg.patch_size && cfg.pool_factor)
+            ? (cfg.image_size / cfg.patch_size) / cfg.pool_factor : 0;
+    nx = per_side;
+    ny = per_side;
+}
+
 uint32_t SiglipEncoder::projection_dim() const {
     return model_.config().projection_dim != 0
         ? model_.config().projection_dim

@@ -133,6 +133,45 @@ ggml_tensor* build_batched_attention(
     float                           softcap = 0.0f,
     ggml_tensor*                    kv_write_indices = nullptr);
 
+// ── M-RoPE section widths ────────────────────────────────────────────────────
+// P2 of docs/plan-qwen35-vision-impl.md. `<arch>.rope.dimension_sections`
+// splits the rotated dimensions into four sections, each reading its own
+// position component. When active, RoPE is ggml_rope_multi instead of
+// ggml_rope_ext and `inp_pos` carries 4 components per token (component-major
+// — see MRopePositionsInput).
+//
+// This is a PARAMETER on RoPE, not a separate attention variant: the rotation
+// layout is identical (ggml uses the same rotate_pairs(n_dims, n_dims/2) for
+// MROPE as for NEOX), only the per-dimension theta source differs. With all
+// four components equal — every text-only step — the two are numerically the
+// same operation.
+struct MRopeSections {
+    // Widths summing to n_rot/2. Qwen 3.5-family GGUFs all declare
+    // [11, 11, 10, 0] against rope.dimension_count 64.
+    int32_t widths[4] = {0, 0, 0, 0};
+
+    // False ⇒ the recipe uses plain NEOX RoPE and a 1-component inp_pos.
+    // Absence of the GGUF key is a legitimate, well-defined state (a text-only
+    // checkpoint), not a missing required input — so it is a flag, not a throw.
+    bool active = false;
+
+    // Build from a GGUF `rope.dimension_sections` array, validating what ggml
+    // and the rotation maths actually require. Shared by every recipe that
+    // reads the key so the checks cannot drift between them.
+    //
+    // Fail-loud on a PRESENT but malformed key — that is a real contradiction
+    // in the file, unlike simple absence. `key` names the slot in the message,
+    // `n_rot` is the recipe's effective rotated width.
+    //   - exactly 4 widths
+    //   - widths sum to n_rot/2 (each rotated pair belongs to exactly one
+    //     section; a short sum makes ggml's `sector % sect_dims` wrap and
+    //     silently rotate against the wrong component)
+    //   - at least one of the first three is > 0 (ggml asserts this)
+    static MRopeSections from_widths(const std::vector<int32_t>& widths,
+                                     const char* key,
+                                     int n_rot);
+};
+
 // ── Gated attention variants (Qwen3.5, Qwen3.6) ─────────────────────────────
 // These models use a joint Q+Gate projection, Q/K RMS norms, partial RoPE, and
 // sigmoid gating after the attention output. They differ structurally from the
@@ -163,7 +202,9 @@ ggml_tensor* build_gated_attention(
     int              n_rot,
     float            freq_base,
     int              context_length,
-    float            rms_norm_eps);
+    float            rms_norm_eps,
+    // Default-inactive so existing call sites keep NEOX behaviour verbatim.
+    const MRopeSections& mrope = MRopeSections{});
 
 // Decode / batched multi-slot gated attention.
 // Same gated projections/norms/gating as above, but operates on a batch of
@@ -195,7 +236,8 @@ ggml_tensor* build_gated_batched_attention(
     float                           freq_base,
     int                             context_length,
     float                           rms_norm_eps,
-    ggml_tensor*                    kv_write_indices = nullptr);
+    ggml_tensor*                    kv_write_indices = nullptr,
+    const MRopeSections&            mrope = MRopeSections{});
 
 // ── AttentionLayer class (Phase 2 canonical interface) ────────────────────────
 //

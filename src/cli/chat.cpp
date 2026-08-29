@@ -29,6 +29,7 @@
 #include "../vision/bitmap.h"
 #include "image_loader.h"
 #include "image_prompt.h"
+#include "../vision/vision_profile.h"
 
 int run_chat(
     Model& model,
@@ -151,12 +152,13 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 throw std::runtime_error(
                     "run_chat: parameter '--image': requires '--mmproj' (the "
                     "vision projector GGUF), got: empty mmproj path");
-            // (Gemma 3 or Gemma 4). Fail loud at setup, not mid-conversation.
+            // (Gemma 3/4, Qwen 3.5-family). Fail loud at setup, not mid-conversation.
             img_recipe = dynamic_cast<IImageEmbeddable*>(forward_pass.get());
             if (img_recipe == nullptr)
                 throw std::runtime_error(
                     "run_chat: parameter '--image': expected a recipe "
-                    "implementing IImageEmbeddable (Gemma 3 or Gemma 4 vision), "
+                    "implementing IImageEmbeddable (Gemma 3, Gemma 4, or "
+                    "Qwen 3.5-family vision), "
                     "got: a different recipe");
 
             ggml_backend_t backend = model.has_metal_backend()
@@ -166,68 +168,23 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             vloader->parse_metadata(args.mmproj_path, *vmodel);
             vloader->load_tensors(*vmodel, backend);
 
-            const auto& id_to_token = tokenizer->get_vocabulary();
-            auto find_id = [&](const std::string& s) -> int32_t {
-                for (size_t i = 0; i < id_to_token.size(); ++i)
-                    if (id_to_token[i] == s) return static_cast<int32_t>(i);
-                return -1;
-            };
+            // Projector-specific setup lives in ONE place (P0). Everything
+            // family-shaped — encoder, cache tag, marker ids, framing string,
+            // thinking requirement, preprocessing — comes back as a profile,
+            // and an unhandled projector throws instead of defaulting.
+            qinf::vision::VisionProfile vprofile = qinf::vision::make_vision_profile(
+                *vmodel, backend, tokenizer->get_vocabulary(),
+                "run_chat: parameter '--image'");
 
-            // Encoder identity tag for the persistent embedding cache header.
-            std::string projector_tag;
-            using PT = qinf::vision::VisionProjectorType;
-            if (vmodel->config().projector_type == PT::Gemma3Siglip) {
-                projector_tag = "gemma3-siglip";
-                vencoder = std::make_unique<qinf::vision::SiglipEncoder>(
-                    *vmodel, backend, vmodel->config().projection_dim);
-                boi_id  = find_id("<start_of_image>");
-                eoi_id  = find_id("<end_of_image>");
-                soft_id = find_id("<image_soft_token>");
-                if (boi_id < 0 || eoi_id < 0 || soft_id < 0)
-                    throw std::runtime_error(
-                        "run_chat: parameter '--image': expected the model's "
-                        "tokenizer to define <start_of_image>/<image_soft_token>/"
-                        "<end_of_image>, got: a text-only (non-multimodal) vocab");
-                // HF Gemma3Processor wraps the image block in "\n\n" on both sides.
-                image_render_prefix = "\n\n<start_of_image>\n\n";
-                image_bitmap = qinf::cli::load_image_to_bitmap(
-                    args.image_path,
-                    qinf::cli::gemma3_preprocess(
-                        static_cast<int>(vmodel->config().image_size)));
-            } else {  // VisionProjectorType::Gemma4Uv
-                projector_tag = "gemma4uv";
-                vencoder = std::make_unique<qinf::vision::Gemma4UvEncoder>(
-                    *vmodel, backend, vmodel->config().projection_dim);
-                // Markers per llama.cpp mtmd: <|image> … <image|>. The per-position
-                // filler <|image|> is cosmetic — its embedding is overwritten by
-                // the substitution; only the N reserved positions matter.
-                boi_id  = find_id("<|image>");
-                eoi_id  = find_id("<image|>");
-                soft_id = find_id("<|image|>");
-                if (boi_id < 0 || eoi_id < 0 || soft_id < 0)
-                    throw std::runtime_error(
-                        "run_chat: parameter '--image': expected the model's "
-                        "tokenizer to define <|image>/<|image|>/<image|>, got: a "
-                        "text-only (non-multimodal) vocab");
-                // The image block is wrapped in "\n\n" — empirically load-bearing:
-                // without the surrounding newlines the begin marker abuts
-                // "<|turn>user\n"/the user text and the image is not read at all
-                // (the model reports a blank/garbled message). With them, the
-                // X-ray is read correctly. (A separate, milder degenerate-prefix
-                // artifact at generation start is still under investigation.)
-                // Gemma 4 image framing per llama.cpp mtmd: inline, NO surrounding
-                // newlines (<|turn>user\n<|image>[img]<image|>text). The gemma3-style
-                // "\n\n<|image>\n\n" copied here originally made the model misread the
-                // image ("abstract digital…" instead of the real content). Combined
-                // with the think branch below, this matches llama's exact token
-                // stream and yields coherent, image-grounded output.
-                image_render_prefix = "<|image>";
-                image_wants_thinking = true;
-                const int eff_patch = static_cast<int>(
-                    vmodel->config().patch_size * vmodel->config().n_merge);
-                image_bitmap = qinf::cli::load_image_to_bitmap(
-                    args.image_path, qinf::cli::gemma4uv_preprocess(eff_patch));
-            }
+            const std::string projector_tag = vprofile.projector_tag;
+            vencoder             = std::move(vprofile.encoder);
+            boi_id               = vprofile.boi_id;
+            eoi_id               = vprofile.eoi_id;
+            soft_id              = vprofile.soft_id;
+            image_render_prefix  = vprofile.marker_prefix;
+            image_wants_thinking = vprofile.wants_thinking;
+            image_bitmap = qinf::cli::load_image_to_bitmap(
+                args.image_path, vprofile.preprocess);
             if (!args.image_embed_cache_dir.empty()) {
                 // Key identity = projector + projection_dim + encode backend. A
                 // different encoder / dim / backend ⇒ different header ⇒ miss
@@ -247,6 +204,21 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                         "run_chat: parameter '--image-prefix-cache': expected a "
                         "recipe that exposes its KV cache(s) (snapshot_kv_caches "
                         "non-empty), got: a recipe without L2 snapshot support");
+                // A 2-D image span writes nx*ny KV rows while advancing the
+                // position by only max(nx, ny). The snapshot blob records a row
+                // count and no rope coordinate, so such a slot cannot be
+                // round-tripped (plan §4 decision 3 — VL sessions are declared
+                // non-snapshottable in v1). capture_slot refuses this too, but
+                // that fires only AFTER a full model load and image encode;
+                // refuse here, before either is paid for.
+                if (img_recipe->image_span_is_2d())
+                    throw std::runtime_error(
+                        "run_chat: parameter '--image-prefix-cache': expected a "
+                        "recipe whose image span advances one position per KV row, "
+                        "got: an M-RoPE recipe, whose image span occupies nx*ny "
+                        "rows but max(nx, ny) positions. The snapshot format "
+                        "carries no rope coordinate, so VL sessions are not "
+                        "prefix-cacheable in v1 — drop --image-prefix-cache");
                 image_prefix_lib = std::make_unique<PrefixLibrary>(
                     args.image_prefix_cache_dir,
                     qinf::snapshot::make_snapshot_header(
@@ -400,7 +372,11 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
 
             // Use Slot 1 for User Session
             const uint32_t session_slot = 1;
-            int current_pos = forward_pass->get_cache_pos(session_slot);
+            // Rope position, NOT the KV row count: an image span writes nx*ny
+            // rows but advances the position by max(nx, ny), so after an image
+            // turn get_cache_pos would start the next turn far past where the
+            // model actually is.
+            int current_pos = forward_pass->get_rope_pos(session_slot);
 
             // Gemma requires a BOS at the very start of the conversation. encode()
             // does not prepend it, so do it here for the first prefill (pos 0).
@@ -633,7 +609,8 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             // turn sees a properly terminated assistant message.
             std::string im_end_suffix = tmpl.turn_end_suffix();
             std::vector<int32_t> im_end_tokens = tokenizer->encode(im_end_suffix);
-            int end_pos = forward_pass->get_cache_pos(session_slot);
+            // Rope position, not the KV row count (they diverge after an image).
+            int end_pos = forward_pass->get_rope_pos(session_slot);
             
             forward_pass->run_prefill(im_end_tokens, end_pos, session_slot, scheduler);
             all_tokens.insert(all_tokens.end(), im_end_tokens.begin(), im_end_tokens.end());

@@ -1,5 +1,7 @@
 #include "slot_snapshot.h"
 
+#include <stdexcept>
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -63,6 +65,22 @@ void add_sections(qinf::session::SessionManifest& man,
 
 std::vector<uint8_t> capture_slot(ForwardPassBase& fp, uint32_t slot,
                                   const qinf::session::CompatHeader& header) {
+    // A snapshot records a ROW COUNT and no rope coordinate. That was lossless
+    // while the two were the same number, but an M-RoPE image span writes nx*ny
+    // rows while advancing the position by only max(nx, ny), so a slot that has
+    // hosted an image cannot be round-tripped: restoring it would resume at the
+    // row count and every later token would rotate at the wrong position.
+    // Refuse rather than persist a blob that decodes wrong
+    // (docs/plan-qwen35-vision-impl.md §4 decision 3 — VL sessions are declared
+    // non-snapshottable in v1; carrying the coordinate needs a header bump).
+    if (fp.has_rope_divergence(slot))
+        throw std::runtime_error(
+            "capture_slot: slot '" + std::to_string(slot) +
+            "': expected KV rows == rope positions (a snapshottable slot), got: "
+            "a slot containing an image span, where they diverge. VL sessions "
+            "are not snapshottable in v1 — disable the prefix/snapshot cache for "
+            "image turns.");
+
     qinf::session::SessionManifest man;
     std::vector<std::unique_ptr<KvCacheSection>> kv_secs;
     std::unique_ptr<DeltaNetStateSection> dn_sec;
@@ -81,6 +99,11 @@ void restore_slot(ForwardPassBase& fp, uint32_t slot,
     add_sections(man, kv_secs, dn_sec, fp, slot);
     qinf::session::SnapshotReader r(blob);
     man.restore(r, expected);
+    // The blob carries no rope coordinate, and capture_slot guarantees it never
+    // held a diverged span — so the restored slot has rows == positions. Drop
+    // any record left over from what this slot held BEFORE the restore, which
+    // would otherwise be applied to unrelated history.
+    fp.reset_rope_pos(slot);
 }
 
 }  // namespace qinf::snapshot

@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "cli/image_loader.h"  // qinf::cli::ImagePreprocess (value member)
+#include "vision/image_preprocess.h"  // qinf::vision::ImagePreprocess (value member)
 
 class Model;
 class ForwardPassBase;
@@ -102,7 +102,7 @@ private:
     int32_t boi_id_ = -1, eoi_id_ = -1, soft_id_ = -1;
     std::string image_marker_prefix_;
     bool image_wants_thinking_ = false;  // Gemma 4 image input → thinking branch
-    qinf::cli::ImagePreprocess preprocess_;
+    qinf::vision::ImagePreprocess preprocess_;
 
     // ── Image caches (opt-in; null unless the dir flag is set) ───────────────
     // V1: skip the ViT re-encode for a recurring image (keyed by content_id).

@@ -198,7 +198,7 @@ TEST(ImageLoader, MatchesLlamaCppGemma3Reference) {
 
 // ── Gemma 4 unified-vision preprocessing (dyn-size + /255 normalize) ──────────
 
-using qinf::cli::gemma4uv_preprocess;
+using qinf::vision::gemma4uv_preprocess;
 
 // A square input fully fills its smart_resize canvas (no pad), so every pixel is
 // the solid color: red → R-plane = 255/255 = 1.0, G/B-planes = 0/255 = 0.0.

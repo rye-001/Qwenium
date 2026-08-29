@@ -98,7 +98,11 @@ public:
     // stays out of ForwardPassBase and StepContext.
     void set_image_embeddings(std::vector<float> embd,
                               int32_t span_start,
-                              uint32_t n_tokens) override {
+                              uint32_t n_tokens,
+                              uint32_t /*grid_w*/ = 0,
+                              uint32_t /*grid_h*/ = 0) override {
+        // Gemma positions are scalar — the image grid carries no information
+        // this recipe can use, so it is accepted and ignored (Seam B, P4).
         image_embd_       = std::move(embd);
         image_span_start_ = span_start;
         image_n_tokens_   = n_tokens;

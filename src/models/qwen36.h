@@ -14,9 +14,13 @@
 
 #include "forward_pass_base.h"
 #include "i_mtp_draftable.h"
+#include "i_image_embeddable.h"
 #include "../state/kv_cache_simple.h"
 #include "../state/deltanet_state.h"
 #include "../layers/moe.h"
+#include "../layers/attention.h"  // MRopeSections
+#include "../graph_inputs/mrope_positions_input.h"
+#include "../graph_inputs/positions_input.h"
 
 #include <cstdint>
 #include <memory>
@@ -48,6 +52,12 @@ struct Qwen35MoEConfig {
 
     // Hybrid-attention
     uint32_t rope_dimension_count;
+
+    // M-RoPE section widths from qwen35moe.rope.dimension_sections (P2 of
+    // docs/plan-qwen35-vision-impl.md). See Qwen35Config for the contract —
+    // identical here; text-only output is unchanged either way.
+    MRopeSections mrope_sections;
+
     uint32_t full_attention_interval;
 
     // MTP / NextN head: number of trailing blocks that are the multi-token
@@ -74,8 +84,23 @@ struct Qwen35MoEConfig {
     static Qwen35MoEConfig from_metadata(const ModelMetadata& meta);
 };
 
-class Qwen36ForwardPass : public ForwardPassBase, public IMtpDraftable {
+class Qwen36ForwardPass : public ForwardPassBase,
+                          public IMtpDraftable,
+                          public IImageEmbeddable {
 public:
+    // ── M-RoPE plumbing (P2). Mirrors Qwen35ForwardPass exactly; inp_pos is
+    // sized by n_pos_per_token() and filled by the matching graph input, so
+    // the two cannot disagree.
+    int n_pos_per_token() const {
+        return cfg_.mrope_sections.active ? MRopePositionsInput::kComponents : 1;
+    }
+    void add_positions_input() {
+        if (cfg_.mrope_sections.active)
+            graph_inputs_.add(std::make_unique<MRopePositionsInput>());
+        else
+            graph_inputs_.add(std::make_unique<PositionsInput>());
+    }
+
     Qwen36ForwardPass(const Model&     model,
                       const ModelMetadata*  metadata,
                       uint32_t              context_len,
@@ -89,6 +114,37 @@ public:
         int pos, uint32_t slot_idx = 0, bool want_logits = true) override;
 
     bool feed_tokens_supported() const override { return true; }
+
+    // ── Seam B (P4 of docs/plan-qwen35-vision-impl.md) ───────────────────────
+    // Arm precomputed image-token embeddings for the next prefill. The recipe
+    // owns the residual stream and performs the substitution; it does not know
+    // how the embeddings were produced.
+    //
+    // grid_w/grid_h are the image's soft-token grid. Unlike Gemma, this recipe
+    // USES them: under M-RoPE each image token's position components are
+    // (t=pos, h=pos+row, w=pos+col, e=0), so the row and column of every token
+    // — hence the grid width — is load-bearing. A non-empty image armed with
+    // grid_w == 0 is refused at the splice rather than silently falling back to
+    // text positions, which would encode the image as a 1-D run.
+    void set_image_embeddings(std::vector<float> embd,
+                              int32_t span_start,
+                              uint32_t n_tokens,
+                              uint32_t grid_w = 0,
+                              uint32_t grid_h = 0) override {
+        image_embd_       = std::move(embd);
+        image_span_start_ = span_start;
+        image_n_tokens_   = n_tokens;
+        image_grid_w_     = grid_w;
+        image_grid_h_     = grid_h;
+    }
+
+    // M-RoPE puts an image on a 2-D position grid, so the span advances the
+    // sequence position by max(nx, ny), not by its token count. Without the
+    // sections declared this recipe is on scalar NEOX positions and the image
+    // is a plain 1-D run, same as Gemma.
+    bool image_span_is_2d() const override {
+        return cfg_.mrope_sections.active;
+    }
 
     // Decode graph is persistent-capable: every step-varying quantity is a
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
@@ -148,6 +204,14 @@ public:
         ggml_backend_sched_t      sched) override;
 
 private:
+    // Armed image-token embeddings for the next prefill (empty => text-only).
+    // Consumed (moved) by build_prefill_graph. See set_image_embeddings.
+    std::vector<float> image_embd_;
+    int32_t            image_span_start_ = -1;
+    uint32_t           image_n_tokens_   = 0;
+    uint32_t           image_grid_w_     = 0;
+    uint32_t           image_grid_h_     = 0;
+
     // One NextN draft step: embed(token) + hidden → eh_proj → block 40 →
     // shared_head_norm → logits ("mtp_logits") + chained hidden ("mtp_h_next").
     // n_past = entries already in the private head KV this draft attempt.
