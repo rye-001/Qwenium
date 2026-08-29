@@ -179,7 +179,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `qwen35_layer` (the layer body shared by the two Qwen 3.5-family hybrids; the FFN is a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
@@ -698,19 +698,21 @@ Current, verified against the tree at time of writing:
   renamed: a rename would make the confusion less visible without resolving it,
   and the fix is to unify the altitude, which is a redesign needing its own plan.
   The header now states the split explicitly.
-- **Qwen 3.5 and 3.6 are two recipes where Gemma 4 is one.** `gemma4` hosts its
-  dense and MoE variants behind an `is_moe` parameter; `qwen35` (dense hybrid)
-  and `qwen36` (MoE hybrid) are separate files with separate config structs,
-  differing on exactly the axis Gemma 4 parameterizes. The same judgment call was
-  made in opposite directions. Not merged. The blocker is **gone as of
-  2026-08-29** — the `Stride::NKvLen` gather bug that would have dragged a
-  behavior fix into the refactor is fixed in its own step, so §11's phasing rule
-  no longer stands in the way. What remains is the open design question itself:
-  whether the FFN choice is a parameter (as Gemma 4 treats it) or a recipe
-  boundary (as Qwen treats it), and whether qwen36's MTP head is a third thing
-  that belongs to neither. That is a decision to take deliberately, not a
-  cleanup — and CLAUDE.md's pressure test says to flag it rather than let it
-  ride.
+- **Qwen 3.5 and 3.6 share one config and one layer body (2026-08-29), but are
+  still two recipe classes.** They differ in exactly one call — dense SwiGLU vs
+  routed experts — so the FFN is now a PARAMETER (`Qwen35Config::is_moe()`,
+  `Qwen35LayerCommon::moe_hp`), settling the inconsistency with Gemma 4, which
+  had always parameterized its own dense/MoE split. `models/qwen35_layer.h`
+  holds the shared body; `Qwen35MoEConfig` is an alias of `Qwen35Config`. The
+  duplication was not theoretical: 11 of the 20 most recent commits touching
+  either recipe had to touch both, and it produced the `Stride::NKvLen` gather
+  defect (wrong in qwen36, right in qwen35, latent for months).
+  Not done, and optional: collapsing `Qwen36ForwardPass` into
+  `Qwen35ForwardPass`. What remains duplicated is class-surface declarations
+  and graph setup, not layer logic. The asymmetry is the MTP head
+  (`IMtpDraftable`, qwen36 only) — a merged class would implement a capability
+  conditionally, and one file would host both hybrids plus the head.
+
 - **`server/inference_server.h` is a 1210-line header-only class.** Past what a
   header should carry, but header-only on purpose: it is what lets the slot and
   queue logic be unit-tested against fake engines with no model, which is a real

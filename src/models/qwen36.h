@@ -1,4 +1,6 @@
 #pragma once
+
+#include "qwen35.h"   // Qwen35Config — shared by both family hybrids
 // qwen36.h — Forward pass for the Qwen 3.6-35B-A3B hybrid architecture.
 //
 // Architecture: 40 layers, layer_idx % 4 == 3: softmax attention (10 layers),
@@ -30,59 +32,13 @@
 // Throws std::runtime_error naming the missing tensor on failure.
 void validate_qwen36_inventory(const ModelMetadata& meta);
 
-// Typed config for the qwen35moe recipe.  Holds only the fields that are
-// family-specific to qwen35moe (SSM / DeltaNet, MoE, partial-RoPE dimension).
-// Universal fields (block_count, embedding_length, head counts, RoPE base,
-// RMS eps) stay on ModelMetadata and are read directly by the recipe.
-//
-// Construct once at recipe startup via from_metadata(); all subsequent
-// graph-building code reads cfg_.* for these fields.
-struct Qwen35MoEConfig {
-    // SSM / DeltaNet block
-    uint32_t ssm_conv_kernel;
-    uint32_t ssm_state_size;
-    uint32_t ssm_group_count;
-    uint32_t ssm_time_step_rank;
-    uint32_t ssm_inner_size;
-
-    // MoE block
-    uint32_t expert_count;
-    uint32_t expert_used_count;
-    uint32_t expert_feed_forward_length;
-
-    // Hybrid-attention
-    uint32_t rope_dimension_count;
-
-    // M-RoPE section widths from qwen35moe.rope.dimension_sections (P2 of
-    // docs/plan-qwen35-vision-impl.md). See Qwen35Config for the contract —
-    // identical here; text-only output is unchanged either way.
-    MRopeSections mrope_sections;
-
-    uint32_t full_attention_interval;
-
-    // MTP / NextN head: number of trailing blocks that are the multi-token
-    // prediction head rather than main decode layers (docs/plan-mtp-decode.md).
-    // 0 for a standard GGUF. The head's tensors are bound (§4) but not executed
-    // until Phase 3/4; here it only shortens the main decode stack.
-    uint32_t nextn_predict_layers;
-
-    // Capability query (mirrors i_image_embeddable's presence check): does this
-    // model carry a trained MTP head?
-    bool has_mtp_head() const { return nextn_predict_layers > 0; }
-
-    // Layer-kind helpers — identical semantics to ModelMetadata::is_*_layer
-    // for the qwen35moe architecture, but self-contained on the config so the
-    // recipe does not read through ModelMetadata at graph-building time.
-    bool is_full_attention_layer(uint32_t il) const {
-        if (full_attention_interval == 0) return true;
-        return (il % full_attention_interval) == (full_attention_interval - 1);
-    }
-    bool is_ssm_layer(uint32_t il) const { return !is_full_attention_layer(il); }
-
-    // Factory: copies family-specific fields from meta and validates
-    // qwen35moe-specific invariants.  Throws std::runtime_error on violation
-    static Qwen35MoEConfig from_metadata(const ModelMetadata& meta);
-};
+// Qwen 3.6's config IS Qwen 3.5's config. The two hybrids differ only in the
+// FFN — dense SwiGLU vs routed experts — which Qwen35Config carries as
+// expert_count/expert_used_count/expert_feed_forward_length and exposes as
+// is_moe(). They were separate, near-identical structs with duplicated helpers
+// and duplicated factories until 2026-08-29; the duplication had already begun
+// drifting stylistically, which is how copies start drifting semantically.
+using Qwen35MoEConfig = Qwen35Config;
 
 class Qwen36ForwardPass : public ForwardPassBase,
                           public IMtpDraftable,

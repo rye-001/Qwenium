@@ -26,6 +26,16 @@ struct Qwen35Config {
     uint32_t ssm_time_step_rank;
     uint32_t ssm_inner_size;
 
+    // MoE block — ZERO on a dense checkpoint. `is_moe()` is the seam between the
+    // two Qwen 3.5-family hybrids: qwen35 (dense SwiGLU FFN) and qwen35moe /
+    // Qwen 3.6 (routed experts). They are otherwise the same recipe — same
+    // DeltaNet/attention interleave, same M-RoPE, same NextN head-out — so the
+    // FFN choice is a PARAMETER here, exactly as Gemma 4 treats its own dense
+    // vs MoE split, rather than a second recipe.
+    uint32_t expert_count = 0;
+    uint32_t expert_used_count = 0;
+    uint32_t expert_feed_forward_length = 0;
+
     // Partial-RoPE dimension (0 -> fall back to full head dimension at use sites)
     uint32_t rope_dimension_count;
 
@@ -46,14 +56,24 @@ struct Qwen35Config {
 
     bool has_mtp_head() const { return nextn_predict_layers > 0; }
 
+    // The dense/MoE seam. Derived from the checkpoint, never configured.
+    bool is_moe() const { return expert_count > 0; }
+
     bool is_full_attention_layer(uint32_t il) const {
         if (full_attention_interval == 0) return true;
         return (il % full_attention_interval) == (full_attention_interval - 1);
     }
     bool is_ssm_layer(uint32_t il) const { return !is_full_attention_layer(il); }
 
-    // Factory: copies family-specific fields from meta and validates
-    // qwen35-specific invariants.  Throws std::runtime_error on violation
+    // Factory: copies family-specific fields from meta and validates the
+    // family's invariants. Throws std::runtime_error on violation.
+    //
+    // Serves BOTH architectures. The GGUF key prefix IS meta.architecture
+    // ("qwen35" or "qwen35moe"), so one reader covers both and every error names
+    // the key the checkpoint actually should have carried. The expert keys are
+    // read only for qwen35moe; rope.dimension_count is required there and
+    // optional (falling back to the head dimension) for qwen35 — preserved
+    // exactly as the two separate factories behaved.
     static Qwen35Config from_metadata(const ModelMetadata& meta);
 };
 
