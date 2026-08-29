@@ -1,4 +1,5 @@
 #include "qwen36.h"
+#include "engine/graph_compute.h"
 
 #include "../layers/attention.h"
 #include "../layers/deltanet.h"
@@ -756,7 +757,8 @@ std::vector<int32_t> Qwen36ForwardPass::mtp_draft(
         ggml_backend_tensor_set(t_mask, mask_zeros.data(), 0,
                                 mask_zeros.size() * sizeof(float));
 
-        ggml_backend_sched_graph_compute(sched, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(sched, gf), "qwen36_mtp_draft");
 
         ggml_tensor* t_logits = ggml_graph_get_tensor(gf, "mtp_logits");
         ggml_tensor* t_hn     = ggml_graph_get_tensor(gf, "mtp_h_next");

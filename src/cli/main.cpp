@@ -316,19 +316,31 @@ int main(int argc, char** argv) {
         std::cout << "Note: Speculative decoding disabled (incompatible with grammar constraints)" << std::endl;
     }
 
-    // --- L1 portable session: save or resume a snapshot (Phase 2) ---
-    if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
-        return run_session(model, args, grammar, log_token);
-    }
-
     // --- Start of Generation ---
-    if (args.chat_mode) {
-        run_chat(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
-    } else if (!args.prompt.empty()) {
-        return run_complete(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
-    } else {
-        std::cout << "\nModel loaded successfully. Provide a prompt to start generation."
-;    }
+    //
+    // The load path above has its own try/catch; this one covers the RUN. A
+    // backend compute failure (engine/graph_compute.h — in practice a Metal
+    // command-buffer failure, usually GPU OOM) throws from deep inside decode,
+    // and without this it would leave main() and std::terminate with no
+    // diagnosis. Report it and exit non-zero, so a script can tell a failed run
+    // from a short one.
+    try {
+        // --- L1 portable session: save or resume a snapshot (Phase 2) ---
+        if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
+            return run_session(model, args, grammar, log_token);
+        }
+
+        if (args.chat_mode) {
+            run_chat(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
+        } else if (!args.prompt.empty()) {
+            return run_complete(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
+        } else {
+            std::cout << "\nModel loaded successfully. Provide a prompt to start generation.";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "\nError during generation: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }

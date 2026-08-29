@@ -184,7 +184,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the fail-loud architecture/tensor-inventory validators), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
-| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill` |
+| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The two services that need `models/`/`graph_inputs/` build into `qinf-engine` or directly into consumers rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
@@ -627,7 +627,16 @@ used only for the output-head matmul, overlapping with the next token's body.
   silent fallbacks, no best-effort recovery: a missing tensor kills the load,
   a wrong-dim vision projector refuses to encode, a version-mismatched
   snapshot refuses to restore, an unknown `conversation_id` tells the client
-  to resend history.
+  to resend history, and **a failed graph compute stops the pass** rather than
+  letting the caller read an uncomputed buffer (`engine/graph_compute.h`).
+  That last one was absent from the text path until 2026-08-29 — ggml-metal
+  returns `GGML_STATUS_FAILED` on a command-buffer failure (usually GPU OOM)
+  and latches it, and every text-path site discarded the status, so the engine
+  decoded fluent nonsense and once caused a misdiagnosis. The vision encoders
+  had always checked. Detection belongs to the engine; **containment belongs to
+  the caller** — the server fails that batch's requests and keeps serving (its
+  inference loop is a bare `std::thread`, so an escaping throw would kill the
+  process), the CLI reports and exits non-zero.
 - **The cross-family rule keeps abstractions honest.** An interface validated
   only on Qwen is presumed Qwen-shaped until a Gemma recipe proves otherwise.
   The success metric for hosting a new variant: zero logic edits to modules
@@ -749,11 +758,6 @@ Current, verified against the tree at time of writing:
   an M-RoPE recipe at setup. Gemma (one position per row) is unaffected.
   Lifting this needs the snapshot header bump described in
   `plan-qwen35-vision-impl.md` §4 decision 3.
-- **A Metal command-buffer OOM does not fail loud.** The backend reports
-  `error state from a previous command buffer failure` and the engine keeps
-  decoding, emitting plausible text. A full-budget (4096-token) image prefill
-  exceeds GPU memory next to a 13–17 GB model on a 32 GB host, so this is
-  reachable from ordinary use, and it has already caused one misdiagnosis.
 
 ## 13. Keeping this document alive
 

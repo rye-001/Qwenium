@@ -1,4 +1,5 @@
 #include "decode_step.h"
+#include "graph_compute.h"
 #include "decode_plan.h"
 #include "decode_graph_cache.h"
 #include "ggml-backend.h"
@@ -109,7 +110,8 @@ int32_t decode_step(
         gf = fp->build_decoding_graph(tokens, slots, positions);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         fp->set_decode_inputs(gf, tokens, slots, positions);
-        ggml_backend_sched_graph_compute(scheduler, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler, gf), "decode_step");
     }
     fp->advance_cache(1, slot);
 

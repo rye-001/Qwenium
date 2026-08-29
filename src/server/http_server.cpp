@@ -17,6 +17,7 @@
 
 // Your existing headers
 #include "engine/model.h"
+#include "engine/graph_compute.h"
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "loader/chat_template.h"
@@ -562,7 +563,8 @@ private:
         ggml_cgraph* gf = forward_pass_->build_prefill_graph(seq, start_pos, slot_id);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
         forward_pass_->set_prefill_inputs(gf, seq, start_pos);
-        ggml_backend_sched_graph_compute(scheduler_, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler_, gf), "server_prefill");
         forward_pass_->advance_cache(seq.size(), slot_id);
 
         // Sample first token
@@ -698,7 +700,8 @@ private:
         ggml_cgraph* gf = forward_pass_->build_decoding_graph(tokens, slot_ids_u32, positions);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
         forward_pass_->set_decode_inputs(gf, tokens, slot_ids_u32, positions);
-        ggml_backend_sched_graph_compute(scheduler_, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler_, gf), "server_decode");
 
         std::vector<int> next_tokens;
         next_tokens.reserve(n_batch);

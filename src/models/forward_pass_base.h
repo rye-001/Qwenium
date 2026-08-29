@@ -9,6 +9,7 @@
 #include "engine/model.h"
 #include "../state/kv_cache_simple.h"
 #include "../graph_inputs/graph_input.h"
+#include "../engine/graph_compute.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
@@ -96,7 +97,8 @@ public:
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler, gf), "run_prefill");
         advance_cache(tokens.size(), slot_idx);
         if (hidden_out) *hidden_out = get_output_hidden(gf);
         return get_output_logits(gf);
@@ -200,7 +202,8 @@ public:
             build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler, gf), "feed_tokens");
         advance_cache(static_cast<uint32_t>(tokens.size()), slot);
         // No get_output_logits: head-less by contract.
     }

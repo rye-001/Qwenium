@@ -1,4 +1,5 @@
 #include "decode_graph_cache.h"
+#include "graph_compute.h"
 
 #include <stdexcept>
 #include <string>
@@ -108,6 +109,7 @@ ggml_cgraph* DecodeGraphCache::step(const std::vector<int32_t>& tokens,
     // HIT and MISS both end the same way: refill typed inputs + recompute. On a
     // hit this is the ONLY work — no reset, no build, no alloc.
     fp_->set_decode_inputs(gf_, tokens, slots, positions);
-    ggml_backend_sched_graph_compute(sched_, gf_);
+    qinf::engine::require_compute_success(
+        ggml_backend_sched_graph_compute(sched_, gf_), "decode_graph_cache");
     return gf_;
 }

@@ -5,6 +5,7 @@
 // interpose.
 
 #include "server_lens.h"
+#include "engine/graph_compute.h"
 
 #include <algorithm>
 #include <cctype>
@@ -698,7 +699,8 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             ggml_backend_sched_reset(sched);
             ggml_backend_sched_alloc_graph(sched, gf);
             fp->set_decode_inputs(gf, tks, slots, positions);
-            ggml_backend_sched_graph_compute(sched, gf);
+            qinf::engine::require_compute_success(
+                ggml_backend_sched_graph_compute(sched, gf), "lens_tapped_decode");
 
             std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
             LensStep st;

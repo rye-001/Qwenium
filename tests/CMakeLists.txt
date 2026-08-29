@@ -772,6 +772,20 @@ target_link_libraries(layer-tests PRIVATE
 target_compile_features(layer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(layer-tests)
 
+# Graph-compute fail-loud check (pure status logic — no GPU, no model).
+add_executable(graph-compute-tests
+    unit/test_graph_compute.cpp
+)
+
+target_link_libraries(graph-compute-tests PRIVATE
+    GTest::gtest_main
+    ggml
+)
+
+target_compile_features(graph-compute-tests PRIVATE cxx_std_17)
+gtest_discover_tests(graph-compute-tests)
+
+
 
 # Gemma 1 forward pass integration test (PR G1.5).
 # Self-skips when the canonical Gemma file is absent.
