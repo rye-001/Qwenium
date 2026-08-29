@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/loader/tokenizer.h"

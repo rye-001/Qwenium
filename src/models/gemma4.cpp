@@ -1,6 +1,6 @@
 #include "gemma4.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
 #include "../layers/norm.h"

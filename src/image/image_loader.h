@@ -29,7 +29,7 @@
 #include "../vision/bitmap.h"
 #include "../vision/image_preprocess.h"
 
-namespace qinf::cli {
+namespace qinf::image {
 
 // Decode + resize + normalize `path` into a channel-planar Bitmap per `pp`.
 // content_id is a content hash of the normalized pixels (encode-cache reuse).
@@ -48,4 +48,4 @@ qinf::vision::Bitmap load_image_to_bitmap_from_memory(const uint8_t* data,
                                                       size_t len,
                                                       const qinf::vision::ImagePreprocess& pp);
 
-}  // namespace qinf::cli
+}  // namespace qinf::image

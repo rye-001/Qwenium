@@ -8,7 +8,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../loader/gguf_loader.h"
 #include "vision_model.h"
 

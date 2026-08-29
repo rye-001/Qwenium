@@ -25,8 +25,8 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/decode_step.h"
-#include "../../src/core/model.h"
+#include "engine/decode_step.h"
+#include "engine/model.h"
 #include "../../src/loader/chat_template.h"
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/loader/tokenizer.h"

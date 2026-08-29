@@ -1,18 +1,18 @@
 #pragma once
 // image_preprocess.h — the projector's preprocessing RECIPE.
 //
-// Split from cli/image_loader.h (2026-08-25, P0 of
+// Split from image/image_loader.h (2026-08-25, P0 of
 // docs/plan-qwen35-vision-impl.md). The division of labour:
 //
 //   - The recipe (this file) is PROJECTOR KNOWLEDGE — what geometry and
 //     normalization the tower was trained against. It belongs beside the
 //     encoder that imposes it, and it is pure data: no image IO, no ggml, no
 //     backend. A recipe is chosen by projector type, never by call site.
-//   - The pipeline (cli/image_loader.h) is IO — decode a JPEG/PNG, resample,
+//   - The pipeline (image/image_loader.h) is IO — decode a JPEG/PNG, resample,
 //     normalize, emit a Bitmap. That stays outside src/vision/, exactly as
 //     image_loader.h has always said it should.
 //
-// Before the split the recipe lived with the IO, which put `qinf::cli` in the
+// Before the split the recipe lived with the IO, which put `qinf::cli` (as it then was) in the
 // type name of something the server, the encoder subsystem and the tests all
 // needed. Nothing about a preprocessing recipe is CLI-shaped.
 //

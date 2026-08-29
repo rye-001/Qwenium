@@ -5,8 +5,10 @@
 // run_prefill bridge. This is the per-recipe correctness harness.
 //
 // THE ORACLE (free, exact): the single-token run_prefill path IS the correct
-// output — it is the same path Gemma decode uses today via DecodeRoute::Bridge
-// (decode_step.cpp). So "decode graph output ≡ single-token run_prefill output"
+// output — it was the path Gemma decode took before this work, through the
+// run_prefill bridge in decode_step (that bridge was deleted 2026-08-29 once
+// this decode graph replaced it). So "decode graph output ≡ single-token
+// run_prefill output"
 // is a true equivalence, not an approximation. This mirrors the feed_tokens
 // differential precedent (docs/plan-feed-tokens.md).
 //
@@ -42,7 +44,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/gemma1.h"
 #include "../../src/models/gemma2.h"
@@ -110,8 +112,8 @@ static std::vector<int32_t> mk_tokens(int base, int n) {
     return v;
 }
 
-// Run ONE single-token decode through the unified decode graph (the
-// DecodeRoute::Unified path of decode_step), returning its logits.
+// Run ONE single-token decode through the decode graph (the path decode_step
+// takes), returning its logits.
 template <typename FP>
 static std::vector<float> decode_one(FP& fp, ggml_backend_sched_t sched,
                                      int32_t token, uint32_t slot, int pos) {
@@ -130,7 +132,7 @@ static std::vector<float> decode_one(FP& fp, ggml_backend_sched_t sched,
 // ── Tier 1: single-slot, bitwise ─────────────────────────────────────────────
 //
 // Reference = single-token run_prefill onto a non-empty mid-decode cache (the
-// exact DecodeRoute::Bridge oracle). Decode = build_decoding_graph for the same
+// exact pre-batched-decode oracle). Decode = build_decoding_graph for the same
 // token at the same position. Same batch shape (N=1) on both sides.
 template <typename FP>
 static DiffResult run_tier1_single_slot(Model& model) {

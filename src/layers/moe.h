@@ -3,8 +3,8 @@
 //
 // Responsibility: construct the MoE subgraph for one transformer layer.
 //   Implements: gating network (top-k softmax over expert scores),
-//   per-expert SwiGLU FFN dispatch via ggml_mul_mat_id (fallback path,
-//   gated behind QINF_MOE_FALLBACK; the fused Metal kernel lives in Phase 4),
+//   per-expert SwiGLU FFN dispatch via three batched ggml_mul_mat_id calls
+//   (native Metal MUL_MAT_ID; launch count is O(1) in n_experts),
 //   and optional sigmoid-gated shared expert blending.
 // Public surface:
 //     MoELayer::build() — unified entry point; Phase arg is accepted for

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "ggml.h"
-#include "../core/platform.h"
+#include "loader/platform.h"
 #include <string>
 #include <memory>
 #include <cstddef>

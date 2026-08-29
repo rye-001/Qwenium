@@ -11,7 +11,7 @@
 #include "cli-args.h"
 #include "speculative-bridge.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
 #include "../sampling/grammar_vocab.h"

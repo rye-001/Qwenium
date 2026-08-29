@@ -174,12 +174,13 @@ src/
 │   └── gemma1-4.*               #   Gemma family (logit soft-cap, sliding-window, PLE, pruned RoPE)
 ├── graph_inputs/                # Typed graph inputs (tokens, positions, masks, image embeddings)
 ├── vision/                      # Image → soft-token encoders (SigLIP, gemma4uv)
-├── core/                        # Engine orchestration: model owner, decode plan, prefix library, caches
-├── session/                     # Portable session-snapshot file format
+├── engine/                      # The loaded model + orchestration of one step over it
+├── session/                     # Session persistence: snapshot format + slot/prefix/image caches
 ├── loader/                      # GGUF parsing, mmap tensor loading, tokenizer, chat templates
 ├── sampling/                    # Sampling, grammar, token-trie, speculative decoding
 ├── server/                      # Inference server + OpenAI-compatible HTTP API
-├── cli/                         # Chat + single-prompt CLI, image preprocessing
+├── image/                       # Host-side image pipeline (decode/resample/normalize, marker expansion)
+├── cli/                         # Chat + single-prompt CLI
 └── telemetry/                   # Observability
 ```
 
@@ -228,7 +229,6 @@ Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
 | `GGML_USE_METAL` | OFF | Metal GPU acceleration (macOS) |
 | `QWEN3_BUILD_TESTS` | OFF | Build unit + integration tests |
 | `QWEN3_ENABLE_OPENMP` | ON | OpenMP parallelism |
-| `QINF_MOE_FALLBACK` | OFF | Use unfused MoE dispatch (reference / debug build) |
 
 ## Tests
 

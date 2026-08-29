@@ -76,23 +76,6 @@ int32_t decode_step(
         have_valid = true;
     }
 
-    // 0. BRIDGE route: single-token run_prefill
-    // No sparse LM head here — run_prefill builds the full dense output;
-    if (plan.route == DecodeRoute::Bridge) {
-        if (graph_cache) graph_cache->invalidate();  // run_prefill resets fp ctx
-        // Rope position, not the KV row count — they diverge after an image.
-        const int32_t pos = fp->get_rope_pos(slot);
-        std::vector<float> logits =
-            fp->run_prefill({token}, pos, slot, scheduler);
-        // run_prefill returns logits for the single decoded position; take the
-        // first vocab_size
-        std::vector<float> last(logits.begin(), logits.begin() + vocab_size);
-        int32_t next_token =
-            static_cast<int32_t>(sampler->sample(last, history, vocab));
-        sampler->accept_token(next_token);
-        return next_token;
-    }
-
     // 1. Query next valid tokens before the forward pass (we don't do it again if elision already did it)
     if (!have_valid) valid_ids = sampler->peek_valid_set();
     const bool use_sparse = plan.sparse_head_allowed &&

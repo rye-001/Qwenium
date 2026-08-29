@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qinf::cli {
+namespace qinf::image {
 
 ExpandedImagePrompt expand_image_markers(
     const std::vector<int32_t>& tokens,
@@ -45,4 +45,4 @@ ExpandedImagePrompt expand_image_markers(
     return out;
 }
 
-}  // namespace qinf::cli
+}  // namespace qinf::image

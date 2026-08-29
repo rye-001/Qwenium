@@ -7,7 +7,6 @@ add_library(qinf-layers STATIC
     ffn.cpp
     deltanet.cpp
     moe.cpp
-    moe_residency.cpp
     norm.cpp
     ple.cpp           # Per-Layer Embedding lookup + projection
     transformer_block.cpp
@@ -22,10 +21,6 @@ target_link_libraries(qinf-layers PUBLIC
     ggml
     qinf-state
 )
-
-if(QINF_MOE_FALLBACK)
-    target_compile_definitions(qinf-layers PUBLIC QINF_MOE_FALLBACK)
-endif()
 
 set_target_properties(qinf-layers PROPERTIES
     POSITION_INDEPENDENT_CODE ON

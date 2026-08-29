@@ -14,7 +14,7 @@
 //   - EOS is only unmasked when grammar is in accepting state
 //   - Vocab is normalized: Qwen3's Ġ (U+0120) → ' ', Ċ (U+010A) → '\n'
 
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "models/qwen35.h"

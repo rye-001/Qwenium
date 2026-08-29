@@ -6,8 +6,8 @@
 #include <stdexcept>
 #include <vector>
 
-#include "../core/decode_step.h"
-#include "../core/model.h"
+#include "engine/decode_step.h"
+#include "engine/model.h"
 #include "../loader/tokenizer.h"
 #include "../models/forward_pass_base.h"
 #include "../models/model_registry.h"

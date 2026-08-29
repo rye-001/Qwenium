@@ -11,8 +11,8 @@
 #include "../models/i_image_embeddable.h"
 #include "../vision/i_vision_encoder.h"
 #include "../vision/bitmap.h"
-#include "image_embedding_cache.h"
-#include "persistent_image_embedding_store.h"
+#include "session/image_embedding_cache.h"
+#include "session/persistent_image_embedding_store.h"
 
 namespace {
 

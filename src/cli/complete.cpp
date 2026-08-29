@@ -3,8 +3,8 @@
 #include <chrono>
 
 #include "complete.h"
-#include "../core/decode_step.h"
-#include "../core/decode_graph_cache.h"
+#include "engine/decode_step.h"
+#include "engine/decode_graph_cache.h"
 #include "../models/model_registry.h"
 #include "../models/i_mtp_draftable.h"
 #include "../sampling/draft_source.h"

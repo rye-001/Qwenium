@@ -46,9 +46,9 @@
 #include <string>
 
 #include "ggml-backend.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
-#include "../../src/core/decode_step.h"
+#include "engine/decode_step.h"
 #include "../../src/sampling/sampling.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/models/qwen35.h"

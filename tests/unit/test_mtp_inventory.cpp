@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "../../src/models/qwen36.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 
 // ---------------------------------------------------------------------------
 // Phase 2 of docs/plan-mtp-decode.md: the qwen35moe inventory validator must

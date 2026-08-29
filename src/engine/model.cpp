@@ -452,17 +452,6 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
     }
 }
 
-bool Model::validate_architecture() const
-{
-    if (!is_loaded_) {
-        return false;
-    }
-    return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" ||
-           metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe" ||
-           metadata_.architecture == "gemma"  || metadata_.architecture == "gemma2" ||
-           metadata_.architecture == "gemma3";
-}
-
 uint64_t Model::parameter_count() const
 {
     uint64_t total = 0;

@@ -10,7 +10,7 @@
 #include <fstream>
 #include <string>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/loader/multimodal_check.h"
 

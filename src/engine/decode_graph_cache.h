@@ -16,7 +16,7 @@
 // Correctness: decode is token-stable but NOT byte-identical vs the exact-n_kv
 //   rebuild path (bucketing re-blocks the reduction — plan §0.1), which is why
 //   the whole path is opt-in.
-// NOT for: sparse-head (grammar) steps, Bridge-route recipes, or recipes with
+// NOT for: sparse-head (grammar) steps, or recipes with
 //   supports_persistent_decode()==false — those keep the per-step rebuild.
 // Unit test: tests/unit/test_decode_graph_cache.cpp
 

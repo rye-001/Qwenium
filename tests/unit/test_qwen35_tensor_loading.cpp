@@ -12,7 +12,7 @@
 #include <string>
 #include <set>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/loader/gguf_loader.h"
 
 static std::string get_qwen35_model_path() {

@@ -12,7 +12,6 @@ add_executable(unit-tests
     unit/test_vocab_file_loading.cpp
     unit/test_qwen35_metadata.cpp
     unit/test_qwen35_tensor_loading.cpp
-    unit/test_ssm_state_cache.cpp
     unit/test_qwen35_tokenizer.cpp
     unit/test_qwen35_hybrid_cache.cpp
     unit/test_qwen35_forward_attn.cpp
@@ -31,7 +30,7 @@ target_link_libraries(unit-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-graph-inputs
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -111,7 +110,7 @@ add_executable(integration-tests
 target_link_libraries(integration-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -122,12 +121,12 @@ gtest_discover_tests(integration-tests)
 # Byte-identical differential harness (compile-identical on main + branch).
 add_executable(logits-dump
     diff/logits_dump.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 target_link_libraries(logits-dump PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -140,7 +139,7 @@ add_executable(order-mngmt-test
 # Link libraries
 target_link_libraries(order-mngmt-test PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -153,7 +152,7 @@ add_executable(parallel-order-mngmt-test
 # Link libraries
 target_link_libraries(parallel-order-mngmt-test PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -176,7 +175,7 @@ gtest_discover_tests(token-trie-tests)
 # rejections from the resolver and re-asserts them here on resolved values.
 add_executable(decode-plan-tests
     unit/test_decode_plan.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 
 target_link_libraries(decode-plan-tests PRIVATE
@@ -194,7 +193,7 @@ add_executable(parallel-grammar-test
 
 target_link_libraries(parallel-grammar-test PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -262,7 +261,7 @@ add_executable(image-embedding-section-tests
 )
 target_link_libraries(image-embedding-section-tests PRIVATE
     GTest::gtest_main
-    core
+    qinf-engine
 )
 target_compile_features(image-embedding-section-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-embedding-section-tests)
@@ -288,7 +287,7 @@ add_executable(prefix-library-tests
 )
 target_link_libraries(prefix-library-tests PRIVATE
     GTest::gtest_main
-    core
+    qinf-engine
 )
 target_compile_features(prefix-library-tests PRIVATE cxx_std_17)
 gtest_discover_tests(prefix-library-tests)
@@ -303,7 +302,7 @@ add_executable(test-l1-session-roundtrip
 target_link_libraries(test-l1-session-roundtrip PRIVATE
     qinf-models
     qinf-state
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -319,7 +318,7 @@ add_executable(test-l2-session-roundtrip
 target_link_libraries(test-l2-session-roundtrip PRIVATE
     qinf-models
     qinf-state
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -335,7 +334,7 @@ add_executable(test-prefix-library-roundtrip
 target_link_libraries(test-prefix-library-roundtrip PRIVATE
     qinf-models
     qinf-state
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -349,14 +348,14 @@ target_compile_features(test-prefix-library-roundtrip PRIVATE cxx_std_17)
 # a Gemma3 (SigLIP) AND a Gemma4 (gemma4uv) image path.
 add_executable(test-image-prefix-roundtrip
     integration/test_image_prefix_roundtrip.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
 )
 target_link_libraries(test-image-prefix-roundtrip PRIVATE
     qinf-models
     qinf-vision
     qinf-state
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -450,19 +449,6 @@ target_link_libraries(moe-tests PRIVATE
 target_compile_features(moe-tests PRIVATE cxx_std_17)
 gtest_discover_tests(moe-tests)
 
-# MoE residency tracker tests (PR 3.M.4) — pure C++, no ggml compute.
-add_executable(moe-residency-tests
-    unit/test_moe_residency.cpp
-)
-
-target_link_libraries(moe-residency-tests PRIVATE
-    GTest::gtest_main
-    qinf-layers
-)
-
-target_compile_features(moe-residency-tests PRIVATE cxx_std_17)
-gtest_discover_tests(moe-residency-tests)
-
 # Qwen36ForwardPass smoke tests (PR 3.I.2).
 # Model-file tests self-skip when QWEN36_MODEL_PATH is unset.
 add_executable(forward-tests-qwen36
@@ -472,7 +458,7 @@ add_executable(forward-tests-qwen36
 target_link_libraries(forward-tests-qwen36 PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -489,7 +475,7 @@ add_executable(forward-pass-base-tests
 target_link_libraries(forward-pass-base-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -510,7 +496,7 @@ target_link_libraries(server-lens-tests PRIVATE
     qinf-models
     qinf-loader
     sampling
-    core
+    qinf-engine
     ggml
 )
 
@@ -526,7 +512,7 @@ add_executable(feed-tokens-tests-qwen36
 target_link_libraries(feed-tokens-tests-qwen36 PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -542,7 +528,7 @@ add_executable(feed-tokens-tests-qwen35
 target_link_libraries(feed-tokens-tests-qwen35 PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -559,7 +545,7 @@ add_executable(feed-tokens-tests-gemma
 target_link_libraries(feed-tokens-tests-gemma PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -577,7 +563,7 @@ add_executable(batched-decode-tests-gemma
 target_link_libraries(batched-decode-tests-gemma PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -596,7 +582,7 @@ target_link_libraries(kv-write-setrows-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-graph-inputs
-    core
+    qinf-engine
     ggml
 )
 
@@ -613,7 +599,7 @@ add_executable(decode-kv-bucket-tests
 target_link_libraries(decode-kv-bucket-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -630,7 +616,7 @@ add_executable(decode-graph-cache-tests
 target_link_libraries(decode-graph-cache-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -648,7 +634,7 @@ target_link_libraries(out-ids-slice-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-graph-inputs
-    core
+    qinf-engine
     ggml
 )
 
@@ -681,7 +667,7 @@ add_executable(config-tests-qwen35
 target_link_libraries(config-tests-qwen35 PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
 )
 
 target_compile_features(config-tests-qwen35 PRIVATE cxx_std_17)
@@ -696,7 +682,7 @@ add_executable(config-tests-qwen36
 target_link_libraries(config-tests-qwen36 PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
 )
 
 target_compile_features(config-tests-qwen36 PRIVATE cxx_std_17)
@@ -709,7 +695,7 @@ add_executable(mtp-inventory-tests
 target_link_libraries(mtp-inventory-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
 )
 target_compile_features(mtp-inventory-tests PRIVATE cxx_std_17)
 gtest_discover_tests(mtp-inventory-tests)
@@ -722,7 +708,7 @@ add_executable(qwen35-nextn-tests
 target_link_libraries(qwen35-nextn-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
 )
 target_compile_features(qwen35-nextn-tests PRIVATE cxx_std_17)
 gtest_discover_tests(qwen35-nextn-tests)
@@ -735,7 +721,7 @@ add_executable(mtp-head-tests
 target_link_libraries(mtp-head-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(mtp-head-tests PRIVATE cxx_std_17)
@@ -780,18 +766,6 @@ target_link_libraries(layer-tests PRIVATE
 target_compile_features(layer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(layer-tests)
 
-# Weight-binding tests (no model file, no ggml compute).
-add_executable(weight-binding-tests
-    unit/test_weight_binding.cpp
-)
-
-target_link_libraries(weight-binding-tests PRIVATE
-    GTest::gtest_main
-    qinf-loader
-)
-
-target_compile_features(weight-binding-tests PRIVATE cxx_std_17)
-gtest_discover_tests(weight-binding-tests)
 
 # Gemma 1 forward pass integration test (PR G1.5).
 # Self-skips when the canonical Gemma file is absent.
@@ -802,7 +776,7 @@ target_link_libraries(forward-tests-gemma1 PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(forward-tests-gemma1 PRIVATE cxx_std_17)
@@ -820,7 +794,7 @@ target_link_libraries(chat-template-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(chat-template-tests PRIVATE cxx_std_17)
@@ -859,7 +833,7 @@ target_link_libraries(gemma4-chat-template-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(gemma4-chat-template-tests PRIVATE cxx_std_17)
@@ -876,7 +850,7 @@ target_link_libraries(gemma4-recipe-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(gemma4-recipe-tests PRIVATE cxx_std_17)
@@ -891,7 +865,7 @@ add_executable(gguf-kv-bag-tests
 
 target_link_libraries(gguf-kv-bag-tests PRIVATE
     GTest::gtest_main
-    core
+    qinf-engine
 )
 
 target_compile_features(gguf-kv-bag-tests PRIVATE cxx_std_17)
@@ -908,7 +882,7 @@ target_link_libraries(loader-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 
@@ -924,7 +898,7 @@ target_link_libraries(model-registry-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 
@@ -939,7 +913,7 @@ add_executable(multimodal-check-tests
 target_link_libraries(multimodal-check-tests PRIVATE
     GTest::gtest_main
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 
@@ -970,7 +944,7 @@ target_link_libraries(vision-loader-tests PRIVATE
     qinf-vision
     qinf-loader
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -989,7 +963,7 @@ target_link_libraries(siglip-encoder-tests PRIVATE
     qinf-vision
     qinf-loader
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -1013,7 +987,7 @@ target_link_libraries(gemma4uv-encoder-tests PRIVATE
     qinf-vision
     qinf-loader
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 
@@ -1025,24 +999,24 @@ endif()
 gtest_discover_tests(gemma4uv-encoder-tests)
 
 # Multimodal prefill orchestrator (Phase 5 vision). Compiles the orchestrator
-# source directly (it lives in src/core/ but is not in the `core` lib — same
+# source directly (it lives in src/engine/ but is not in the qinf-engine lib — same
 # arrangement as decode_step.cpp — because it bridges qinf-vision + qinf-models
 # which both sit above `core`). Self-skips without a Gemma 3 text model + mmproj.
 add_executable(multimodal-prefill-tests
     unit/test_multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
     # cli host-side image pipeline, compiled directly (cli is an exe, not a lib)
     # so the e2e gate can decode a real image + expand the marker stream.
-    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
 )
 target_link_libraries(multimodal-prefill-tests PRIVATE
     GTest::gtest_main
     qinf-vision
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(multimodal-prefill-tests PRIVATE cxx_std_17)
@@ -1056,7 +1030,7 @@ gtest_discover_tests(multimodal-prefill-tests)
 # src/cli/ sources directly (the cli builds an executable, not a lib).
 add_executable(image-loader-tests
     unit/test_image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
     ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
 )
 target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main)
@@ -1072,7 +1046,7 @@ target_link_libraries(rope-divergence-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-graph-inputs
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -1090,7 +1064,7 @@ gtest_discover_tests(image-preprocess-tests)
 
 add_executable(image-prompt-tests
     unit/test_image_prompt.cpp
-    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
 )
 target_link_libraries(image-prompt-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-prompt-tests PRIVATE cxx_std_17)
@@ -1124,7 +1098,7 @@ target_link_libraries(qwen3vl-encoder-tests PRIVATE
     qinf-vision
     qinf-loader
     qinf-models
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(qwen3vl-encoder-tests PRIVATE cxx_std_17)
@@ -1137,7 +1111,7 @@ gtest_discover_tests(qwen3vl-encoder-tests)
 # Phase 7 image-embedding reuse cache — no model file needed (counting lambda).
 add_executable(image-embedding-cache-tests
     unit/test_image_embedding_cache.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
 )
 target_link_libraries(image-embedding-cache-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-embedding-cache-tests PRIVATE cxx_std_17)
@@ -1277,7 +1251,7 @@ add_executable(gemma2-sliding-window-tests
 target_link_libraries(gemma2-sliding-window-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    core
+    qinf-engine
 )
 target_compile_features(gemma2-sliding-window-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma2-sliding-window-tests)
@@ -1293,7 +1267,7 @@ target_link_libraries(gemma3-config-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-layers
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(gemma3-config-tests PRIVATE cxx_std_17)
@@ -1308,7 +1282,7 @@ target_link_libraries(forward-tests-gemma3 PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(forward-tests-gemma3 PRIVATE cxx_std_17)
@@ -1323,7 +1297,7 @@ target_link_libraries(gemma3-image-substitution-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(gemma3-image-substitution-tests PRIVATE cxx_std_17)
@@ -1339,7 +1313,7 @@ target_link_libraries(gemma4-image-substitution-tests PRIVATE
     GTest::gtest_main
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     ggml
 )
 target_compile_features(gemma4-image-substitution-tests PRIVATE cxx_std_17)
@@ -1361,7 +1335,7 @@ target_compile_definitions(perf-baseline PRIVATE
 target_link_libraries(perf-baseline PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml
@@ -1376,7 +1350,7 @@ add_executable(batch-scaling
 target_link_libraries(batch-scaling PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -1389,7 +1363,7 @@ add_executable(decode-breakdown
 target_link_libraries(decode-breakdown PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -1402,7 +1376,7 @@ add_executable(alloc-reuse
 target_link_libraries(alloc-reuse PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -1422,7 +1396,7 @@ target_link_libraries(attn-provenance PRIVATE
     nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     ggml
 )
@@ -1438,7 +1412,7 @@ add_executable(moe-breakdown
 target_link_libraries(moe-breakdown PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml
@@ -1456,7 +1430,7 @@ target_link_libraries(attention-breakdown PRIVATE
     qinf-models
     qinf-loader
     qinf-state
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml
@@ -1474,7 +1448,7 @@ target_link_libraries(deltanet-breakdown PRIVATE
     qinf-loader
     qinf-layers
     qinf-state
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml
@@ -1493,7 +1467,7 @@ target_link_libraries(deltanet-substage-breakdown PRIVATE
     qinf-loader
     qinf-layers
     qinf-state
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml
@@ -1509,7 +1483,7 @@ add_executable(norms-breakdown
 target_link_libraries(norms-breakdown PRIVATE
     qinf-models
     qinf-loader
-    core
+    qinf-engine
     sampling
     nlohmann_json::nlohmann_json
     ggml

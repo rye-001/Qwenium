@@ -6,7 +6,7 @@
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/qwen36.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -224,5 +224,8 @@ TEST_F(Qwen36ModelFile, TensorInventoryResolvesWithoutError) {
     Model model;
     ASSERT_NO_THROW(model.load_metadata(model_path()));
     ASSERT_NO_THROW(model.load_tensors());
-    EXPECT_TRUE(model.validate_architecture());
+    // The architecture allow-list is enforced by GGUFLoader::validate_architecture
+    // during load_metadata (it throws on an unknown arch), so reaching here already
+    // proves acceptance; assert the arch we actually loaded.
+    EXPECT_EQ(model.get_metadata().architecture, "qwen35moe");
 }

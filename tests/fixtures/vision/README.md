@@ -81,7 +81,7 @@ git -C "$LLAMA_SRC" worktree remove --force "$LLAMA_WT"
 
 ## Preprocessing reference fixtures (Task 2)
 
-Lock `src/cli/image_loader.cpp` to llama.cpp mtmd's gemma3 preprocessing
+Lock `src/image/image_loader.cpp` to llama.cpp mtmd's gemma3 preprocessing
 (`mtmd_image_preprocessor_fixed_size`, PAD_CEIL) byte-for-byte. Consumed by
 `tests/unit/test_image_loader.cpp::MatchesLlamaCppGemma3Reference`.
 
@@ -117,7 +117,7 @@ catches the stretch-vs-aspect-pad divergence decisively while staying ~46 KB.
 
 ## Preprocessing reference fixtures — qwen3vl (P5)
 
-Lock `src/cli/image_loader.cpp`'s **DynSmartResize** path, as
+Lock `src/image/image_loader.cpp`'s **DynSmartResize** path, as
 `vision/image_preprocess.h::qwen3vl_preprocess` parameterizes it, to llama.cpp
 mtmd's `mtmd_image_preprocessor_dyn_size` byte-for-byte. Consumed by
 `tests/unit/test_image_loader.cpp::MatchesLlamaCppQwen3VlReference{,Upscaled}`.

@@ -38,7 +38,7 @@
 
 #include "ggml-backend.h"
 
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/tokenizer.h"
 #include "models/forward_pass_base.h"
 #include "models/model_registry.h"

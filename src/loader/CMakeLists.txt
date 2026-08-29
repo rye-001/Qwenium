@@ -1,9 +1,8 @@
-# GGUF loader, tokenizer, and weight-binding infrastructure.
+# GGUF loader, tokenizer, chat templates, and the GGUF value bag / mmap wrapper.
 
 add_library(qinf-loader STATIC
     gguf_loader.cpp
     tokenizer.cpp
-    weight_binding.cpp
     chat_template.cpp
     multimodal_check.cpp
     channel_filter.cpp

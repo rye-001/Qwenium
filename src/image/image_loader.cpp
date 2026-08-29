@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace qinf::cli {
+namespace qinf::image {
 
 namespace {
 
@@ -206,4 +206,4 @@ qinf::vision::Bitmap load_image_to_bitmap(const std::string& path, int target) {
     return load_image_to_bitmap(path, qinf::vision::gemma3_preprocess(target));
 }
 
-}  // namespace qinf::cli
+}  // namespace qinf::image

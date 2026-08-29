@@ -5,13 +5,13 @@
 #include <fstream>
 
 #include "chat.h"
-#include "../core/decode_step.h"
-#include "../core/decode_graph_cache.h"
-#include "../core/multimodal_prefill.h"
-#include "../core/image_embedding_cache.h"
-#include "../core/persistent_image_embedding_store.h"
-#include "../core/prefix_library.h"
-#include "../core/slot_snapshot.h"
+#include "engine/decode_step.h"
+#include "engine/decode_graph_cache.h"
+#include "engine/multimodal_prefill.h"
+#include "session/image_embedding_cache.h"
+#include "session/persistent_image_embedding_store.h"
+#include "session/prefix_library.h"
+#include "session/slot_snapshot.h"
 #include "../session/compat_header.h"
 #include "../session/session_manifest.h"
 #include "../session/snapshot_io.h"
@@ -27,8 +27,8 @@
 #include "../vision/siglip_encoder.h"
 #include "../vision/gemma4uv_encoder.h"
 #include "../vision/bitmap.h"
-#include "image_loader.h"
-#include "image_prompt.h"
+#include "image/image_loader.h"
+#include "image/image_prompt.h"
 #include "../vision/vision_profile.h"
 
 int run_chat(
@@ -183,7 +183,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             soft_id              = vprofile.soft_id;
             image_render_prefix  = vprofile.marker_prefix;
             image_wants_thinking = vprofile.wants_thinking;
-            image_bitmap = qinf::cli::load_image_to_bitmap(
+            image_bitmap = qinf::image::load_image_to_bitmap(
                 args.image_path, vprofile.preprocess);
             if (!args.image_embed_cache_dir.empty()) {
                 // Key identity = projector + projection_dim + encode backend. A
@@ -408,7 +408,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                     turn, /*add_assistant_prompt=*/true,
                     image_wants_thinking ? std::optional<bool>(true) : std::nullopt);
                 std::vector<int32_t> raw = tokenizer->encode(turn_prompt);
-                qinf::cli::ExpandedImagePrompt built = qinf::cli::expand_image_markers(
+                qinf::image::ExpandedImagePrompt built = qinf::image::expand_image_markers(
                     raw, boi_id, soft_id, eoi_id, vencoder->mm_tokens_for(image_bitmap));
                 new_tokens = std::move(built.tokens);
                 int img_span_start = built.span_start;

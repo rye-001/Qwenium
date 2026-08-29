@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "../../src/models/qwen35.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 
 // ---------------------------------------------------------------------------
 // The qwen35 recipe must recognise the optional NextN / MTP head that Qwen3.8

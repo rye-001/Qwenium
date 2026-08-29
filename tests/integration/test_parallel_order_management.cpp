@@ -1,4 +1,4 @@
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "models/qwen35.h"

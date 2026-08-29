@@ -30,7 +30,7 @@
 #include <limits>
 #include <vector>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/gemma3.h"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

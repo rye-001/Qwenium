@@ -3,7 +3,7 @@
 #include <string>
 
 #include "../../src/models/qwen35.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 
 // ---------------------------------------------------------------------------
 // Helpers

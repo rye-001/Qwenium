@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../state/kv_cache_simple.h"
 #include "../graph_inputs/graph_input.h"
 #include "ggml-backend.h"
@@ -49,12 +49,6 @@ public:
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
-
-    // False ⇒ this recipe has no build_decoding_graph (it throws); decode_step
-    // must route through the legacy single-token run_prefill bridge instead.
-    // Default true; recipes whose build_decoding_graph is unimplemented
-    // (Gemma 1–4) override to false.
-    virtual bool has_decode_graph() const { return true; }
 
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
     // Returns output logits.

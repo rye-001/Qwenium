@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/forward_pass_base.h"
 
 namespace {

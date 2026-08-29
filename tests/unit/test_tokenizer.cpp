@@ -1,6 +1,6 @@
 #include "gtest/gtest.h"
 #include "loader/tokenizer.h"
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/gguf_loader.h"
 #include "models/model_registry.h"
 #include <memory>

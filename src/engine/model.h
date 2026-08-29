@@ -7,7 +7,7 @@
 #include <memory>
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "gguf_value.h"
+#include "loader/gguf_value.h"
 
 class GGUFLoader;
 class Tokenizer;
@@ -163,7 +163,6 @@ public:
     void load_metadata(const std::string& model_path, bool allow_multimodal = false);
     void load_tensors();
 
-    bool validate_architecture() const;
 
     // Total trainable parameters, summed from the tensor inventory (every
     // tensor the GGUF ships, MoE experts and any NextN head included). This is

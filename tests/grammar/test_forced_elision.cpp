@@ -33,9 +33,9 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/decode_step.h"
-#include "../../src/core/decode_plan.h"
-#include "../../src/core/model.h"
+#include "engine/decode_step.h"
+#include "engine/decode_plan.h"
+#include "engine/model.h"
 #include "../../src/loader/chat_template.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/models/forward_pass_base.h"
@@ -187,9 +187,6 @@ int main(int argc, char** argv) {
         grammar->accept_token(t, vocab);
         return t;
     };
-    auto route_str = [](DecodeRoute r) {
-        return r == DecodeRoute::Unified ? "Unified" : "Bridge";
-    };
     auto diag_str = [](DecodeDiagnostic d) {
         return d == DecodeDiagnostic::Optimized ? "Optimized" : "ForceDense";
     };
@@ -210,11 +207,10 @@ int main(int argc, char** argv) {
         // combinations would have thrown in resolve — none here, all legal).
         DecodePlan plan = resolve_decode_plan(fp.get(), cs.forced,
                                               cs.force_dense);
-        std::cerr << "[plan " << cs.name << "] route=" << route_str(plan.route)
+        std::cerr << "[plan " << cs.name << "]"
                   << " diagnostic=" << diag_str(plan.diagnostic)
                   << " allow_forced_elision=" << plan.allow_forced_elision
-                  << " sparse_head_allowed=" << plan.sparse_head_allowed
-                  << " has_decode_graph=" << plan.has_decode_graph << "\n";
+                  << " sparse_head_allowed=" << plan.sparse_head_allowed << "\n";
 
         auto s = make_sampler();
         int32_t first = fresh_start(s.get(), slot);

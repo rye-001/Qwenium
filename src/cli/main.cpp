@@ -15,7 +15,7 @@
 #include "chat.h"
 #include "session_mode.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../loader/gguf_loader.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"

@@ -12,7 +12,7 @@
 #include <functional>
 #include <vector>
 
-#include "../../src/core/image_embedding_cache.h"
+#include "session/image_embedding_cache.h"
 
 namespace {
 // An encode() stand-in that counts invocations and returns a recognizable

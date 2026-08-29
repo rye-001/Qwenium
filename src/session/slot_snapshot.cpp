@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-#include "model.h"                      // ModelMetadata
+#include "engine/model.h"                // ModelMetadata
 #include "models/forward_pass_base.h"   // ForwardPassBase (+ simple_kv_cache via include)
 #include "state/deltanet_state.h"       // DeltaNetState, DeltaNetStateSection
 #include "state/kv_cache_simple.h"      // simple_kv_cache, KvCacheSection

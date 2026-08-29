@@ -16,7 +16,7 @@
 #include "nlohmann/json.hpp"
 
 // Your existing headers
-#include "core/model.h"
+#include "engine/model.h"
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "loader/chat_template.h"
@@ -41,8 +41,8 @@
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
-#include "core/prefix_library.h"
-#include "core/slot_snapshot.h"
+#include "session/prefix_library.h"
+#include "session/slot_snapshot.h"
 
 #include <iostream>
 #include <thread>
@@ -672,7 +672,7 @@ private:
         return tok;
     }
 
-    // TODO: migrate to decode_step (src/core/decode_step.h) once the server
+    // TODO: migrate to decode_step (src/engine/decode_step.h) once the server
     // gains per-slot grammar support.  Today this path uses GreedySampler with
     // no grammar, so the sparse LM head can never fire; migrating now would add
     // dead code.  The batched nature (n > 1 slots per call) also needs a

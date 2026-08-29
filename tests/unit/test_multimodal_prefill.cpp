@@ -33,13 +33,13 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/model.h"
-#include "../../src/core/multimodal_prefill.h"
+#include "engine/model.h"
+#include "engine/multimodal_prefill.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/gemma3.h"
 #include "../../src/loader/tokenizer.h"
-#include "../../src/cli/image_loader.h"
-#include "../../src/cli/image_prompt.h"
+#include "../../src/image/image_loader.h"
+#include "../../src/image/image_prompt.h"
 #include "../../src/vision/bitmap.h"
 #include "../../src/vision/siglip_encoder.h"
 #include "../../src/vision/vision_loader.h"
@@ -260,10 +260,10 @@ TEST(MultimodalPrefill, BidiImageAttentionProducesNonImageNextToken) {
     std::vector<int32_t> pre = tok->encode(rendered);
     pre.insert(pre.begin(), bos);
     auto expanded =
-        qinf::cli::expand_image_markers(pre, boi, soft, eoi, n_img);
+        qinf::image::expand_image_markers(pre, boi, soft, eoi, n_img);
 
     qinf::vision::Bitmap bmp =
-        qinf::cli::load_image_to_bitmap(e2e_image_path(), 896);
+        qinf::image::load_image_to_bitmap(e2e_image_path(), 896);
     std::vector<ImagePromptChunk> chunks = {{&bmp, expanded.span_start}};
 
     std::vector<float> logits = prefill_multimodal(

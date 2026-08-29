@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace qinf::cli {
+namespace qinf::image {
 
 struct ExpandedImagePrompt {
     std::vector<int32_t> tokens;       // stream with the image block expanded
@@ -38,4 +38,4 @@ ExpandedImagePrompt expand_image_markers(
     int32_t  end_of_image_id,
     uint32_t n_image_tokens);
 
-}  // namespace qinf::cli
+}  // namespace qinf::image

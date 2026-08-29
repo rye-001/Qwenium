@@ -10,7 +10,7 @@
 #include <vector>
 #include <iostream>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/qwen3.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/loader/tokenizer.h"

@@ -20,9 +20,9 @@
 #include <string>
 #include <vector>
 
-#include "../../src/cli/image_loader.h"
+#include "../../src/image/image_loader.h"
 
-using qinf::cli::load_image_to_bitmap;
+using qinf::image::load_image_to_bitmap;
 
 namespace {
 

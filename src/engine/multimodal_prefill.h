@@ -10,7 +10,7 @@
 //   3. Run the text prefill (the encoded soft-tokens substitute into the
 //      residual stream at the placeholder span).
 //
-// Lives in src/core/ but is compiled into consumers (tests, cli), not the
+// Lives in src/engine/ but is compiled into consumers (tests, cli), not the
 // `core` static lib — same arrangement as decode_step.cpp, because it depends
 // on BOTH qinf-vision and qinf-models while `core` sits below qinf-models.
 //

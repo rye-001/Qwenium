@@ -6,7 +6,7 @@
 // instead of silently re-prefilled (docs/plan-session-snapshot.md).
 //
 // Phase 0 carries these as plain fields; populating them from a live Model
-// (src/core/model.h ModelMetadata) is deferred to the service phases. The
+// (src/engine/model.h ModelMetadata) is deferred to the service phases. The
 // struct intentionally has no dependency on the model so it stays unit-testable
 // in isolation.
 

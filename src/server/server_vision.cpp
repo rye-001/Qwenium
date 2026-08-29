@@ -6,22 +6,22 @@
 
 #include "inference_server.h"  // qwenium::InferenceRequest
 
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "models/forward_pass_base.h"
 
-#include "core/multimodal_prefill.h"
-#include "core/persistent_image_embedding_store.h"  // vision V1 (image-embed cache)
-#include "core/prefix_library.h"                    // vision V2 (image-prefix KV cache)
-#include "core/slot_snapshot.h"                      // shared L2 capture/restore helpers
+#include "engine/multimodal_prefill.h"
+#include "session/persistent_image_embedding_store.h"  // vision V1 (image-embed cache)
+#include "session/prefix_library.h"                    // vision V2 (image-prefix KV cache)
+#include "session/slot_snapshot.h"                      // shared L2 capture/restore helpers
 #include "models/i_image_embeddable.h"
 #include "vision/vision_model.h"
 #include "vision/vision_loader.h"
 #include "vision/i_vision_encoder.h"
 #include "vision/bitmap.h"
-#include "cli/image_loader.h"   // load_image_to_bitmap_from_memory (IO)
-#include "cli/image_prompt.h"
+#include "image/image_loader.h"   // load_image_to_bitmap_from_memory (IO)
+#include "image/image_prompt.h"
 #include "vision/vision_profile.h"
 
 #include "ggml-backend.h"
@@ -156,14 +156,14 @@ int ServerVision::run_multimodal_prefill(int slot_id,
             std::to_string(req.image_bytes.size()));
 
     // Decode the image FILE bytes + apply the projector's preprocessing.
-    qinf::vision::Bitmap bitmap = qinf::cli::load_image_to_bitmap_from_memory(
+    qinf::vision::Bitmap bitmap = qinf::image::load_image_to_bitmap_from_memory(
         req.image_bytes[0].data(), req.image_bytes[0].size(), preprocess_);
     const uint32_t n_img_tokens = vencoder_->mm_tokens_for(bitmap);
 
     // Tokenize the already marker-rendered prompt, then expand the single
     // image marker into the soft-token span the encoder fills.
     std::vector<int32_t> raw = tokenizer_.encode(req.prompt);
-    qinf::cli::ExpandedImagePrompt built = qinf::cli::expand_image_markers(
+    qinf::image::ExpandedImagePrompt built = qinf::image::expand_image_markers(
         raw, boi_id_, soft_id_, eoi_id_, n_img_tokens);
     out_tokens = std::move(built.tokens);
     int img_span_start = built.span_start;

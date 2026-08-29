@@ -23,8 +23,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "../../src/core/model.h"
-#include "../../src/core/decode_graph_cache.h"
+#include "engine/model.h"
+#include "engine/decode_graph_cache.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/models/gemma3.h"
