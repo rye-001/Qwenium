@@ -32,11 +32,16 @@ endif()
 # Find dependencies
 find_package(Threads REQUIRED)
 
-# OpenMP support
+# OpenMP support.
+# find_package and the compile definition must run HERE, before any
+# add_subdirectory: a directory-scoped definition only reaches targets created
+# after it. The matching link cannot run here — the target does not exist yet —
+# so it is deferred to just after the engine subdirectory is added below.
+# Linking a not-yet-defined target is a hard configure error, which is why this
+# was invisible on hosts without libomp and broke configure on hosts with it.
 if(QWEN3_ENABLE_OPENMP)
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(qinf-engine PRIVATE OpenMP::OpenMP_CXX)
         add_compile_definitions(QWEN3_USE_OPENMP)
     endif()
 endif()
@@ -91,6 +96,12 @@ include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
 add_subdirectory(src/engine)
+
+# Deferred from the OpenMP block near the top: qinf-engine exists only now.
+if(QWEN3_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(qinf-engine PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 # Session snapshot seams: dependency-free; declared before its consumers
 # (sampling, state) so their target_link_libraries reference resolves cleanly.
 add_subdirectory(src/session)
