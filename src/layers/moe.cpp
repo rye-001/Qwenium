@@ -6,12 +6,15 @@
 #include <stdexcept>
 #include <string>
 
-// Phase 3 ships only the ggml_mul_mat_id fallback dispatch path.
-// Phase 4 adds the fused Metal kernel; at that point this guard is removed and
-// replaced with an #ifdef inside MoELayer::build().
-#ifndef QINF_MOE_FALLBACK
-#  error "moe.cpp: build with -DQINF_MOE_FALLBACK=ON (Phase 3). Fused MoE Metal kernel is Phase 4."
-#endif
+// Expert dispatch is three batched ggml_mul_mat_id calls per layer (gate / up /
+// down), each backed by a native Metal MUL_MAT_ID kernel, so the C-level launch
+// count is O(1) in n_experts. This was once guarded by a QINF_MOE_FALLBACK
+// option reserving the "OFF" branch for a fused Phase 4 kernel. That kernel was
+// never written — docs/phase4-investigation.md measured its ceiling at ≤1.13x on
+// Qwen 3.6 and dropped it — and the option could not actually be switched off
+// (OFF hit an #error). Both were deleted 2026-08-29. If MoE dispatch is ever
+// revisited, the candidate is patching ggml-metal's MUL_MAT_ID kernel for sparse
+// routing, not a graph-level fusion (CLAUDE.md, ggml constraints).
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -94,7 +97,7 @@ ggml_tensor* MoELayer::build(
     ggml_tensor* expert_weights = ggml_soft_max(ctx, expert_logits);
     moe_set_name(gf, expert_weights, "moe_weights", il);
 
-    // ── 2. Expert dispatch via ggml_mul_mat_id (QINF_MOE_FALLBACK path) ───────
+    // ── 2. Expert dispatch via ggml_mul_mat_id ────────────────────────────────
     //
     // ggml_mul_mat_id: batched matmul where each token uses a different expert
     // weight matrix. Signature: (W [in, out, n_exp], x [in, n_tok], idx [top_k, n_tok])

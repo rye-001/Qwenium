@@ -28,7 +28,7 @@
 #include "snapshot_io.h"
 #include "token_sequence_section.h"
 
-using namespace qwenium;
+using namespace qinf;
 using qinf::session::CompatHeader;
 using qinf::session::SessionManifest;
 using qinf::session::SnapshotReader;

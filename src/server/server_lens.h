@@ -54,7 +54,7 @@ class Tokenizer;
 struct ModelMetadata;
 typedef struct ggml_backend_sched* ggml_backend_sched_t;
 
-namespace qwenium {
+namespace qinf {
 
 class GrammarVocab;
 
@@ -97,7 +97,9 @@ struct LensRun {
     int  n_head = 0;
     std::vector<LensStep> steps;            // one per gen token; steps.size() == G
     std::string model;                      // passthrough for the report header
-    bool validated_envelope = true;         // false ⇒ prompt exceeded the 4K floor (disclosure)
+    // false ⇒ prompt exceeded the 4 K CALIBRATION floor (a disclosure on the
+    // report, not an error). Unrelated to the 10 K workload envelope.
+    bool validated_envelope = true;
 };
 
 // ── Lens report (the interchange format; P3 versions/documents it) ───────────
@@ -239,8 +241,8 @@ struct LensExtractOptions {
 // server's per-request `grammar` field on the OpenAI endpoints.
 //
 // NOTE: `::Tokenizer` is force-qualified. Tokenizer is a global type, but
-// inference_server.h forward-declares a phantom `qwenium::Tokenizer`; without
-// the `::` this declaration would bind to that phantom inside namespace qwenium
+// inference_server.h forward-declares a phantom `qinf::Tokenizer`; without
+// the `::` this declaration would bind to that phantom inside namespace qinf
 // wherever both headers are visible (e.g. http_server.cpp), mismatching the
 // definition.
 LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
@@ -285,4 +287,4 @@ const char* lens_grammar_gbnf();
 // (the class the lens claims citations for). Empty ⇒ "" (used for absent).
 std::string lens_value_tier(const std::string& value);
 
-}  // namespace qwenium
+}  // namespace qinf

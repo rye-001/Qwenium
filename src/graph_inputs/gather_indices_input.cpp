@@ -17,7 +17,7 @@ void GatherIndicesInput::set_input(const StepContext& step) {
     const uint32_t n_total = static_cast<uint32_t>(t->ne[0]);
     const uint32_t n_batch = static_cast<uint32_t>(step.n_rows());
     const uint32_t n_kv_len = n_total / n_batch;
-    const uint32_t stride = (stride_ == Stride::NCtxMax) ? n_ctx_max_ : n_kv_len;
+    const uint32_t stride = n_ctx_max_;
 
     std::vector<int32_t> indices(n_total);
     for (uint32_t b = 0; b < n_batch; ++b) {

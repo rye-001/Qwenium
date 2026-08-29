@@ -29,10 +29,10 @@ class Tokenizer;
 class PersistentImageEmbeddingStore;  // vision V1
 class PrefixLibrary;                   // vision V2
 
-namespace qwenium {
+namespace qinf {
 class Sampler;
 struct InferenceRequest;
-}  // namespace qwenium
+}  // namespace qinf
 
 namespace qinf::vision {
 class VisionModel;
@@ -80,9 +80,9 @@ public:
     // expanded token stream into `out_tokens`. Fail-loud (throws) on a malformed
     // image, >1 image, or an over-ceiling prompt. `sampler` is this slot's
     // sampler (built by the integration from the request).
-    int run_multimodal_prefill(int slot_id, const qwenium::InferenceRequest& req,
+    int run_multimodal_prefill(int slot_id, const qinf::InferenceRequest& req,
                                int start_pos, std::vector<int32_t>& out_tokens,
-                               qwenium::Sampler& sampler);
+                               qinf::Sampler& sampler);
 
 private:
     // Human-readable identity for fail-loud errors: arch + model name.

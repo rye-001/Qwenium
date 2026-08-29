@@ -18,7 +18,7 @@
 //
 // Placement: src/vision/, with the encoders it selects between. A profile is
 // entirely projector knowledge, so it belongs to the encoder subsystem. This
-// became possible when the preprocessing RECIPE moved out of cli/image_loader.h
+// became possible when the preprocessing RECIPE moved out of image/image_loader.h
 // into vision/image_preprocess.h — the profile carries a recipe, not a pipeline,
 // and src/vision/ stays free of image IO exactly as before.
 

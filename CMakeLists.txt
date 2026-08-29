@@ -13,7 +13,6 @@ option(QWEN3_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
 option(QWEN3_ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
 option(QWEN3_STATIC_LINK "Build static binaries" OFF)
 option(GGML_USE_METAL "Enable Metal for GPU acceleration on Apple devices" OFF)
-option(QINF_MOE_FALLBACK "Use ggml_mul_mat_id fallback for MoE expert dispatch (ON=fallback path, OFF=fused Metal kernel — Phase 4 only)" ON)
 
 # Set standard output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -33,11 +32,16 @@ endif()
 # Find dependencies
 find_package(Threads REQUIRED)
 
-# OpenMP support
+# OpenMP support.
+# find_package and the compile definition must run HERE, before any
+# add_subdirectory: a directory-scoped definition only reaches targets created
+# after it. The matching link cannot run here — the target does not exist yet —
+# so it is deferred to just after the engine subdirectory is added below.
+# Linking a not-yet-defined target is a hard configure error, which is why this
+# was invisible on hosts without libomp and broke configure on hosts with it.
 if(QWEN3_ENABLE_OPENMP)
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(core PRIVATE OpenMP::OpenMP_CXX)
         add_compile_definitions(QWEN3_USE_OPENMP)
     endif()
 endif()
@@ -91,7 +95,13 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
-add_subdirectory(src/core)
+add_subdirectory(src/engine)
+
+# Deferred from the OpenMP block near the top: qinf-engine exists only now.
+if(QWEN3_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(qinf-engine PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 # Session snapshot seams: dependency-free; declared before its consumers
 # (sampling, state) so their target_link_libraries reference resolves cleanly.
 add_subdirectory(src/session)
@@ -103,17 +113,13 @@ add_subdirectory(src/cli)
 # HTTP Server
 add_subdirectory(src/server)
 
-# New modular structure (stubs — populated by Phase 1 extraction PRs 1.2–1.6)
+# Layer-type modules, state, recipes and the subsystems around them.
 add_subdirectory(src/layers)
 add_subdirectory(src/state)
 add_subdirectory(src/graph_inputs)
 add_subdirectory(src/models)
 add_subdirectory(src/loader)
-add_subdirectory(src/quant)
 add_subdirectory(src/vision)
-if(APPLE)
-    add_subdirectory(src/metal)
-endif()
 
 # Optional components
 if(QWEN3_BUILD_TESTS)
@@ -132,7 +138,7 @@ install(TARGETS qwenium-cli
     ARCHIVE DESTINATION lib
 )
 
-install(DIRECTORY src/core/ 
-    DESTINATION include/core
+install(DIRECTORY src/engine/ 
+    DESTINATION include/engine
     FILES_MATCHING PATTERN "*.h"
 )

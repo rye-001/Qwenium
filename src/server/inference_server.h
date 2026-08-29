@@ -18,7 +18,7 @@
 #include <iostream>
 #include <algorithm>
 
-namespace qwenium {
+namespace qinf {
 
 // Forward declarations - these come from your existing codebase
 class Model;
@@ -441,7 +441,23 @@ public:
     const ServerStats& stats() const { return stats_; }
 
     // Start inference loop (blocks - run in dedicated thread)
+    // Backstop: this runs as a bare std::thread, so an escaping exception is
+    // std::terminate — the whole server dies with no diagnosis. Individual
+    // failure modes are contained at their own call sites (prefill callbacks,
+    // batched decode); this catches anything that got past them, reports it, and
+    // stops the loop cleanly instead of aborting the process.
     void run() {
+        try {
+            run_loop();
+        } catch (const std::exception& e) {
+            std::cerr << "[inference] fatal: " << e.what()
+                      << "\n[inference] the inference loop has stopped; "
+                         "restart the server" << std::endl;
+            running_ = false;
+        }
+    }
+
+    void run_loop() {
         running_ = true;
         while (running_) {
             // 0. Apply any queued clear/flush control ops (from HTTP threads).
@@ -1086,8 +1102,37 @@ private:
             batch_slot_ids.push_back(slot_id);
         }
 
-        // Single batched forward pass - returns next token for each slot
-        std::vector<int> next_tokens = batched_decode_(batch_tokens, batch_slot_ids);
+        // Single batched forward pass - returns next token for each slot.
+        //
+        // A throw here is a backend compute failure (engine/graph_compute.h) —
+        // in practice a Metal command-buffer failure, usually GPU OOM. It is not
+        // per-request bad input: the pass computed nothing, so EVERY slot in this
+        // batch is affected and none of them has a next token. Fail them all with
+        // the named error rather than let the exception escape run(), which is
+        // launched as a bare std::thread and would std::terminate the server.
+        //
+        // Metal latches this state, so subsequent batches will fail the same way.
+        // That is deliberate and honest: every client gets a clear error until the
+        // process is restarted, instead of one wrong answer followed by more.
+        std::vector<int> next_tokens;
+        try {
+            next_tokens = batched_decode_(batch_tokens, batch_slot_ids);
+        } catch (const std::exception& e) {
+            for (int slot_id : batch_slot_ids) {
+                auto& slot = slots_[slot_id];
+                if (slot.request) {
+                    slot.request->error_message = e.what();
+                    slot.request->finish_reason = "error";
+                    slot.request->token_queue->finish();
+                }
+                // Same teardown the normal completion path uses.
+                release_slot_kv(slot_id);
+                slots_[slot_id].reset();
+                active_slot_ids_.erase(slot_id);
+            }
+            stats_.active_slots = active_slot_ids_.size();
+            return;
+        }
 
         // Process results
         std::vector<int> slots_to_remove;
@@ -1208,4 +1253,4 @@ private:
     std::mutex control_mutex_;
 };
 
-}  // namespace qwenium
+}  // namespace qinf

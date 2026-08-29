@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/forward_pass_base.h"
 #include "../../src/loader/tokenizer.h"

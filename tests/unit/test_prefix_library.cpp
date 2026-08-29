@@ -23,7 +23,7 @@
 
 #include <gtest/gtest.h>
 
-#include "core/prefix_library.h"
+#include "session/prefix_library.h"
 #include "session/compat_header.h"
 #include "session/snapshot_io.h"
 

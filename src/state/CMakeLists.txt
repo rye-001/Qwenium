@@ -2,7 +2,6 @@
 
 add_library(qinf-state STATIC
     kv_cache_simple.cpp
-    ssm_state_cache.cpp
     recurrent_state.cpp
     deltanet_state.cpp
     token_sequence_section.cpp

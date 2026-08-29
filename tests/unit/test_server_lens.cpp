@@ -11,7 +11,7 @@
 
 #include "../../src/server/server_lens.h"
 
-using namespace qwenium;
+using namespace qinf;
 
 namespace {
 

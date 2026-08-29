@@ -5,6 +5,7 @@
 // interpose.
 
 #include "server_lens.h"
+#include "engine/graph_compute.h"
 
 #include <algorithm>
 #include <cctype>
@@ -19,7 +20,7 @@
 #include "../loader/chat_template.h"
 #include "../sampling/grammar_vocab.h"
 
-namespace qwenium {
+namespace qinf {
 
 // ── The REFUTED fixed KV grammar — probe control arm only ────────────────────
 // Once the product path's ONE fixed universal KV grammar (plan §1.1, a P0-locked
@@ -603,7 +604,14 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     run.model              = "Qwen3.6 (attention lens)";
     run.n_head             = (int)meta.attention_head_count;
     run.document           = document;   // value-source lookups resolve against the doc
-    run.validated_envelope = prompt_tokens.size() <= 4096;  // 4K = validated floor (plan §1.5)
+    // 4096 is the CALIBRATION floor, not the workload envelope (that is 10 K as
+    // of 2026-08-24). The lens constants — L3H13 citations, the body_mass
+    // grounded/ungrounded threshold, the coverage bar — were all measured on
+    // prompts at or below 4 K, so beyond it the signals still compute but are
+    // extrapolated. The flag is a DISCLOSURE on the report, not a refusal; an
+    // oversized document is rejected separately, above. Raising this number
+    // means re-measuring, not editing it (plan-qemmi-lens.md §1.5).
+    run.validated_envelope = prompt_tokens.size() <= 4096;
 
     // Locate the document's token range within the ChatML-wrapped prompt: the
     // chat header precedes it and the instruction follows, so the document is an
@@ -691,7 +699,8 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             ggml_backend_sched_reset(sched);
             ggml_backend_sched_alloc_graph(sched, gf);
             fp->set_decode_inputs(gf, tks, slots, positions);
-            ggml_backend_sched_graph_compute(sched, gf);
+            qinf::engine::require_compute_success(
+                ggml_backend_sched_graph_compute(sched, gf), "lens_tapped_decode");
 
             std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
             LensStep st;
@@ -799,4 +808,4 @@ LensReport apply_absent_by_omission(LensReport report,
     return report;
 }
 
-}  // namespace qwenium
+}  // namespace qinf

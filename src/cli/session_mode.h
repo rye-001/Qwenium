@@ -19,14 +19,14 @@
 #include <functional>
 #include <memory>
 
-#include "cli-args.h"
+#include "cli_args.h"
 
 class Model;
-namespace qwenium {
+namespace qinf {
 class GrammarVocab;
 }
 
 // Runs the save/load session flow. Returns a process exit code (0 = success).
 int run_session(Model& model, const CliArgs& args,
-                std::unique_ptr<qwenium::GrammarVocab>& grammar,
+                std::unique_ptr<qinf::GrammarVocab>& grammar,
                 const std::function<void(int32_t)>& log_token);

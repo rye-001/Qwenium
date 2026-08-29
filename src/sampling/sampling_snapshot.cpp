@@ -5,7 +5,7 @@
 
 #include "snapshot_io.h"
 
-namespace qwenium {
+namespace qinf {
 
 void SamplerStateSection::write(qinf::session::SnapshotWriter& w) const {
     // Record whether RNG state follows so restore can fail loud if the
@@ -28,4 +28,4 @@ void SamplerStateSection::read(qinf::session::SnapshotReader& r) {
     if (has) sampler_.read_rng_state(r);
 }
 
-}  // namespace qwenium
+}  // namespace qinf

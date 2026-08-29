@@ -9,7 +9,7 @@ class SnapshotWriter;
 class SnapshotReader;
 }  // namespace qinf::session
 
-namespace qwenium {
+namespace qinf {
 
 class TokenTrie;  // forward declaration
 
@@ -72,4 +72,4 @@ private:
     uint64_t state_version_ = 0;
 };
 
-} // namespace qwenium
+} // namespace qinf

@@ -11,7 +11,7 @@
 // complete at the same recursion depth. Direct self-recursion is unaffected.
 
 #include "grammar_vocab.h"
-#include "token-trie.h"
+#include "token_trie.h"
 #include "snapshot_io.h"
 
 #include <algorithm>
@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qwenium {
+namespace qinf {
 
 // ============================================================================
 // Internal element types — identical to grammar.cpp
@@ -940,4 +940,4 @@ void GrammarVocab::dump_expected() const {
         }
     }
 }
-} // namespace qwenium
+} // namespace qinf

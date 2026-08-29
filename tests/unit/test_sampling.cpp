@@ -14,7 +14,7 @@
 
 #include "../../src/sampling/sampling.h"
 
-using qwenium::GreedySampler;
+using qinf::GreedySampler;
 
 namespace {
 

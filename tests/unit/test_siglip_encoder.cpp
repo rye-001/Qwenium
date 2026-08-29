@@ -43,7 +43,7 @@
 #include "../../src/vision/siglip_encoder.h"
 #include "../../src/vision/vision_loader.h"
 #include "../../src/vision/vision_model.h"
-#include "../../src/core/persistent_image_embedding_store.h"
+#include "session/persistent_image_embedding_store.h"
 #include "../../src/graph_inputs/image_embedding_section.h"
 #include "../../src/session/compat_header.h"
 

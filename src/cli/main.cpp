@@ -15,7 +15,7 @@
 #include "chat.h"
 #include "session_mode.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../loader/gguf_loader.h"
 #include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
@@ -62,11 +62,16 @@ void print_usage(const char* program_name) {
     std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
-    std::cout << "  --image FILE            (chat) Attach an image to the first user turn (Gemma)\n";
-    std::cout << "  --mmproj FILE           Gemma vision projector GGUF (required with --image)\n";
+    std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";
+    std::cout << "  --mmproj FILE           Vision projector GGUF (required with --image);\n";
+    std::cout << "                          gemma3, gemma4uv or qwen3vl_merger\n";
     std::cout << "  --image-embed-cache DIR (chat) Disk cache for image embeddings; encode each image once per node (ViT skip)\n";
     std::cout << "  --prefix-cache DIR      (chat) Opt-in warm-prefix KV cache; skips re-prefilling a recurring system prompt\n";
     std::cout << "  --image-prefix-cache DIR (chat) Opt-in image-prefix KV cache; skips ViT encode + image-position prefill for a recurring image\n";
+    std::cout << "  --save-session FILE     Write a portable session snapshot at the end of the run\n";
+    std::cout << "  --save-session-at N     Write the snapshot after N generated tokens instead\n";
+    std::cout << "  --load-session FILE     Resume from a snapshot (refused fail-loud on a\n";
+    std::cout << "                          model/quant/kernel-path or KV-dtype mismatch)\n";
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";
@@ -250,7 +255,7 @@ int main(int argc, char** argv) {
     }
 
     // --- Grammar Setup ---
-    std::unique_ptr<qwenium::GrammarVocab> grammar;
+    std::unique_ptr<qinf::GrammarVocab> grammar;
     if (!args.grammar_file.empty()) {
         std::ifstream file(args.grammar_file);
         if (!file) {
@@ -259,7 +264,7 @@ int main(int argc, char** argv) {
         }
         std::string grammar_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        grammar = qwenium::GrammarVocab::parse_impl(grammar_str);
+        grammar = qinf::GrammarVocab::parse_impl(grammar_str);
         if (!grammar) {
             std::cerr << "Error: Failed to parse grammar file." << std::endl;
             return 1;
@@ -294,12 +299,12 @@ int main(int argc, char** argv) {
     // --- Speculative Decoder Setup (shared by both modes) ---
     // PLD is disabled when grammar is active (grammar needs per-token validation)
     bool use_speculative = args.speculative && !grammar;
-    std::unique_ptr<qwenium::SpeculativeDecoder> spec;
+    std::unique_ptr<qinf::SpeculativeDecoder> spec;
     if (use_speculative && args.speculative_mode == "pld") {
-        qwenium::PromptLookupConfig pld_config;
+        qinf::PromptLookupConfig pld_config;
         pld_config.ngram_size = args.pld_ngram_size;
         pld_config.max_draft = args.pld_max_draft;
-        spec = std::make_unique<qwenium::SpeculativeDecoder>(
+        spec = std::make_unique<qinf::SpeculativeDecoder>(
             pld_config, (int)model.get_metadata().vocab_size);
         std::cout << "Prompt Lookup Decoding enabled (ngram=" << pld_config.ngram_size
                   << ", max_draft=" << pld_config.max_draft << ")" << std::endl;
@@ -311,19 +316,31 @@ int main(int argc, char** argv) {
         std::cout << "Note: Speculative decoding disabled (incompatible with grammar constraints)" << std::endl;
     }
 
-    // --- L1 portable session: save or resume a snapshot (Phase 2) ---
-    if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
-        return run_session(model, args, grammar, log_token);
-    }
-
     // --- Start of Generation ---
-    if (args.chat_mode) {
-        run_chat(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
-    } else if (!args.prompt.empty()) {
-        return run_complete(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
-    } else {
-        std::cout << "\nModel loaded successfully. Provide a prompt to start generation."
-;    }
+    //
+    // The load path above has its own try/catch; this one covers the RUN. A
+    // backend compute failure (engine/graph_compute.h — in practice a Metal
+    // command-buffer failure, usually GPU OOM) throws from deep inside decode,
+    // and without this it would leave main() and std::terminate with no
+    // diagnosis. Report it and exit non-zero, so a script can tell a failed run
+    // from a short one.
+    try {
+        // --- L1 portable session: save or resume a snapshot (Phase 2) ---
+        if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
+            return run_session(model, args, grammar, log_token);
+        }
+
+        if (args.chat_mode) {
+            run_chat(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
+        } else if (!args.prompt.empty()) {
+            return run_complete(model, args, grammar, spec.get(), use_speculative, log_token, log_tokens);
+        } else {
+            std::cout << "\nModel loaded successfully. Provide a prompt to start generation.";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "\nError during generation: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }

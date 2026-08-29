@@ -1,6 +1,6 @@
 #include "gemma4.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
 #include "../layers/norm.h"
@@ -325,20 +325,20 @@ ggml_tensor* Gemma4ForwardPass::build_moe_geglu(
     // Routing logits + top-k indices + softmaxed routing weights.
     // router_in is computed by the caller from attn_out (pre-norm input):
     //   router_in = ggml_mul(rms_norm(attn_out) * 1/sqrt(n_embd), ffn_gate_inp.scale)
-    ggml_tensor* logits = ggml_mul_mat(ctx_, w.moe_router, router_in);
+    ggml_tensor* logits = ggml_mul_mat(arena_.ctx(), w.moe_router, router_in);
     set_tensor_name(gf, logits, "moe_logits", static_cast<int>(il));
 
-    ggml_tensor* sorted_idx = ggml_argsort(ctx_, logits, GGML_SORT_ORDER_DESC);
-    ggml_tensor* expert_idx = ggml_view_2d(ctx_, sorted_idx,
+    ggml_tensor* sorted_idx = ggml_argsort(arena_.ctx(), logits, GGML_SORT_ORDER_DESC);
+    ggml_tensor* expert_idx = ggml_view_2d(arena_.ctx(), sorted_idx,
         top_k, n_tokens, sorted_idx->nb[1], 0);
     set_tensor_name(gf, expert_idx, "moe_idx", static_cast<int>(il));
 
     // Reshape logits to [1, n_experts, n_tokens] so ggml_get_rows picks
     // from the n_experts dim.
-    ggml_tensor* logits_3d = ggml_reshape_3d(ctx_, logits, 1, n_exp, n_tokens);
-    ggml_tensor* expert_logits = ggml_get_rows(ctx_, logits_3d, expert_idx);
-    expert_logits = ggml_reshape_2d(ctx_, expert_logits, top_k, n_tokens);
-    ggml_tensor* expert_weights = ggml_soft_max(ctx_, expert_logits);
+    ggml_tensor* logits_3d = ggml_reshape_3d(arena_.ctx(), logits, 1, n_exp, n_tokens);
+    ggml_tensor* expert_logits = ggml_get_rows(arena_.ctx(), logits_3d, expert_idx);
+    expert_logits = ggml_reshape_2d(arena_.ctx(), expert_logits, top_k, n_tokens);
+    ggml_tensor* expert_weights = ggml_soft_max(arena_.ctx(), expert_logits);
     set_tensor_name(gf, expert_weights, "moe_weights", static_cast<int>(il));
 
     // 3. Split fused gate+up tensor into halves.
@@ -348,10 +348,10 @@ ggml_tensor* Gemma4ForwardPass::build_moe_geglu(
     //    expert's gate-half and up-half remain at the same in-buffer
     //    offsets the original tensor places them at, so ggml_mul_mat_id
     //    can resolve them via the existing per-expert nb[2] stride.
-    ggml_tensor* w_gate = ggml_view_3d(ctx_, w.moe_gate_up_exps,
+    ggml_tensor* w_gate = ggml_view_3d(arena_.ctx(), w.moe_gate_up_exps,
         n_embd, ffn_dim, n_exp,
         w.moe_gate_up_exps->nb[1], w.moe_gate_up_exps->nb[2], 0);
-    ggml_tensor* w_up   = ggml_view_3d(ctx_, w.moe_gate_up_exps,
+    ggml_tensor* w_up   = ggml_view_3d(arena_.ctx(), w.moe_gate_up_exps,
         n_embd, ffn_dim, n_exp,
         w.moe_gate_up_exps->nb[1], w.moe_gate_up_exps->nb[2],
         static_cast<size_t>(ffn_dim) * w.moe_gate_up_exps->nb[1]);
@@ -359,34 +359,34 @@ ggml_tensor* Gemma4ForwardPass::build_moe_geglu(
     // 4. Expert dispatch: for each token, run its top-k experts.
     //    input_3d: [n_embd, 1, n_tokens] aligns with mul_mat_id's expected
     //    "b" tensor shape (n_embd, ?, n_tokens).
-    ggml_tensor* input_3d = ggml_reshape_3d(ctx_, expert_in, n_embd, 1, n_tokens);
+    ggml_tensor* input_3d = ggml_reshape_3d(arena_.ctx(), expert_in, n_embd, 1, n_tokens);
 
-    ggml_tensor* gate_out = ggml_mul_mat_id(ctx_, w_gate, input_3d, expert_idx);
-    ggml_tensor* up_out   = ggml_mul_mat_id(ctx_, w_up,   input_3d, expert_idx);
+    ggml_tensor* gate_out = ggml_mul_mat_id(arena_.ctx(), w_gate, input_3d, expert_idx);
+    ggml_tensor* up_out   = ggml_mul_mat_id(arena_.ctx(), w_up,   input_3d, expert_idx);
     set_tensor_name(gf, gate_out, "moe_exp_gate", static_cast<int>(il));
     set_tensor_name(gf, up_out,   "moe_exp_up",   static_cast<int>(il));
 
     // 5. GeGLU-tanh activation: gelu(gate) * up.  ggml_gelu uses the
     //    tanh approximation by default (matches gelu_pytorch_tanh).
-    ggml_tensor* exp_act = ggml_mul(ctx_, ggml_gelu(ctx_, gate_out), up_out);
+    ggml_tensor* exp_act = ggml_mul(arena_.ctx(), ggml_gelu(arena_.ctx(), gate_out), up_out);
 
     // 6. Down projection: [n_embd, top_k, n_tokens]
-    ggml_tensor* exp_down = ggml_mul_mat_id(ctx_, w.moe_down_exps,
+    ggml_tensor* exp_down = ggml_mul_mat_id(arena_.ctx(), w.moe_down_exps,
                                              exp_act, expert_idx);
     set_tensor_name(gf, exp_down, "moe_exp_down", static_cast<int>(il));
 
     // 7. Weighted sum across the top_k axis → [n_embd, n_tokens].
-    ggml_tensor* w_expanded = ggml_reshape_3d(ctx_, expert_weights,
+    ggml_tensor* w_expanded = ggml_reshape_3d(arena_.ctx(), expert_weights,
                                                1, top_k, n_tokens);
-    ggml_tensor* weighted = ggml_mul(ctx_, exp_down, w_expanded);
+    ggml_tensor* weighted = ggml_mul(arena_.ctx(), exp_down, w_expanded);
 
-    ggml_tensor* routed = ggml_view_2d(ctx_, weighted,
+    ggml_tensor* routed = ggml_view_2d(arena_.ctx(), weighted,
         n_embd, n_tokens, weighted->nb[2], 0);
     for (int k = 1; k < top_k; ++k) {
-        ggml_tensor* slice = ggml_view_2d(ctx_, weighted,
+        ggml_tensor* slice = ggml_view_2d(arena_.ctx(), weighted,
             n_embd, n_tokens, weighted->nb[2],
             static_cast<size_t>(k) * weighted->nb[1]);
-        routed = ggml_add(ctx_, routed, slice);
+        routed = ggml_add(arena_.ctx(), routed, slice);
     }
     set_tensor_name(gf, routed, "moe_routed", static_cast<int>(il));
     return routed;
@@ -414,12 +414,12 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     ggml_tensor* inpSA = cur;
 
     // ── A. Attention ─────────────────────────────────────────────────────
-    cur = build_rms_norm(ctx_, cur, w.attn_norm, config_.rms_norm_eps,
+    cur = build_rms_norm(arena_.ctx(), cur, w.attn_norm, config_.rms_norm_eps,
                          static_cast<int>(il));
     set_tensor_name(gf, cur, "attn_pre_norm", static_cast<int>(il));
 
-    ggml_tensor* Qcur = ggml_mul_mat(ctx_, w.attn_q, cur);
-    ggml_tensor* Kcur = ggml_mul_mat(ctx_, w.attn_k, cur);
+    ggml_tensor* Qcur = ggml_mul_mat(arena_.ctx(), w.attn_q, cur);
+    ggml_tensor* Kcur = ggml_mul_mat(arena_.ctx(), w.attn_k, cur);
 
     // V == K for global layers (no attn_v.weight in the GGUF; the
     // attention kernel still wants a separately-shaped V tensor, so we
@@ -428,31 +428,31 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     // the same source data — that wastes V-cache bytes on global layers
     // but keeps the call site uniform.  G4.8 follow-up could special-case
     // this if memory matters.)
-    ggml_tensor* Vcur = is_global ? Kcur : ggml_mul_mat(ctx_, w.attn_v, cur);
+    ggml_tensor* Vcur = is_global ? Kcur : ggml_mul_mat(arena_.ctx(), w.attn_v, cur);
 
-    Qcur = ggml_reshape_3d(ctx_, Qcur, head_dim, config_.n_head, n_tokens);
-    Kcur = ggml_reshape_3d(ctx_, Kcur, head_dim, n_kv_heads,     n_tokens);
-    Vcur = ggml_reshape_3d(ctx_, Vcur, head_dim, n_kv_heads,     n_tokens);
+    Qcur = ggml_reshape_3d(arena_.ctx(), Qcur, head_dim, config_.n_head, n_tokens);
+    Kcur = ggml_reshape_3d(arena_.ctx(), Kcur, head_dim, n_kv_heads,     n_tokens);
+    Vcur = ggml_reshape_3d(arena_.ctx(), Vcur, head_dim, n_kv_heads,     n_tokens);
 
     // QK-norm: per-head, [head_dim]-shaped weight broadcast across heads
     // (Gemma 3 / 4 share this shape; the wider [head_dim, n_head] qwen3
     // variant is a different op).
-    Qcur = build_rms_norm(ctx_, Qcur, w.attn_q_norm, config_.rms_norm_eps,
+    Qcur = build_rms_norm(arena_.ctx(), Qcur, w.attn_q_norm, config_.rms_norm_eps,
                           static_cast<int>(il));
-    Kcur = build_rms_norm(ctx_, Kcur, w.attn_k_norm, config_.rms_norm_eps,
+    Kcur = build_rms_norm(arena_.ctx(), Kcur, w.attn_k_norm, config_.rms_norm_eps,
                           static_cast<int>(il));
     // V is RMS-normed without a weight (Gemma 4 spec; matches llama.cpp's
     // gemma4-iswa reference: `Vcur = ggml_rms_norm(ctx0, Vcur, eps)`).
-    Vcur = ggml_rms_norm(ctx_, Vcur, config_.rms_norm_eps);
+    Vcur = ggml_rms_norm(arena_.ctx(), Vcur, config_.rms_norm_eps);
     set_tensor_name(gf, Vcur, "Vcur_normed", static_cast<int>(il));
 
     // RoPE — full or pruned.  When rope_dim == head_dim (the case in
     // 26B-A4B), Pruned and Standard produce bit-identical output.  The
     // op is selected by build_rope_pruned regardless; the kernel's
     // pass-through tail handles the (rope_dim < head_dim) case cleanly.
-    Qcur = build_rope_pruned(ctx_, Qcur, inp_pos, rope_dim,
+    Qcur = build_rope_pruned(arena_.ctx(), Qcur, inp_pos, rope_dim,
                               static_cast<int>(config_.context_len), rope_base);
-    Kcur = build_rope_pruned(ctx_, Kcur, inp_pos, rope_dim,
+    Kcur = build_rope_pruned(arena_.ctx(), Kcur, inp_pos, rope_dim,
                               static_cast<int>(config_.context_len), rope_base);
 
     // const float kq_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -468,7 +468,7 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     // (global vs swa) flows through without explicit dims. softcap off for G4
     // (QK-norm replaces it).
     if (phase.is_decode()) {
-        cur = build_batched_attention(ctx_, gf, cache, Qcur, Kcur, Vcur,
+        cur = build_batched_attention(arena_.ctx(), gf, cache, Qcur, Kcur, Vcur,
                                       /*layer_idx=*/cache_il, kq_scale,
                                       *phase.slots, *phase.positions,
                                       (*phase.layer_masks)[il],
@@ -476,7 +476,7 @@ ggml_tensor* Gemma4ForwardPass::build_block(
                                       /*il=*/static_cast<int>(il),
                                       /*softcap=*/0.0f);
     } else {
-        cur = build_attention(ctx_, gf, cache, Qcur, Kcur, Vcur,
+        cur = build_attention(arena_.ctx(), gf, cache, Qcur, Kcur, Vcur,
                               /*layer_idx=*/cache_il,
                               kq_scale, n_tokens, phase.slot_idx,
                               /*il=*/static_cast<int>(il),
@@ -484,14 +484,14 @@ ggml_tensor* Gemma4ForwardPass::build_block(
                               /*softcap=*/0.0f);
     }
 
-    cur = ggml_mul_mat(ctx_, w.attn_output, cur);
+    cur = ggml_mul_mat(arena_.ctx(), w.attn_output, cur);
     set_tensor_name(gf, cur, "attn_out", static_cast<int>(il));
 
-    cur = build_rms_norm(ctx_, cur, w.post_attn_norm, config_.rms_norm_eps,
+    cur = build_rms_norm(arena_.ctx(), cur, w.post_attn_norm, config_.rms_norm_eps,
                          static_cast<int>(il));
     set_tensor_name(gf, cur, "post_attn_normed", static_cast<int>(il));
 
-    ggml_tensor* attn_out = ggml_add(ctx_, cur, inpSA);
+    ggml_tensor* attn_out = ggml_add(arena_.ctx(), cur, inpSA);
     set_tensor_name(gf, attn_out, "attn_residual", static_cast<int>(il));
 
     // ── B. Feed-forward (Gemma 4 topology) ───────────────────────────────
@@ -505,13 +505,13 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     ggml_tensor* ffn_inner;
     if (config_.is_moe) {
         // B.1 Dense (shared) MLP sandwich: ffn_norm → GeGLU-tanh → post_ffw_norm_1
-        ggml_tensor* cur_mlp = build_rms_norm(ctx_, attn_out, w.ffn_norm,
+        ggml_tensor* cur_mlp = build_rms_norm(arena_.ctx(), attn_out, w.ffn_norm,
                                               config_.rms_norm_eps,
                                               static_cast<int>(il));
-        cur_mlp = build_ffn_geglu_tanh(ctx_, gf, cur_mlp,
+        cur_mlp = build_ffn_geglu_tanh(arena_.ctx(), gf, cur_mlp,
                                        w.ffn_gate, w.ffn_up, w.ffn_down,
                                        static_cast<int>(il));
-        cur_mlp = build_rms_norm(ctx_, cur_mlp, w.post_ffn_norm_1,
+        cur_mlp = build_rms_norm(arena_.ctx(), cur_mlp, w.post_ffn_norm_1,
                                  config_.rms_norm_eps, static_cast<int>(il));
         set_tensor_name(gf, cur_mlp, "ffn_mlp", static_cast<int>(il));
 
@@ -519,32 +519,32 @@ ggml_tensor* Gemma4ForwardPass::build_block(
         //     router uses an unweighted rms_norm of attn_out scaled by
         //     1/sqrt(n_embd) and the per-channel ffn_gate_inp.scale.  This
         //     mirrors llama.cpp's gemma4-iswa reference exactly.
-        ggml_tensor* expert_in = build_rms_norm(ctx_, attn_out, w.pre_moe_norm,
+        ggml_tensor* expert_in = build_rms_norm(arena_.ctx(), attn_out, w.pre_moe_norm,
                                                 config_.rms_norm_eps,
                                                 static_cast<int>(il));
         set_tensor_name(gf, expert_in, "ffn_norm_2", static_cast<int>(il));
 
-        ggml_tensor* router_in = ggml_rms_norm(ctx_, attn_out, config_.rms_norm_eps);
-        router_in = ggml_scale(ctx_, router_in,
+        ggml_tensor* router_in = ggml_rms_norm(arena_.ctx(), attn_out, config_.rms_norm_eps);
+        router_in = ggml_scale(arena_.ctx(), router_in,
                                1.0f / std::sqrt(static_cast<float>(config_.hidden_dim)));
-        router_in = ggml_mul(ctx_, router_in, w.moe_router_scale);
+        router_in = ggml_mul(arena_.ctx(), router_in, w.moe_router_scale);
         set_tensor_name(gf, router_in, "moe_router_in", static_cast<int>(il));
 
         ggml_tensor* cur_moe = build_moe_geglu(gf, expert_in, router_in, w, il, n_tokens);
-        cur_moe = build_rms_norm(ctx_, cur_moe, w.post_ffn_norm_2,
+        cur_moe = build_rms_norm(arena_.ctx(), cur_moe, w.post_ffn_norm_2,
                                  config_.rms_norm_eps, static_cast<int>(il));
         set_tensor_name(gf, cur_moe, "ffn_moe", static_cast<int>(il));
 
         // B.3 Sum dense + MoE.
-        ffn_inner = ggml_add(ctx_, cur_mlp, cur_moe);
+        ffn_inner = ggml_add(arena_.ctx(), cur_mlp, cur_moe);
         set_tensor_name(gf, ffn_inner, "ffn_moe_combined", static_cast<int>(il));
     } else {
         // Dense variant: a single GeGLU-tanh FFN (no parallel MoE branch and
         // no post_ffw_norm_1; the common post_ffw_norm below is the only
         // FFN post-norm).  Matches llama.cpp gemma4.cpp non-MoE branch.
-        ffn_inner = build_rms_norm(ctx_, attn_out, w.ffn_norm,
+        ffn_inner = build_rms_norm(arena_.ctx(), attn_out, w.ffn_norm,
                                    config_.rms_norm_eps, static_cast<int>(il));
-        ffn_inner = build_ffn_geglu_tanh(ctx_, gf, ffn_inner,
+        ffn_inner = build_ffn_geglu_tanh(arena_.ctx(), gf, ffn_inner,
                                          w.ffn_gate, w.ffn_up, w.ffn_down,
                                          static_cast<int>(il));
         set_tensor_name(gf, ffn_inner, "ffn_out", static_cast<int>(il));
@@ -553,12 +553,12 @@ ggml_tensor* Gemma4ForwardPass::build_block(
     // B.4 Common outer post-norm (post_ffw_norm), single residual, and
     //     layer_output_scale on the whole layer output.  Matches llama.cpp's
     //     `ffn_post_norm` (applied to either branch result) + `out_scale`.
-    cur = build_rms_norm(ctx_, ffn_inner, w.post_ffn_norm,
+    cur = build_rms_norm(arena_.ctx(), ffn_inner, w.post_ffn_norm,
                          config_.rms_norm_eps, static_cast<int>(il));
     set_tensor_name(gf, cur, "ffn_post_norm", static_cast<int>(il));
 
-    ggml_tensor* layer_out = ggml_add(ctx_, attn_out, cur);
-    layer_out = ggml_mul(ctx_, layer_out, w.layer_out_scale);
+    ggml_tensor* layer_out = ggml_add(arena_.ctx(), attn_out, cur);
+    layer_out = ggml_mul(arena_.ctx(), layer_out, w.layer_out_scale);
     set_tensor_name(gf, layer_out, "layer_out_scaled", static_cast<int>(il));
     return layer_out;
 }
@@ -576,14 +576,14 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
 
     // 1. Embedding + sqrt(d_model) scale (fp32; consistent with G1/G2/G3).
     ggml_tensor* inpL = embedding(gf, tokens);
-    inpL = build_embed_scale(ctx_, inpL,
+    inpL = build_embed_scale(arena_.ctx(), inpL,
                              std::sqrt(static_cast<float>(config_.hidden_dim)));
     set_tensor_name(gf, inpL, "inpL_scaled");
     ggml_build_forward_expand(gf, inpL);
 
     // 2. Position tensor (one per token; per-layer rope_base differs but
     //    they all consume the same int32 positions).
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -648,7 +648,7 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     if (want_logits) {
         // Final norm + LM head + final logit soft-cap (G4.6).
         ggml_tensor* cur = build_rms_norm(
-            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            arena_.ctx(), build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
             config_.rms_norm_eps, /*il=*/-1);
         set_tensor_name(gf, cur, "final_norm");
         ggml_set_output(cur);
@@ -657,13 +657,13 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
         // Tied embeddings: prefer output.weight if explicitly present, else
         // reuse token_embd.weight (the Gemma 1/2/3/4 path).
         if (model_.get_output_weight() != nullptr) {
-            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+            cur = ggml_mul_mat(arena_.ctx(), model_.get_output_weight(), cur);
         } else {
-            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+            cur = ggml_mul_mat(arena_.ctx(), model_.get_token_embedding_weight(), cur);
         }
 
         if (config_.final_softcap > 0.0f) {
-            cur = build_softcap(ctx_, cur, config_.final_softcap);
+            cur = build_softcap(arena_.ctx(), cur, config_.final_softcap);
         }
 
         ggml_set_name(cur, "logits");
@@ -697,12 +697,12 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     // 1. Token embedding + sqrt(d_model) scale (fp32).
     ggml_tensor* inpL = embedding(gf, tokens);
     set_tensor_name(gf, inpL, "inpL");
-    inpL = build_embed_scale(ctx_, inpL, std::sqrt(static_cast<float>(hidden_dim)));
+    inpL = build_embed_scale(arena_.ctx(), inpL, std::sqrt(static_cast<float>(hidden_dim)));
     set_tensor_name(gf, inpL, "inpL_scaled");
 
     // 2. Position tensor (one per token across all slots; per-layer rope_base
     //    differs but all layers consume the same int32 positions).
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -725,7 +725,7 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     // 5. KV gather indices, shared across all layers AND both caches (identical
     //    n_ctx_max + lockstep positions ⇒ one index tensor addresses both).
     ggml_tensor* gather_indices =
-        ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens * n_kv_len);
+        ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens * n_kv_len);
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 

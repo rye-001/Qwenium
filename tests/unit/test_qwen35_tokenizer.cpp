@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/loader/tokenizer.h"
 
 static std::string get_qwen35_model_path() {

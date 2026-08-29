@@ -117,8 +117,8 @@ public:
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
     bool supports_persistent_decode() const override { return true; }
 
-    // has_decode_graph() inherits the default (true): build_decoding_graph is
-    // implemented (Phase 3 of docs/plan-gemma-batched-decode.md).
+    // build_decoding_graph is implemented (Phase 3 of
+    // docs/plan-gemma-batched-decode.md).
 
     // Inputs are populated via the typed graph_inputs_ set built in
     // build_prefill_graph / build_decoding_graph (no set_inputs override).

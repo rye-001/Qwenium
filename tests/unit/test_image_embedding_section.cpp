@@ -8,7 +8,7 @@
 
 #include <gtest/gtest.h>
 
-#include "core/persistent_image_embedding_store.h"
+#include "session/persistent_image_embedding_store.h"
 #include "graph_inputs/image_embedding_section.h"
 #include "session/compat_header.h"
 #include "session/snapshot_io.h"

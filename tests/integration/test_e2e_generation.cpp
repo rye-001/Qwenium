@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "loader/tokenizer.h"
@@ -58,7 +58,7 @@ protected:
         auto model = model_it->second;
 
         Tokenizer tokenizer(&model->get_metadata());
-        qwenium::GreedySampler sampler;
+        qinf::GreedySampler sampler;
         Qwen3ForwardPass forward_pass(*model, &model->get_metadata(), 4096);
         ggml_backend_sched_t scheduler = model->get_scheduler();
 

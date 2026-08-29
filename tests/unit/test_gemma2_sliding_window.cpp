@@ -22,7 +22,7 @@
 #include <limits>
 #include <vector>
 
-#include "../../src/core/model.h"          // ModelMetadata, GGUFKVBag
+#include "engine/model.h"          // ModelMetadata, GGUFKVBag
 #include "../../src/models/gemma2.h"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

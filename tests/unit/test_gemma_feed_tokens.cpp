@@ -26,7 +26,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/gemma1.h"
 #include "../../src/models/gemma2.h"

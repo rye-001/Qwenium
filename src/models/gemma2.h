@@ -73,9 +73,9 @@ public:
     // KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
-    // has_decode_graph() inherits the default (true): build_decoding_graph is
-    // implemented (Phase 2), so decode_step routes Gemma 2 through the unified
-    // batched decode path, not the run_prefill bridge.
+    // build_decoding_graph is implemented (Phase 2 of
+    // docs/plan-gemma-batched-decode.md), so Gemma 2 decodes through the
+    // batched decode path like every other recipe.
 
     // Inputs are populated via the typed graph_inputs_ set built in
     // build_prefill_graph (no set_inputs override).

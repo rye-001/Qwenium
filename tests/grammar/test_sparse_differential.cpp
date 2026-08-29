@@ -25,8 +25,8 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/decode_step.h"
-#include "../../src/core/model.h"
+#include "engine/decode_step.h"
+#include "engine/model.h"
 #include "../../src/loader/chat_template.h"
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/loader/tokenizer.h"
@@ -99,8 +99,8 @@ struct RunResult {
 RunResult run_n(
     ForwardPassBase* fp,
     ggml_backend_sched_t scheduler,
-    qwenium::Sampler* sampler,
-    qwenium::GrammarVocab* grammar,
+    qinf::Sampler* sampler,
+    qinf::GrammarVocab* grammar,
     const std::vector<std::string>& vocab,
     uint32_t vocab_size,
     int mode,
@@ -247,7 +247,7 @@ void fwr_u64(FILE* f, uint64_t v) { std::fwrite(&v, sizeof(v), 1, f); }
 
 int32_t capture_sparse_step(FILE* f, ForwardPassBase* fp,
                             ggml_backend_sched_t scheduler,
-                            qwenium::Sampler* sampler,
+                            qinf::Sampler* sampler,
                             const std::vector<std::string>& vocab,
                             uint32_t vocab_size, int32_t token, uint32_t slot) {
     // decode_step sparse decision (SPARSE_HEAD_FRACTION_DENOM = 8),
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
 
     // ---- Load grammar ----
     auto grammar_str = slurp(grammar_path);
-    auto grammar = qwenium::GrammarVocab::parse_impl(grammar_str);
+    auto grammar = qinf::GrammarVocab::parse_impl(grammar_str);
     if (!grammar) {
         std::cerr << "ERROR: failed to parse grammar\n";
         return 1;
@@ -388,7 +388,7 @@ int main(int argc, char** argv) {
 
     const std::vector<int32_t> stop_ids = meta.stop_token_ids;
 
-    auto fresh_start = [&](qwenium::Sampler* sampler, uint32_t slot) -> int32_t {
+    auto fresh_start = [&](qinf::Sampler* sampler, uint32_t slot) -> int32_t {
         grammar->reset();
         std::vector<float> logits = forward_pass->run_prefill(
             user_tokens, static_cast<int32_t>(system_tokens.size()),
@@ -402,7 +402,7 @@ int main(int argc, char** argv) {
 
     // ---- Run three configurations ----
     auto make_sampler = [&]() {
-        auto s = std::make_unique<qwenium::GreedySampler>();
+        auto s = std::make_unique<qinf::GreedySampler>();
         s->set_grammar(grammar.get());
         s->build_token_trie(decoded_vocab);
         for (int32_t id : stop_ids) s->add_eos_token_id(id);

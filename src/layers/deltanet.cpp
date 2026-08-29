@@ -307,7 +307,12 @@ ggml_tensor* DeltaNetLayer::build_decode(
     }
 
     // Multi-slot decode: slice the batch input per slot, process independently,
-    // then concatenate. This is correct but not fused; Phase 4 can optimize.
+    // then concatenate. Correct, but O(n_slots) dispatches rather than one
+    // batched op. Deliberately left alone: the two fused DeltaNet kernels we DID
+    // ship (patches/, ~+7% tok/s) targeted the per-token small-op launches that
+    // dominate this layer, and batching this concat was never shown to clear the
+    // agreed measurement bar. Optimize it only behind two signals — per-step
+    // timing AND end-to-end tok/s (docs/phase4-investigation.md).
     std::vector<ggml_tensor*> slot_outs;
     slot_outs.reserve(n_batch);
 

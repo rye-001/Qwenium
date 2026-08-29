@@ -1,12 +1,13 @@
 # Model recipes: Qwen2/3 and Qwen3.5.
 # Each file composes layer modules (src/layers/) into a complete forward pass.
 # Phase 1 (PR 1.6): mechanical move of Qwen3ForwardPass and Qwen35ForwardPass
-# from src/core/ to here. Logic is unchanged.
+# from src/engine/ to here. Logic is unchanged.
 
 add_library(qinf-models STATIC
     forward_pass_base.cpp
     qwen3.cpp
     qwen35.cpp
+    qwen35_family.cpp
     qwen36.cpp
     gemma1.cpp
     gemma2.cpp
@@ -23,7 +24,7 @@ target_include_directories(qinf-models PUBLIC
 
 target_link_libraries(qinf-models PUBLIC
     ggml
-    core
+    qinf-engine
     qinf-layers
     qinf-state
     qinf-graph-inputs

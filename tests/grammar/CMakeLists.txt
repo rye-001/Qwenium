@@ -25,12 +25,12 @@ target_link_libraries(grammar-test-corpus-parse PRIVATE sampling)
 # Heavy — loads a real model. Not a unit test; gated on QWENIUM_MODEL_PATH at runtime.
 add_executable(grammar-test-sparse-differential
     test_sparse_differential.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 target_link_libraries(grammar-test-sparse-differential PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
     Threads::Threads
@@ -46,12 +46,12 @@ endif()
 # Heavy — loads a real model; self-skips when QWENIUM_MODEL_PATH is absent.
 add_executable(grammar-test-forced-elision
     test_forced_elision.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 target_link_libraries(grammar-test-forced-elision PRIVATE
     qinf-models
-    core
+    qinf-engine
     sampling
     ggml
     Threads::Threads

@@ -6,7 +6,7 @@
 #include "prompt_lookup.h"
 #include "speculative.h"
 
-using namespace qwenium;
+using namespace qinf;
 
 // ============================================================================
 // Test helpers

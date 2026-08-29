@@ -16,7 +16,7 @@
 #include "section_ids.h"
 #include "snapshot_section.h"
 
-namespace qwenium {
+namespace qinf {
 
 // Serializes a sampler's PRNG state (no-op for deterministic samplers).
 class SamplerStateSection : public qinf::session::SnapshotSection {
@@ -59,4 +59,4 @@ private:
     GrammarVocab& grammar_;
 };
 
-}  // namespace qwenium
+}  // namespace qinf

@@ -45,14 +45,14 @@ add_executable(http_server
     server_lens.cpp
     image_data_uri.cpp
     # Host-side image pipeline + multimodal orchestrator, compiled directly (these
-    # live in src/cli and src/core but are built into consumers, not a lib — same
-    # arrangement the CLI and multimodal-prefill-tests use). Enables image input
-    # on /v1/chat/completions when the server is started with --mmproj.
-    ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/cli/image_prompt.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/slot_snapshot.cpp
+    # live in src/image, src/session and src/engine but are built into consumers, not a lib —
+    # same arrangement the CLI and multimodal-prefill-tests use). Enables image
+    # input on /v1/chat/completions when the server is started with --mmproj.
+    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/slot_snapshot.cpp
 )
 
 target_link_libraries(http_server PRIVATE
@@ -61,7 +61,7 @@ target_link_libraries(http_server PRIVATE
     nlohmann_json::nlohmann_json
     qinf-models
     qinf-vision
-    core
+    qinf-engine
     sampling
     ggml
     Threads::Threads

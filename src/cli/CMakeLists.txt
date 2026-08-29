@@ -4,13 +4,13 @@ add_executable(qwenium-cli
     chat.cpp
     main.cpp
     session_mode.cpp
-    image_loader.cpp
-    image_prompt.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/decode_plan.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/image_embedding_cache.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/slot_snapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_step.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
+    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/slot_snapshot.cpp
 )
 
 target_link_libraries(qwenium-cli PRIVATE
@@ -18,7 +18,7 @@ target_link_libraries(qwenium-cli PRIVATE
     qinf-vision
     qinf-state
     qinf-session
-    core
+    qinf-engine
     sampling
     ggml
     Threads::Threads

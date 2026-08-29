@@ -40,7 +40,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/state/deltanet_state.h"
 #include "../../src/layers/deltanet.h"

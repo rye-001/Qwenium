@@ -156,9 +156,8 @@ public:
                                       const std::vector<uint32_t>& slots,
                                       const std::vector<int32_t>& positions) override;
 
-    // has_decode_graph() inherits the default (true): build_decoding_graph is
-    // implemented (batched decode), so decode_step routes via the unified path,
-    // not the run_prefill bridge — matching Gemma 1/2/3.
+    // build_decoding_graph is implemented (batched decode), matching
+    // Gemma 1/2/3.
 
     // Phase 3 of docs/plan-feed-tokens.md: gemma4 honors want_logits=false
     // with one head-guard site. Attention-only (dense + MoE FFN, no

@@ -13,7 +13,7 @@
 #include <vector>
 #include <algorithm>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/qwen36.h"
 #include "../../src/models/model_registry.h"
 

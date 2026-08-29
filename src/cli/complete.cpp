@@ -3,8 +3,8 @@
 #include <chrono>
 
 #include "complete.h"
-#include "../core/decode_step.h"
-#include "../core/decode_graph_cache.h"
+#include "engine/decode_step.h"
+#include "engine/decode_graph_cache.h"
 #include "../models/model_registry.h"
 #include "../models/i_mtp_draftable.h"
 #include "../sampling/draft_source.h"
@@ -13,8 +13,8 @@
 int run_complete(
     Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwenium::GrammarVocab>& grammar,
-    qwenium::SpeculativeDecoder* spec,
+    std::unique_ptr<qinf::GrammarVocab>& grammar,
+    qinf::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens
@@ -41,9 +41,9 @@ int run_complete(
         Tokenizer* tokenizer = model.get_tokenizer();
         const auto vocab = tokenizer->get_vocabulary();
 
-        std::unique_ptr<qwenium::Sampler> sampler;
+        std::unique_ptr<qinf::Sampler> sampler;
         if (args.temperature > 0.0f) {
-            sampler = std::make_unique<qwenium::TemperatureSampler>(
+            sampler = std::make_unique<qinf::TemperatureSampler>(
                 args.temperature, 
                 args.repetition_penalty, 
                 64, // lookback window
@@ -54,7 +54,7 @@ int run_complete(
             // Greedy is a true argmax unless --repeat-penalty was explicitly
             // given. Passing it here is what makes the flag mean something on
             // this path; it used to be silently dropped.
-            sampler = std::make_unique<qwenium::GreedySampler>(
+            sampler = std::make_unique<qinf::GreedySampler>(
                 args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
         }
         if (grammar) {
@@ -68,7 +68,7 @@ int run_complete(
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
         if (!args.vocab_prune_list_path.empty()) {
-            pruned_vocab = qwenium::load_keep_list(args.vocab_prune_list_path);
+            pruned_vocab = qinf::load_keep_list(args.vocab_prune_list_path);
             sampler->set_pruned_vocab(&pruned_vocab);
             if (args.verbose) {
                 std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";
@@ -108,7 +108,7 @@ int run_complete(
         // scheduler: a new graph shape must not share galloc state with the
         // main graphs (docs/server-image-multirequest-bug.md precedent).
         const bool mtp_mode = use_speculative && args.speculative_mode == "mtp";
-        std::unique_ptr<qwenium::SpeculativeDecoder> mtp_spec;
+        std::unique_ptr<qinf::SpeculativeDecoder> mtp_spec;
         ggml_backend_sched_t mtp_sched = nullptr;
         if (mtp_mode) {
             auto* mtp_cap = dynamic_cast<IMtpDraftable*>(forward_pass.get());
@@ -157,8 +157,8 @@ int run_complete(
                 uint32_t k) {
                 return mtp_cap->mtp_draft(slot, h, t, p, k, mtp_sched);
             };
-            mtp_spec = std::make_unique<qwenium::SpeculativeDecoder>(
-                std::make_unique<qwenium::MtpDraft>(bridge_fn, args.mtp_max_draft),
+            mtp_spec = std::make_unique<qinf::SpeculativeDecoder>(
+                std::make_unique<qinf::MtpDraft>(bridge_fn, args.mtp_max_draft),
                 (int)cmp_meta.vocab_size);
             spec = mtp_spec.get();
             std::cout << "MTP speculative decoding enabled (head-draft="

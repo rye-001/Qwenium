@@ -6,9 +6,12 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "../state/kv_cache_simple.h"
 #include "../graph_inputs/graph_input.h"
+#include "../engine/graph_compute.h"
+#include "graph_arena.h"
+#include "decode_policy.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
@@ -16,19 +19,40 @@ struct ggml_tensor;
 struct ggml_cgraph;
 class DeltaNetState;  // L2 snapshot reach-through (OverwriteRecurrent lane)
 
-constexpr size_t FP_GRAPH_SIZE_METADATA = 128 * 1024 * 1024;
-constexpr size_t FP_GRAPH_SIZE = 16384;
-
-/**
- * Base class for forward pass implementations.
- * 
- * Owns the shared ggml context and buffer. Provides utility methods
- * used by all architectures: embedding lookup, RMS norm, SwiGLU FFN,
- * multi-head attention kernel, output logits extraction.
- *
- * Each architecture subclass owns its own cache(s) and implements
- * its own graph building logic.
- */
+// forward_pass_base.h — the base every model recipe derives from.
+//
+// Responsibility: own the per-forward-pass ggml context and buffer, provide the
+//   graph-building scaffolding every recipe shares (embedding lookup, output
+//   head, the Seam B image splice), and declare the interface the engine drives
+//   a recipe through. Recipes own their own state (KV cache, recurrent state)
+//   and their own layer composition; this class owns neither.
+// Public surface, in four groups:
+//   (1) the recipe interface — build_prefill_graph / build_decoding_graph /
+//       advance_cache / clear_slot / set_cache_pos / clone_slot, plus the
+//       run_prefill and feed_tokens drivers built on them;
+//   (2) per-slot rope coordinate (get_rope_pos) — NOT the KV row count; an
+//       M-RoPE image span consumes nx*ny rows while advancing position by
+//       max(nx, ny), so the two diverge and every decode site wants the former;
+//   (3) opt-in, default-off output seams — hidden state (MTP, plan-mtp-decode.md
+//       §5 D3), attention rows (the lens tap, plan-qemmi-lens.md P1/A1), sparse
+//       LM head ids, and the L2 snapshot reach-through;
+//   (4) decode-path policy the engine sets — KV write mode (baked-offset cpy vs
+//       value-driven set_rows) and n_kv bucketing, which move together and only
+//       under --persistent-graph.
+// Invariants:
+//   - The opt-in seams are byte-inert when disarmed: an empty tap set marks no
+//     node, output_hidden_ adds no graph output. Gated by
+//     tests/unit/test_forward_pass_base.cpp (TapOffByteIdentical).
+//   - graph_inputs_ must be cleared BEFORE build_image_substitution, never
+//     after — clearing after discards the ImageEmbeddingsInput that uploads the
+//     encoder output while leaving the splice in place, so the image span
+//     carries stale buffer contents and the model describes noise. That was the
+//     qwen36 vision bug; set_prefill_inputs now refuses it fail-loud
+//     (GraphInputSet::has_slot).
+//   - Architecture direction: this is a shared base class, and the blueprint
+//     wants composition over inheritance — a known eventual deletion target
+//     (architecture.md §12).
+// Unit test: tests/unit/test_forward_pass_base.cpp
 class ForwardPassBase {
 public:
     ForwardPassBase(const Model& model, const ModelMetadata* metadata);
@@ -49,12 +73,6 @@ public:
         const std::vector<int32_t>& tokens,
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
-
-    // False ⇒ this recipe has no build_decoding_graph (it throws); decode_step
-    // must route through the legacy single-token run_prefill bridge instead.
-    // Default true; recipes whose build_decoding_graph is unimplemented
-    // (Gemma 1–4) override to false.
-    virtual bool has_decode_graph() const { return true; }
 
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
     // Returns output logits.
@@ -78,7 +96,8 @@ public:
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler, gf), "run_prefill");
         advance_cache(tokens.size(), slot_idx);
         if (hidden_out) *hidden_out = get_output_hidden(gf);
         return get_output_logits(gf);
@@ -182,7 +201,8 @@ public:
             build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler, gf), "feed_tokens");
         advance_cache(static_cast<uint32_t>(tokens.size()), slot);
         // No get_output_logits: head-less by contract.
     }
@@ -293,8 +313,8 @@ public:
     // needs_hidden_state(). A no-op on recipes that don't read it (Gemma), so
     // their byte gate is unaffected. Honoured by qwen36's prefill AND decode
     // graphs (the Phase-3 "prefill + batched decode" scope decision).
-    void set_output_hidden(bool on) { output_hidden_ = on; }
-    bool output_hidden() const { return output_hidden_; }
+    void set_output_hidden(bool on) { policy_.output_hidden = on; }
+    bool output_hidden() const { return policy_.output_hidden; }
     std::vector<float> get_output_hidden(ggml_cgraph* gf);
 
     // ── Lens tap: opt-in attention-row output (docs/plan-qemmi-lens.md P1/A1) ─
@@ -318,8 +338,8 @@ public:
         int n_head;                // attention heads (= tensor ne[2])
         std::vector<float> rows;   // row-major [n_head][n_kv]; row h sums to ~1
     };
-    void set_attention_taps(std::vector<int> layers) { attention_taps_ = std::move(layers); }
-    const std::vector<int>& attention_taps() const { return attention_taps_; }
+    void set_attention_taps(std::vector<int> layers) { policy_.attention_taps = std::move(layers); }
+    const std::vector<int>& attention_taps() const { return policy_.attention_taps; }
     // Mark each armed layer's `kq_soft.<il>` as a graph output on `gf`. No-op
     // when the layer set is empty (byte-inert). Fail-loud if an armed layer's
     // tap tensor is absent from the graph (names the layer, expected, actual).
@@ -332,8 +352,10 @@ public:
 protected:
     const ModelMetadata& meta_;
     const Model& model_;
-    struct ggml_context* ctx_;
-    std::vector<uint8_t> ctx_buffer_;
+    // Composition, not inheritance: the context lifecycle is a value this class
+    // HOLDS. First extraction toward retiring this base class entirely
+    // (architecture.md §12). Recipes reach the context as arena_.ctx().
+    GraphArena arena_;
 
     // Typed inputs for the current graph. Each recipe rebuilds this in its
     // build_*_graph; run_prefill / decode_step fan set_input over it.
@@ -360,19 +382,6 @@ protected:
         ggml_cgraph* gf,
         ggml_tensor* cur,
         ggml_tensor* mw,
-        int il) const;
-
-    // Core multi-head attention: Q @ K^T → softmax → @ V
-    // Handles GQA, permutations, stream splitting, and recombination.
-    ggml_tensor* build_attn_mha(
-        ggml_cgraph* gf,
-        ggml_tensor* q,
-        ggml_tensor* k,
-        ggml_tensor* v,
-        ggml_tensor* kq_mask,
-        ggml_tensor* sinks,
-        float kq_scale,
-        uint32_t pos,
         int il) const;
 
     // Build the output head: final norm → LM head matmul → "logits" tensor
@@ -511,8 +520,8 @@ public:
     // Set false to build the dense head over all N positions — the bit-for-bit
     // reference the slice differential compares against. Explicit and
     // caller-selected; not an error fallback (CLAUDE.md fail-loud contract).
-    void set_slice_prefill_head(bool on) { slice_prefill_head_ = on; }
-    bool slice_prefill_head() const { return slice_prefill_head_; }
+    void set_slice_prefill_head(bool on) { policy_.slice_prefill_head = on; }
+    bool slice_prefill_head() const { return policy_.slice_prefill_head; }
 
     // ── Decode KV write mode ─────────────────────────────────────────────────
     // Differential seam for the decode KV write, mirroring slice_prefill_head:
@@ -524,9 +533,11 @@ public:
     // Only recipes that pass kv_write_indices into the batched attention
     // helpers honor it; others are Cpy-only regardless. Explicit and
     // caller-selected; not a fallback.
-    enum class KvWriteMode { SetRows, Cpy };
-    void set_kv_write_mode(KvWriteMode m) { kv_write_mode_ = m; }
-    KvWriteMode kv_write_mode() const { return kv_write_mode_; }
+    // The enum lives on DecodePolicy; aliased here so existing call sites keep
+    // spelling it ForwardPassBase::KvWriteMode.
+    using KvWriteMode = DecodePolicy::KvWriteMode;
+    void set_kv_write_mode(KvWriteMode m) { policy_.kv_write_mode = m; }
+    KvWriteMode kv_write_mode() const { return policy_.kv_write_mode; }
 
     // True ⇒ this recipe's build_decoding_graph is persistent-graph capable:
     // every step-varying quantity is a graph-input VALUE (tokens, positions,
@@ -548,26 +559,20 @@ public:
     // (test_decode_kv_bucket; same fork class as architecture.md §11). The
     // persistent path opts IN to bucket 256; the default decode path stays
     // exact. Only recipes that call decode_kv_len() honor it.
-    void set_decode_kv_bucket(uint32_t b) { decode_kv_bucket_ = b; }
-    uint32_t decode_kv_bucket() const { return decode_kv_bucket_; }
+    void set_decode_kv_bucket(uint32_t b) { policy_.decode_kv_bucket = b; }
+    uint32_t decode_kv_bucket() const { return policy_.decode_kv_bucket; }
+
+    // The whole run-time policy as one value, for a caller that wants to read or
+    // assert on the pass's mode rather than poll five getters.
+    const DecodePolicy& decode_policy() const { return policy_; }
 
 protected:
-    // Bucketed decode KV width: max_pos_plus_1 rounded up to the bucket,
-    // capped at n_ctx_max. Bucket 0 ⇒ exact (max_pos_plus_1 unchanged).
     uint32_t decode_kv_len(uint32_t max_pos_plus_1, uint32_t n_ctx_max) const {
-        if (decode_kv_bucket_ == 0) return max_pos_plus_1;
-        const uint64_t up =
-            (static_cast<uint64_t>(max_pos_plus_1) + decode_kv_bucket_ - 1) /
-            decode_kv_bucket_ * decode_kv_bucket_;
-        return up < n_ctx_max ? static_cast<uint32_t>(up) : n_ctx_max;
+        return policy_.decode_kv_len(max_pos_plus_1, n_ctx_max);
     }
 
-    bool slice_prefill_head_ = true;
-    bool output_hidden_ = false;   // D3 opt-in; see set_output_hidden
-    std::vector<int> attention_taps_;  // lens-tap opt-in; see set_attention_taps
-    // Defaults = today's decode: baked-offset cpy write, exact per-step n_kv.
-    // The opt-in persistent path (--persistent-graph) sets both to
-    // {SetRows, 256} together; nothing else changes them.
-    KvWriteMode kv_write_mode_ = KvWriteMode::Cpy;
-    uint32_t decode_kv_bucket_ = 0;
+    // Run-time policy, held not inherited (see decode_policy.h). Defaults are
+    // the byte-reproducible path; --persistent-graph is the only thing that sets
+    // kv_write_mode and decode_kv_bucket, and it sets them together.
+    DecodePolicy policy_;
 };

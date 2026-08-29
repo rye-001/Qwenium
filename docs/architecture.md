@@ -23,7 +23,8 @@ weights) on Apple Silicon, using [ggml](https://github.com/ggml-org/ggml) as
 the tensor library and Metal as the GPU backend. It ships two front ends over
 one engine:
 
-- a **CLI** (`qwen3` binary): single-user chat/completion, with vision,
+- a **CLI** (`qwenium` binary, CMake target `qwenium-cli`): single-user
+  chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
   decode graph (`--persistent-graph`, §5), and session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
@@ -90,10 +91,10 @@ Qwen and one Gemma recipe before it counts as done.
                                       │ clear_slot / tokenize / ... (slot_id + tokens)
                        ┌──────────────▼───────────────────────────────┐
                        │              engine core                     │
-                       │  src/core/model.{h,cpp}   — owns weights,    │
+                       │  src/engine/model.{h,cpp} — owns weights,    │
                        │    backend, scheduler, the forward pass      │
-                       │  src/core/decode_plan / decode_step          │
-                       │  src/core/multimodal_prefill                 │
+                       │  src/engine/decode_plan / decode_step        │
+                       │  src/engine/multimodal_prefill               │
                        └──────┬───────────────┬───────────────────────┘
                               │               │
               ┌───────────────▼──┐   ┌────────▼─────────────────────┐
@@ -117,8 +118,9 @@ Qwen and one Gemma recipe before it counts as done.
               └───────────────────────────────────────────────────────┘
 
   side pipelines:  src/vision/  (image → soft tokens, joins at one seam)
-                   src/session/ + src/core/{slot_snapshot,prefix_library}
-                                (portable snapshots, warm-KV caches)
+                   src/session/ (portable snapshots, warm-KV caches:
+                                format + slot_snapshot/prefix_library/
+                                image-embedding caches)
   foundation:      ggml (pinned, patched via patches/), Metal + CPU backends
 ```
 
@@ -176,35 +178,51 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 
 | Directory | Concept | Key files |
 |---|---|---|
-| `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly), `moe_residency` (routing-skew telemetry) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (the recipe interface plus the graph scaffolding recipes share: embed, output head, the Seam B image splice, decode masks — each of which builds nodes *and* declares the typed input they consume; per-step arming lives here too. Context and run-time policy were extracted out to `graph_arena` / `decode_policy`), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
-| `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` + `ssm_state_cache` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
+| `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
-| `src/loader/` | GGUF → live model | `gguf_loader` (mmap, metadata), `weight_binding` (fail-loud tensor inventory), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check` |
-| `src/core/` | Engine orchestration + persistence primitives | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `slot_snapshot`, `image_embedding_cache` + `persistent_image_embedding_store`, `platform` (mmap wrapper) |
+| `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the fail-loud architecture/tensor-inventory validators), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
+| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
-| `src/session/` | Portable snapshot file format | `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch |
+| `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The two services that need `models/`/`graph_inputs/` build into `qinf-engine` or directly into consumers rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
-| `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `image_loader` (image **IO**: decode/resample/normalize — the encoder is content-blind; the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt`, `speculative-bridge` |
-| `src/telemetry/` | Metrics | `metrics.h` |
-| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | |
+| `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
+| `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
+| `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
 
 Test tiers under `tests/`: `unit/` (co-located per module, includes bitwise
 recipe gates), `integration/`, `smoke/` (end-to-end shell gates against real
 models — server caching, conversational mode, image coherence), `perf/`,
 `grammar/`, `diff/` (differential fixtures, e.g. captured llama.cpp tensors).
 
-> **Flagged smell — `src/core/`.** The directory postdates the CLAUDE.md
-> "no dumping grounds" list and its name is concept-free; today it hosts the
-> engine owner (`model`), decode orchestration, and four persistence/caching
-> facilities that mostly serve the snapshot/caching system. It has not yet been
-> deliberately admitted to the allowlist or split (e.g. `engine/` + merging the
-> cache pieces into `session/`). Until that decision is made, treat additions
-> to `core/` with suspicion. Same status applies to `session/`, `telemetry/`,
-> `vision/` (all reasonable concepts, none yet in the CLAUDE.md list), and to
-> `metal/`/`quant/` (listed in CLAUDE.md but not existing as directories —
-> Metal work lives in `patches/`).
+Read the co-location invariant (`src/<m>.cpp` ⇒ `tests/unit/test_<m>.cpp`) as
+the rule for *modules*, not recipes. Recipes and the front ends are covered by
+**aspect** tests instead — `test_qwen35_forward_attn`, `test_gemma3_config`,
+`test_qwen36_hparams`, `test_gemma_batched_decode` — which is better testing
+than one file per recipe would be, but it means "no `test_qwen35.cpp`" does not
+mean "qwen35 is untested". Model-file tests self-skip when their model is
+absent (`QWEN3_MODEL_PATH` and friends), so a green run with skips is normal;
+check the reported total, not only the failure list.
+
+> **Directory admission — settled and still open.** `src/core/` was a flagged
+> smell: a concept-free name hosting the engine owner, decode orchestration and
+> four persistence facilities, with `loader/` depending on it while it *was* the
+> load path. **Settled 2026-08-29:** `gguf_value` + `platform` → `loader/`, the
+> four persistence services → `session/`, the remainder renamed `engine/` (build
+> target `core` → `qinf-engine`), and the host-side image pipeline moved out of
+> `cli/` into its own `image/` (both front ends consume it — the server compiles
+> it directly). `engine/` and `image/` are in the CLAUDE.md allowlist.
+>
+> Also settled the same day: `session/` and `vision/` joined the allowlist, and
+> three directories left the tree entirely. `metal/` and `quant/` held nothing but
+> a comment-only CMakeLists reserving space for a Phase 4 whose measured ceiling
+> (≤1.13×, [`phase4-investigation.md`](phase4-investigation.md)) killed it — a
+> directory is admitted when it holds code, not in advance. `telemetry/` was one
+> 17-line header with a single-field struct, feeding `layers/moe_residency`,
+> which had **no production caller at all**; both went. The allowlist is now what
+> the tree is.
 
 ---
 
@@ -213,7 +231,7 @@ models — server caching, conversational mode, image coherence), `perf/`,
 **Load.** `gguf_loader` mmaps the file and reads metadata; `model_registry`
 maps the GGUF `general.architecture` string to a recipe factory and a tensor
 *inventory validator* — the load fails loudly if a tensor the recipe needs is
-missing or mis-shaped, before any graph is built. `core/model` then allocates
+missing or mis-shaped, before any graph is built. `engine/model` then allocates
 one backend buffer for all weights and copies them in (the copy is the SSD
 read; unified memory removes the PCIe hop, not the disk), and **then releases
 the mapping** (`release_file_mapping`). That release is load-bearing, not
@@ -252,7 +270,7 @@ step's input. Exit on EOS, stop sequence, token budget, or (server) timeout.
 
 Rebuilding + reallocating that graph every step costs ~12 ms of galloc replan
 (26% of a step on M1 Pro). The opt-in **persistent decode graph** (CLI
-`--persistent-graph`, `core/decode_graph_cache`) removes it: the graph is
+`--persistent-graph`, `engine/decode_graph_cache`) removes it: the graph is
 built + allocated once per KV-width *bucket* on a dedicated scheduler and
 reused across steps — only the typed inputs (tokens, positions, mask, gather
 and set_rows write indices) are refilled and recomputed. Measured **1.32×**
@@ -426,7 +444,10 @@ Two interfaces carry the whole boundary, and both have two implementations
 Preprocessing splits along the same grain as the seams. The **recipe** —
 `vision/image_preprocess.h`, `ImagePreprocess` plus one factory per projector —
 is projector knowledge and lives with the encoders. The **pipeline** —
-`cli/image_loader` — is IO: decode, resample, normalize, emit a Bitmap. It is
+`image/image_loader` — is IO: decode, resample, normalize, emit a Bitmap. It
+lives in its own directory rather than in `vision/` (which is the encoder
+subsystem, not the image pipeline) and rather than in `cli/` (both front ends
+consume it — the server compiles it directly). It is
 byte-gated against captured llama.cpp references — both sizing modes, the
 gemma3 fixed square and the qwen3vl dyn-size canvas (one fixture per branch of
 smart_resize) — because the encoder must see exactly what it saw in training
@@ -490,7 +511,7 @@ buckets handle char-classes, and **resolve-once** groups states by
 instead of once per candidate token.
 
 A fourth mechanism skips the forward pass entirely: **forced-token elision**
-(`core/decode_step`, opt-in per call). When the peek collapses to exactly one
+(`engine/decode_step`, opt-in per call). When the peek collapses to exactly one
 legal token, the next token needs no model — the run of determined tokens
 (capped at 64) is chained through the automaton and model state is advanced
 over the whole run in a single `feed_tokens` dispatch: no decode graph, no
@@ -540,7 +561,7 @@ both kinds simultaneously, which is why every prefix-reuse feature in §6 is
 safe only for pure-attention models.
 
 Both state kinds, plus sampler state and token history, serialize into the
-**portable session snapshot** (`src/session/` format, `core/slot_snapshot`
+**portable session snapshot** (`src/session/` format, `session/slot_snapshot`
 extraction): versioned sections, a compatibility header (backend/kernel-path
 tag — cross-backend restore refuses fail-loud rather than silently degrading),
 byte-fidelity gated on Metal and CPU for both families. The same machinery
@@ -606,7 +627,16 @@ used only for the output-head matmul, overlapping with the next token's body.
   silent fallbacks, no best-effort recovery: a missing tensor kills the load,
   a wrong-dim vision projector refuses to encode, a version-mismatched
   snapshot refuses to restore, an unknown `conversation_id` tells the client
-  to resend history.
+  to resend history, and **a failed graph compute stops the pass** rather than
+  letting the caller read an uncomputed buffer (`engine/graph_compute.h`).
+  That last one was absent from the text path until 2026-08-29 — ggml-metal
+  returns `GGML_STATUS_FAILED` on a command-buffer failure (usually GPU OOM)
+  and latches it, and every text-path site discarded the status, so the engine
+  decoded fluent nonsense and once caused a misdiagnosis. The vision encoders
+  had always checked. Detection belongs to the engine; **containment belongs to
+  the caller** — the server fails that batch's requests and keeps serving (its
+  inference loop is a bare `std::thread`, so an escaping throw would kill the
+  process), the CLI reports and exits non-zero.
 - **The cross-family rule keeps abstractions honest.** An interface validated
   only on Qwen is presumed Qwen-shaped until a Gemma recipe proves otherwise.
   The success metric for hosting a new variant: zero logic edits to modules
@@ -638,7 +668,6 @@ used only for the output-head matmul, overlapping with the next token's body.
 
 Current, verified against the tree at time of writing:
 
-- `src/core/` naming/admission is unsettled (§4 flag).
 - **`--kv-f16` on Gemma 4 MoE is unexplained and ungated.** F32→F16 shifts the
   step-0 top-1 logit by 0.93 on `gemma-4-26B-A4B-it-Q2_K` (later steps drift
   0.06–0.3), against 0.0007–0.0387 on every other recipe including Gemma 4
@@ -650,8 +679,81 @@ Current, verified against the tree at time of writing:
   steps, but that is thin evidence on a checkpoint whose output is already
   incoherent on the probe prompt. Treat Gemma 4 MoE + `--kv-f16` as unvalidated
   until the amplification is explained.
-- `forward_pass_base` remains a shared base class; the blueprint's direction
-  is composition-over-inheritance and it is a known eventual deletion target.
+- **`forward_pass_base` is being shrunk to a cohesive core — not deleted.** The
+  blueprint's direction is composition-over-inheritance, and this was recorded as
+  an eventual deletion target until the primitives were actually measured
+  (below), which does not support that. The **first extraction landed
+  2026-08-29**: the ggml context and its metadata
+  buffer are now a `GraphArena` the base *holds* rather than *is*
+  (`models/graph_arena.h`, unit-tested without a model or backend). Recipes
+  reach it as `arena_.ctx()`. The **second extraction landed the same day**: the
+  run-time policy flags — prefill head slice, hidden-state output, attention
+  taps, KV write mode, decode n_kv bucket — are now a `DecodePolicy` value the
+  base holds (`models/decode_policy.h`), the base's accessors delegating so no
+  caller changed. Its defaults ARE the byte-reproducible path, which is the
+  precondition §11's receipts claims rest on; `is_default_byte_reproducible()`
+  makes that assertable, and `decode_kv_len`'s bucketing — including its
+  cap-at-`n_ctx_max` edge — is now unit-tested without a model.
+  **The graph primitives were then measured, and the "delete the base class"
+  framing needs revising.** They are three different things, not one:
+  (a) four already-pure helpers (`set_tensor_name`, the three `get_output_*`) —
+  extractable, but they are the caller-facing interface and moving them would be
+  ~46 call sites of churn for no structural gain;
+  (b) thin wrappers over layer modules — `build_attn_mha` was one and had
+  **zero callers** despite a comment claiming qwen35 used it (deleted
+  2026-08-29); `build_norm`/`embedding` stay, they save 22 and 14 call sites
+  from repeating `meta_.rms_norm_eps` and the token-embedding lookup;
+  (c) `build_output_head`, `build_out_ids_slice`, `build_image_substitution`,
+  `build_decode_layer_masks` — each builds graph nodes AND registers the typed
+  input those nodes consume (`SparseHeadInput`, `OutputIdsInput`,
+  `ImageEmbeddingsInput`, `AttnMaskInput`).
+  That coupling in (c) is **correct, not accidental**: creating the node and its
+  input together is what prevents "node built but input never filled" — which is
+  precisely the qwen36 vision bug (§7). Pulling them out as free functions would
+  mean threading `meta_`, `model_`, the arena, `graph_inputs_`, `policy_`,
+  `sparse_decode_ids_` and `image_spliced_` through 5-6 parameters each, i.e.
+  trading a cohesive class for the fat-parameter smell CLAUDE.md warns about.
+  So the honest end state is a SMALL base class, not none. Per-step arming
+  (`sparse_decode_ids_`, the rope-divergence record) is the remaining candidate
+  to move; the (c) group should stay.
+- **The attention free functions sit at two altitudes under one naming scheme.**
+  `build_attention`/`build_batched_attention` take already-projected Q/K/V (an
+  attention *core*); `build_gated_attention`/`build_gated_batched_attention` take
+  the normed residual plus six weight tensors and project internally (a whole
+  *layer*, 24 parameters at the decode variant). The prefill/decode split is
+  legitimate — different graph topology, forced by §3's one-topology-per-graph
+  rule. The plain/gated split is not the same kind of thing. Deliberately NOT
+  renamed: a rename would make the confusion less visible without resolving it,
+  and the fix is to unify the altitude, which is a redesign needing its own plan.
+  The header now states the split explicitly.
+- **Qwen 3.5 and 3.6 share one config and one layer body (2026-08-29), but are
+  still two recipe classes.** They differ in exactly one call — dense SwiGLU vs
+  routed experts — so the FFN is now a PARAMETER (`Qwen35Config::is_moe()`,
+  `Qwen35LayerCommon::moe_hp`), settling the inconsistency with Gemma 4, which
+  had always parameterized its own dense/MoE split. `models/qwen35_family.h`
+  holds the shared body; `Qwen35MoEConfig` is an alias of `Qwen35Config`. The
+  duplication was not theoretical: 11 of the 20 most recent commits touching
+  either recipe had to touch both, and it produced the `Stride::NKvLen` gather
+  defect (wrong in qwen36, right in qwen35, latent for months).
+  The typed-input declarations are shared too (`register_qwen35_*_inputs`):
+  neither recipe calls `graph_inputs_.add` any more. That is the block the
+  gather defect actually lived in, so the defect class is now structurally
+  impossible here — one declaration site, one stride, pinned by
+  `test_qwen35_family` including a test that the dense and MoE hybrids declare
+  identical decode inputs.
+  **Collapsing the two recipe classes was considered and deliberately rejected.**
+  What is left is not duplication: the image splice, the MoE hparam wiring and
+  the NextN head-out genuinely differ, so a merged class would branch internally
+  rather than share — trading CLAUDE.md's "model zoo" failure mode for its "fat
+  function of orthogonal knobs" one. The MTP head (`IMtpDraftable`, qwen36 only,
+  ~240 lines) would also make a merged class implement a capability
+  conditionally. Two clearly-named classes over a shared config, layer body and
+  input set is the better side of that judgment.
+
+- **`server/inference_server.h` is a 1210-line header-only class.** Past what a
+  header should carry, but header-only on purpose: it is what lets the slot and
+  queue logic be unit-tested against fake engines with no model, which is a real
+  design win. Recorded as a known shape, not a defect.
 - The chat endpoint flattens engine finish reasons (`timeout`, `cancelled`,
   `error`) to OpenAI's `"stop"` — the completions endpoint reports honestly;
   the chat path lies by enum-compat (`chat_finish_reason` in
@@ -660,6 +762,17 @@ Current, verified against the tree at time of writing:
   visible answer can be cut with a clean `"length"` — no
   `max_completion_tokens` split yet.
 - Grammar engine: two documented too-permissive bugs (§8).
+- **Namespacing is half-unified.** The `qwenium` root was collapsed into `qinf`
+  on 2026-08-29, so the two-root split is gone (`qwenium` now survives only as
+  the product name — the binary, and the `qwenium_version` field serialized into
+  every snapshot header, which must NOT be renamed). What remains is `qinf` with
+  per-subsystem sub-namespaces where a subsystem is self-contained
+  (`qinf::vision`, `qinf::session`, `qinf::image`, `qinf::engine`) alongside a
+  large body of core code — `layers/`, `models/`, `graph_inputs/`, `loader/`,
+  most of `state/` — still in the GLOBAL namespace. The blueprint asks for
+  `qinf::layers` / `qinf::models` / `qinf::state`; getting there is a whole-tree
+  mechanical change with little functional payoff, so it is recorded rather than
+  scheduled.
 - Vision: the strict numeric encoder differentials vs llama.cpp are
   `DISABLED_` (coarse gates + coherence smokes stand in); Gemma 4 image turns
   can emit a short degenerate prefix before recovering.
@@ -677,22 +790,23 @@ Current, verified against the tree at time of writing:
   once the persistent path is the default — which awaits a decision, since
   bucketing makes it token-stable-not-identical (a deliberate opt-in, §5/§11),
   not a soft spot to silently fix.
-- qwen36's decode KV gather uses `Stride::NKvLen` (`slot*n_kv_len + t`)
-  against `gather_k`'s `n_ctx_max`-strided flat layout — correct only for
-  slot 0. Latent wrong-rows gather for multi-slot qwen36 decode (today only
-  the CLI/probes exercise qwen36, single-slot); must be fixed (→ `NCtxMax`,
-  as qwen35) before qwen36 serves multi-slot. The Qemmi-Lens attention tap
-  (`forward_pass_base` `set_attention_taps`/`mark_attention_taps`/
-  `get_attention_taps`, [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads
-  the frozen `kq_soft.<il>` rows on this same qwen36 decode path, so it inherits
-  the single-slot limit — V1 serves single-slot by construction. The seam is
-  opt-in and byte-inert when disarmed (default empty layer set marks no node —
-  same liveness-only argument as `set_output_hidden`; gated by
-  `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the
-  tensor name is the seam, so any recipe that names `kq_soft` hosts it — no lens
-  *claims* for Gemma yet, its constants are unprobed).
-
----
+- The Qemmi-Lens attention tap (`forward_pass_base`
+  `set_attention_taps`/`mark_attention_taps`/`get_attention_taps`,
+  [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads the frozen
+  `kq_soft.<il>` rows on the qwen36 decode path. V1 serves single-slot — now by
+  choice (receipts-grade determinism is B=1, §11) rather than because the gather
+  was broken: qwen36's decode KV gather used `Stride::NKvLen`
+  (`slot*n_kv_len + t`) against `gather_k`'s `n_ctx_max`-strided flat layout,
+  correct only for slot 0. **Fixed 2026-08-29** — it now uses the cache's
+  `n_ctx_max` stride like qwen35 and gemma3, and the second stride policy was
+  deleted outright so there is no wrong one left to select
+  (`test_gather_indices_input` pins the multi-slot rows, and asserts the slot-0
+  identity that let the defect stay latent). The tap seam remains opt-in and
+  byte-inert when disarmed (default empty layer set marks no node — same
+  liveness-only argument as `set_output_hidden`; gated by
+  `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the tensor
+  name is the seam, so any recipe naming `kq_soft` hosts it — no lens *claims*
+  for Gemma yet, its constants are unprobed).
 
 - **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
   automated test** — but the two links most likely to fail quietly are now
@@ -718,11 +832,6 @@ Current, verified against the tree at time of writing:
   an M-RoPE recipe at setup. Gemma (one position per row) is unaffected.
   Lifting this needs the snapshot header bump described in
   `plan-qwen35-vision-impl.md` §4 decision 3.
-- **A Metal command-buffer OOM does not fail loud.** The backend reports
-  `error state from a previous command buffer failure` and the engine keeps
-  decoding, emitting plausible text. A full-budget (4096-token) image prefill
-  exceeds GPU memory next to a 13–17 GB model on a 32 GB host, so this is
-  reachable from ordinary use, and it has already caused one misdiagnosis.
 
 ## 13. Keeping this document alive
 

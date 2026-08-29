@@ -6,9 +6,9 @@
 
 #include <vector>
 
-#include "../../src/cli/image_prompt.h"
+#include "../../src/image/image_prompt.h"
 
-using qinf::cli::expand_image_markers;
+using qinf::image::expand_image_markers;
 
 namespace {
 constexpr int32_t  START = 1000, SOFT = 2000, END = 3000;

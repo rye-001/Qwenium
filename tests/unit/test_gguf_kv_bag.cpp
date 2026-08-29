@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "../../src/core/gguf_value.h"
+#include "loader/gguf_value.h"
 
 // ── Round-trip: each scalar type survives set → get ──────────────────────────
 

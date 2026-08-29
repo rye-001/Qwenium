@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/gemma4.h"
 
 // Build a synthetic 26B-A4B-shaped ModelMetadata with `n_blocks` layers,

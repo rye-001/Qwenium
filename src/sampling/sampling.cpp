@@ -9,7 +9,7 @@
 #include <iostream>
 #include <sstream>
 
-namespace qwenium {
+namespace qinf {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     if (!pruned_vocab_) return;
@@ -396,4 +396,4 @@ void TemperatureSampler::read_rng_state(qinf::session::SnapshotReader& r) {
     }
 }
 
-} // namespace qwenium
+} // namespace qinf

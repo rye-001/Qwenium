@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "tokenizer_config.h"
 #include <vector>
 #include <unordered_map>

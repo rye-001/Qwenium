@@ -48,8 +48,8 @@
 
 #include "ggml-backend.h"
 
-#include "core/model.h"
-#include "core/prefix_library.h"
+#include "engine/model.h"
+#include "session/prefix_library.h"
 #include "loader/tokenizer.h"
 #include "models/forward_pass_base.h"
 #include "models/model_registry.h"

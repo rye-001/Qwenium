@@ -147,7 +147,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 ./bin/qwenium model.gguf --chat --speculative    # with speculative decoding
 ./bin/qwenium model.gguf -p "Hello, world!"      # single prompt
 ./bin/qwenium model.gguf --chat \
-    --mmproj vision.gguf --image photo.jpg       # ask about an image (Gemma 3/4)
+    --mmproj vision.gguf --image photo.jpg       # ask about an image (Gemma 3/4, Qwen 3.5/3.6)
 ```
 
 ## Architecture
@@ -160,27 +160,31 @@ src/
 │   ├── attention.*              #   Plain + gated attention (build_attention, build_gated_attention)
 │   ├── deltanet.*               #   Gated DeltaNet (Qwen3.5/3.6 recurrent path)
 │   ├── ffn.*                    #   SwiGLU FFN
-│   ├── moe.*                    #   Mixture-of-Experts dispatch + residency
-│   ├── norm.*                   #   Shared RMS-norm helper
+│   ├── moe.*                    #   Mixture-of-Experts dispatch (3x mul_mat_id)
+│   ├── norm.*                   #   Shared RMS-norm helper (+ Gemma (1+w) variant)
+│   ├── ple.*                    #   Per-layer embeddings (Gemma 4)
+│   ├── layer.h                  #   Shared vocabulary: Phase, AttentionKind, LayerSpec
 │   └── transformer_block.*      #   Per-layer composer (norm → attn → FFN → residual)
 ├── state/                       # Per-sequence state (KV + recurrent)
-│   ├── kv_cache_simple.*        #   ggml-backed slot KV cache
+│   ├── kv_cache_simple.*        #   ggml-backed slot KV cache (append semantics)
 │   ├── deltanet_state.*         #   Recurrent state for GatedDeltaNet
 │   └── recurrent_state.*        #   Base for checkpoint/restore semantics
 ├── models/                      # Model recipes (compose layer modules)
+│   ├── forward_pass_base.*      #   Shared graph scaffolding + the recipe interface
+│   ├── model_registry.*         #   GGUF arch string → factory + inventory validator
 │   ├── qwen3.*                  #   Qwen2/2.5/3 (pure transformer)
 │   ├── qwen35.*                 #   Qwen3.5 (attention + SSM)
 │   ├── qwen36.*                 #   Qwen3.6 (DeltaNet + attention + MoE)
 │   └── gemma1-4.*               #   Gemma family (logit soft-cap, sliding-window, PLE, pruned RoPE)
 ├── graph_inputs/                # Typed graph inputs (tokens, positions, masks, image embeddings)
-├── vision/                      # Image → soft-token encoders (SigLIP, gemma4uv)
-├── core/                        # Engine orchestration: model owner, decode plan, prefix library, caches
-├── session/                     # Portable session-snapshot file format
+├── vision/                      # Image → soft-token encoders (SigLIP, gemma4uv, qwen3vl)
+├── engine/                      # The loaded model + orchestration of one step over it
+├── session/                     # Session persistence: snapshot format + slot/prefix/image caches
 ├── loader/                      # GGUF parsing, mmap tensor loading, tokenizer, chat templates
 ├── sampling/                    # Sampling, grammar, token-trie, speculative decoding
 ├── server/                      # Inference server + OpenAI-compatible HTTP API
-├── cli/                         # Chat + single-prompt CLI, image preprocessing
-└── telemetry/                   # Observability
+├── image/                       # Host-side image pipeline (decode/resample/normalize, marker expansion)
+└── cli/                         # Chat + single-prompt CLI
 ```
 
 One inference thread owns the model. HTTP threads push requests to a queue and block on per-request token queues. All active slots decode together in a single batched forward pass.
@@ -228,7 +232,6 @@ Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
 | `GGML_USE_METAL` | OFF | Metal GPU acceleration (macOS) |
 | `QWEN3_BUILD_TESTS` | OFF | Build unit + integration tests |
 | `QWEN3_ENABLE_OPENMP` | ON | OpenMP parallelism |
-| `QINF_MOE_FALLBACK` | OFF | Use unfused MoE dispatch (reference / debug build) |
 
 ## Tests
 

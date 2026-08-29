@@ -33,9 +33,9 @@
 #include <string>
 #include <vector>
 
-#include "../../src/core/decode_step.h"
-#include "../../src/core/decode_plan.h"
-#include "../../src/core/model.h"
+#include "engine/decode_step.h"
+#include "engine/decode_plan.h"
+#include "engine/model.h"
 #include "../../src/loader/chat_template.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/models/forward_pass_base.h"
@@ -58,7 +58,7 @@ std::string slurp(const std::string& path) {
 // (NOT including first_token; grammar already advanced past first_token).
 std::vector<int32_t> run_decode(
     ForwardPassBase* fp, ggml_backend_sched_t sched,
-    qwenium::Sampler* sampler, const std::vector<std::string>& vocab,
+    qinf::Sampler* sampler, const std::vector<std::string>& vocab,
     uint32_t vocab_size, int32_t first_token, uint32_t slot, int n_tokens,
     const std::vector<int32_t>& stop_ids, bool forced, bool force_dense,
     size_t* elided = nullptr) {
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     const uint32_t vocab_size = meta.vocab_size;
 
     auto gstr = slurp(grammar_path);
-    auto grammar = qwenium::GrammarVocab::parse_impl(gstr);
+    auto grammar = qinf::GrammarVocab::parse_impl(gstr);
     if (!grammar) { std::cerr << "ERROR: grammar parse failed\n"; return 1; }
 
     const ChatTemplate* tmpl = lookup_chat_template(meta.architecture);
@@ -171,13 +171,13 @@ int main(int argc, char** argv) {
 
     const std::vector<int32_t> stop_ids = meta.stop_token_ids;
     auto make_sampler = [&]() {
-        auto s = std::make_unique<qwenium::GreedySampler>();
+        auto s = std::make_unique<qinf::GreedySampler>();
         s->set_grammar(grammar.get());
         s->build_token_trie(vocab);
         for (int32_t id : stop_ids) s->add_eos_token_id(id);
         return s;
     };
-    auto fresh_start = [&](qwenium::Sampler* s, uint32_t slot) -> int32_t {
+    auto fresh_start = [&](qinf::Sampler* s, uint32_t slot) -> int32_t {
         grammar->reset();
         std::vector<float> logits = fp->run_prefill(
             user_tokens, static_cast<int32_t>(sys_tokens.size()), slot, sched);
@@ -186,9 +186,6 @@ int main(int argc, char** argv) {
         int32_t t = static_cast<int32_t>(s->sample(last, hist, vocab));
         grammar->accept_token(t, vocab);
         return t;
-    };
-    auto route_str = [](DecodeRoute r) {
-        return r == DecodeRoute::Unified ? "Unified" : "Bridge";
     };
     auto diag_str = [](DecodeDiagnostic d) {
         return d == DecodeDiagnostic::Optimized ? "Optimized" : "ForceDense";
@@ -210,11 +207,10 @@ int main(int argc, char** argv) {
         // combinations would have thrown in resolve — none here, all legal).
         DecodePlan plan = resolve_decode_plan(fp.get(), cs.forced,
                                               cs.force_dense);
-        std::cerr << "[plan " << cs.name << "] route=" << route_str(plan.route)
+        std::cerr << "[plan " << cs.name << "]"
                   << " diagnostic=" << diag_str(plan.diagnostic)
                   << " allow_forced_elision=" << plan.allow_forced_elision
-                  << " sparse_head_allowed=" << plan.sparse_head_allowed
-                  << " has_decode_graph=" << plan.has_decode_graph << "\n";
+                  << " sparse_head_allowed=" << plan.sparse_head_allowed << "\n";
 
         auto s = make_sampler();
         int32_t first = fresh_start(s.get(), slot);

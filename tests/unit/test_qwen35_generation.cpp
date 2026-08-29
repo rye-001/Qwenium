@@ -10,7 +10,7 @@
 #include <vector>
 #include <iostream>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/qwen3.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/loader/tokenizer.h"
@@ -39,7 +39,7 @@ protected:
         auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
         ggml_backend_sched_t sched = model_->get_scheduler();
         Tokenizer* tok = model_->get_tokenizer();
-        qwenium::GreedySampler sampler;
+        qinf::GreedySampler sampler;
 
         std::vector<int32_t> tokens = tok->encode(prompt);
         EXPECT_GT(tokens.size(), 0u);
@@ -132,7 +132,7 @@ TEST_F(Qwen35GenerationTest, LogitsStayFinite) {
     auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
     ggml_backend_sched_t sched = model_->get_scheduler();
     Tokenizer* tok = model_->get_tokenizer();
-    qwenium::GreedySampler sampler;
+    qinf::GreedySampler sampler;
 
     std::vector<int32_t> tokens = tok->encode("Hello world");
 

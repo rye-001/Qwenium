@@ -50,9 +50,10 @@ public:
     // recurrent state); still owes its own KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
-    // has_decode_graph() inherits the default (true): build_decoding_graph is
-    // the real batched decode path (docs/plan-gemma-batched-decode.md Phase 1),
-    // so decode_step routes Gemma 1 via DecodeRoute::Unified, not the bridge.
+    // build_decoding_graph is the real batched decode path
+    // (docs/plan-gemma-batched-decode.md Phase 1). Before it existed, Gemma
+    // decoded one token at a time through a run_prefill bridge in decode_step;
+    // that bridge was deleted 2026-08-29 once every recipe had a decode graph.
 
     // Inputs are populated via the typed graph_inputs_ set built in
     // build_prefill_graph / build_decoding_graph (no set_inputs override).

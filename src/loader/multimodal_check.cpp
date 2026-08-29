@@ -1,6 +1,6 @@
 #include "multimodal_check.h"
 
-#include "../core/model.h"
+#include "engine/model.h"
 #include "gguf_loader.h"
 
 #include <fstream>

@@ -14,10 +14,9 @@
 #include <string>
 #include <set>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/qwen35.h"
 #include "../../src/models/model_registry.h"
-#include "../../src/state/ssm_state_cache.h"
 
 static std::string get_qwen35_model_path() {
     const char* path = std::getenv("QWEN35_MODEL_PATH");

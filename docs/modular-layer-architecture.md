@@ -749,22 +749,39 @@ test file. The block is not prose; it is a scannable contract. Update
 it when the module's responsibility changes.
 
 **Test co-location.** `src/<path>/<module>.cpp` has its unit test at
-`tests/unit/test_<module>.cpp`. Always. No exceptions, no nesting
-variants. A reviewer or agent looking for a module's test should
-never have to search.
+`tests/unit/test_<module>.cpp`. No nesting variants. A reviewer or agent looking
+for a module's test should never have to search.
 
-**Naming discipline.** Layer types end in `Layer` (`AttentionLayer`,
-`DeltaNetLayer`). State types end in `State` (`KVCacheState`,
-`RecurrentState`). Metal kernels are named `<module>_<op>.metal`
-(`moe_dispatch.metal`, `attention_flash.metal`). Namespaced under
-`qinf::layers`, `qinf::state`, `qinf::models`, `qinf::sampling`.
-Consistency matters more than the specific scheme — once three
-variants of the same concept exist, grep-uniqueness dies and both
-humans and agents rank false positives.
+This is the rule for MODULES. Recipes and the front ends are covered by *aspect*
+tests instead — `test_qwen35_forward_attn`, `test_gemma3_config`,
+`test_qwen36_hparams`, `test_gemma_batched_decode` — which is better testing than
+one file per recipe would be. So the absence of `test_qwen35.cpp` does not mean
+qwen35 is untested; a module's header names the tests that cover it.
+
+**Naming discipline.** File and symbol names are snake_case and PascalCase
+respectively; no hyphenated file names (the last three — `token-trie`,
+`cli-args`, `speculative-bridge` — were renamed 2026-08-29). State types end in
+`State` (`DeltaNetState`, `RecurrentState`).
+
+The root namespace is `qinf`, with a sub-namespace per self-contained subsystem
+(`qinf::vision`, `qinf::session`, `qinf::image`, `qinf::engine`). This replaced a
+two-root split where half the tree was `qwenium` and half `qinf` — sometimes both
+inside one file. `qwenium` remains ONLY as the product name: the binary, and the
+`qwenium_version` field serialized into snapshot headers.
+
+Stated honestly, because the previous version of this paragraph described a
+scheme the code did not follow: the core — `layers/`, `models/`, `graph_inputs/`,
+`loader/`, most of `state/` — is still in the GLOBAL namespace. Putting it under
+`qinf::layers` / `qinf::models` / `qinf::state` is the remaining step; it is a
+whole-tree mechanical change with little functional payoff, so it is recorded in
+architecture.md §12 rather than scheduled. Consistency matters more than the
+specific scheme — once three variants of the same concept exist, grep-uniqueness
+dies and both humans and agents rank false positives.
 
 **No dumping grounds.** `src/` contains only directories that name a
 concept from this spec (`layers/`, `state/`, `graph_inputs/`, `models/`,
-`metal/`, `sampling/`, `quant/`, `loader/`, `cli/`, `server/`). Do not add
+`sampling/`, `loader/`, `cli/`, `server/`, `image/`, `engine/`,
+`session/`, `vision/`). Do not add
 `util/`, `common/`, `misc/`, `helpers/`. If a piece of code doesn't
 fit in one of the named directories, either (a) it belongs in a new
 concept-named directory whose purpose is stated in this spec, or

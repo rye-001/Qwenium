@@ -46,9 +46,9 @@
 #include <string>
 
 #include "ggml-backend.h"
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
-#include "../../src/core/decode_step.h"
+#include "engine/decode_step.h"
 #include "../../src/sampling/sampling.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/models/qwen35.h"
@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
         prefill = fp->run_prefill(tokens, 0, 0, sched);
     }
 
-    qwenium::GreedySampler sampler;
+    qinf::GreedySampler sampler;
     sampler.build_token_trie(vocab);
     std::vector<int32_t> history = tokens;
     std::vector<int32_t> gen;

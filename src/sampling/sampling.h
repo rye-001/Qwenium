@@ -1,7 +1,7 @@
 #pragma once
 
 #include "grammar_vocab.h"
-#include "token-trie.h"
+#include "token_trie.h"
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -16,7 +16,7 @@ class SnapshotWriter;
 class SnapshotReader;
 }  // namespace qinf::session
 
-namespace qwenium {
+namespace qinf {
 
 class Sampler {
 public:
@@ -189,4 +189,4 @@ private:
     std::mt19937 gen_;
 };
 
-} // namespace qwenium
+} // namespace qinf

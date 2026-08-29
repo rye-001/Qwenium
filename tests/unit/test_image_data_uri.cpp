@@ -59,9 +59,9 @@ std::string png_data_uri() {
 
 }  // namespace
 
-using qwenium::decode_image_data_uri;
-using qwenium::extract_images_from_content;
-using qwenium::content_has_image;
+using qinf::decode_image_data_uri;
+using qinf::extract_images_from_content;
+using qinf::content_has_image;
 
 // ── Happy path: a base64 PNG data URI decodes to exactly its bytes ────────────
 TEST(ImageDataUri, DecodesPngDataUriRoundTrip) {

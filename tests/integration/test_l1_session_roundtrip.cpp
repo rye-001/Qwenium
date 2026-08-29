@@ -38,7 +38,7 @@
 
 #include "ggml-backend.h"
 
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/tokenizer.h"
 #include "models/forward_pass_base.h"
 #include "models/model_registry.h"
@@ -52,11 +52,11 @@
 
 namespace {
 
-using qwenium::GrammarStateSection;
-using qwenium::GrammarVocab;
-using qwenium::SamplerStateSection;
-using qwenium::Sampler;
-using qwenium::TemperatureSampler;
+using qinf::GrammarStateSection;
+using qinf::GrammarVocab;
+using qinf::SamplerStateSection;
+using qinf::Sampler;
+using qinf::TemperatureSampler;
 using qinf::session::CompatHeader;
 using qinf::session::SessionManifest;
 using qinf::session::SnapshotReader;

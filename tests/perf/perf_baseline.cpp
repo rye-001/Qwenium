@@ -31,7 +31,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/forward_pass_base.h"
 #include "../../src/loader/tokenizer.h"
@@ -74,7 +74,7 @@ static PromptResult run_one(
     const std::string&        prompt,
     int                       decode_n)
 {
-    qwenium::GreedySampler sampler;
+    qinf::GreedySampler sampler;
     const auto vocab = tok.get_vocabulary();
 
     std::vector<int32_t> tokens = tok.encode(prompt);

@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <algorithm>
 
-namespace qwenium {
+namespace qinf {
 
 // ============================================================================
 // PromptLookup: N-gram based draft token proposal
@@ -87,4 +87,4 @@ private:
     PromptLookupConfig config_;
 };
 
-} // namespace qwenium
+} // namespace qinf

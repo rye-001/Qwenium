@@ -16,7 +16,8 @@
 #include "nlohmann/json.hpp"
 
 // Your existing headers
-#include "core/model.h"
+#include "engine/model.h"
+#include "engine/graph_compute.h"
 #include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "loader/chat_template.h"
@@ -41,8 +42,8 @@
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
-#include "core/prefix_library.h"
-#include "core/slot_snapshot.h"
+#include "session/prefix_library.h"
+#include "session/slot_snapshot.h"
 
 #include <iostream>
 #include <thread>
@@ -159,7 +160,7 @@ public:
         // slot's sampler/grammar from its request when that request is assigned.
         slot_samplers_.resize(max_slots_);
         for (auto& s : slot_samplers_)
-            s = std::make_unique<qwenium::GreedySampler>();
+            s = std::make_unique<qinf::GreedySampler>();
         slot_grammars_.resize(max_slots_);  // null unless a request sets a grammar
 
         // Cache the vocabulary once (id -> token string). Passed as token_strs to
@@ -325,25 +326,25 @@ public:
     // do not drive concurrent OpenAI traffic on slot 0 while extracting.
     //
     // Throws std::runtime_error on bad input (empty concepts, oversized doc) ⇒ the
-    // route maps that to 400; qwenium::LensUnparseableError when the MODEL's output
+    // route maps that to 400; qinf::LensUnparseableError when the MODEL's output
     // holds no parseable object ⇒ 422. Those are different events and the route
     // must keep them apart (docs/lens-format.md §"The shape contract").
     std::string extract_lens_json(const std::string& document,
-                                  const std::vector<qwenium::LensConcept>& concepts,
+                                  const std::vector<qinf::LensConcept>& concepts,
                                   int max_new_tokens) {
         std::lock_guard<std::mutex> lock(model_mutex_);
-        qwenium::LensExtractOptions opts;
+        qinf::LensExtractOptions opts;
         opts.max_new_tokens = max_new_tokens;
         // One prefill, one pass, no grammar. Absent concepts come back
         // value:null/badge:"absent" by omission — the model declines natively
         // (30/30 on Leg C) once nothing forces it to fill every key.
-        qwenium::LensReport rep = qwenium::run_lens_extract(
+        qinf::LensReport rep = qinf::run_lens_extract(
             forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
             (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts);
-        return qwenium::lens_report_to_json(rep);
+        return qinf::lens_report_to_json(rep);
     }
 
-    void configure_server(qwenium::InferenceServer& server) {
+    void configure_server(qinf::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
             // Model-aware single user-turn template (F6). System prompt is
             // handled separately via caching.
@@ -366,7 +367,7 @@ public:
         });
 
         // Build this slot's sampler (+ grammar) from the request before prefill.
-        server.set_prepare_slot([this](int slot_id, const qwenium::InferenceRequest& req) {
+        server.set_prepare_slot([this](int slot_id, const qinf::InferenceRequest& req) {
             prepare_slot(slot_id, req);
         });
 
@@ -382,7 +383,7 @@ public:
         // Delegated wholesale to ServerVision.
         if (vision_) {
             server.set_multimodal_prefill(
-                [this](int slot_id, const qwenium::InferenceRequest& req, int start_pos,
+                [this](int slot_id, const qinf::InferenceRequest& req, int start_pos,
                        std::vector<int32_t>& out_tokens) {
                     return vision_->run_multimodal_prefill(slot_id, req, start_pos,
                                                            out_tokens, *slot_samplers_[slot_id]);
@@ -395,7 +396,7 @@ public:
         // cacheable_prefix_text is non-empty.
         if (text_prefix_lib_) {
             server.set_cached_text_prefill(
-                [this](int slot_id, const qwenium::InferenceRequest& req, int start_pos,
+                [this](int slot_id, const qinf::InferenceRequest& req, int start_pos,
                        std::vector<int32_t>& out_tokens) {
                     return run_cached_text_prefill(slot_id, req, start_pos, out_tokens);
                 });
@@ -445,7 +446,7 @@ public:
     // system <|think|> turn + a generation prompt ending at "model\n". Gemma 3
     // keeps its no-think image path. See docs/server-image-multirequest-bug.md §5.
     bool image_wants_thinking() const { return vision_->image_wants_thinking(); }
-    size_t max_image_bytes() const { return qwenium::kDefaultMaxImageBytes; }
+    size_t max_image_bytes() const { return qinf::kDefaultMaxImageBytes; }
     // Human-readable identity for the fail-loud capability-gate error: the
     // loaded model's architecture + name.
     std::string model_label() const {
@@ -494,30 +495,30 @@ private:
     // top_p/top_k; a non-negative `seed` makes the draw stream reproducible.
     // Runs on the inference thread before this slot's prefill (no model_mutex_
     // needed: pure object construction, single-threaded with all sampling).
-    void prepare_slot(int slot_id, const qwenium::InferenceRequest& req) {
+    void prepare_slot(int slot_id, const qinf::InferenceRequest& req) {
         // Sampler from temperature/top_p/seed.
-        std::unique_ptr<qwenium::Sampler> sampler;
+        std::unique_ptr<qinf::Sampler> sampler;
         if (req.temperature > 0.0f) {
-            auto ts = std::make_unique<qwenium::TemperatureSampler>(
+            auto ts = std::make_unique<qinf::TemperatureSampler>(
                 req.temperature, /*repetition_penalty=*/1.1f,
                 /*repetition_lookback=*/64, req.top_k, req.top_p);
             if (req.seed >= 0)
                 ts->seed(static_cast<uint32_t>(req.seed));
             sampler = std::move(ts);
         } else {
-            sampler = std::make_unique<qwenium::GreedySampler>();
+            sampler = std::make_unique<qinf::GreedySampler>();
         }
 
         // Optional GBNF grammar for constrained output (text requests only).
         // Fail-loud (caught by the engine → named request error): a bad GBNF, or
         // the unsupported grammar+image combo, rejects the request cleanly.
-        std::unique_ptr<qwenium::GrammarVocab> grammar;
+        std::unique_ptr<qinf::GrammarVocab> grammar;
         if (!req.grammar.empty()) {
             if (!req.image_bytes.empty())
                 throw std::runtime_error(
                     "slot " + std::to_string(slot_id) + ": parameter 'grammar': "
                     "structured output is not supported with image input (v1)");
-            grammar = qwenium::GrammarVocab::parse_impl(req.grammar);
+            grammar = qinf::GrammarVocab::parse_impl(req.grammar);
             if (!grammar)
                 throw std::runtime_error(
                     "slot " + std::to_string(slot_id) + ": parameter 'grammar': "
@@ -562,7 +563,8 @@ private:
         ggml_cgraph* gf = forward_pass_->build_prefill_graph(seq, start_pos, slot_id);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
         forward_pass_->set_prefill_inputs(gf, seq, start_pos);
-        ggml_backend_sched_graph_compute(scheduler_, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler_, gf), "server_prefill");
         forward_pass_->advance_cache(seq.size(), slot_id);
 
         // Sample first token
@@ -589,7 +591,7 @@ private:
     // byte-identical to a full cold prefill (transparent). Mirrors the vision V2
     // image-prefix split and the CLI --prefix-cache path. Fail-loud: a foreign /
     // stale cached blob is refused (never silently re-used — the F9 rule).
-    int run_cached_text_prefill(int slot_id, const qwenium::InferenceRequest& req,
+    int run_cached_text_prefill(int slot_id, const qinf::InferenceRequest& req,
                                 int start_pos, std::vector<int32_t>& out_tokens) {
         std::lock_guard<std::mutex> lock(model_mutex_);
         const auto& md = model_.get_metadata();
@@ -672,7 +674,7 @@ private:
         return tok;
     }
 
-    // TODO: migrate to decode_step (src/core/decode_step.h) once the server
+    // TODO: migrate to decode_step (src/engine/decode_step.h) once the server
     // gains per-slot grammar support.  Today this path uses GreedySampler with
     // no grammar, so the sparse LM head can never fire; migrating now would add
     // dead code.  The batched nature (n > 1 slots per call) also needs a
@@ -698,7 +700,8 @@ private:
         ggml_cgraph* gf = forward_pass_->build_decoding_graph(tokens, slot_ids_u32, positions);
         ggml_backend_sched_alloc_graph(scheduler_, gf);
         forward_pass_->set_decode_inputs(gf, tokens, slot_ids_u32, positions);
-        ggml_backend_sched_graph_compute(scheduler_, gf);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(scheduler_, gf), "server_decode");
 
         std::vector<int> next_tokens;
         next_tokens.reserve(n_batch);
@@ -728,11 +731,11 @@ private:
     // Per-slot samplers (index = slot_id). Greedy by default; rebuilt per request
     // by prepare_slot(). Each slot's TemperatureSampler owns its own RNG, so a
     // seeded request is reproducible and concurrent slots never interleave draws.
-    std::vector<std::unique_ptr<qwenium::Sampler>> slot_samplers_;
+    std::vector<std::unique_ptr<qinf::Sampler>> slot_samplers_;
     // Per-slot grammars (index = slot_id; null unless the request set a GBNF
     // grammar). Owns the cursor the slot's sampler points at via set_grammar; its
     // accepting state drives the engine's grammar-completion stop. Text-only.
-    std::vector<std::unique_ptr<qwenium::GrammarVocab>> slot_grammars_;
+    std::vector<std::unique_ptr<qinf::GrammarVocab>> slot_grammars_;
     // Cached vocabulary (id -> token string), built once. Passed to sample() as
     // token_strs and used to build each grammar slot's trie.
     std::vector<std::string> vocab_;
@@ -821,9 +824,9 @@ static std::string render_chat_with_images(
     for (const auto& msg : messages) {
         const json content = msg.contains("content") ? msg["content"] : json();
         std::string text = chat_content_to_text(content);
-        if (qwenium::content_has_image(content)) {
+        if (qinf::content_has_image(content)) {
             for (auto& img :
-                 qwenium::extract_images_from_content(content, max_image_bytes))
+                 qinf::extract_images_from_content(content, max_image_bytes))
                 out_images.push_back(std::move(img.bytes));
             text = image_marker_prefix + text;  // marker before the user's text
         }
@@ -856,7 +859,7 @@ static std::string chat_finish_reason(const std::string& engine_reason) {
 // =============================================================================
 // HTTP Routes
 // =============================================================================
-void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, QweniumServerIntegration& integration) {
+void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, QweniumServerIntegration& integration) {
     
     // Health check
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -892,7 +895,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         std::cout << "Received prompt: " << prompt << std::endl;
         std::cout << "Received prompt End" << std::endl;
 
-        auto inf_req = std::make_shared<qwenium::InferenceRequest>();
+        auto inf_req = std::make_shared<qinf::InferenceRequest>();
         inf_req->prompt = prompt;
         inf_req->max_tokens = body.value("max_tokens", 256);
         inf_req->temperature = body.value("temperature", 0.0f);
@@ -966,7 +969,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                     while (true) {
                         int token_id = inf_req->token_queue->pop_blocking();
 
-                        if (token_id == qwenium::TokenQueue::QUEUE_END) {
+                        if (token_id == qinf::TokenQueue::QUEUE_END) {
                             std::cout << "=========Qwenium Response===========" << std::endl;
                             std::cout << inf_req->output_text << std::endl;
                             std::cout << "=========Qwenium Response End===========" << std::endl;
@@ -1009,7 +1012,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             // Non-streaming: block until the inference thread signals completion.
             // The server owns the canonical (stop-truncated) output_text, token
             // counts, and finish_reason; drain the queue only to wait for the end.
-            while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
+            while (inf_req->token_queue->pop_blocking() != qinf::TokenQueue::QUEUE_END) {
                 // tokens are folded into output_text on the inference thread
             }
 
@@ -1073,13 +1076,13 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
         bool wants_image = false;
         for (const auto& msg : body["messages"]) {
             if (msg.contains("content") &&
-                qwenium::content_has_image(msg["content"])) {
+                qinf::content_has_image(msg["content"])) {
                 wants_image = true;
                 break;
             }
         }
 
-        auto inf_req = std::make_shared<qwenium::InferenceRequest>();
+        auto inf_req = std::make_shared<qinf::InferenceRequest>();
         if (wants_image) {
             // Capability gate (fail-loud, CLAUDE.md): a text-only model cannot
             // consume image input — name the field, the expected capability, and
@@ -1212,7 +1215,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
 
                     while (true) {
                         int token_id = inf_req->token_queue->pop_blocking();
-                        if (token_id == qwenium::TokenQueue::QUEUE_END) {
+                        if (token_id == qinf::TokenQueue::QUEUE_END) {
                             std::string payload;
                             if (!inf_req->error_message.empty()) {
                                 // Fail-loud: surface the named rejection (e.g.
@@ -1278,7 +1281,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             );
         } else {
             // Block until the inference thread signals completion.
-            while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
+            while (inf_req->token_queue->pop_blocking() != qinf::TokenQueue::QUEUE_END) {
                 // tokens are folded into output_text on the inference thread
             }
 
@@ -1369,7 +1372,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             return;
         }
         std::string document;
-        std::vector<qwenium::LensConcept> concepts;
+        std::vector<qinf::LensConcept> concepts;
         int max_tokens = 512;
         try {
             json body = json::parse(req.body);
@@ -1383,7 +1386,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
                 if (kv.is_string()) {
                     concepts.push_back({kv.get<std::string>(), ""});
                 } else if (kv.is_object()) {
-                    qwenium::LensConcept c;
+                    qinf::LensConcept c;
                     c.key   = kv.at("key").get<std::string>();
                     c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
                     concepts.push_back(std::move(c));
@@ -1405,7 +1408,7 @@ void setup_routes(httplib::Server& http, qwenium::InferenceServer& inference, Qw
             std::string lens_json =
                 integration.extract_lens_json(document, concepts, max_tokens);
             res.set_content(lens_json, "application/json");
-        } catch (const qwenium::LensUnparseableError& e) {
+        } catch (const qinf::LensUnparseableError& e) {
             // The shape contract (docs/lens-format.md): the REQUEST was fine —
             // the model's output for THIS document could not be parsed. That is
             // not a bad request, and an importer must be able to tell the two
@@ -1550,7 +1553,7 @@ int main(int argc, char* argv[]) {
         if (attention_lens) integration.enable_attention_lens();
 
         // Create inference server
-        qwenium::InferenceServer::Config config;
+        qinf::InferenceServer::Config config;
         config.max_slots = integration.max_slots();
         config.max_queue_depth = 100;
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
@@ -1574,7 +1577,7 @@ int main(int argc, char* argv[]) {
                          "conversation_id continuation, chat.cpp-grade reasoning "
                          "retention (warm != cold)" << std::endl;
 
-        qwenium::InferenceServer inference(config);
+        qinf::InferenceServer inference(config);
         integration.configure_server(inference);
 
         // Start inference thread

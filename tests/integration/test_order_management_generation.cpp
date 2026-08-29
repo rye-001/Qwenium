@@ -1,4 +1,4 @@
-#include "core/model.h"
+#include "engine/model.h"
 #include "loader/gguf_loader.h"
 #include "models/qwen3.h"
 #include "loader/tokenizer.h"
@@ -516,7 +516,7 @@ public:
         // Rewind cache to after system prompt
         forward_pass_->set_cache_pos(system_prompt_cache_pos_, 0); // Slot 0
 
-        qwenium::GreedySampler sampler;
+        qinf::GreedySampler sampler;
         ggml_backend_sched_t scheduler = model_->get_scheduler();
 
         // Format and tokenize user prompt only

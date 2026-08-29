@@ -118,9 +118,18 @@ engineering wins and the rule is revised. Full list in
 - **Test co-location.** `src/<path>/<module>.cpp` has its unit test at
   `tests/unit/test_<module>.cpp`. Always. No nesting variants.
 - **No dumping grounds.** `src/` contains only concept-named directories
-  (`layers/`, `state/`, `graph_inputs/`, `models/`, `metal/`, `sampling/`,
-  `quant/`, `loader/`, `cli/`, `server/`). No `util/`, `common/`, `misc/`,
-  `helpers/`.
+  (`layers/`, `state/`, `graph_inputs/`, `models/`, `sampling/`,
+  `loader/`, `cli/`, `server/`, `image/`, `engine/`, `session/`, `vision/`).
+  No `util/`, `common/`, `misc/`, `helpers/`. Three notes on the 2026-08-29
+  revision: `engine/` is the loaded model (weights, backend, scheduler) plus
+  the orchestration of one step over it — it replaced the concept-free
+  `core/`. `image/` is the host-side image **pipeline** (decode → resample →
+  normalize → `Bitmap`, plus token-level marker expansion); it is not
+  `vision/` (that is the encoder subsystem) and not `cli/` (both front ends
+  consume it — the server compiles it directly). `metal/` and `quant/` left
+  the list: they were reserved for a Phase 4 that measurement dropped, existed
+  only as comment-only CMakeLists, and were deleted — a directory is admitted
+  when it holds code, not in advance. Metal work lives in `patches/`.
 - **Fail-loud error contract.** Errors at module boundaries name the slot
   or parameter, the expected value, and the actual value, in that order.
   Silent fallbacks and best-effort recovery are forbidden at module

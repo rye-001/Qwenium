@@ -1,4 +1,7 @@
 #include "qwen35.h"
+#include "qwen35_family.h"
+
+#include <string>
 #include "../layers/attention.h"
 #include "../layers/deltanet.h"
 #include "../layers/ffn.h"
@@ -19,63 +22,106 @@
 // ── Qwen35Config::from_metadata ──────────────────────────────────────────────
 
 Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
-    const uint32_t ssm_state_size          = meta.raw_kv.get_uint32("qwen35.ssm.state_size");
-    const uint32_t ssm_inner_size          = meta.raw_kv.get_uint32("qwen35.ssm.inner_size");
-    const uint32_t ssm_time_step_rank      = meta.raw_kv.get_uint32("qwen35.ssm.time_step_rank");
-    const uint32_t ssm_group_count         = meta.raw_kv.get_uint32("qwen35.ssm.group_count");
-    const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32("qwen35.ssm.conv_kernel");
-    const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
-    const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32_opt("qwen35.rope.dimension_count").value_or(0u);
-    // M-RoPE sections (P2). Effective n_rot mirrors the use sites below:
-    // rope_dimension_count when declared, else the full head dimension.
-    MRopeSections mrope_sections;
+    // The GGUF key prefix is the architecture string itself, so one reader
+    // serves qwen35 (dense hybrid) and qwen35moe (Qwen 3.6, MoE hybrid) and
+    // every message names the key the checkpoint should have carried.
+    const std::string p   = meta.architecture;
+    const bool        moe = (meta.architecture == "qwen35moe");
+    auto key = [&p](const char* suffix) { return p + suffix; };
+
+    const uint32_t ssm_state_size          = meta.raw_kv.get_uint32(key(".ssm.state_size"));
+    const uint32_t ssm_inner_size          = meta.raw_kv.get_uint32(key(".ssm.inner_size"));
+    const uint32_t ssm_time_step_rank      = meta.raw_kv.get_uint32(key(".ssm.time_step_rank"));
+    const uint32_t ssm_group_count         = meta.raw_kv.get_uint32(key(".ssm.group_count"));
+    const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32(key(".ssm.conv_kernel"));
+    const uint32_t full_attention_interval = meta.raw_kv.get_uint32(key(".full_attention_interval"));
+
+    // MoE-only keys. Absent on a dense checkpoint, where they stay 0 and
+    // is_moe() reads false.
+    const uint32_t expert_count = moe ? meta.raw_kv.get_uint32(key(".expert_count")) : 0u;
+    const uint32_t expert_used_count =
+        moe ? meta.raw_kv.get_uint32(key(".expert_used_count")) : 0u;
+    const uint32_t expert_feed_forward_length =
+        moe ? meta.raw_kv.get_uint32(key(".expert_feed_forward_length")) : 0u;
+
+    // Required for qwen35moe (asserted > 0 below); optional for qwen35, where
+    // absence falls back to the full head dimension at the use sites.
+    const uint32_t rope_dimension_count =
+        moe ? meta.raw_kv.get_uint32(key(".rope.dimension_count"))
+            : meta.raw_kv.get_uint32_opt(key(".rope.dimension_count")).value_or(0u);
+
+    // M-RoPE sections (P2). Effective n_rot mirrors the use sites: the declared
+    // rope_dimension_count when present, else the full head dimension.
+    MRopeSections mrope_sections{};
     {
-        static constexpr const char* kSectionsKey = "qwen35.rope.dimension_sections";
-        if (auto widths = meta.raw_kv.get_int32_array_opt(kSectionsKey)) {
+        const std::string sections_key = key(".rope.dimension_sections");
+        if (auto widths = meta.raw_kv.get_int32_array_opt(sections_key)) {
             const int n_rot = rope_dimension_count > 0
                 ? static_cast<int>(rope_dimension_count)
                 : static_cast<int>(meta.attention_key_length);
-            mrope_sections = MRopeSections::from_widths(*widths, kSectionsKey, n_rot);
+            mrope_sections =
+                MRopeSections::from_widths(*widths, sections_key.c_str(), n_rot);
         }
     }
-    // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
-    const uint32_t nextn_predict_layers    = meta.nextn_predict_layers();
+
+    const uint32_t nextn_predict_layers = meta.nextn_predict_layers();
 
     QINF_ASSERT(ssm_state_size > 0,
         "Qwen35Config: field \"ssm_state_size\" expected > 0, got 0 "
-        "(GGUF key: qwen35.ssm.state_size)");
+        "(GGUF key: " + key(".ssm.state_size") + ")");
     QINF_ASSERT(ssm_inner_size > 0,
         "Qwen35Config: field \"ssm_inner_size\" expected > 0, got 0 "
-        "(GGUF key: qwen35.ssm.inner_size)");
+        "(GGUF key: " + key(".ssm.inner_size") + ")");
     QINF_ASSERT(ssm_time_step_rank > 0,
         "Qwen35Config: field \"ssm_time_step_rank\" expected > 0, got 0 "
-        "(GGUF key: qwen35.ssm.time_step_rank)");
+        "(GGUF key: " + key(".ssm.time_step_rank") + ")");
     QINF_ASSERT(ssm_group_count > 0,
         "Qwen35Config: field \"ssm_group_count\" expected > 0, got 0 "
-        "(GGUF key: qwen35.ssm.group_count)");
+        "(GGUF key: " + key(".ssm.group_count") + ")");
     QINF_ASSERT(ssm_conv_kernel > 0,
         "Qwen35Config: field \"ssm_conv_kernel\" expected > 0, got 0 "
-        "(GGUF key: qwen35.ssm.conv_kernel)");
+        "(GGUF key: " + key(".ssm.conv_kernel") + ")");
     QINF_ASSERT(full_attention_interval > 0,
         "Qwen35Config: field \"full_attention_interval\" expected > 0, got 0 "
-        "(GGUF key: qwen35.full_attention_interval)");
+        "(GGUF key: " + key(".full_attention_interval") + ")");
     QINF_ASSERT(nextn_predict_layers < meta.block_count,
         "Qwen35Config: field \"nextn_predict_layers\" expected < block_count (" +
         std::to_string(meta.block_count) + "), got " +
         std::to_string(nextn_predict_layers) +
-        " (GGUF key: qwen35.nextn_predict_layers)");
+        " (GGUF key: " + key(".nextn_predict_layers") + ")");
+    // NOTE: read via ModelMetadata::nextn_predict_layers(), not raw_kv — the
+    // loader already normalizes this key across the family.
 
-    return Qwen35Config{
-        ssm_conv_kernel,
-        ssm_state_size,
-        ssm_group_count,
-        ssm_time_step_rank,
-        ssm_inner_size,
-        rope_dimension_count,
-        mrope_sections,
-        full_attention_interval,
-        nextn_predict_layers,
-    };
+    if (moe) {
+        QINF_ASSERT(expert_count > 0,
+            "Qwen35Config: field \"expert_count\" expected > 0, got 0 "
+            "(GGUF key: " + key(".expert_count") + ")");
+        QINF_ASSERT(expert_feed_forward_length > 0,
+            "Qwen35Config: field \"expert_feed_forward_length\" expected > 0, got 0 "
+            "(GGUF key: " + key(".expert_feed_forward_length") + ")");
+        QINF_ASSERT(expert_used_count <= expert_count,
+            "Qwen35Config: field \"expert_used_count\" expected <= expert_count (" +
+            std::to_string(expert_count) + "), got " +
+            std::to_string(expert_used_count));
+        QINF_ASSERT(rope_dimension_count > 0,
+            "Qwen35Config: field \"rope_dimension_count\" expected > 0, got 0 "
+            "(GGUF key: " + key(".rope.dimension_count") + ")");
+    }
+
+    Qwen35Config cfg;
+    cfg.ssm_conv_kernel            = ssm_conv_kernel;
+    cfg.ssm_state_size             = ssm_state_size;
+    cfg.ssm_group_count            = ssm_group_count;
+    cfg.ssm_time_step_rank         = ssm_time_step_rank;
+    cfg.ssm_inner_size             = ssm_inner_size;
+    cfg.expert_count               = expert_count;
+    cfg.expert_used_count          = expert_used_count;
+    cfg.expert_feed_forward_length = expert_feed_forward_length;
+    cfg.rope_dimension_count       = rope_dimension_count;
+    cfg.mrope_sections             = mrope_sections;
+    cfg.full_attention_interval    = full_attention_interval;
+    cfg.nextn_predict_layers       = nextn_predict_layers;
+    return cfg;
 }
 
 // ============================================================
@@ -171,9 +217,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // Typed inputs for this graph (replaces set_inputs). Cleared here so
     // build_output_head can append SparseHeadInput when the sparse path is
     // armed; per-attention-layer masks are added in the layer loop.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
+    register_qwen35_common_inputs(graph_inputs_, cfg_);
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -222,7 +266,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // Position tensor (for attention layers with RoPE). M-RoPE needs four
     // position components per token — see MRopePositionsInput.
     ggml_tensor* inp_pos = ggml_new_tensor_1d(
-        ctx_, GGML_TYPE_I32, n_tokens * n_pos_per_token());
+        arena_.ctx(), GGML_TYPE_I32, n_tokens * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -230,78 +274,25 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     ggml_tensor* cur;
 
     // 2. Layer loop
+    // Registered AFTER the image splice above, which is where this recipe has
+    // always put them; qwen36 registers them before. Same set either way.
+    register_qwen35_prefill_masks(graph_inputs_, cfg_, n_layers);
+
+    // The layer body is shared with qwen35moe (Qwen 3.6) — see
+    // models/qwen35_family.h. The two recipes ran equivalent copies of it until
+    // 2026-08-29; the FFN choice is the only thing that differed, and it is now
+    // a parameter (moe_hp null here ⇒ dense SwiGLU).
+    const Qwen35LayerCommon lc{
+        arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
+        /*moe_hp=*/nullptr};
+
     for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor* inpSA = inpL;
-        auto& block = model_.get_block(il);
-
-        // Pre-attention norm (shared by both layer types)
-        cur = build_norm(gf, inpL, block.attn_norm_weight, il);
-        set_tensor_name(gf, cur, "attn_norm", il);
-
-        if (cfg_.is_ssm_layer(il)) {
-            uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
-            cur = build_deltanet_layer(
-                ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
-                block.attn_qkv_weight, block.attn_gate_weight,
-                block.ssm_beta_weight, block.ssm_alpha_weight,
-                block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
-                block.ssm_norm_weight, block.ssm_out_weight,
-                static_cast<int>(meta_.embedding_length),
-                static_cast<int>(cfg_.ssm_inner_size),
-                static_cast<int>(cfg_.ssm_state_size),
-                static_cast<int>(cfg_.ssm_group_count),
-                static_cast<int>(cfg_.ssm_time_step_rank),
-                static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
-                static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
-                static_cast<int>(cfg_.ssm_conv_kernel),
-                meta_.rms_norm_eps,
-                il);
-        } else {
-            int32_t kv_idx = kv_layer_map_[il];
-            const int n_embd_head = meta_.attention_key_length;
-            const int n_rot = (cfg_.rope_dimension_count > 0)
-                ? cfg_.rope_dimension_count : n_embd_head;
-            cur = ::build_gated_attention(
-                ctx_, gf, kv_cache_.get(), cur, inp_pos, kv_idx, n_tokens, slot_idx, il,
-                block.attn_q_weight, block.attn_q_norm_weight,
-                block.attn_k_weight, block.attn_k_norm_weight,
-                block.attn_v_weight, block.attn_output_weight,
-                n_embd_head,
-                meta_.attention_head_count,
-                meta_.attention_head_count_kv,
-                n_rot,
-                meta_.rope_freq_base,
-                static_cast<int>(meta_.context_length),
-                meta_.rms_norm_eps,
-                cfg_.mrope_sections);
-
-            // build_gated_attention names this layer's mask "kq_mask.{il}".
-            // Qwen3.5 uses one uniform causal mask (no sliding window).
-            graph_inputs_.add(std::make_unique<AttnMaskInput>(
-                "kq_mask." + std::to_string(il), 0u));
-        }
-
-        // Residual connection after attention/SSM
-        cur = ggml_add(ctx_, cur, inpSA);
-        set_tensor_name(gf, cur, "attn_residual", il);
-
-        // Save for FFN residual
-        ggml_tensor* ffn_residual = cur;
-
-        // Post-attention norm
-        cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-        set_tensor_name(gf, cur, "post_attn_norm", il);
-
-        // FFN
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
-                         block.ffn_down_weight, il);
-        set_tensor_name(gf, cur, "ffn_out", il);
-
-        // FFN residual
-        cur = ggml_add(ctx_, cur, ffn_residual);
-        set_tensor_name(gf, cur, "post_ffn", il);
-
-        inpL = cur;
+        const uint32_t dn_idx = cfg_.is_ssm_layer(il)
+            ? static_cast<uint32_t>(ssm_layer_map_[il]) : 0u;
+        const int kv_idx = cfg_.is_ssm_layer(il) ? 0 : kv_layer_map_[il];
+        inpL = build_qwen35_layer_prefill(lc, inpL, model_.get_block(il),
+                                          inp_pos, n_tokens, slot_idx,
+                                          dn_idx, kv_idx, il);
     }
 
     // 3. Output head.
@@ -339,7 +330,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     const std::vector<int32_t>& positions)
 {
     reset_context();
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(arena_.ctx(), FP_GRAPH_SIZE, false);
 
     const uint32_t n_layers = n_main_layers_;   // excludes any NextN head block
     const size_t n_batch    = tokens.size();
@@ -351,7 +342,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
 
     // 2. Position tensor (four components per row under M-RoPE)
     ggml_tensor* inp_pos = ggml_new_tensor_1d(
-        ctx_, GGML_TYPE_I32, n_batch * n_pos_per_token());
+        arena_.ctx(), GGML_TYPE_I32, n_batch * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -367,22 +358,22 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     }
     uint32_t n_kv_len = decode_kv_len(max_pos + 1, kv_cache_->get_n_ctx_max());
 
-    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(arena_.ctx(), GGML_TYPE_F32,
         n_kv_len, 1, 1, n_batch);
     ggml_set_input(kq_mask);
     ggml_set_name(kq_mask, "kq_mask_b");
     ggml_build_forward_expand(gf, kq_mask);
 
     uint32_t n_total_indices = n_batch * n_kv_len;
-    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_total_indices);
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
     // KV write rows as input VALUES (persistent-graph write path); Cpy mode
     // is the byte-gate reference and builds no such tensor.
     ggml_tensor* kv_write_idx = nullptr;
-    if (kv_write_mode_ == KvWriteMode::SetRows) {
-        kv_write_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I64, n_batch);
+    if (kv_write_mode() == KvWriteMode::SetRows) {
+        kv_write_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I64, n_batch);
         ggml_set_input(kv_write_idx);
         ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
     }
@@ -390,84 +381,26 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // Typed inputs for the decode graph (replaces set_batched_inputs).
     // Single shared causal mask + KV gather; build_output_head appends
     // SparseHeadInput when the grammar sparse path is armed.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
-    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
-    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
-        kv_cache_->get_n_ctx_max()));
-    if (kv_write_idx)
-        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
-            kv_cache_->get_n_ctx_max()));
+    register_qwen35_decode_inputs(graph_inputs_, cfg_,
+                                  kv_cache_->get_n_ctx_max(),
+                                  /*with_kv_write_indices=*/kv_write_idx != nullptr);
 
     // 4. Layer loop
     ggml_tensor* cur;
 
+    // Shared layer body — see the prefill loop above and qwen35_family.h.
+    const Qwen35LayerCommon lc{
+        arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
+        /*moe_hp=*/nullptr};
+
     for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor* inpSA = inpL;
-        auto& block = model_.get_block(il);
-
-        // Pre-attention/SSM norm
-        cur = build_norm(gf, inpL, block.attn_norm_weight, il);
-
-        if (cfg_.is_ssm_layer(il)) {
-            uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
-            DeltaNetLayer::PrefillArgs pa_unused{1, 0};
-            DeltaNetLayer::DecodeArgs da{slots};
-            DeltaNetLayer dn_layer(
-                block.attn_qkv_weight, block.attn_gate_weight,
-                block.ssm_beta_weight, block.ssm_alpha_weight,
-                block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
-                block.ssm_norm_weight, block.ssm_out_weight,
-                dn_state_.get(),
-                DeltaNetLayer::Hparams{
-                    static_cast<int>(meta_.embedding_length),
-                    static_cast<int>(cfg_.ssm_inner_size),
-                    static_cast<int>(cfg_.ssm_state_size),
-                    static_cast<int>(cfg_.ssm_group_count),
-                    static_cast<int>(cfg_.ssm_time_step_rank),
-                    static_cast<int>(cfg_.ssm_inner_size / cfg_.ssm_time_step_rank),
-                    static_cast<int>(cfg_.ssm_inner_size + 2 * cfg_.ssm_group_count * cfg_.ssm_state_size),
-                    static_cast<int>(cfg_.ssm_conv_kernel),
-                    meta_.rms_norm_eps
-                });
-            cur = dn_layer.build(ctx_, gf, cur, dn_idx, Phase::Decode, pa_unused, &da);
-        } else {
-            {
-                int32_t kv_idx = kv_layer_map_[il];
-                const int n_embd_head = meta_.attention_key_length;
-                const int n_rot = (cfg_.rope_dimension_count > 0)
-                    ? cfg_.rope_dimension_count : n_embd_head;
-                cur = ::build_gated_batched_attention(
-                    ctx_, gf, kv_cache_.get(), cur, inp_pos,
-                    kq_mask, gather_indices, kv_idx, slots, positions, il,
-                    block.attn_q_weight, block.attn_q_norm_weight,
-                    block.attn_k_weight, block.attn_k_norm_weight,
-                    block.attn_v_weight, block.attn_output_weight,
-                    n_embd_head,
-                    meta_.attention_head_count,
-                    meta_.attention_head_count_kv,
-                    n_rot,
-                    meta_.rope_freq_base,
-                    static_cast<int>(meta_.context_length),
-                    meta_.rms_norm_eps,
-                    kv_write_idx,
-                    cfg_.mrope_sections);
-            }
-        }
-
-        // Residual after attention/SSM
-        cur = ggml_add(ctx_, cur, inpSA);
-
-        ggml_tensor* ffn_residual = cur;
-
-        // Post-attention norm + FFN + residual
-        cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight,
-                         block.ffn_up_weight, block.ffn_down_weight, il);
-        cur = ggml_add(ctx_, cur, ffn_residual);
-
-        inpL = cur;
+        const uint32_t dn_idx = cfg_.is_ssm_layer(il)
+            ? static_cast<uint32_t>(ssm_layer_map_[il]) : 0u;
+        const int kv_idx = cfg_.is_ssm_layer(il) ? 0 : kv_layer_map_[il];
+        inpL = build_qwen35_layer_decode(lc, inpL, model_.get_block(il),
+                                         inp_pos, kq_mask, gather_indices,
+                                         kv_write_idx, slots, positions,
+                                         dn_idx, kv_idx, il);
     }
 
     // 5. Output head — shared helper (final norm + LM head). Routes through

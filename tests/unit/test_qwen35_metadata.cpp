@@ -15,7 +15,7 @@
 #include <string>
 #include <set>
 
-#include "../../src/core/model.h"
+#include "engine/model.h"
 #include "../../src/loader/gguf_loader.h"
 #include "../../src/models/qwen35.h"
 
@@ -350,13 +350,18 @@ TEST(Qwen35Metadata, NormNamingConvention) {
 }
 
 // ============================================================
-// Test: validate_architecture accepts qwen35
+// Test: the architecture allow-list accepts qwen35
 // ============================================================
+// GGUFLoader::validate_architecture is the live check — load_metadata calls it
+// and it THROWS on an architecture outside the allow-list. So a load that
+// completes is the acceptance, and the arch string is what it accepted.
+// (Model::validate_architecture was a second, unreferenced copy of this list
+// whose allow-list had gone stale; deleted 2026-08-29.)
 TEST(Qwen35Metadata, ValidateArchitectureAcceptsQwen35) {
     SKIP_IF_NO_MODEL();
 
     Model model;
-    model.load_metadata(get_qwen35_model_path());
+    ASSERT_NO_THROW(model.load_metadata(get_qwen35_model_path()));
 
-    EXPECT_TRUE(model.validate_architecture());
+    EXPECT_EQ(model.get_metadata().architecture, "qwen35");
 }

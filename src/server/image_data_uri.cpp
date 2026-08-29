@@ -5,12 +5,12 @@
 #include <cctype>
 #include <stdexcept>
 
-namespace qwenium {
+namespace qinf {
 
 namespace {
 
 // The MIME types we accept = the formats the host-side decoder (vendored
-// stb_image, see src/cli/image_loader.cpp) can actually decode. WebP is
+// stb_image, see src/image/image_loader.cpp) can actually decode. WebP is
 // deliberately excluded: stb_image does not support it, so accepting it here
 // would only defer the failure to an opaque stb error later. Fail-loud now.
 bool is_supported_image_mime(const std::string& mime) {
@@ -169,4 +169,4 @@ std::vector<DecodedImage> extract_images_from_content(
     return images;
 }
 
-}  // namespace qwenium
+}  // namespace qinf
