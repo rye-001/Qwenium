@@ -7,14 +7,19 @@
 //
 // Usage:
 //   QINF_ASSERT(condition, "context: what went wrong")
-//   QINF_SLOT_ERROR("q_proj", "shape [4096,4096] dtype f16", "shape [4096,2048] dtype f16")
 //
-// QINF_ASSERT is used by the qwen35/qwen36 config validators. QINF_SLOT_ERROR
-// has NO caller as of 2026-08-29: its only one was loader/weight_binding, the
-// declarative binder that the blueprint named canonical but nothing ever used
-// (deleted). The live weight path is Model::assign_tensor_pointers, which
-// formats its errors by hand. Kept pending a decision on which of the two the
-// contract should be expressed through — see docs/plan-post-vision-consolidation.md.
+// Scope: QINF_ASSERT, used by the qwen35/qwen36 config validators.
+//
+// There was also a QINF_SLOT_ERROR macro emitting
+//   "weight_binding: slot <slot> expected <exp>, got <got>"
+// Its only caller was loader/weight_binding — the declarative binder the
+// blueprint named canonical and nothing ever adopted — so when that was deleted
+// the macro had none, and its hardcoded "weight_binding:" prefix named a module
+// that no longer existed. Deleted 2026-08-29. The contract it encoded is not
+// gone: errors still name the slot, the expected value and the actual one, in
+// that order — see Model::assign_tensor_pointers' require() and the fail-loud
+// messages throughout src/. The format is the rule; the macro was one unused
+// way of spelling it.
 
 #include <stdexcept>
 #include <string>
@@ -27,10 +32,3 @@
         }                                                         \
     } while (0)
 
-// Throw the canonical slot-error: "<module>: slot <slot> expected <exp>, got <got>".
-// NOTE: the literal prefix below still says "weight_binding" — stale now that the
-// module is gone; fixing it changes error text, so it is a separate decision.
-#define QINF_SLOT_ERROR(slot, expected, got)                                         \
-    throw std::runtime_error(                                                         \
-        std::string("weight_binding: slot \"") + (slot) +                            \
-        "\" expected " + (expected) + ", got " + (got))

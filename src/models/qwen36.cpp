@@ -510,14 +510,21 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
         ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
     }
 
-    // Typed inputs (replaces set_batched_inputs). qwen36 KV gather uses an
-    // n_kv_len per-slot stride (not n_ctx_max).
+    // Typed inputs (replaces set_batched_inputs). The gather stride MUST be
+    // n_ctx_max: gather_k reshapes the cache to a flat
+    // [n_embd, n_ctx_max * n_batch_max] and ggml_get_rows indexes into that, so
+    // slot s position t is row s*n_ctx_max + t. This used to pass Stride::NKvLen
+    // (s*n_kv_len + t), which is correct ONLY for slot 0 — where both reduce to
+    // t — and silently read rows out of slot 0's region for every other slot.
+    // Latent rather than live: qwen36 has only ever been driven single-slot (CLI
+    // and probes, and the lens pins slot 0). Fixed 2026-08-29; qwen35 and gemma3
+    // always did it this way.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     add_positions_input();
     graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
-        GatherIndicesInput::Stride::NKvLen));
+        kv_cache_->get_n_ctx_max()));
     if (kv_write_idx)
         graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
             kv_cache_->get_n_ctx_max()));

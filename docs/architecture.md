@@ -688,14 +688,6 @@ Current, verified against the tree at time of writing:
   (embed, output head, image splice), the run-time policy flags, and the recipe
   interface itself — the graph primitives are the entangled part and should be
   attacked last.
-- **`layers/attention` carries a dead parallel implementation.** `AttentionLayer`
-  (~210 lines across the header and `attention.cpp`) has NO production caller —
-  only `tests/unit/test_attention.cpp`. Its header called it "canonical going
-  forward"; it never became canonical, every recipe calls the free functions,
-  and its `project_qkv` **duplicates** the projection logic recipes do inline, so
-  the two can silently drift. Same shape as the deleted `loader/weight_binding`:
-  a declared-canonical path nothing adopted. Proposed: delete it. Not done —
-  found while doing C2 and not in an approved set.
 - **The attention free functions sit at two altitudes under one naming scheme.**
   `build_attention`/`build_batched_attention` take already-projected Q/K/V (an
   attention *core*); `build_gated_attention`/`build_gated_batched_attention` take
@@ -710,26 +702,19 @@ Current, verified against the tree at time of writing:
   dense and MoE variants behind an `is_moe` parameter; `qwen35` (dense hybrid)
   and `qwen36` (MoE hybrid) are separate files with separate config structs,
   differing on exactly the axis Gemma 4 parameterizes. The same judgment call was
-  made in opposite directions. Not merged, and deliberately so: qwen36 also
-  carries the MTP head and the `Stride::NKvLen` gather bug below, so a merge
-  would combine a refactor with a behavior fix — which §11's phasing rule
-  forbids. Fix the gather bug first, in its own step; then the merge is a clean
-  extraction question.
+  made in opposite directions. Not merged. The blocker is **gone as of
+  2026-08-29** — the `Stride::NKvLen` gather bug that would have dragged a
+  behavior fix into the refactor is fixed in its own step, so §11's phasing rule
+  no longer stands in the way. What remains is the open design question itself:
+  whether the FFN choice is a parameter (as Gemma 4 treats it) or a recipe
+  boundary (as Qwen treats it), and whether qwen36's MTP head is a third thing
+  that belongs to neither. That is a decision to take deliberately, not a
+  cleanup — and CLAUDE.md's pressure test says to flag it rather than let it
+  ride.
 - **`server/inference_server.h` is a 1210-line header-only class.** Past what a
   header should carry, but header-only on purpose: it is what lets the slot and
   queue logic be unit-tested against fake engines with no model, which is a real
   design win. Recorded as a known shape, not a defect.
-- **The fail-loud contract has two expressions and the canonical one is empty.**
-  `qinf_error.h` defines `QINF_ASSERT` (live — the qwen35/qwen36 config
-  validators) and `QINF_SLOT_ERROR`, whose only caller was `loader/weight_binding`
-  — the declarative binder the blueprint named canonical and that nothing ever
-  used, deleted 2026-08-29. Every fail-loud error in the tree is now formatted by
-  hand. The messages are right; the macro is unused, and its literal prefix still
-  reads `weight_binding:`. Decide: adopt the macro at the boundaries, or delete it
-  and let `qinf_error.h` be `QINF_ASSERT` alone. Related: the live weight path,
-  `Model::assign_tensor_pointers`, still has older branches that throw an unnamed
-  `std::out_of_range` instead of naming the tensor — a real contract violation,
-  and the reason a declarative binder was wanted in the first place.
 - The chat endpoint flattens engine finish reasons (`timeout`, `cancelled`,
   `error`) to OpenAI's `"stop"` — the completions endpoint reports honestly;
   the chat path lies by enum-compat (`chat_finish_reason` in
@@ -766,22 +751,23 @@ Current, verified against the tree at time of writing:
   once the persistent path is the default — which awaits a decision, since
   bucketing makes it token-stable-not-identical (a deliberate opt-in, §5/§11),
   not a soft spot to silently fix.
-- qwen36's decode KV gather uses `Stride::NKvLen` (`slot*n_kv_len + t`)
-  against `gather_k`'s `n_ctx_max`-strided flat layout — correct only for
-  slot 0. Latent wrong-rows gather for multi-slot qwen36 decode (today only
-  the CLI/probes exercise qwen36, single-slot); must be fixed (→ `NCtxMax`,
-  as qwen35) before qwen36 serves multi-slot. The Qemmi-Lens attention tap
-  (`forward_pass_base` `set_attention_taps`/`mark_attention_taps`/
-  `get_attention_taps`, [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads
-  the frozen `kq_soft.<il>` rows on this same qwen36 decode path, so it inherits
-  the single-slot limit — V1 serves single-slot by construction. The seam is
-  opt-in and byte-inert when disarmed (default empty layer set marks no node —
-  same liveness-only argument as `set_output_hidden`; gated by
-  `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the
-  tensor name is the seam, so any recipe that names `kq_soft` hosts it — no lens
-  *claims* for Gemma yet, its constants are unprobed).
-
----
+- The Qemmi-Lens attention tap (`forward_pass_base`
+  `set_attention_taps`/`mark_attention_taps`/`get_attention_taps`,
+  [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads the frozen
+  `kq_soft.<il>` rows on the qwen36 decode path. V1 serves single-slot — now by
+  choice (receipts-grade determinism is B=1, §11) rather than because the gather
+  was broken: qwen36's decode KV gather used `Stride::NKvLen`
+  (`slot*n_kv_len + t`) against `gather_k`'s `n_ctx_max`-strided flat layout,
+  correct only for slot 0. **Fixed 2026-08-29** — it now uses the cache's
+  `n_ctx_max` stride like qwen35 and gemma3, and the second stride policy was
+  deleted outright so there is no wrong one left to select
+  (`test_gather_indices_input` pins the multi-slot rows, and asserts the slot-0
+  identity that let the defect stay latent). The tap seam remains opt-in and
+  byte-inert when disarmed (default empty layer set marks no node — same
+  liveness-only argument as `set_output_hidden`; gated by
+  `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the tensor
+  name is the seam, so any recipe naming `kq_soft` hosts it — no lens *claims*
+  for Gemma yet, its constants are unprobed).
 
 - **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
   automated test** — but the two links most likely to fail quietly are now

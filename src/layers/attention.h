@@ -1,5 +1,5 @@
 #pragma once
-// attention.h — attention layer graph-building: free functions + AttentionLayer class.
+// attention.h — attention graph-building for one transformer layer.
 //
 // Responsibility: construct the KV-cache-backed attention subgraph for one
 //   transformer layer.
@@ -19,11 +19,11 @@
 // adjective suggests: one is a kernel, the other is a layer. Resolving that is a
 // deliberate redesign, not a rename — see architecture.md §12.
 //
-// DEAD: class AttentionLayer, below, has NO production caller (only
-// tests/unit/test_attention.cpp). This header used to call it "canonical going
-// forward"; it never became canonical, and its project_qkv DUPLICATES the
-// projection logic recipes do inline, so the two can drift. Deleting it is
-// proposed in architecture.md §12 — do not build on it.
+// There was also a `class AttentionLayer` here, described as "canonical going
+// forward". It never became canonical: nothing outside its own unit test ever
+// called it, and its project_qkv duplicated the projection logic recipes do
+// inline, so the two could drift. Deleted 2026-08-29. The free functions above
+// are the interface.
 // State owned: none — KV cache and weight tensors are passed in by the caller.
 // Invariants: all tensors are appended to the caller's ggml_cgraph;
 //   no ggml_context is created inside this module.
@@ -252,98 +252,3 @@ ggml_tensor* build_gated_batched_attention(
     float                           rms_norm_eps,
     ggml_tensor*                    kv_write_indices = nullptr,
     const MRopeSections&            mrope = MRopeSections{});
-
-// ── AttentionLayer class (Phase 2 canonical interface) ────────────────────────
-//
-// Wraps weight refs + hyperparams; exposes a single build() that dispatches on
-// Phase.  input is the normed residual [n_embd, n_tokens/n_batch]; this class
-// performs Q/K/V projections, optional RMS norms, RoPE, KV cache write or
-// scatter/gather, MHA, and output projection internally.
-//
-// The existing free functions (build_attention, build_batched_attention) remain
-// as the internal implementation and for legacy call sites in model recipes
-// until Phase 3 migrates them.
-
-class AttentionLayer {
-public:
-    struct Hparams {
-        int   n_head;
-        int   n_head_kv;
-        int   n_embd_head;
-        float kq_scale;
-        int   n_rot;
-        float freq_base;
-        int   context_len;
-        float rms_norm_eps;
-        bool  has_q_norm;  // true for Qwen3 (QK RMS norms applied post-projection)
-        bool  has_bias;    // true for Qwen2 (QKV additive biases)
-    };
-
-    // All weight tensors are borrowed references — AttentionLayer does not own them.
-    // w_q_norm / w_k_norm: required when hp.has_q_norm == true; nullptr otherwise.
-    // q_bias / k_bias / v_bias: required when hp.has_bias == true; nullptr otherwise.
-    AttentionLayer(
-        ggml_tensor* w_q,
-        ggml_tensor* w_k,
-        ggml_tensor* w_v,
-        ggml_tensor* w_out,
-        ggml_tensor* w_q_norm,
-        ggml_tensor* w_k_norm,
-        ggml_tensor* q_bias,
-        ggml_tensor* k_bias,
-        ggml_tensor* v_bias,
-        simple_kv_cache* kv_cache,
-        const Hparams& hp);
-
-    // Args for Phase::Prefill.
-    struct PrefillArgs {
-        ggml_tensor* inp_pos;  // [n_tokens] token position indices
-        uint32_t     n_tokens;
-        uint32_t     slot_idx;
-    };
-
-    // Args for Phase::Decode.
-    struct DecodeArgs {
-        ggml_tensor*                 inp_pos;         // [n_batch]
-        const std::vector<uint32_t>* slots;           // per-batch slot index
-        const std::vector<int32_t>*  positions;       // per-batch token position
-        ggml_tensor*                 kq_mask;         // causal mask [n_kv, 1, 1, n_batch]
-        ggml_tensor*                 gather_indices;  // KV gather indices
-    };
-
-    // Unified build entry point.
-    // phase == Prefill: uses prefill_args; decode_args may be nullptr.
-    // phase == Decode:  uses *decode_args; prefill_args fields are ignored.
-    // Returns: output tensor [n_embd, n_tokens/n_batch] after output projection.
-    ggml_tensor* build(
-        ggml_context*      ctx,
-        ggml_cgraph*       gf,
-        ggml_tensor*       input,
-        int                layer_idx,
-        Phase              phase,
-        const PrefillArgs& prefill_args,
-        const DecodeArgs*  decode_args = nullptr);
-
-private:
-    ggml_tensor*     w_q_;
-    ggml_tensor*     w_k_;
-    ggml_tensor*     w_v_;
-    ggml_tensor*     w_out_;
-    ggml_tensor*     w_q_norm_;
-    ggml_tensor*     w_k_norm_;
-    ggml_tensor*     q_bias_;
-    ggml_tensor*     k_bias_;
-    ggml_tensor*     v_bias_;
-    simple_kv_cache* kv_cache_;
-    Hparams          hp_;
-
-    ggml_tensor* build_prefill(ggml_context*, ggml_cgraph*, ggml_tensor* input,
-                                int layer_idx, const PrefillArgs&);
-    ggml_tensor* build_decode(ggml_context*, ggml_cgraph*, ggml_tensor* input,
-                               int layer_idx, const DecodeArgs&);
-    // Project input → Q/K/V, apply optional RMS norm and RoPE.
-    // Returns {Qcur, Kcur, Vcur} reshaped to [n_embd_head, n_head(_kv), n_tokens].
-    struct QKV { ggml_tensor* q; ggml_tensor* k; ggml_tensor* v; };
-    QKV project_qkv(ggml_context*, ggml_cgraph*, ggml_tensor* input,
-                    ggml_tensor* inp_pos, int layer_idx, uint32_t n_tokens);
-};

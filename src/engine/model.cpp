@@ -239,20 +239,14 @@ void Model::load_tensors()
 void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors)
 {
     try {
-        token_embd_weight_ = tensors.at("token_embd.weight");
-        output_norm_weight_ = tensors.at("output_norm.weight");
-
-        auto it = tensors.find("output.weight");
-        if (it != tensors.end()) {
-            output_weight_ = it->second;
-        }
-
-        blocks_.resize(metadata_.block_count);
-
-        // Fail-loud tensor lookup: names the architecture and the missing
-        // tensor.  Used by the qwen35-family branches below; the older
-        // branches still use tensors.at(), which throws an unnamed
-        // std::out_of_range.
+        // Fail-loud tensor lookup: names the architecture and the missing tensor.
+        // Every REQUIRED tensor goes through this. It used to serve only the
+        // qwen35-family branches while the older ones called require(), which
+        // throws an unnamed std::out_of_range — the caller learned that A tensor
+        // was missing but not WHICH, on the one path where the answer is most
+        // mechanical to give. Unified 2026-08-29 (architecture.md §12).
+        // Genuinely OPTIONAL tensors still use tensors.find() and a null check;
+        // absent is a legitimate state for those, not an error.
         auto require = [&](const std::string& key) -> ggml_tensor* {
             auto it = tensors.find(key);
             if (it == tensors.end()) {
@@ -263,15 +257,25 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
             return it->second;
         };
 
+        token_embd_weight_ = require("token_embd.weight");
+        output_norm_weight_ = require("output_norm.weight");
+
+        auto it = tensors.find("output.weight");
+        if (it != tensors.end()) {
+            output_weight_ = it->second;
+        }
+
+        blocks_.resize(metadata_.block_count);
+
         for (uint32_t i = 0; i < metadata_.block_count; ++i) {
             std::string prefix = "blk." + std::to_string(i) + ".";
 
             // Shared: attention norm (pre-attention RMS norm)
-            blocks_[i].attn_norm_weight = tensors.at(prefix + "attn_norm.weight");
+            blocks_[i].attn_norm_weight = require(prefix + "attn_norm.weight");
 
             if (metadata_.architecture == "qwen35moe") {
                 // Pre-FFN norm (called post_attention_norm in this family)
-                blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
+                blocks_[i].ffn_norm_weight = require(prefix + "post_attention_norm.weight");
 
                 // MoE FFN tensors present in every layer
                 blocks_[i].moe_router_weight     = require(prefix + "ffn_gate_inp.weight");
@@ -324,13 +328,13 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
             }
 
             // FFN (shared by qwen2/qwen3/qwen35)
-            blocks_[i].ffn_gate_weight = tensors.at(prefix + "ffn_gate.weight");
-            blocks_[i].ffn_up_weight   = tensors.at(prefix + "ffn_up.weight");
-            blocks_[i].ffn_down_weight = tensors.at(prefix + "ffn_down.weight");
+            blocks_[i].ffn_gate_weight = require(prefix + "ffn_gate.weight");
+            blocks_[i].ffn_up_weight   = require(prefix + "ffn_up.weight");
+            blocks_[i].ffn_down_weight = require(prefix + "ffn_down.weight");
 
             if (metadata_.architecture == "qwen35") {
                 // qwen35: FFN norm is called "post_attention_norm"
-                blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
+                blocks_[i].ffn_norm_weight = require(prefix + "post_attention_norm.weight");
 
                 // Inline arithmetic: tensor binding runs at load time, before any recipe
                 // exists.  Typed configs (Qwen35Config) are constructed by recipes after
@@ -374,51 +378,51 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 }
 
             } else if (metadata_.architecture == "qwen3") {
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
-                blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
-                blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
+                blocks_[i].attn_q_norm_weight = require(prefix + "attn_q_norm.weight");
+                blocks_[i].attn_k_norm_weight = require(prefix + "attn_k_norm.weight");
 
             } else if (metadata_.architecture == "qwen2") {
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
-                blocks_[i].attn_q_bias        = tensors.at(prefix + "attn_q.bias");
-                blocks_[i].attn_k_bias        = tensors.at(prefix + "attn_k.bias");
-                blocks_[i].attn_v_bias        = tensors.at(prefix + "attn_v.bias");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
+                blocks_[i].attn_q_bias        = require(prefix + "attn_q.bias");
+                blocks_[i].attn_k_bias        = require(prefix + "attn_k.bias");
+                blocks_[i].attn_v_bias        = require(prefix + "attn_v.bias");
             } else if (metadata_.architecture == "gemma") {
                 // Gemma 1: GQA, no QK-norm, no biases, GeGLU FFN.
                 // Norm form is (1+w) — applied at graph time, not at load time.
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
             } else if (metadata_.architecture == "gemma2") {
                 // Gemma 2: same QKV / FFN tensor names as Gemma 1.
                 // post_attention_norm / post_ffw_norm are fetched by the recipe
                 // directly via ggml_get_tensor — they are G2-specific and not in
                 // the generic TransformerBlock struct.
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
             } else if (metadata_.architecture == "gemma3") {
                 // Gemma 3: same QKV / FFN names as Gemma 2, plus QK-norm weights.
                 // post_attention_norm / post_ffw_norm / attn_q_norm / attn_k_norm
                 // are fetched by the recipe via ggml_get_tensor (G3-specific, not
                 // in the generic TransformerBlock struct).
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = require(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
             } else if (metadata_.architecture == "gemma4") {
                 // Gemma 4 (G4.8):
                 //   - QK-norm weights ARE bound to the block (q_norm/k_norm slots)
@@ -432,12 +436,12 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
                 //     layer_output_scale live outside the generic
                 //     TransformerBlock struct and are resolved by the recipe
                 //     via ggml_get_tensor (Gemma4ForwardPass::require_tensor).
-                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
-                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
-                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
-                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
-                blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
-                blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+                blocks_[i].ffn_norm_weight    = require(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = require(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = require(prefix + "attn_k.weight");
+                blocks_[i].attn_output_weight = require(prefix + "attn_output.weight");
+                blocks_[i].attn_q_norm_weight = require(prefix + "attn_q_norm.weight");
+                blocks_[i].attn_k_norm_weight = require(prefix + "attn_k_norm.weight");
                 {
                     // attn_v conditional — sliding-only.
                     auto v_it = tensors.find(prefix + "attn_v.weight");
@@ -447,6 +451,10 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
             }
         }
     }
+    // Backstop, unreachable today: every required lookup goes through require(),
+    // which throws a named GGUFLoadError. Kept so that if a bare .at() ever comes
+    // back it still surfaces as a load error rather than an opaque std::exception
+    // — but the named path above is the one that should fire.
     catch (const std::out_of_range &e) {
         throw GGUFLoadError("Error assigning tensor: " + std::string(e.what()));
     }
