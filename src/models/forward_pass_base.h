@@ -11,6 +11,7 @@
 #include "../graph_inputs/graph_input.h"
 #include "../engine/graph_compute.h"
 #include "graph_arena.h"
+#include "decode_policy.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
@@ -312,8 +313,8 @@ public:
     // needs_hidden_state(). A no-op on recipes that don't read it (Gemma), so
     // their byte gate is unaffected. Honoured by qwen36's prefill AND decode
     // graphs (the Phase-3 "prefill + batched decode" scope decision).
-    void set_output_hidden(bool on) { output_hidden_ = on; }
-    bool output_hidden() const { return output_hidden_; }
+    void set_output_hidden(bool on) { policy_.output_hidden = on; }
+    bool output_hidden() const { return policy_.output_hidden; }
     std::vector<float> get_output_hidden(ggml_cgraph* gf);
 
     // ── Lens tap: opt-in attention-row output (docs/plan-qemmi-lens.md P1/A1) ─
@@ -337,8 +338,8 @@ public:
         int n_head;                // attention heads (= tensor ne[2])
         std::vector<float> rows;   // row-major [n_head][n_kv]; row h sums to ~1
     };
-    void set_attention_taps(std::vector<int> layers) { attention_taps_ = std::move(layers); }
-    const std::vector<int>& attention_taps() const { return attention_taps_; }
+    void set_attention_taps(std::vector<int> layers) { policy_.attention_taps = std::move(layers); }
+    const std::vector<int>& attention_taps() const { return policy_.attention_taps; }
     // Mark each armed layer's `kq_soft.<il>` as a graph output on `gf`. No-op
     // when the layer set is empty (byte-inert). Fail-loud if an armed layer's
     // tap tensor is absent from the graph (names the layer, expected, actual).
@@ -532,8 +533,8 @@ public:
     // Set false to build the dense head over all N positions — the bit-for-bit
     // reference the slice differential compares against. Explicit and
     // caller-selected; not an error fallback (CLAUDE.md fail-loud contract).
-    void set_slice_prefill_head(bool on) { slice_prefill_head_ = on; }
-    bool slice_prefill_head() const { return slice_prefill_head_; }
+    void set_slice_prefill_head(bool on) { policy_.slice_prefill_head = on; }
+    bool slice_prefill_head() const { return policy_.slice_prefill_head; }
 
     // ── Decode KV write mode ─────────────────────────────────────────────────
     // Differential seam for the decode KV write, mirroring slice_prefill_head:
@@ -545,9 +546,11 @@ public:
     // Only recipes that pass kv_write_indices into the batched attention
     // helpers honor it; others are Cpy-only regardless. Explicit and
     // caller-selected; not a fallback.
-    enum class KvWriteMode { SetRows, Cpy };
-    void set_kv_write_mode(KvWriteMode m) { kv_write_mode_ = m; }
-    KvWriteMode kv_write_mode() const { return kv_write_mode_; }
+    // The enum lives on DecodePolicy; aliased here so existing call sites keep
+    // spelling it ForwardPassBase::KvWriteMode.
+    using KvWriteMode = DecodePolicy::KvWriteMode;
+    void set_kv_write_mode(KvWriteMode m) { policy_.kv_write_mode = m; }
+    KvWriteMode kv_write_mode() const { return policy_.kv_write_mode; }
 
     // True ⇒ this recipe's build_decoding_graph is persistent-graph capable:
     // every step-varying quantity is a graph-input VALUE (tokens, positions,
@@ -569,26 +572,20 @@ public:
     // (test_decode_kv_bucket; same fork class as architecture.md §11). The
     // persistent path opts IN to bucket 256; the default decode path stays
     // exact. Only recipes that call decode_kv_len() honor it.
-    void set_decode_kv_bucket(uint32_t b) { decode_kv_bucket_ = b; }
-    uint32_t decode_kv_bucket() const { return decode_kv_bucket_; }
+    void set_decode_kv_bucket(uint32_t b) { policy_.decode_kv_bucket = b; }
+    uint32_t decode_kv_bucket() const { return policy_.decode_kv_bucket; }
+
+    // The whole run-time policy as one value, for a caller that wants to read or
+    // assert on the pass's mode rather than poll five getters.
+    const DecodePolicy& decode_policy() const { return policy_; }
 
 protected:
-    // Bucketed decode KV width: max_pos_plus_1 rounded up to the bucket,
-    // capped at n_ctx_max. Bucket 0 ⇒ exact (max_pos_plus_1 unchanged).
     uint32_t decode_kv_len(uint32_t max_pos_plus_1, uint32_t n_ctx_max) const {
-        if (decode_kv_bucket_ == 0) return max_pos_plus_1;
-        const uint64_t up =
-            (static_cast<uint64_t>(max_pos_plus_1) + decode_kv_bucket_ - 1) /
-            decode_kv_bucket_ * decode_kv_bucket_;
-        return up < n_ctx_max ? static_cast<uint32_t>(up) : n_ctx_max;
+        return policy_.decode_kv_len(max_pos_plus_1, n_ctx_max);
     }
 
-    bool slice_prefill_head_ = true;
-    bool output_hidden_ = false;   // D3 opt-in; see set_output_hidden
-    std::vector<int> attention_taps_;  // lens-tap opt-in; see set_attention_taps
-    // Defaults = today's decode: baked-offset cpy write, exact per-step n_kv.
-    // The opt-in persistent path (--persistent-graph) sets both to
-    // {SetRows, 256} together; nothing else changes them.
-    KvWriteMode kv_write_mode_ = KvWriteMode::Cpy;
-    uint32_t decode_kv_bucket_ = 0;
+    // Run-time policy, held not inherited (see decode_policy.h). Defaults are
+    // the byte-reproducible path; --persistent-graph is the only thing that sets
+    // kv_write_mode and decode_kv_bucket, and it sets them together.
+    DecodePolicy policy_;
 };

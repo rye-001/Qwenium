@@ -772,6 +772,18 @@ target_link_libraries(layer-tests PRIVATE
 target_compile_features(layer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(layer-tests)
 
+# DecodePolicy — run-time policy of a forward pass (no model, no backend).
+add_executable(decode-policy-tests
+    unit/test_decode_policy.cpp
+)
+
+target_link_libraries(decode-policy-tests PRIVATE
+    GTest::gtest_main
+)
+
+target_compile_features(decode-policy-tests PRIVATE cxx_std_17)
+gtest_discover_tests(decode-policy-tests)
+
 # Qwen 3.5-family shared recipe parts (typed-input declarations; model-free).
 add_executable(qwen35-family-tests
     unit/test_qwen35_family.cpp

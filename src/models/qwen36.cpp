@@ -278,7 +278,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // condition on it. Marking an existing node as output adds no compute ⇒
     // off-path is byte-identical; the verify pass needs all K positions, which
     // is exactly inpL before the head slice. Named before the head builds.
-    if (output_hidden_) {
+    if (output_hidden()) {
         set_tensor_name(gf, inpL, "hidden_out");
         ggml_set_output(inpL);
         ggml_build_forward_expand(gf, inpL);
@@ -354,7 +354,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     // KV write rows as input VALUES (persistent-graph write path); Cpy mode
     // is the byte-gate reference and builds no such tensor.
     ggml_tensor* kv_write_idx = nullptr;
-    if (kv_write_mode_ == KvWriteMode::SetRows) {
+    if (kv_write_mode() == KvWriteMode::SetRows) {
         kv_write_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I64, n_batch);
         ggml_set_input(kv_write_idx);
         ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
@@ -392,7 +392,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
 
     // D3: expose the pre-final-norm hidden (all active slots) on the decode
     // graph too (Phase-3 "prefill + batched decode" scope). Off ⇒ byte-identical.
-    if (output_hidden_) {
+    if (output_hidden()) {
         set_tensor_name(gf, inpL, "hidden_out");
         ggml_set_output(inpL);
         ggml_build_forward_expand(gf, inpL);

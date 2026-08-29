@@ -141,7 +141,7 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
 ggml_tensor* ForwardPassBase::build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* cur) {
     // Explicit dense-reference path (differential seam). Not a silent fallback:
     // the caller chose it via set_slice_prefill_head(false).
-    if (!slice_prefill_head_) {
+    if (!policy_.slice_prefill_head) {
         return cur;
     }
 
@@ -277,7 +277,7 @@ std::vector<float> ForwardPassBase::get_output_hidden(ggml_cgraph* gf) {
 // recipe; marking an existing node as an output adds no compute, so the tap-off
 // path (empty layer set → this is a no-op) is byte-identical to today.
 void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
-    for (int il : attention_taps_) {
+    for (int il : policy_.attention_taps) {
         std::string nm = "kq_soft." + std::to_string(il);
         ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
         if (!ts)
@@ -294,8 +294,8 @@ void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
 std::vector<ForwardPassBase::AttentionTap>
 ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
     std::vector<AttentionTap> out;
-    out.reserve(attention_taps_.size());
-    for (int il : attention_taps_) {
+    out.reserve(policy_.attention_taps.size());
+    for (int il : policy_.attention_taps) {
         std::string nm = "kq_soft." + std::to_string(il);
         ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
         if (!ts)

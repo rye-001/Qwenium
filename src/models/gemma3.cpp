@@ -396,7 +396,7 @@ ggml_cgraph* Gemma3ForwardPass::build_decoding_graph(
     // KV write rows as input VALUES (persistent-graph write path); Cpy mode
     // is the byte-gate reference and builds no such tensor.
     ggml_tensor* kv_write_idx = nullptr;
-    if (kv_write_mode_ == KvWriteMode::SetRows) {
+    if (kv_write_mode() == KvWriteMode::SetRows) {
         kv_write_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I64,
                                           static_cast<int64_t>(n_tokens));
         ggml_set_input(kv_write_idx);

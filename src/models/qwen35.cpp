@@ -372,7 +372,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // KV write rows as input VALUES (persistent-graph write path); Cpy mode
     // is the byte-gate reference and builds no such tensor.
     ggml_tensor* kv_write_idx = nullptr;
-    if (kv_write_mode_ == KvWriteMode::SetRows) {
+    if (kv_write_mode() == KvWriteMode::SetRows) {
         kv_write_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I64, n_batch);
         ggml_set_input(kv_write_idx);
         ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
