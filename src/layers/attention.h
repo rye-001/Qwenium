@@ -3,13 +3,27 @@
 //
 // Responsibility: construct the KV-cache-backed attention subgraph for one
 //   transformer layer.
-// Public surface (Phase 1 free functions, still used by model recipes):
-//     build_attn_mha         — core Q@K^T→softmax→@V kernel (GQA-aware)
-//     build_attention        — prefill path: cache write + full-history MHA
-//     build_batched_attention — decode path: per-slot scatter + gather MHA
-// Public surface (Phase 2 class, canonical going forward):
-//     AttentionLayer::build() — unified entry point dispatching on Phase enum.
-//       input is the normed residual; projections and output proj are internal.
+// Public surface — the free functions, which are what every recipe actually
+// calls. They sit at TWO DIFFERENT ALTITUDES, and the names hide it:
+//
+//   ATTENTION CORE — caller has already projected; pass Q/K/V in.
+//     build_attn_mha          — Q@K^T → softmax → @V (GQA-aware)
+//     build_attention         — prefill: cache write + full-history MHA
+//     build_batched_attention — decode: per-slot scatter + gather MHA
+//   WHOLE ATTENTION LAYER — caller passes the normed residual and the weights;
+//   projections, Q/K norms, RoPE and the output projection happen inside.
+//     build_gated_attention          — prefill (Qwen 3.5/3.6)
+//     build_gated_batched_attention  — decode   (Qwen 3.5/3.6)
+//
+// So `build_attention` and `build_gated_attention` differ by far more than the
+// adjective suggests: one is a kernel, the other is a layer. Resolving that is a
+// deliberate redesign, not a rename — see architecture.md §12.
+//
+// DEAD: class AttentionLayer, below, has NO production caller (only
+// tests/unit/test_attention.cpp). This header used to call it "canonical going
+// forward"; it never became canonical, and its project_qkv DUPLICATES the
+// projection logic recipes do inline, so the two can drift. Deleting it is
+// proposed in architecture.md §12 — do not build on it.
 // State owned: none — KV cache and weight tensors are passed in by the caller.
 // Invariants: all tensors are appended to the caller's ggml_cgraph;
 //   no ggml_context is created inside this module.

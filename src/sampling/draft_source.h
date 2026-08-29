@@ -9,7 +9,7 @@
 
 #include "prompt_lookup.h"
 
-namespace qwenium {
+namespace qinf {
 
 // ============================================================================
 // IDraftSource: where speculative draft tokens come from
@@ -144,4 +144,4 @@ private:
     int     max_head_draft_;
 };
 
-} // namespace qwenium
+} // namespace qinf

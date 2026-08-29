@@ -21,7 +21,7 @@
 
 #include "../../src/server/inference_server.h"
 
-using qwenium::InferenceServer;
+using qinf::InferenceServer;
 using Pick = InferenceServer::WarmPick;
 using Tokens = std::vector<int32_t>;
 

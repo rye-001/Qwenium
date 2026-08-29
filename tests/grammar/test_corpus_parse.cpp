@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     int pass = 0, fail = 0, idx = 0;
     for (const auto& ex : examples) {
         ++idx;
-        auto g = qwenium::GrammarVocab::parse_impl(gbnf);
+        auto g = qinf::GrammarVocab::parse_impl(gbnf);
         if (!g) { std::cerr << "[" << idx << "] FAIL grammar parse\n"; ++fail; continue; }
         bool dead = false;
         for (unsigned char ch : ex) {

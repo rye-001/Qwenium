@@ -6,7 +6,7 @@
 #include "draft_source.h"
 #include "speculative.h"
 
-using namespace qwenium;
+using namespace qinf;
 
 // ============================================================================
 // Lightweight harness (matches test_speculative.cpp — own main(), no gtest).

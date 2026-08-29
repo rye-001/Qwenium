@@ -34,8 +34,8 @@
 int run_chat(
     Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwenium::GrammarVocab>& grammar,
-    qwenium::SpeculativeDecoder* spec,
+    std::unique_ptr<qinf::GrammarVocab>& grammar,
+    qinf::SpeculativeDecoder* spec,
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens
@@ -57,15 +57,15 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
     decoded_vocab.push_back(tokenizer->decode(static_cast<int32_t>(i)));
 }        
 
-        std::unique_ptr<qwenium::Sampler> sampler;
+        std::unique_ptr<qinf::Sampler> sampler;
         if (args.temperature > 0.0f) {
-            sampler = std::make_unique<qwenium::TemperatureSampler>(
+            sampler = std::make_unique<qinf::TemperatureSampler>(
                 args.temperature, args.repetition_penalty, 64, args.top_k, args.top_p);
         } else {
             // Greedy is a true argmax unless --repeat-penalty was explicitly
             // given. Passing it here is what makes the flag mean something on
             // this path; it used to be silently dropped.
-            sampler = std::make_unique<qwenium::GreedySampler>(
+            sampler = std::make_unique<qinf::GreedySampler>(
                 args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
         }
         if (grammar) {
@@ -79,7 +79,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
         if (!args.vocab_prune_list_path.empty()) {
-            pruned_vocab = qwenium::load_keep_list(args.vocab_prune_list_path);
+            pruned_vocab = qinf::load_keep_list(args.vocab_prune_list_path);
             sampler->set_pruned_vocab(&pruned_vocab);
             if (args.verbose) {
                 std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";

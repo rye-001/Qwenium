@@ -16,8 +16,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "cli-args.h"
-#include "speculative-bridge.h"
+#include "cli_args.h"
+#include "speculative_bridge.h"
 
 #include "engine/model.h"
 #include "../loader/tokenizer.h"
@@ -28,7 +28,7 @@
 
 class Model;
 
-namespace qwenium {
+namespace qinf {
     class SpeculativeDecoder;
 }
 
@@ -37,8 +37,8 @@ namespace qwenium {
 int run_complete(
     Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwenium::GrammarVocab>& grammar,        // nullable
-    qwenium::SpeculativeDecoder* spec,                  // nullable
+    std::unique_ptr<qinf::GrammarVocab>& grammar,        // nullable
+    qinf::SpeculativeDecoder* spec,                  // nullable
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens

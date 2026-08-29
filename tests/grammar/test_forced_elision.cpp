@@ -58,7 +58,7 @@ std::string slurp(const std::string& path) {
 // (NOT including first_token; grammar already advanced past first_token).
 std::vector<int32_t> run_decode(
     ForwardPassBase* fp, ggml_backend_sched_t sched,
-    qwenium::Sampler* sampler, const std::vector<std::string>& vocab,
+    qinf::Sampler* sampler, const std::vector<std::string>& vocab,
     uint32_t vocab_size, int32_t first_token, uint32_t slot, int n_tokens,
     const std::vector<int32_t>& stop_ids, bool forced, bool force_dense,
     size_t* elided = nullptr) {
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     const uint32_t vocab_size = meta.vocab_size;
 
     auto gstr = slurp(grammar_path);
-    auto grammar = qwenium::GrammarVocab::parse_impl(gstr);
+    auto grammar = qinf::GrammarVocab::parse_impl(gstr);
     if (!grammar) { std::cerr << "ERROR: grammar parse failed\n"; return 1; }
 
     const ChatTemplate* tmpl = lookup_chat_template(meta.architecture);
@@ -171,13 +171,13 @@ int main(int argc, char** argv) {
 
     const std::vector<int32_t> stop_ids = meta.stop_token_ids;
     auto make_sampler = [&]() {
-        auto s = std::make_unique<qwenium::GreedySampler>();
+        auto s = std::make_unique<qinf::GreedySampler>();
         s->set_grammar(grammar.get());
         s->build_token_trie(vocab);
         for (int32_t id : stop_ids) s->add_eos_token_id(id);
         return s;
     };
-    auto fresh_start = [&](qwenium::Sampler* s, uint32_t slot) -> int32_t {
+    auto fresh_start = [&](qinf::Sampler* s, uint32_t slot) -> int32_t {
         grammar->reset();
         std::vector<float> logits = fp->run_prefill(
             user_tokens, static_cast<int32_t>(sys_tokens.size()), slot, sched);

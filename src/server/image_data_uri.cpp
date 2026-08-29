@@ -5,7 +5,7 @@
 #include <cctype>
 #include <stdexcept>
 
-namespace qwenium {
+namespace qinf {
 
 namespace {
 
@@ -169,4 +169,4 @@ std::vector<DecodedImage> extract_images_from_content(
     return images;
 }
 
-}  // namespace qwenium
+}  // namespace qinf

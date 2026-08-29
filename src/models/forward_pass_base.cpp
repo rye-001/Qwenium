@@ -17,37 +17,19 @@
 #include <cmath>
 #include <stdexcept>
 
+// The arena default-constructs its buffer and context, so the constructor only
+// binds the model references now.
 ForwardPassBase::ForwardPassBase(const Model& model, const ModelMetadata* metadata)
-    : meta_(*metadata), model_(model), ctx_(nullptr)
+    : meta_(*metadata), model_(model)
 {
-        // Pre-allocate persistent buffer for graph metadata
-        ctx_buffer_.resize(FP_GRAPH_SIZE_METADATA);
-
-        struct ggml_init_params params = {
-            .mem_size   = ctx_buffer_.size(),
-            .mem_buffer = ctx_buffer_.data(),
-            .no_alloc   = true,
-        };
-        ctx_ = ggml_init(params);
 }
 
-ForwardPassBase::~ForwardPassBase() {
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-}
+// The arena's destructor frees the context.
+ForwardPassBase::~ForwardPassBase() = default;
 
 void ForwardPassBase::reset_context() {
     image_spliced_ = false;
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-    struct ggml_init_params params = {
-        .mem_size   = ctx_buffer_.size(),
-        .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true,
-    };
-    ctx_ = ggml_init(params);
+    arena_.reset();
     // NOTE: do NOT clear sparse_decode_ids_ here. reset_context is called
     // inside build_decoding_graph (between the caller's set_sparse_decode_ids
     // and build_output_head's read), so clearing would erase the indices the
@@ -56,7 +38,7 @@ void ForwardPassBase::reset_context() {
 }
 
 ggml_cgraph* ForwardPassBase::new_graph() {
-    return ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
+    return arena_.new_graph();
 }
 
 ggml_tensor* ForwardPassBase::embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens) {
@@ -64,7 +46,7 @@ ggml_tensor* ForwardPassBase::embedding(ggml_cgraph* gf, const std::vector<int32
 
     // 1. Create a 1D tensor from the input token IDs
     struct ggml_tensor* tokens_tensor = ggml_new_tensor_1d(
-        ctx_,
+        arena_.ctx(),
         GGML_TYPE_I32,
         n_tokens
     );
@@ -76,7 +58,7 @@ ggml_tensor* ForwardPassBase::embedding(ggml_cgraph* gf, const std::vector<int32
 
     // 2. Perform the embedding lookup using ggml_get_rows
     ggml_tensor * cur = ggml_get_rows(
-        ctx_,
+        arena_.ctx(),
         model_.get_token_embedding_weight(),
         tokens_tensor
     );
@@ -91,7 +73,7 @@ ggml_tensor* ForwardPassBase::build_norm(
     ggml_tensor* mw,
     int il) const
 {
-    return build_rms_norm(ctx_, cur, mw, meta_.rms_norm_eps, il);
+    return build_rms_norm(arena_.ctx(), cur, mw, meta_.rms_norm_eps, il);
 }
 
 // Thin wrapper — implementation lives in src/layers/attention.cpp.
@@ -108,7 +90,7 @@ ggml_tensor* ForwardPassBase::build_attn_mha(
     uint32_t pos,
     int il) const
 {
-    return ::build_attn_mha(ctx_, gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
+    return ::build_attn_mha(arena_.ctx(), gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
 }
 
 void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx, bool gemma_final_norm, float final_softcap) {
@@ -117,7 +99,7 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
     // uploaded later by SparseHeadInput (via set_prefill/decode_inputs) and
     // cleared there (consume-on-use).
     if (valid_idx == nullptr && !sparse_decode_ids_.empty()) {
-        valid_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32,
+        valid_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32,
                                        static_cast<int64_t>(sparse_decode_ids_.size()));
         ggml_set_input(valid_idx);
         ggml_set_name(valid_idx, "valid_indices");
@@ -132,7 +114,7 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
     // Gemma's final norm is (x / rms(x)) * (1 + w); every other recipe uses
     // x * w. Default false keeps Qwen and all non-Gemma recipes byte-identical.
     cur = gemma_final_norm
-        ? build_rms_norm_gemma(ctx_, cur, model_.get_output_norm_weight(),
+        ? build_rms_norm_gemma(arena_.ctx(), cur, model_.get_output_norm_weight(),
                                meta_.rms_norm_eps, /*il=*/-1)
         : build_norm(gf, cur, model_.get_output_norm_weight(), -1);
     set_tensor_name(gf, cur, "final_norm");
@@ -142,15 +124,15 @@ void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_
         : model_.get_token_embedding_weight();
 
     if (valid_idx) {
-        weight = ggml_get_rows(ctx_, weight, valid_idx);
+        weight = ggml_get_rows(arena_.ctx(), weight, valid_idx);
         ggml_set_name(weight, "output_weight_k");
     }
-    cur = ggml_mul_mat(ctx_, weight, cur);
+    cur = ggml_mul_mat(arena_.ctx(), weight, cur);
     // Gemma 2 final logit soft-capping (cap == 0 → off, byte-identical for all
     // non-Gemma-2 recipes). Applied before the "logits" name so get_output_logits
     // reads the capped values, matching the recipe's prefill head.
     if (final_softcap > 0.0f) {
-        cur = build_softcap(ctx_, cur, final_softcap);
+        cur = build_softcap(arena_.ctx(), cur, final_softcap);
     }
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
@@ -168,13 +150,13 @@ ggml_tensor* ForwardPassBase::build_out_ids_slice(ggml_cgraph* gf, ggml_tensor* 
     // [hidden, n_tokens] hidden state elides the discarded first n_tokens-1
     // head rows. Composes with build_output_head's vocab-axis weight slice:
     // different tensor, different axis, order-independent.
-    ggml_tensor* out_ids = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_tensor* out_ids = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, 1);
     ggml_set_input(out_ids);
     ggml_set_name(out_ids, "out_ids");
     ggml_build_forward_expand(gf, out_ids);
     graph_inputs_.add(std::make_unique<OutputIdsInput>());
 
-    ggml_tensor* sliced = ggml_get_rows(ctx_, cur, out_ids);
+    ggml_tensor* sliced = ggml_get_rows(arena_.ctx(), cur, out_ids);
     ggml_set_name(sliced, "out_ids_slice");
     return sliced;
 }
@@ -198,14 +180,14 @@ ggml_tensor* ForwardPassBase::build_image_substitution(
             std::to_string(span_start) + " n_img=" + std::to_string(n_img));
 
     ggml_tensor* img_in = ggml_new_tensor_2d(
-        ctx_, GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
+        arena_.ctx(), GGML_TYPE_F32, hidden_dim, static_cast<int64_t>(n_img));
     ggml_set_input(img_in);
     set_tensor_name(gf, img_in, "image_embeddings");
     ggml_build_forward_expand(gf, img_in);
 
     // inpL[:, span : span+n_img] = img_in (one op; the surviving text columns
     // keep their sqrt(d_model) scale, the image columns enter unscaled).
-    inpL = ggml_set_2d(ctx_, inpL, img_in, inpL->nb[1],
+    inpL = ggml_set_2d(arena_.ctx(), inpL, img_in, inpL->nb[1],
                        static_cast<size_t>(span_start) * inpL->nb[1]);
     set_tensor_name(gf, inpL, "inpL_image_subst");
     // Pin the substituted residual as a graph output. Without this, galloc
@@ -238,7 +220,7 @@ std::vector<ggml_tensor*> ForwardPassBase::build_decode_layer_masks(
             // identical for every layer of this window within a decode step
             // (same positions/slots/n_kv), so sharing is bit-for-bit equivalent
             // to the former tensor-per-layer while collapsing the input count.
-            ggml_tensor* m = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+            ggml_tensor* m = ggml_new_tensor_4d(arena_.ctx(), GGML_TYPE_F32,
                                                 n_kv_len, 1, 1, n_tokens);
             ggml_set_input(m);
             const std::string name = "kq_mask.w" + std::to_string(w);

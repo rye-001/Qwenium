@@ -1,9 +1,9 @@
-// token-trie.cpp — TokenTrie implementation for grammar-constrained decoding.
+// token_trie.cpp — TokenTrie implementation for grammar-constrained decoding.
 // Built once from vocabulary at startup, immutable and read-only thereafter.
 
-#include "token-trie.h"
+#include "token_trie.h"
 
-namespace qwenium {
+namespace qinf {
 
 void TokenTrie::build(const std::vector<std::string>& vocab) {
     root_ = std::make_unique<TrieNode>();
@@ -125,4 +125,4 @@ void TokenTrie::collect_subtree(const TrieNode* node, std::vector<int32_t>& out)
     }
 }
 
-} // namespace qwenium
+} // namespace qinf

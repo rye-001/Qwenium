@@ -55,9 +55,9 @@ using qinf::session::SessionManifest;
 using qinf::session::SnapshotReader;
 using qinf::session::SnapshotWriter;
 using qinf::state::TokenSequenceSection;
-using qwenium::Sampler;
-using qwenium::SamplerStateSection;
-using qwenium::TemperatureSampler;
+using qinf::Sampler;
+using qinf::SamplerStateSection;
+using qinf::TemperatureSampler;
 
 constexpr uint32_t kCtx = 512;
 constexpr int kWarmupK = 6;

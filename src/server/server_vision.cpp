@@ -4,7 +4,7 @@
 
 #include "server_vision.h"
 
-#include "inference_server.h"  // qwenium::InferenceRequest
+#include "inference_server.h"  // qinf::InferenceRequest
 
 #include "engine/model.h"
 #include "loader/tokenizer.h"
@@ -141,10 +141,10 @@ std::string ServerVision::model_label() const {
 }
 
 int ServerVision::run_multimodal_prefill(int slot_id,
-                                         const qwenium::InferenceRequest& req,
+                                         const qinf::InferenceRequest& req,
                                          int start_pos,
                                          std::vector<int32_t>& out_tokens,
-                                         qwenium::Sampler& sampler) {
+                                         qinf::Sampler& sampler) {
     std::lock_guard<std::mutex> lock(model_mutex_);
 
     // v1 single-image scope: marker expansion + the recipe substitution each

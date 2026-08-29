@@ -34,7 +34,7 @@ class DecodeGraphCache;
 int32_t decode_step(
     ForwardPassBase*       fp,
     ggml_backend_sched_t   scheduler,
-    qwenium::Sampler*      sampler,
+    qinf::Sampler*      sampler,
     int32_t                token,
     uint32_t               slot,
     const std::vector<int32_t>&    history,

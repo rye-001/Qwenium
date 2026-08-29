@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
         prefill = fp->run_prefill(tokens, 0, 0, sched);
     }
 
-    qwenium::GreedySampler sampler;
+    qinf::GreedySampler sampler;
     sampler.build_token_trie(vocab);
     std::vector<int32_t> history = tokens;
     std::vector<int32_t> gen;

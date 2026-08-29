@@ -20,7 +20,7 @@
 #include "../loader/chat_template.h"
 #include "../sampling/grammar_vocab.h"
 
-namespace qwenium {
+namespace qinf {
 
 // ── The REFUTED fixed KV grammar — probe control arm only ────────────────────
 // Once the product path's ONE fixed universal KV grammar (plan §1.1, a P0-locked
@@ -808,4 +808,4 @@ LensReport apply_absent_by_omission(LensReport report,
     return report;
 }
 
-}  // namespace qwenium
+}  // namespace qinf

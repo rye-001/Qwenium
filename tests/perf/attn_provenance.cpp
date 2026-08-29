@@ -44,7 +44,7 @@
 #include "../../src/loader/tokenizer.h"
 #include "../../src/sampling/prompt_lookup.h"   // DP1: shipped PLD, called not reimplemented
 #include "../../src/sampling/grammar_vocab.h"   // Qemmi-Docs leg A: the fixed KV grammar
-#include "../../src/sampling/token-trie.h"      // Qemmi-Docs leg A: literal-candidate narrowing
+#include "../../src/sampling/token_trie.h"      // Qemmi-Docs leg A: literal-candidate narrowing
 #include "../../src/loader/chat_template.h"      // Qemmi-Docs: production chat-render (instruct regime)
 #include "../../src/server/server_lens.h"        // QDOCS_S1: the SHIPPED lens math, called not reimplemented
 #include "ggml.h"
@@ -1104,7 +1104,7 @@ static std::vector<UPrompt> make_tier2(bool held) {
 // Simulate pointer / PLD / OWN acceptance for one generation.
 static std::vector<Rec> simulate(const FreeRun& R, Tokenizer* tok, int tier, bool held) {
     const int K = 8;
-    qwenium::PromptLookup pld({/*ngram*/3, /*max_draft*/5, /*min_draft*/1});  // shipped params
+    qinf::PromptLookup pld({/*ngram*/3, /*max_draft*/5, /*min_draft*/1});  // shipped params
     const auto& prompt = R.prompt_tokens;
     const auto& gen = R.gen_tokens;
     const int P = R.P, G = (int)gen.size();
@@ -2468,7 +2468,7 @@ static FreeRun run_freegen_grammar(ForwardPassBase* fp, ggml_backend_sched_t sch
                                    Tokenizer* tok, const ModelMetadata& meta,
                                    const std::string& body_text, const std::string& instr_text,
                                    const std::vector<int>& tap_layers, int max_new,
-                                   qwenium::GrammarVocab* gr,
+                                   qinf::GrammarVocab* gr,
                                    const std::vector<std::string>& vocab,
                                    uint32_t vocab_size,
                                    std::vector<GStep>* trace) {
@@ -2829,8 +2829,8 @@ static int run_qdocs_leg_b(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
     const std::vector<std::string>& vocab = tok->get_vocabulary();
     const uint32_t vocab_size = (uint32_t)vocab.size();
-    qwenium::TokenTrie trie; trie.build(vocab);
-    auto gr = qwenium::GrammarVocab::parse_impl(QDOCS_GBNF);
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
     gr->set_token_trie(&trie);
     std::vector<int> tap1 = {attn_layers[0]};   // minimal tap; leg B needs keys only
     auto corpus = qdocs_legb_corpus();
@@ -3127,8 +3127,8 @@ static int run_qdocs_leg_d(ForwardPassBase* fp, ggml_backend_sched_t sched,
     const int TOL = 2;
     const std::vector<std::string>& vocab = tok->get_vocabulary();
     const uint32_t vocab_size = (uint32_t)vocab.size();
-    qwenium::TokenTrie trie; trie.build(vocab);
-    auto gr = qwenium::GrammarVocab::parse_impl(QDOCS_GBNF);
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
     gr->set_token_trie(&trie);
     // Tap only the 2 layers the signals need: layer 3 (L3H13 citation, slot 0)
     // and layer 11 (COV1 coverage, slot 1). Keeps long-context runs tractable.
@@ -3217,8 +3217,8 @@ static int run_qdocs_leg_c(ForwardPassBase* fp, ggml_backend_sched_t sched,
     const int TOL = 2;
     const std::vector<std::string>& vocab = tok->get_vocabulary();
     const uint32_t vocab_size = (uint32_t)vocab.size();
-    qwenium::TokenTrie trie; trie.build(vocab);
-    auto gr = qwenium::GrammarVocab::parse_impl(QDOCS_GBNF);
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
     gr->set_token_trie(&trie);
     std::vector<int> taps10(attn_layers.begin(), attn_layers.end());
     // Complete key-vocabulary hint (leg B's winning arm).
@@ -3321,11 +3321,11 @@ static int run_qdocs_leg_a(ForwardPassBase* fp, ggml_backend_sched_t sched,
     std::printf("vocab_size=%u\n", vocab_size);
 
     // Build the trie once (production narrows LITERAL candidates through it).
-    qwenium::TokenTrie trie;
+    qinf::TokenTrie trie;
     trie.build(vocab);
     std::printf("trie tokens indexed=%zu\n", trie.token_count());
 
-    auto gr = qwenium::GrammarVocab::parse_impl(QDOCS_GBNF);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
     gr->set_token_trie(&trie);
     std::printf("grammar parsed OK (root/pair/key/value/ws)\n");
 
@@ -3531,8 +3531,8 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
     const std::vector<std::string>& vocab = tok->get_vocabulary();
     const uint32_t vocab_size = (uint32_t)vocab.size();
-    qwenium::TokenTrie trie; trie.build(vocab);
-    auto gr = qwenium::GrammarVocab::parse_impl(qwenium::lens_grammar_gbnf());
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(qinf::lens_grammar_gbnf());
     gr->set_token_trie(&trie);
 
     auto corpus = qdocs_messy_corpus();
@@ -3560,9 +3560,9 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
     };
 
     // Does any of the top-n citations land on a real source of the value?
-    auto cited_in_span = [&](const qwenium::LensField& f, const std::string& doc, int topn) {
+    auto cited_in_span = [&](const qinf::LensField& f, const std::string& doc, int topn) {
         for (int i = 0; i < (int)f.citations.size() && i < topn; ++i)
-            if (qwenium::lens_cites_a_real_source(doc, f.value, f.citations[i].byte_lo,
+            if (qinf::lens_cites_a_real_source(doc, f.value, f.citations[i].byte_lo,
                                                   f.citations[i].byte_hi, TOL))
                 return true;
         return false;
@@ -3586,27 +3586,27 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
         return n.empty() || n == "null" || n == "none" || n == "n/a" || n == "-";
     };
 
-    auto run_arm = [&](const char* tag, qwenium::GrammarVocab* grammar) -> Arm {
+    auto run_arm = [&](const char* tag, qinf::GrammarVocab* grammar) -> Arm {
         Arm A;
         std::printf("\n%s\n ARM: %s\n%s\n", std::string(72, '=').c_str(),
                     grammar ? "FIXED KV GRAMMAR" : "NO GRAMMAR (free decode)",
                     std::string(72, '=').c_str());
         for (const QMessy& d : corpus) {
-            std::vector<qwenium::LensConcept> concepts;
+            std::vector<qinf::LensConcept> concepts;
             for (const QLabel& f : d.fields) concepts.push_back({f.concept, ""});
             for (const std::string& a : ABSENT) concepts.push_back({a, ""});
 
-            qwenium::LensExtractOptions opts;
+            qinf::LensExtractOptions opts;
             opts.max_new_tokens = 400;
             // `grammar` is the CONTROL ARM seam (null ⇒ the shipped free path).
             // Both arms run the same driver, which is the whole point: the grammar
             // is the only variable, and the free arm under test is product code.
-            qwenium::LensReport r;
+            qinf::LensReport r;
             try {
-                r = qwenium::run_lens_extract(
+                r = qinf::run_lens_extract(
                     fp, sched, tok, meta, vocab_size, n_ctx, d.document, concepts,
-                    opts, qwenium::LensConstants{}, grammar, grammar ? &vocab : nullptr);
-            } catch (const qwenium::LensUnparseableError& e) {
+                    opts, qinf::LensConstants{}, grammar, grammar ? &vocab : nullptr);
+            } catch (const qinf::LensUnparseableError& e) {
                 // The shape contract firing. Report it as the loud refusal it is —
                 // do NOT skip the doc silently, that would flatter the arm.
                 A.docs++;
@@ -3623,7 +3623,7 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
             A.fields_located += (int)r.fields.size();
             if (r.fields.empty()) A.empty_docs.push_back(d.tag);
 
-            const int fr = qwenium::lens_count_confident_false_receipts(r, TOL);
+            const int fr = qinf::lens_count_confident_false_receipts(r, TOL);
             A.false_receipts += fr;
             if (fr) A.false_docs.push_back(d.tag);
 
@@ -3639,7 +3639,7 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
             // truly read that span, but it sits outside this value's occurrence).
             for (const auto& f : r.fields) {
                 if (!f.grounded || !f.found_in_document) continue;
-                if (qwenium::lens_value_tier(f.value) != "distinctive") continue;
+                if (qinf::lens_value_tier(f.value) != "distinctive") continue;
                 if (f.citations.empty()) { std::printf("    !! %s: NO CITATIONS\n", f.key.c_str()); continue; }
                 if (cited_in_span(f, r.document_text, 1)) continue;
                 const auto& c = f.citations[0];
@@ -3669,13 +3669,13 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
             for (const auto& f : r.fields) {
                 FieldRec rec; rec.value = f.value;
                 if (f.grounded && f.found_in_document &&
-                    qwenium::lens_value_tier(f.value) == "distinctive") {
+                    qinf::lens_value_tier(f.value) == "distinctive") {
                     rec.checked = true;
                     rec.top1 = cited_in_span(f, r.document_text, 1);
                     rec.top3 = cited_in_span(f, r.document_text, 3);
                     if (!f.citations.empty()) rec.top1_mass = f.citations[0].mass;
                     for (int i = 0; i < (int)f.citations.size(); ++i)
-                        if (qwenium::lens_cites_a_real_source(r.document_text, f.value,
+                        if (qinf::lens_cites_a_real_source(r.document_text, f.value,
                                 f.citations[i].byte_lo, f.citations[i].byte_hi, TOL)) {
                             rec.in_span_mass = f.citations[i].mass;
                             rec.in_span_rank = i;
@@ -3688,13 +3688,13 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 A.per_doc.back().emplace(f.key, rec);  // first wins (a collapse repeats keys)
             }
             // Fidelity vs the corpus labels; absent handling on the two planted keys.
-            auto value_of = [&](const std::string& key) -> const qwenium::LensField* {
+            auto value_of = [&](const std::string& key) -> const qinf::LensField* {
                 for (const auto& f : r.fields) if (f.key == key) return &f;
                 return nullptr;
             };
             for (const QLabel& lf : d.fields) {
                 A.fid_tot++;
-                const qwenium::LensField* got = value_of(lf.concept);
+                const qinf::LensField* got = value_of(lf.concept);
                 if (!got) continue;
                 const std::string t = norm(lf.value), g = norm(got->value);
                 if (!g.empty() && (t.find(g) != std::string::npos || g.find(t) != std::string::npos))
@@ -3702,7 +3702,7 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
             }
             for (const std::string& key : ABSENT) {
                 A.absent_tot++;
-                const qwenium::LensField* got = value_of(key);
+                const qinf::LensField* got = value_of(key);
                 if (!got || declined(got->value)) A.absent_ok++;
                 else A.fabricated.push_back(d.tag + ":" + key + "=\"" + got->value + "\"");
             }

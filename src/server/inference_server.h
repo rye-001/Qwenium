@@ -18,7 +18,7 @@
 #include <iostream>
 #include <algorithm>
 
-namespace qwenium {
+namespace qinf {
 
 // Forward declarations - these come from your existing codebase
 class Model;
@@ -1253,4 +1253,4 @@ private:
     std::mutex control_mutex_;
 };
 
-}  // namespace qwenium
+}  // namespace qinf

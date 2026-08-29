@@ -520,10 +520,10 @@ public:
             throw std::runtime_error("Too many tests for batch size");
         }
 
-        qwenium::GreedySampler sampler;
+        qinf::GreedySampler sampler;
 
         // Load pruned vocabulary if specified
-        // std::unordered_set<int32_t> pruned_vocab = qwenium::load_keep_list("./output/vocab_artifacts/keep_list.bin");
+        // std::unordered_set<int32_t> pruned_vocab = qinf::load_keep_list("./output/vocab_artifacts/keep_list.bin");
         // sampler.set_pruned_vocab(&pruned_vocab);
         // std::cout << "Loaded pruned vocabulary: " << pruned_vocab.size() << " tokens\n";
 

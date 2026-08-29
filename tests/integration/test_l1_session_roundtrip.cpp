@@ -52,11 +52,11 @@
 
 namespace {
 
-using qwenium::GrammarStateSection;
-using qwenium::GrammarVocab;
-using qwenium::SamplerStateSection;
-using qwenium::Sampler;
-using qwenium::TemperatureSampler;
+using qinf::GrammarStateSection;
+using qinf::GrammarVocab;
+using qinf::SamplerStateSection;
+using qinf::Sampler;
+using qinf::TemperatureSampler;
 using qinf::session::CompatHeader;
 using qinf::session::SessionManifest;
 using qinf::session::SnapshotReader;

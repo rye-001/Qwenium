@@ -17,7 +17,7 @@ struct SpeculativeBridge {
     // With the slice on, run_prefill returns [1 * vocab] and the decoder's
     // shape check rejects every draft — speculation silently degenerates to
     // normal decode (the bug that masked this path for months).
-    qwenium::SpeculativeDecoder::VerifyFunc make_verify(uint32_t slot) {
+    qinf::SpeculativeDecoder::VerifyFunc make_verify(uint32_t slot) {
         return [this, slot](int /*slot_id*/, const std::vector<int32_t>& draft, int start_pos)
             -> std::vector<float>
         {
@@ -34,7 +34,7 @@ struct SpeculativeBridge {
     // Argument order is (pos, slot_idx) — this call site once had them swapped,
     // which made every partial-reject write positions[new_pos] on a 1-slot
     // cache (out-of-bounds) instead of rewinding.
-    qwenium::SpeculativeDecoder::RewindCacheFunc make_rewind(uint32_t slot) {
+    qinf::SpeculativeDecoder::RewindCacheFunc make_rewind(uint32_t slot) {
         return [this, slot](int /*slot_id*/, int new_pos) {
             forward_pass->set_cache_pos(static_cast<uint32_t>(new_pos), slot);
         };

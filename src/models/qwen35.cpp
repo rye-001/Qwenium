@@ -222,7 +222,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // Position tensor (for attention layers with RoPE). M-RoPE needs four
     // position components per token — see MRopePositionsInput.
     ggml_tensor* inp_pos = ggml_new_tensor_1d(
-        ctx_, GGML_TYPE_I32, n_tokens * n_pos_per_token());
+        arena_.ctx(), GGML_TYPE_I32, n_tokens * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -241,7 +241,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         if (cfg_.is_ssm_layer(il)) {
             uint32_t dn_idx = static_cast<uint32_t>(ssm_layer_map_[il]);
             cur = build_deltanet_layer(
-                ctx_, gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
+                arena_.ctx(), gf, cur, dn_state_.get(), dn_idx, slot_idx, n_tokens,
                 block.attn_qkv_weight, block.attn_gate_weight,
                 block.ssm_beta_weight, block.ssm_alpha_weight,
                 block.ssm_dt_bias, block.ssm_a, block.ssm_conv1d_weight,
@@ -262,7 +262,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
             const int n_rot = (cfg_.rope_dimension_count > 0)
                 ? cfg_.rope_dimension_count : n_embd_head;
             cur = ::build_gated_attention(
-                ctx_, gf, kv_cache_.get(), cur, inp_pos, kv_idx, n_tokens, slot_idx, il,
+                arena_.ctx(), gf, kv_cache_.get(), cur, inp_pos, kv_idx, n_tokens, slot_idx, il,
                 block.attn_q_weight, block.attn_q_norm_weight,
                 block.attn_k_weight, block.attn_k_norm_weight,
                 block.attn_v_weight, block.attn_output_weight,
@@ -282,7 +282,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         }
 
         // Residual connection after attention/SSM
-        cur = ggml_add(ctx_, cur, inpSA);
+        cur = ggml_add(arena_.ctx(), cur, inpSA);
         set_tensor_name(gf, cur, "attn_residual", il);
 
         // Save for FFN residual
@@ -293,12 +293,12 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         set_tensor_name(gf, cur, "post_attn_norm", il);
 
         // FFN
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+        cur = build_ffn_swiglu(arena_.ctx(), gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
                          block.ffn_down_weight, il);
         set_tensor_name(gf, cur, "ffn_out", il);
 
         // FFN residual
-        cur = ggml_add(ctx_, cur, ffn_residual);
+        cur = ggml_add(arena_.ctx(), cur, ffn_residual);
         set_tensor_name(gf, cur, "post_ffn", il);
 
         inpL = cur;
@@ -339,7 +339,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     const std::vector<int32_t>& positions)
 {
     reset_context();
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(arena_.ctx(), FP_GRAPH_SIZE, false);
 
     const uint32_t n_layers = n_main_layers_;   // excludes any NextN head block
     const size_t n_batch    = tokens.size();
@@ -351,7 +351,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
 
     // 2. Position tensor (four components per row under M-RoPE)
     ggml_tensor* inp_pos = ggml_new_tensor_1d(
-        ctx_, GGML_TYPE_I32, n_batch * n_pos_per_token());
+        arena_.ctx(), GGML_TYPE_I32, n_batch * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -367,14 +367,14 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     }
     uint32_t n_kv_len = decode_kv_len(max_pos + 1, kv_cache_->get_n_ctx_max());
 
-    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(arena_.ctx(), GGML_TYPE_F32,
         n_kv_len, 1, 1, n_batch);
     ggml_set_input(kq_mask);
     ggml_set_name(kq_mask, "kq_mask_b");
     ggml_build_forward_expand(gf, kq_mask);
 
     uint32_t n_total_indices = n_batch * n_kv_len;
-    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_total_indices);
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
@@ -382,7 +382,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // is the byte-gate reference and builds no such tensor.
     ggml_tensor* kv_write_idx = nullptr;
     if (kv_write_mode_ == KvWriteMode::SetRows) {
-        kv_write_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I64, n_batch);
+        kv_write_idx = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I64, n_batch);
         ggml_set_input(kv_write_idx);
         ggml_set_name(kv_write_idx, KvWriteIndicesInput::slot_);
     }
@@ -431,7 +431,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
                     static_cast<int>(cfg_.ssm_conv_kernel),
                     meta_.rms_norm_eps
                 });
-            cur = dn_layer.build(ctx_, gf, cur, dn_idx, Phase::Decode, pa_unused, &da);
+            cur = dn_layer.build(arena_.ctx(), gf, cur, dn_idx, Phase::Decode, pa_unused, &da);
         } else {
             {
                 int32_t kv_idx = kv_layer_map_[il];
@@ -439,7 +439,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
                 const int n_rot = (cfg_.rope_dimension_count > 0)
                     ? cfg_.rope_dimension_count : n_embd_head;
                 cur = ::build_gated_batched_attention(
-                    ctx_, gf, kv_cache_.get(), cur, inp_pos,
+                    arena_.ctx(), gf, kv_cache_.get(), cur, inp_pos,
                     kq_mask, gather_indices, kv_idx, slots, positions, il,
                     block.attn_q_weight, block.attn_q_norm_weight,
                     block.attn_k_weight, block.attn_k_norm_weight,
@@ -457,15 +457,15 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
         }
 
         // Residual after attention/SSM
-        cur = ggml_add(ctx_, cur, inpSA);
+        cur = ggml_add(arena_.ctx(), cur, inpSA);
 
         ggml_tensor* ffn_residual = cur;
 
         // Post-attention norm + FFN + residual
         cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight,
+        cur = build_ffn_swiglu(arena_.ctx(), gf, cur, block.ffn_gate_weight,
                          block.ffn_up_weight, block.ffn_down_weight, il);
-        cur = ggml_add(ctx_, cur, ffn_residual);
+        cur = ggml_add(arena_.ctx(), cur, ffn_residual);
 
         inpL = cur;
     }

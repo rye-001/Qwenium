@@ -83,7 +83,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
     set_tensor_name(gf, inpL, "inpL");
 
     // Position tensor
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);  // Mark as input tensor
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -131,7 +131,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         w.ffn_up    = block.ffn_up_weight;
         w.ffn_down  = block.ffn_down_weight;
 
-        inpL = build_transformer_layer(ctx_, gf, kv_cache_.get(), inpL, inp_pos,
+        inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
                                        static_cast<uint32_t>(n_tokens));
     }
@@ -147,18 +147,12 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     const std::vector<uint32_t>& slots, 
     const std::vector<int32_t>& positions
 ) {
-    // Reset context
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-    struct ggml_init_params params = {
-        .mem_size   = ctx_buffer_.size(),
-        .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true, 
-    };
-    ctx_ = ggml_init(params);
+    // Was an inline copy of reset_context()'s body — the same ggml_free +
+    // ggml_init over the same buffer. The GraphArena extraction surfaced the
+    // duplicate; there is one way to reset the context now.
+    reset_context();
 
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, GRAPH_SIZE, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(arena_.ctx(), GRAPH_SIZE, false);
     
     // Core parameters
     int n_layers = meta_.block_count;
@@ -181,7 +175,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inpL, "inpL");
 
     // Position tensor (vector of positions, one per token)
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -195,8 +189,8 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
     // Attention Mask (shared across layers)
     // Shape: [n_kv_len, n_tokens, 1]
-    // ggml_tensor* kq_mask = ggml_new_tensor_3d(ctx_, GGML_TYPE_F32, n_kv_len, n_tokens, 1);
-    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
+    // ggml_tensor* kq_mask = ggml_new_tensor_3d(arena_.ctx(), GGML_TYPE_F32, n_kv_len, n_tokens, 1);
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(arena_.ctx(), GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
     
     ggml_set_input(kq_mask);
     ggml_set_name(kq_mask, "kq_mask_b");
@@ -205,7 +199,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     // KV Gather Indices (shared across layers)
     // Shape: [n_tokens * n_kv_len] (1D tensor of indices)
     uint32_t n_total_indices = n_tokens * n_kv_len;
-    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_total_indices);
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
@@ -227,19 +221,19 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
         cur = build_norm(gf, inpL, block.attn_norm_weight, il);
         
         // B. Q, K, V
-        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-        if (meta_.architecture == "qwen2") Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
+        ggml_tensor* Qcur = ggml_mul_mat(arena_.ctx(), block.attn_q_weight, cur);
+        if (meta_.architecture == "qwen2") Qcur = ggml_add(arena_.ctx(), Qcur, block.attn_q_bias);
         
-        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-        if (meta_.architecture == "qwen2") Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
+        ggml_tensor* Kcur = ggml_mul_mat(arena_.ctx(), block.attn_k_weight, cur);
+        if (meta_.architecture == "qwen2") Kcur = ggml_add(arena_.ctx(), Kcur, block.attn_k_bias);
         
-        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-        if (meta_.architecture == "qwen2") Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
+        ggml_tensor* Vcur = ggml_mul_mat(arena_.ctx(), block.attn_v_weight, cur);
+        if (meta_.architecture == "qwen2") Vcur = ggml_add(arena_.ctx(), Vcur, block.attn_v_bias);
 
         // Reshape [n_head, n_embd_head, n_tokens]
-        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Qcur = ggml_reshape_3d(arena_.ctx(), Qcur, n_embd_head, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(arena_.ctx(), Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(arena_.ctx(), Vcur, n_embd_head, n_head_kv, n_tokens);
 
         // Qwen3 Norm
         if (meta_.architecture == "qwen3") {
@@ -249,23 +243,23 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // RoPE (using vector positions)
         float freq_base = meta_.rope_freq_base;
-        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        Qcur = ggml_rope_ext(arena_.ctx(), Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        Kcur = ggml_rope_ext(arena_.ctx(), Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
         // D. Attention (Batched)
         float kq_scale = 1.0f/sqrtf(float(n_embd_head));
-        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, kq_mask, gather_indices, il);
+        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, kq_mask, gather_indices, il);
 
         // E. Output Projection & Residual
-        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-        ggml_tensor * ffn_inp = ggml_add(ctx_, cur, inpSA);
+        cur = ggml_mul_mat(arena_.ctx(), block.attn_output_weight, cur);
+        ggml_tensor * ffn_inp = ggml_add(arena_.ctx(), cur, inpSA);
 
         // F. FFN
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = build_ffn_swiglu(arena_.ctx(), gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         
         // H. FFN Residual
-        cur = ggml_add(ctx_, cur, ffn_inp);
+        cur = ggml_add(arena_.ctx(), cur, ffn_inp);
         inpL = cur;
     }
     

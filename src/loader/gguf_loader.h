@@ -15,7 +15,7 @@
 // Note: the big tokenizer arrays (vocab, merges, scores, token types) are
 //   intercepted by key here and placed on ModelMetadata's typed members; only
 //   scalar/small-array family keys reach the generic GGUFValue bag (gguf_value.h).
-// Unit tests: tests/unit/test_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
+// Unit tests: tests/unit/test_gguf_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
 
 #include "engine/model.h"
 #include "ggml.h"

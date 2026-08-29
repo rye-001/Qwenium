@@ -26,8 +26,8 @@ using qinf::session::SessionManifest;
 using qinf::session::SnapshotReader;
 using qinf::session::SnapshotWriter;
 using qinf::state::TokenSequenceSection;
-using qwenium::GrammarStateSection;
-using qwenium::SamplerStateSection;
+using qinf::GrammarStateSection;
+using qinf::SamplerStateSection;
 
 // Compat-header discriminants available from the loaded model. weights_hash is
 // the model's content identity (computed at load); build_path_tag stays default
@@ -49,7 +49,7 @@ CompatHeader make_header(const ModelMetadata& m) {
 }  // namespace
 
 int run_session(Model& model, const CliArgs& args,
-                std::unique_ptr<qwenium::GrammarVocab>& grammar,
+                std::unique_ptr<qinf::GrammarVocab>& grammar,
                 const std::function<void(int32_t)>& log_token) {
     const ModelMetadata& meta = model.get_metadata();
     Tokenizer* tok = model.get_tokenizer();
@@ -70,14 +70,14 @@ int run_session(Model& model, const CliArgs& args,
 
     // Sampler + grammar mirror complete.cpp's setup so the session decodes on
     // the production path.
-    std::unique_ptr<qwenium::Sampler> sampler;
+    std::unique_ptr<qinf::Sampler> sampler;
     if (args.temperature > 0.0f) {
-        sampler = std::make_unique<qwenium::TemperatureSampler>(
+        sampler = std::make_unique<qinf::TemperatureSampler>(
             args.temperature, args.repetition_penalty, 64, args.top_k, args.top_p);
     } else {
         // Greedy is a true argmax unless --repeat-penalty was explicitly
         // given (see complete.cpp).
-        sampler = std::make_unique<qwenium::GreedySampler>(
+        sampler = std::make_unique<qinf::GreedySampler>(
             args.repetition_penalty_set ? args.repetition_penalty : 1.0f);
     }
     if (grammar) sampler->set_grammar(grammar.get());

@@ -755,7 +755,7 @@ gtest_discover_tests(norm-tests)
 #         FFN Phase parameter, kv_cache build/position/truncate.
 add_executable(layer-tests
     unit/test_layer_state.cpp
-    unit/test_kv_cache.cpp
+    unit/test_kv_cache_simple.cpp
     unit/test_recurrent_state.cpp
     unit/test_attention.cpp
     unit/test_ffn.cpp
@@ -771,6 +771,19 @@ target_link_libraries(layer-tests PRIVATE
 
 target_compile_features(layer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(layer-tests)
+
+# GraphArena — context lifetime, testable without a model or a backend.
+add_executable(graph-arena-tests
+    unit/test_graph_arena.cpp
+)
+
+target_link_libraries(graph-arena-tests PRIVATE
+    GTest::gtest_main
+    ggml
+)
+
+target_compile_features(graph-arena-tests PRIVATE cxx_std_17)
+gtest_discover_tests(graph-arena-tests)
 
 # Graph-compute fail-loud check (pure status logic — no GPU, no model).
 add_executable(graph-compute-tests
@@ -895,7 +908,7 @@ gtest_discover_tests(gguf-kv-bag-tests)
 # GGUFKVBagLoaderTest suite additionally exercises raw_kv population from a
 # real GGUF; those tests self-skip when QWEN35_MODEL_PATH is unset.
 add_executable(loader-tests
-    unit/test_loader.cpp
+    unit/test_gguf_loader.cpp
 )
 
 target_link_libraries(loader-tests PRIVATE

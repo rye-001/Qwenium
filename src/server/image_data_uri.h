@@ -30,7 +30,7 @@
 
 #include "nlohmann/json.hpp"
 
-namespace qwenium {
+namespace qinf {
 
 // Default ceiling on the DECODED image size (bytes). A 4 K order-management
 // screenshot is well under this; a runaway payload is rejected fail-loud rather
@@ -58,4 +58,4 @@ std::vector<DecodedImage> extract_images_from_content(
     const nlohmann::json& content,
     size_t max_decoded_bytes = kDefaultMaxImageBytes);
 
-}  // namespace qwenium
+}  // namespace qinf

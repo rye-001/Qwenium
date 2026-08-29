@@ -35,7 +35,7 @@ public:
         eos_token_ = 0;
     }
 
-    void configure_server(qwenium::InferenceServer& server) {
+    void configure_server(qinf::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
             return tokenize(text);
         });
@@ -131,13 +131,13 @@ protected:
         // Set default response: "Hello!"
         mock_->set_response({'H', 'e', 'l', 'l', 'o', '!', 0});
 
-        qwenium::InferenceServer::Config config;
+        qinf::InferenceServer::Config config;
         config.max_slots = 4;
         config.max_queue_depth = 10;
         config.max_context = 64;  // small ceiling so the fail-loud test can exceed it
         config.request_timeout = std::chrono::seconds(5);
 
-        server_ = std::make_unique<qwenium::InferenceServer>(config);
+        server_ = std::make_unique<qinf::InferenceServer>(config);
         mock_->configure_server(*server_);
 
         // Start inference thread
@@ -201,7 +201,7 @@ protected:
                 return;
             }
 
-            auto inf_req = std::make_shared<qwenium::InferenceRequest>();
+            auto inf_req = std::make_shared<qinf::InferenceRequest>();
             inf_req->prompt = prompt;
             inf_req->max_tokens = body.value("max_tokens", 256);
 
@@ -233,7 +233,7 @@ protected:
                     [inf_req, this](size_t, httplib::DataSink& sink) {
                         while (true) {
                             int token_id = inf_req->token_queue->pop_blocking();
-                            if (token_id == qwenium::TokenQueue::QUEUE_END) {
+                            if (token_id == qinf::TokenQueue::QUEUE_END) {
                                 sink.write("data: [DONE]\n\n", 14);
                                 sink.done();
                                 return false;
@@ -252,7 +252,7 @@ protected:
             } else {
                 // Mirror production: the server owns the canonical output_text,
                 // token counts, and finish_reason. Drain only to wait for the end.
-                while (inf_req->token_queue->pop_blocking() != qwenium::TokenQueue::QUEUE_END) {
+                while (inf_req->token_queue->pop_blocking() != qinf::TokenQueue::QUEUE_END) {
                 }
                 if (!inf_req->error_message.empty()) {
                     res.status = 413;
@@ -281,7 +281,7 @@ protected:
     }
 
     std::unique_ptr<MockInferenceBackend> mock_;
-    std::unique_ptr<qwenium::InferenceServer> server_;
+    std::unique_ptr<qinf::InferenceServer> server_;
     std::unique_ptr<httplib::Server> http_server_;
     std::thread inference_thread_;
     std::thread http_thread_;

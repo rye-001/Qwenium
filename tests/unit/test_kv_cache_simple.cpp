@@ -1,4 +1,4 @@
-// test_kv_cache.cpp — PR 2.8
+// test_kv_cache_simple.cpp — PR 2.8
 //
 // Unit tests for simple_kv_cache: build test, advance/position management,
 // truncate_to_position, LayerState conformance, and scratch-budget note.

@@ -21,8 +21,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "cli-args.h"
-#include "speculative-bridge.h"
+#include "cli_args.h"
+#include "speculative_bridge.h"
 
 #include "engine/model.h"
 #include "../loader/tokenizer.h"
@@ -39,7 +39,7 @@ class ForwardPassBase;
 class Tokenizer;
 struct ChatMessage;
 
-namespace qwenium {
+namespace qinf {
     class Sampler;
     class SpeculativeDecoder;
 }
@@ -49,8 +49,8 @@ namespace qwenium {
 int run_chat(
     Model& model,
     const CliArgs& args,
-    std::unique_ptr<qwenium::GrammarVocab>& grammar,        // nullable, may be reset per turn
-    qwenium::SpeculativeDecoder* spec,                  // nullable
+    std::unique_ptr<qinf::GrammarVocab>& grammar,        // nullable, may be reset per turn
+    qinf::SpeculativeDecoder* spec,                  // nullable
     bool use_speculative,
     std::function<void(int32_t)> log_token,
     std::function<void(const std::vector<int32_t>&)> log_tokens

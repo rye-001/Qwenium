@@ -10,15 +10,13 @@
 #include "../state/kv_cache_simple.h"
 #include "../graph_inputs/graph_input.h"
 #include "../engine/graph_compute.h"
+#include "graph_arena.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
 struct ggml_tensor;
 struct ggml_cgraph;
 class DeltaNetState;  // L2 snapshot reach-through (OverwriteRecurrent lane)
-
-constexpr size_t FP_GRAPH_SIZE_METADATA = 128 * 1024 * 1024;
-constexpr size_t FP_GRAPH_SIZE = 16384;
 
 // forward_pass_base.h — the base every model recipe derives from.
 //
@@ -353,8 +351,10 @@ public:
 protected:
     const ModelMetadata& meta_;
     const Model& model_;
-    struct ggml_context* ctx_;
-    std::vector<uint8_t> ctx_buffer_;
+    // Composition, not inheritance: the context lifecycle is a value this class
+    // HOLDS. First extraction toward retiring this base class entirely
+    // (architecture.md §12). Recipes reach the context as arena_.ctx().
+    GraphArena arena_;
 
     // Typed inputs for the current graph. Each recipe rebuilds this in its
     // build_*_graph; run_prefill / decode_step fan set_input over it.

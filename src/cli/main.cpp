@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
     }
 
     // --- Grammar Setup ---
-    std::unique_ptr<qwenium::GrammarVocab> grammar;
+    std::unique_ptr<qinf::GrammarVocab> grammar;
     if (!args.grammar_file.empty()) {
         std::ifstream file(args.grammar_file);
         if (!file) {
@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
         }
         std::string grammar_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        grammar = qwenium::GrammarVocab::parse_impl(grammar_str);
+        grammar = qinf::GrammarVocab::parse_impl(grammar_str);
         if (!grammar) {
             std::cerr << "Error: Failed to parse grammar file." << std::endl;
             return 1;
@@ -299,12 +299,12 @@ int main(int argc, char** argv) {
     // --- Speculative Decoder Setup (shared by both modes) ---
     // PLD is disabled when grammar is active (grammar needs per-token validation)
     bool use_speculative = args.speculative && !grammar;
-    std::unique_ptr<qwenium::SpeculativeDecoder> spec;
+    std::unique_ptr<qinf::SpeculativeDecoder> spec;
     if (use_speculative && args.speculative_mode == "pld") {
-        qwenium::PromptLookupConfig pld_config;
+        qinf::PromptLookupConfig pld_config;
         pld_config.ngram_size = args.pld_ngram_size;
         pld_config.max_draft = args.pld_max_draft;
-        spec = std::make_unique<qwenium::SpeculativeDecoder>(
+        spec = std::make_unique<qinf::SpeculativeDecoder>(
             pld_config, (int)model.get_metadata().vocab_size);
         std::cout << "Prompt Lookup Decoding enabled (ngram=" << pld_config.ngram_size
                   << ", max_draft=" << pld_config.max_draft << ")" << std::endl;

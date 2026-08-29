@@ -12,7 +12,7 @@
 #include "prompt_lookup.h"
 #include "draft_source.h"
 
-namespace qwenium {
+namespace qinf {
 
 // ============================================================================
 // SpeculativeResult: What the caller gets back
@@ -321,4 +321,4 @@ private:
     SpeculativeStats stats_;
 };
 
-} // namespace qwenium
+} // namespace qinf

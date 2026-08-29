@@ -1,5 +1,5 @@
 #pragma once
-// cli-args.h — the parsed command line, one struct.
+// cli_args.h — the parsed command line, one struct.
 //
 // Responsibility: hold every CLI flag's resolved value so chat/complete/
 //   session_mode read fields instead of re-parsing argv. Parsing itself and the

@@ -72,7 +72,7 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     // 1. Token embedding lookup followed by sqrt(d_model) scaling (Gemma).
     ggml_tensor* inpL = embedding(gf, tokens);
     set_tensor_name(gf, inpL, "inpL");
-    inpL = build_embed_scale(ctx_, inpL, std::sqrt(static_cast<float>(hidden_dim)));
+    inpL = build_embed_scale(arena_.ctx(), inpL, std::sqrt(static_cast<float>(hidden_dim)));
     set_tensor_name(gf, inpL, "inpL_scaled");
     // Diagnostic-only: keep this tensor's buffer alive so DumpInpL* can read it.
     // Removing this in steady state is a 1-line revert; cheap to leave for now.
@@ -80,7 +80,7 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     ggml_build_forward_expand(gf, inpL);
 
     // Position tensor.
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -129,7 +129,7 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
         w.ffn_up    = block.ffn_up_weight;
         w.ffn_down  = block.ffn_down_weight;
 
-        inpL = build_transformer_layer(ctx_, gf, kv_cache_.get(), inpL, inp_pos,
+        inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
                                        static_cast<uint32_t>(n_tokens));
         // Diagnostic: keep each layer's output alive so we can compare per-layer.
@@ -158,16 +158,16 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     // KV-append mid-stream differential ("attention-only" is not a skip).
     if (want_logits) {
         ggml_tensor* cur = build_rms_norm_gemma(
-            ctx_, build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
+            arena_.ctx(), build_out_ids_slice(gf, inpL), model_.get_output_norm_weight(),
             meta_.rms_norm_eps, /*il=*/-1);
         set_tensor_name(gf, cur, "final_norm");
         ggml_set_output(cur);
         ggml_build_forward_expand(gf, cur);
 
         if (model_.get_output_weight() != nullptr) {
-            cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
+            cur = ggml_mul_mat(arena_.ctx(), model_.get_output_weight(), cur);
         } else {
-            cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+            cur = ggml_mul_mat(arena_.ctx(), model_.get_token_embedding_weight(), cur);
         }
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
@@ -200,11 +200,11 @@ ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
     //    the residual stream enters attention sqrt(2048)≈45x too small.
     ggml_tensor* inpL = embedding(gf, tokens);
     set_tensor_name(gf, inpL, "inpL");
-    inpL = build_embed_scale(ctx_, inpL, std::sqrt(static_cast<float>(hidden_dim)));
+    inpL = build_embed_scale(arena_.ctx(), inpL, std::sqrt(static_cast<float>(hidden_dim)));
     set_tensor_name(gf, inpL, "inpL_scaled");
 
     // Position tensor (one per token across all slots).
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -218,14 +218,14 @@ ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
     uint32_t n_kv_len = max_pos + 1;
 
     // Attention mask, shared across layers: [n_kv_len, 1, 1, n_tokens].
-    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(arena_.ctx(), GGML_TYPE_F32, n_kv_len, 1, 1, n_tokens);
     ggml_set_input(kq_mask);
     ggml_set_name(kq_mask, "kq_mask_b");
     ggml_build_forward_expand(gf, kq_mask);
 
     // KV gather indices, shared across layers: [n_tokens * n_kv_len].
     uint32_t n_total_indices = n_tokens * n_kv_len;
-    ggml_tensor* gather_indices = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_total_indices);
+    ggml_tensor* gather_indices = ggml_new_tensor_1d(arena_.ctx(), GGML_TYPE_I32, n_total_indices);
     ggml_set_input(gather_indices);
     ggml_set_name(gather_indices, "gather_indices");
 
@@ -253,40 +253,40 @@ ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
         cur = build_norm(gf, inpL, block.attn_norm_weight, il);
 
         // B. Q/K/V projections (no bias — Gemma 1).
-        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
+        ggml_tensor* Qcur = ggml_mul_mat(arena_.ctx(), block.attn_q_weight, cur);
+        ggml_tensor* Kcur = ggml_mul_mat(arena_.ctx(), block.attn_k_weight, cur);
+        ggml_tensor* Vcur = ggml_mul_mat(arena_.ctx(), block.attn_v_weight, cur);
 
-        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Qcur = ggml_reshape_3d(arena_.ctx(), Qcur, n_embd_head, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(arena_.ctx(), Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(arena_.ctx(), Vcur, n_embd_head, n_head_kv, n_tokens);
 
         // (No QK norm — Gemma 1 has no q_norm/k_norm.)
 
         // C. RoPE — NEOX, same constants as prefill (transformer_block.cpp):
         //    freq_scale 1.0, ext_factor 0.0, attn_factor 1.0, beta 32/1.
-        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot,
+        Qcur = ggml_rope_ext(arena_.ctx(), Qcur, inp_pos, nullptr, n_rot,
                              GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
                              1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot,
+        Kcur = ggml_rope_ext(arena_.ctx(), Kcur, inp_pos, nullptr, n_rot,
                              GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
                              1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
         // D. Batched attention (per-slot scatter + gather MHA).
         float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur,
+        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur,
                                       il, kq_scale, slots, positions,
                                       kq_mask, gather_indices, il);
 
         // E. Output projection + post-attention residual.
-        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-        ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
+        cur = ggml_mul_mat(arena_.ctx(), block.attn_output_weight, cur);
+        ggml_tensor* ffn_inp = ggml_add(arena_.ctx(), cur, inpSA);
 
         // F. Pre-FFN norm → GeGLU-tanh FFN (Gemma) → residual.
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = build_ffn_geglu_tanh(ctx_, gf, cur, block.ffn_gate_weight,
+        cur = build_ffn_geglu_tanh(arena_.ctx(), gf, cur, block.ffn_gate_weight,
                                    block.ffn_up_weight, block.ffn_down_weight, il);
-        cur = ggml_add(ctx_, cur, ffn_inp);
+        cur = ggml_add(arena_.ctx(), cur, ffn_inp);
         inpL = cur;
     }
 

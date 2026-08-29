@@ -1,5 +1,5 @@
 // test_js_subset.cpp
-// JS-subset grammar integration tests adapted for qwenium::GrammarVocab.
+// JS-subset grammar integration tests adapted for qinf::GrammarVocab.
 //
 // API changes from test_js_subset_grammar.cpp:
 //   parse_impl(gbnf_str)        — no token_map argument
@@ -106,7 +106,7 @@ static std::vector<std::string> build_js_vocab()
 // Helper: accept and verify token is in valid set
 class Acc {
 public:
-    Acc(qwenium::GrammarVocab* g, const std::vector<std::string>& v) : g(g), v(v) {}
+    Acc(qinf::GrammarVocab* g, const std::vector<std::string>& v) : g(g), v(v) {}
     void operator()(int32_t tok, const char* desc) {
         auto valid = g->get_valid_tokens(v);
         std::set<int32_t> vs(valid.begin(), valid.end());
@@ -126,7 +126,7 @@ public:
         g->accept_token(tok, v);
     }
 private:
-    qwenium::GrammarVocab* g;
+    qinf::GrammarVocab* g;
     const std::vector<std::string>& v;
 };
 
@@ -136,14 +136,14 @@ private:
 
 static void test_js_grammar_parses()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
 }
 
 // await getAccounts({ priority: "high" });
 static void test_js_await_call()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);
@@ -159,7 +159,7 @@ static void test_js_await_call()
 // await getAccounts();  (no args)
 static void test_js_await_call_2()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);
@@ -174,7 +174,7 @@ static void test_js_await_call_2()
 // const tickets = await getSupportTickets({ accountId: account.id });
 static void test_js_let_decl()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);
@@ -192,7 +192,7 @@ static void test_js_let_decl()
 // for (const account of accounts) { await getAccounts({}); }
 static void test_js_for_of()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);
@@ -210,7 +210,7 @@ static void test_js_for_of()
 // if (tickets.length > "2") { await reassignAccount({}); } else { await addAccountNote({}); }
 static void test_js_if_else()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);
@@ -233,7 +233,7 @@ static void test_js_if_else()
 // await Promise.all([ await getAccounts({}), await getSupportTickets({}) ]);
 static void test_js_promise_all()
 {
-    auto g = qwenium::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
+    auto g = qinf::GrammarVocab::parse_impl(JS_SUBSET_GRAMMAR);
     ASSERT_NE(g, nullptr);
     auto vocab = build_js_vocab();
     Acc acc(g.get(), vocab);

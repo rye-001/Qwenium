@@ -23,7 +23,7 @@
 // Fail-loud gap (architecture.md §12): assign_tensor_pointers' newer branches
 //   use require(), which names the architecture and the tensor; the older ones
 //   still use tensors.at() and throw an unnamed std::out_of_range.
-// Unit tests: tests/unit/test_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
+// Unit tests: tests/unit/test_gguf_loader.cpp, tests/unit/test_gguf_kv_bag.cpp
 
 #include <cstdint>
 #include <string>

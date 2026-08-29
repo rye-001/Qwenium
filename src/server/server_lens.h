@@ -54,7 +54,7 @@ class Tokenizer;
 struct ModelMetadata;
 typedef struct ggml_backend_sched* ggml_backend_sched_t;
 
-namespace qwenium {
+namespace qinf {
 
 class GrammarVocab;
 
@@ -241,8 +241,8 @@ struct LensExtractOptions {
 // server's per-request `grammar` field on the OpenAI endpoints.
 //
 // NOTE: `::Tokenizer` is force-qualified. Tokenizer is a global type, but
-// inference_server.h forward-declares a phantom `qwenium::Tokenizer`; without
-// the `::` this declaration would bind to that phantom inside namespace qwenium
+// inference_server.h forward-declares a phantom `qinf::Tokenizer`; without
+// the `::` this declaration would bind to that phantom inside namespace qinf
 // wherever both headers are visible (e.g. http_server.cpp), mismatching the
 // definition.
 LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
@@ -287,4 +287,4 @@ const char* lens_grammar_gbnf();
 // (the class the lens claims citations for). Empty ⇒ "" (used for absent).
 std::string lens_value_tier(const std::string& value);
 
-}  // namespace qwenium
+}  // namespace qinf

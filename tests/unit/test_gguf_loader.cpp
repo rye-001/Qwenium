@@ -1,4 +1,4 @@
-// test_loader.cpp — PR 2.8
+// test_gguf_loader.cpp — PR 2.8
 //
 // Unit tests for src/loader/: GGUFLoader construction, Tokenizer build,
 // and known-answer ASCII round-trip.  No model file required.

@@ -74,7 +74,7 @@ static PromptResult run_one(
     const std::string&        prompt,
     int                       decode_n)
 {
-    qwenium::GreedySampler sampler;
+    qinf::GreedySampler sampler;
     const auto vocab = tok.get_vocabulary();
 
     std::vector<int32_t> tokens = tok.encode(prompt);
