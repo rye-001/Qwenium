@@ -94,36 +94,16 @@ uint64_t content_hash(const std::vector<float>& pixels) {
 
 }  // namespace
 
-ImagePreprocess gemma3_preprocess(int target) {
-    ImagePreprocess pp;
-    pp.sizing       = ImagePreprocess::Sizing::FixedSquarePadCeil;
-    pp.fixed_target = target;
-    pp.mean[0]   = pp.mean[1]   = pp.mean[2]   = 0.5f;
-    pp.stddev[0] = pp.stddev[1] = pp.stddev[2] = 0.5f;
-    return pp;
-}
-
-ImagePreprocess gemma4uv_preprocess(int align, int min_tokens, int max_tokens) {
-    ImagePreprocess pp;
-    pp.sizing     = ImagePreprocess::Sizing::DynSmartResize;
-    pp.align      = align;
-    pp.min_tokens = min_tokens;
-    pp.max_tokens = max_tokens;
-    pp.mean[0]   = pp.mean[1]   = pp.mean[2]   = 0.0f;   // verified mmproj kv [0,0,0]
-    pp.stddev[0] = pp.stddev[1] = pp.stddev[2] = 1.0f;   // verified mmproj kv [1,1,1]
-    return pp;
-}
-
 namespace {
 
 // Shared core: turn an already-decoded interleaved 8-bit RGB buffer into the
 // preprocessed channel-planar Bitmap.The file- and memory-based entry points
 // differ only in how `data` is produced, so this is byte-identical between them.
 qinf::vision::Bitmap bitmap_from_rgb(const unsigned char* data, int w, int h,
-                                     const ImagePreprocess& pp) {
+                                     const qinf::vision::ImagePreprocess& pp) {
     // ── Target canvas dims (aspect ratio handled by the PAD_CEIL letterbox) ───
     int target_w, target_h;
-    if (pp.sizing == ImagePreprocess::Sizing::FixedSquarePadCeil) {
+    if (pp.sizing == qinf::vision::ImagePreprocess::Sizing::FixedSquarePadCeil) {
         target_w = target_h = pp.fixed_target;
     } else {
         const int patch_area = pp.align * pp.align;  // cur_merge==1 ⇒ align²
@@ -179,7 +159,7 @@ qinf::vision::Bitmap bitmap_from_rgb(const unsigned char* data, int w, int h,
 }  // namespace
 
 qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
-                                          const ImagePreprocess& pp) {
+                                          const qinf::vision::ImagePreprocess& pp) {
     int w = 0, h = 0, src_channels = 0;
     // Force 3 channels (RGB); stb drops alpha and expands grayscale.
     unsigned char* data = stbi_load(path.c_str(), &w, &h, &src_channels, 3);
@@ -202,7 +182,7 @@ qinf::vision::Bitmap load_image_to_bitmap(const std::string& path,
 
 qinf::vision::Bitmap load_image_to_bitmap_from_memory(const uint8_t* data,
                                                       size_t len,
-                                                      const ImagePreprocess& pp) {
+                                                      const qinf::vision::ImagePreprocess& pp) {
     int w = 0, h = 0, src_channels = 0;
     unsigned char* rgb = stbi_load_from_memory(
         data, static_cast<int>(len), &w, &h, &src_channels, 3);
@@ -223,7 +203,7 @@ qinf::vision::Bitmap load_image_to_bitmap_from_memory(const uint8_t* data,
 }
 
 qinf::vision::Bitmap load_image_to_bitmap(const std::string& path, int target) {
-    return load_image_to_bitmap(path, gemma3_preprocess(target));
+    return load_image_to_bitmap(path, qinf::vision::gemma3_preprocess(target));
 }
 
 }  // namespace qinf::cli

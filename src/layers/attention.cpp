@@ -1,4 +1,6 @@
 #include "attention.h"
+#include <stdexcept>
+#include <string>
 #include "norm.h"
 #include "../state/kv_cache_simple.h"
 
@@ -57,6 +59,86 @@ ggml_tensor* build_rope_pruned(
     return ggml_rope_ext(ctx, x, inp_pos, /*freq_factors=*/nullptr,
                          n_rot, GGML_ROPE_TYPE_NEOX, context_len,
                          freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+}
+
+// ── MRopeSections::from_widths ───────────────────────────────────────────────
+MRopeSections MRopeSections::from_widths(const std::vector<int32_t>& widths,
+                                         const char* key, int n_rot)
+{
+    if (widths.size() != 4)
+        throw std::runtime_error(
+            std::string("MRopeSections: key '") + key +
+            "' expected 4 section widths, actual: " +
+            std::to_string(widths.size()));
+
+    int64_t sum = 0;
+    for (int32_t w : widths) {
+        if (w < 0)
+            throw std::runtime_error(
+                std::string("MRopeSections: key '") + key +
+                "' expected non-negative section widths, actual: " +
+                std::to_string(w));
+        sum += w;
+    }
+
+    if (sum != n_rot / 2)
+        throw std::runtime_error(
+            std::string("MRopeSections: key '") + key +
+            "' expected widths summing to n_rot/2 (" +
+            std::to_string(n_rot / 2) + "), actual: " + std::to_string(sum));
+
+    if (widths[0] <= 0 && widths[1] <= 0 && widths[2] <= 0)
+        throw std::runtime_error(
+            std::string("MRopeSections: key '") + key +
+            "' expected at least one of the first three widths > 0 "
+            "(ggml_rope_multi asserts this), actual: all zero");
+
+    MRopeSections m;
+    for (int i = 0; i < 4; ++i) m.widths[i] = widths[i];
+    m.active = true;
+    return m;
+}
+
+// ── build_rope_gated ─────────────────────────────────────────────────────────
+// The RoPE used by the gated (Qwen 3.5-family) attention paths.
+//
+// Two kernels, one operation. ggml applies the SAME rotation layout to MROPE
+// as to NEOX — rotate_pairs(n_dims, n_dims/2) in both cases — and differs only
+// in where each dimension's theta comes from: NEOX uses the single position,
+// MROPE picks one of four position components per section. When the four
+// components are equal (every text-only step) ggml_mrope_cache_init walks all
+// four thetas in lockstep, so whichever section is selected yields the same
+// theta NEOX would have produced, and the results coincide exactly.
+//
+// That is why P2 can switch the Qwen 3.5 family onto ggml_rope_multi and still
+// gate on byte-identical text output.
+static ggml_tensor* build_rope_gated(
+    ggml_context*        ctx,
+    ggml_tensor*         x,
+    ggml_tensor*         inp_pos,
+    int                  n_rot,
+    int                  context_length,
+    float                freq_base,
+    const MRopeSections& mrope)
+{
+    if (!mrope.active) {
+        return ggml_rope_ext(ctx, x, inp_pos, /*freq_factors=*/nullptr,
+                             n_rot, GGML_ROPE_TYPE_NEOX,
+                             context_length, freq_base,
+                             1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    }
+    // ggml takes a mutable int[4]; MRopeSections holds int32_t. Copy rather
+    // than cast so the widths cannot be modified through our config.
+    int sections[GGML_MROPE_SECTIONS] = {
+        static_cast<int>(mrope.widths[0]), static_cast<int>(mrope.widths[1]),
+        static_cast<int>(mrope.widths[2]), static_cast<int>(mrope.widths[3]),
+    };
+    // Every scaling parameter is identical to the NEOX branch above; the ONLY
+    // difference is the kernel and the shape of inp_pos.
+    return ggml_rope_multi(ctx, x, inp_pos, /*freq_factors=*/nullptr,
+                           n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                           context_length, freq_base,
+                           1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 }
 
 // ── build_attn_mha ───────────────────────────────────────────────────────────
@@ -329,7 +411,8 @@ ggml_tensor* build_gated_attention(
     int              n_rot,
     float            freq_base,
     int              context_length,
-    float            rms_norm_eps)
+    float            rms_norm_eps,
+    const MRopeSections& mrope)
 {
     // A. Joint Q+Gate projection
     ggml_tensor* Qcur_full = ggml_mul_mat(ctx, w_q, cur);
@@ -364,15 +447,9 @@ ggml_tensor* build_gated_attention(
     gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head, n_tokens);
     set_name(gate, "gate", il);
 
-    // E. Partial RoPE
-    Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    // E. Partial RoPE (M-RoPE when the recipe declares sections)
+    Qcur = build_rope_gated(ctx, Qcur, inp_pos, n_rot, context_length, freq_base, mrope);
+    Kcur = build_rope_gated(ctx, Kcur, inp_pos, n_rot, context_length, freq_base, mrope);
 
     // F. KV cache write + full-history read
     const float    kq_scale  = 1.0f / sqrtf(float(n_embd_head));
@@ -438,7 +515,8 @@ ggml_tensor* build_gated_batched_attention(
     float                        freq_base,
     int                          context_length,
     float                        rms_norm_eps,
-    ggml_tensor*                 kv_write_indices)
+    ggml_tensor*                 kv_write_indices,
+    const MRopeSections&         mrope)
 {
     const size_t n_batch = slots.size();
 
@@ -470,15 +548,9 @@ ggml_tensor* build_gated_batched_attention(
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head, n_batch);
 
-    // E. Partial RoPE
-    Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    // E. Partial RoPE (M-RoPE when the recipe declares sections)
+    Qcur = build_rope_gated(ctx, Qcur, inp_pos, n_rot, context_length, freq_base, mrope);
+    Kcur = build_rope_gated(ctx, Kcur, inp_pos, n_rot, context_length, freq_base, mrope);
 
     // F. Per-slot KV cache write + G. gather. Read width follows the recipe-
     // built mask (keeps bucketed decode n_kv coherent). In the set_rows path

@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cstdlib>
 #include "multimodal_prefill.h"
 
 #include <stdexcept>
@@ -21,6 +23,16 @@ struct PrefillChunk {
     std::vector<int32_t> tokens;      // span token ids (placeholders for image)
     std::vector<float>   image_embd;  // moved into the recipe when n_img > 0
     uint32_t             n_img;       // image soft-token count (0 ⇒ text chunk)
+    uint32_t             grid_w = 0;  // image soft-token grid (M-RoPE); 0 = none
+    uint32_t             grid_h = 0;
+
+    // How far this chunk advances the ROPE POSITION, which is not always its
+    // row count (P4). A text chunk advances by its token count. An image chunk
+    // under M-RoPE advances by max(nx, ny) — llama.cpp
+    // mtmd_image_tokens_get_n_pos, MTMD_POS_TYPE_MROPE — because its tokens
+    // are laid out on a 2-D grid whose rows and columns share positions, so
+    // the span consumes far fewer positions than it occupies KV rows.
+    uint32_t n_pos_advance = 0;
 };
 
 // Drive a chunk sequence over one shared KV, continuing positions, causal.
@@ -46,11 +58,20 @@ std::vector<float> drive_prefill_chunks(
     for (size_t i = 0; i < chunks.size(); ++i) {
         PrefillChunk& c = chunks[i];
         if (c.n_img > 0)
-            embeddable.set_image_embeddings(std::move(c.image_embd), 0, c.n_img);
+            embeddable.set_image_embeddings(std::move(c.image_embd), 0, c.n_img,
+                                            c.grid_w, c.grid_h);
+        // Record any rows-vs-positions divergence this chunk introduces BEFORE
+        // handing off, so the next turn's starting position is derivable from
+        // the engine rather than from the KV row count (get_rope_pos).
+        text_fp.note_span_rows_vs_positions(
+            slot, static_cast<uint32_t>(c.tokens.size()), c.n_pos_advance);
         if (i + 1 == chunks.size())
             return text_fp.run_prefill(c.tokens, pos, slot, scheduler);
-        text_fp.feed_tokens(c.tokens, slot, scheduler);
-        pos += static_cast<int>(c.tokens.size());
+        // Pass `pos` explicitly: feed_tokens would otherwise derive it from the
+        // KV row count, which stops equalling the rope position the moment an
+        // image chunk advances by max(nx, ny) instead of its token count.
+        text_fp.feed_tokens(c.tokens, slot, scheduler, pos);
+        pos += static_cast<int>(c.n_pos_advance);
     }
     // Unreachable: the loop returns on the last chunk.
     throw std::runtime_error("drive_prefill_chunks: fell through chunk loop");
@@ -173,13 +194,38 @@ std::vector<float> prefill_multimodal(
             std::to_string(tokens.size()) + "), got: start=" +
             std::to_string(span) + " n_img=" + std::to_string(nimg));
 
+    // The image's soft-token GRID, needed both for the M-RoPE component
+    // construction inside the recipe and for the position advance here. Seam A
+    // reports it; cross-check it against the count rather than trusting that
+    // nx*ny == mm_tokens_for (they come from different code paths).
+    uint32_t grid_w = 0, grid_h = 0;
+    encoder.mm_grid_for(*chunk.bitmap, grid_w, grid_h);
+    if (static_cast<uint64_t>(grid_w) * grid_h != nimg)
+        throw std::runtime_error(
+            "prefill_multimodal: slot 'mm_grid_for': expected nx*ny == "
+            "mm_tokens_for (" + std::to_string(nimg) + "), got: " +
+            std::to_string(grid_w) + "*" + std::to_string(grid_h) + " = " +
+            std::to_string(static_cast<uint64_t>(grid_w) * grid_h));
+
+    // Position advance for the image span. max(nx, ny) under M-RoPE (the image
+    // is 2-D, so rows and columns share positions); the token count otherwise.
+    // Ported from llama.cpp mtmd_image_tokens_get_n_pos.
+    const uint32_t img_pos_advance =
+        embeddable->image_span_is_2d() ? std::max(grid_w, grid_h) : nimg;
+
     std::vector<PrefillChunk> chunks;
-    if (span > 0)  // text prefix (absent when the image opens the turn)
-        chunks.push_back({{tokens.begin(), tokens.begin() + span}, {}, 0});
+
+    if (span > 0) {  // text prefix (absent when the image opens the turn)
+        const uint32_t n = static_cast<uint32_t>(span);
+        chunks.push_back({{tokens.begin(), tokens.begin() + span}, {}, 0, 0, 0, n});
+    }
     chunks.push_back({{tokens.begin() + span, tokens.begin() + span + nimg},
-                      std::move(embd), nimg});
-    if (static_cast<size_t>(span) + nimg < tokens.size())  // text suffix
-        chunks.push_back({{tokens.begin() + span + nimg, tokens.end()}, {}, 0});
+                      std::move(embd), nimg, grid_w, grid_h, img_pos_advance});
+    if (static_cast<size_t>(span) + nimg < tokens.size()) {  // text suffix
+        const uint32_t n =
+            static_cast<uint32_t>(tokens.size() - (static_cast<size_t>(span) + nimg));
+        chunks.push_back({{tokens.begin() + span + nimg, tokens.end()}, {}, 0, 0, 0, n});
+    }
 
     return drive_prefill_chunks(text_fp, *embeddable, scheduler, chunks, pos, slot);
 }

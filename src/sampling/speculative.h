@@ -135,7 +135,17 @@ public:
     //   prompt_tokens:    original prompt (for n-gram search)
     //   generated_tokens: all tokens generated so far (including latest)
     //   slot_id:          which KV cache slot
-    //   current_pos:      current KV cache position (after latest token)
+    //   current_pos:      rope position of the next token (after latest token)
+    //   current_rows:     KV ROW count for the same point, used only by rewind.
+    //                     -1 (default) means "same as current_pos", which was
+    //                     true for every caller until M-RoPE: one token, one
+    //                     row, one position. An image span breaks that — it
+    //                     writes nx*ny rows but advances the position by only
+    //                     max(nx, ny) — so a caller that has prefilled across an
+    //                     image must pass both. verify() takes a POSITION
+    //                     (it feeds run_prefill), rewind() takes a ROW COUNT
+    //                     (it feeds set_cache_pos); conflating them rewinds the
+    //                     KV to the wrong place.
     //   verify:           forward pass callable
     //   rewind:           cache rewind callable
     //   eos_token:        stop if draft/bonus is EOS
@@ -151,7 +161,8 @@ public:
         RewindCacheFunc rewind,
         int eos_token = -1,
         const std::vector<float>& last_hidden = {},
-        int32_t expected_first = -1)
+        int32_t expected_first = -1,
+        int current_rows = -1)
     {
         assert(vocab_size_ > 0 && "Must set vocab_size before calling");
 
@@ -276,7 +287,9 @@ public:
         //    stand-in for the bonus and shifted every later position by one.)
         int keep = accepted;
         if (keep < K) {
-            rewind(slot_id, current_pos + keep);
+            // ROWS, not the rope position — rewind feeds set_cache_pos.
+            const int rows_base = current_rows < 0 ? current_pos : current_rows;
+            rewind(slot_id, rows_base + keep);
         }
 
         // 5. Build result

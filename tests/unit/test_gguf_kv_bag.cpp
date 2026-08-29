@@ -247,3 +247,91 @@ TEST(GGUFKVBag, MultipleKeysIndependent) {
     EXPECT_TRUE(bag.contains("b"));
     EXPECT_FALSE(bag.contains("z"));
 }
+
+// ── Arrays (P1 of docs/plan-qwen35-vision-impl.md) ───────────────────────────
+//
+// Three real consumers arrived at once: rope.dimension_sections (int32[]),
+// clip.vision.image_{mean,std} (float[]) and is_deepstack_layers (bool[]).
+// The contract is the scalars' contract — same missing/wrong-type messages,
+// one alternative per element type.
+
+TEST(GGUFKVBag, RoundTripInt32Array) {
+    GGUFKVBag bag;
+    // The shape every qwen35-family GGUF actually carries.
+    bag.set("rope.dimension_sections", std::vector<int32_t>{11, 11, 10, 0});
+    const auto& v = bag.get_int32_array("rope.dimension_sections");
+    ASSERT_EQ(v.size(), 4u);
+    EXPECT_EQ(v[0], 11);
+    EXPECT_EQ(v[1], 11);
+    EXPECT_EQ(v[2], 10);
+    EXPECT_EQ(v[3], 0);
+}
+
+TEST(GGUFKVBag, RoundTripFloatArray) {
+    GGUFKVBag bag;
+    bag.set("image_mean", std::vector<float>{0.5f, 0.5f, 0.5f});
+    const auto& v = bag.get_float_array("image_mean");
+    ASSERT_EQ(v.size(), 3u);
+    for (float x : v) EXPECT_FLOAT_EQ(x, 0.5f);
+}
+
+TEST(GGUFKVBag, RoundTripBoolArray) {
+    GGUFKVBag bag;
+    std::vector<bool> ds(27, false);
+    ds[3] = true;
+    bag.set("is_deepstack_layers", ds);
+    const auto& v = bag.get_bool_array("is_deepstack_layers");
+    ASSERT_EQ(v.size(), 27u);
+    EXPECT_TRUE(v[3]);
+    EXPECT_FALSE(v[0]);
+}
+
+TEST(GGUFKVBag, RoundTripUint32AndStringArrays) {
+    GGUFKVBag bag;
+    bag.set("u32s", std::vector<uint32_t>{1u, 2u, 3u});
+    bag.set("strs", std::vector<std::string>{"a", "b"});
+    EXPECT_EQ(bag.get_uint32_array("u32s").size(), 3u);
+    ASSERT_EQ(bag.get_string_array("strs").size(), 2u);
+    EXPECT_EQ(bag.get_string_array("strs")[1], "b");
+}
+
+TEST(GGUFKVBag, EmptyArrayIsAValuePresentNotMissing) {
+    GGUFKVBag bag;
+    bag.set("empty", std::vector<int32_t>{});
+    EXPECT_TRUE(bag.contains("empty"));
+    EXPECT_TRUE(bag.get_int32_array("empty").empty());
+    EXPECT_TRUE(bag.get_int32_array_opt("empty").has_value());
+}
+
+TEST(GGUFKVBag, MissingArrayFailsLoud) {
+    GGUFKVBag bag;
+    EXPECT_THROW(bag.get_float_array("nope"), std::runtime_error);
+    EXPECT_FALSE(bag.get_float_array_opt("nope").has_value());
+}
+
+// An array read as the wrong element type must name both types — this is the
+// exact mistake a caller makes when a key's element type is not what they
+// assumed (image_mean is float[], not int32[]).
+TEST(GGUFKVBag, ArrayWrongElementTypeFailsLoudWithBothTypes) {
+    GGUFKVBag bag;
+    bag.set("image_mean", std::vector<float>{0.5f, 0.5f, 0.5f});
+    try {
+        (void)bag.get_int32_array("image_mean");
+        FAIL() << "expected a wrong-type throw";
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("image_mean"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("int32[]"),    std::string::npos) << msg;
+        EXPECT_NE(msg.find("float[]"),    std::string::npos) << msg;
+    }
+}
+
+// A scalar and an array of the same element type are DIFFERENT alternatives;
+// asking for one when the other is stored must not silently succeed.
+TEST(GGUFKVBag, ScalarAndArrayOfSameTypeDoNotAlias) {
+    GGUFKVBag bag;
+    bag.set("scalar", uint32_t{7});
+    bag.set("array",  std::vector<uint32_t>{7u});
+    EXPECT_THROW(bag.get_uint32_array("scalar"), std::runtime_error);
+    EXPECT_THROW(bag.get_uint32("array"),        std::runtime_error);
+}

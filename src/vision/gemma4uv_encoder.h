@@ -61,6 +61,11 @@ public:
     // (W/P)·(H/P) with P = effective patch (48). Pure — no encode.
     uint32_t mm_tokens_for(const Bitmap& bitmap) const override;
 
+    // (W/P) × (H/P) for the effective patch P — the same factors
+    // mm_tokens_for multiplies together.
+    void mm_grid_for(const Bitmap& bitmap,
+                     uint32_t& nx, uint32_t& ny) const override;
+
     uint32_t projection_dim() const override;
 
 private:

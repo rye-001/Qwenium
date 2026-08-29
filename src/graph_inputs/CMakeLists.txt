@@ -5,6 +5,7 @@ add_library(qinf-graph-inputs STATIC
     graph_input.cpp
     tokens_input.cpp
     positions_input.cpp
+    mrope_positions_input.cpp
     attn_mask_input.cpp
     gather_indices_input.cpp
     kv_write_indices_input.cpp

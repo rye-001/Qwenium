@@ -80,7 +80,8 @@ int32_t decode_step(
     // No sparse LM head here — run_prefill builds the full dense output;
     if (plan.route == DecodeRoute::Bridge) {
         if (graph_cache) graph_cache->invalidate();  // run_prefill resets fp ctx
-        const int32_t pos = static_cast<int32_t>(fp->get_cache_pos(slot));
+        // Rope position, not the KV row count — they diverge after an image.
+        const int32_t pos = fp->get_rope_pos(slot);
         std::vector<float> logits =
             fp->run_prefill({token}, pos, slot, scheduler);
         // run_prefill returns logits for the single decoded position; take the
@@ -110,7 +111,8 @@ int32_t decode_step(
     // Sparse steps have a per-step structure (grammar-narrowed head), so they
     // always take the rebuild path — and MUST invalidate the retained graph,
     // because build_decoding_graph resets fp's ggml_context out from under it.
-    const int32_t           pos       = static_cast<int32_t>(fp->get_cache_pos(slot));
+    // Rope position, not the KV row count — they diverge after an image.
+    const int32_t           pos       = fp->get_rope_pos(slot);
     const std::vector<int32_t>  tokens    = {token};
     const std::vector<uint32_t> slots     = {slot};
     const std::vector<int32_t>  positions = {pos};

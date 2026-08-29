@@ -112,6 +112,13 @@ private:
 
     void skip_gguf_value_from_mem(size_t& offset, GGUFValueType type);
 
+    // Read an ARRAY value at `offset` into metadata_.raw_kv under `key`.
+    // Element types GGUFValue models (uint32/int32/float/bool/string) are
+    // stored; any other element type is skipped without storing. Advances
+    // `offset` past the whole array either way. See the ARRAY case in
+    // parse_metadata for why unmodelled element types are skipped, not refused.
+    void read_array_into_kv(size_t& offset, const std::string& key);
+
     size_t calculate_tensor_bytes(const TensorMetadata& meta) const;
     void validate_tensor_inventory() const;
     void is_valid_utf8(const std::string& str) const;

@@ -13,6 +13,7 @@
 #include "../../src/graph_inputs/graph_input.h"
 #include "../../src/graph_inputs/tokens_input.h"
 #include "../../src/graph_inputs/positions_input.h"
+#include "../../src/graph_inputs/image_embeddings_input.h"
 
 TEST(GraphInputSet, FansOutSetInputAndIsConservative) {
     std::vector<int32_t> toks{3, 1, 4};
@@ -76,4 +77,29 @@ TEST(GraphInput, RequireTensorFailsLoudOnTypeMismatch) {
     TokensInput in;
     EXPECT_THROW(in.set_input(step), std::runtime_error);
     ggml_free(ctx);
+}
+
+// has_slot backs the fail-loud assertion in ForwardPassBase::set_prefill_inputs
+// that the ImageEmbeddingsInput registered by build_image_substitution is still
+// present when the graph is filled. qwen36 once called graph_inputs_.clear()
+// AFTER the splice, silently discarding that input: the image span then carried
+// whatever the buffer held and the model described noise, with no error
+// anywhere (docs/plan-qwen35-vision-impl.md §9). Pin the query the guard uses.
+TEST(GraphInputSet, HasSlotSeesTheImageInputAndClearRemovesIt) {
+    GraphInputSet set;
+    EXPECT_FALSE(set.has_slot("image_embeddings"));
+
+    set.add(std::make_unique<TokensInput>());
+    EXPECT_TRUE(set.has_slot("tokens"));
+    EXPECT_FALSE(set.has_slot("image_embeddings"))
+        << "a text-only set must not claim to own the image slot";
+
+    set.add(std::make_unique<ImageEmbeddingsInput>(std::vector<float>(8, 0.0f)));
+    EXPECT_TRUE(set.has_slot("image_embeddings"));
+
+    // The exact hazard: clearing after the splice drops the upload input.
+    set.clear();
+    EXPECT_FALSE(set.has_slot("image_embeddings"))
+        << "clear() must drop the image input — the guard relies on detecting this";
+    EXPECT_FALSE(set.has_slot("tokens"));
 }

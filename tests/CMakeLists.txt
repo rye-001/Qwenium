@@ -20,6 +20,8 @@ add_executable(unit-tests
     unit/test_graph_input.cpp
     unit/test_tokens_input.cpp
     unit/test_positions_input.cpp
+    unit/test_mrope_positions_input.cpp
+    unit/test_mrope_image_positions.cpp
     unit/test_gather_indices_input.cpp
     unit/test_sparse_head_input.cpp
 )
@@ -1055,10 +1057,20 @@ gtest_discover_tests(multimodal-prefill-tests)
 add_executable(image-loader-tests
     unit/test_image_loader.cpp
     ${CMAKE_SOURCE_DIR}/src/cli/image_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
 )
 target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-loader-tests)
+
+# Preprocessing recipes (pure data — no ggml, no IO, no model file).
+add_executable(image-preprocess-tests
+    unit/test_image_preprocess.cpp
+    ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
+)
+target_link_libraries(image-preprocess-tests PRIVATE GTest::gtest_main)
+target_compile_features(image-preprocess-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-preprocess-tests)
 
 add_executable(image-prompt-tests
     unit/test_image_prompt.cpp
@@ -1067,6 +1079,44 @@ add_executable(image-prompt-tests
 target_link_libraries(image-prompt-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-prompt-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-prompt-tests)
+
+# Vision profile dispatch (P0 of docs/plan-qwen35-vision-impl.md). Covers only
+# the branches that precede encoder construction, so it needs no mmproj and no
+# model file — but it does link qinf-vision for VisionModel's ctor/dtor.
+add_executable(vision-profile-tests
+    unit/test_vision_profile.cpp
+)
+target_link_libraries(vision-profile-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    ggml
+)
+target_compile_features(vision-profile-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(vision-profile-tests PRIVATE ggml-metal)
+endif()
+gtest_discover_tests(vision-profile-tests)
+
+# Qwen 3.5-family ViT encoder (P3). Structural/behavioural invariants only —
+# the numerical reference gate is docs/plan-qwen35-vision-impl.md §8.6 and is
+# NOT covered here. Needs the Qwen mmproj; skips without it.
+add_executable(qwen3vl-encoder-tests
+    unit/test_qwen3vl_encoder.cpp
+)
+target_link_libraries(qwen3vl-encoder-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-loader
+    qinf-models
+    core
+    ggml
+)
+target_compile_features(qwen3vl-encoder-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(qwen3vl-encoder-tests PRIVATE ggml-metal)
+    target_compile_definitions(qwen3vl-encoder-tests PRIVATE QINF_TEST_HAS_METAL)
+endif()
+gtest_discover_tests(qwen3vl-encoder-tests)
 
 # Phase 7 image-embedding reuse cache — no model file needed (counting lambda).
 add_executable(image-embedding-cache-tests

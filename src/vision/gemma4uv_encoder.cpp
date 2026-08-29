@@ -141,6 +141,14 @@ uint32_t Gemma4UvEncoder::mm_tokens_for(const Bitmap& bitmap) const {
            static_cast<uint32_t>(bitmap.height / static_cast<int>(P));
 }
 
+void Gemma4UvEncoder::mm_grid_for(const Bitmap& bitmap,
+                                  uint32_t& nx, uint32_t& ny) const {
+    const uint32_t P = eff_patch_;
+    if (P == 0 || bitmap.width <= 0 || bitmap.height <= 0) { nx = 0; ny = 0; return; }
+    nx = static_cast<uint32_t>(bitmap.width  / static_cast<int>(P));
+    ny = static_cast<uint32_t>(bitmap.height / static_cast<int>(P));
+}
+
 uint32_t Gemma4UvEncoder::projection_dim() const {
     const uint32_t pd = model_.config().projection_dim;
     return pd != 0 ? pd : text_embed_dim_;

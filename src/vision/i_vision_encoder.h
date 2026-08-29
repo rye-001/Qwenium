@@ -48,6 +48,21 @@ public:
     // this value fail-loud (the encode is authoritative; this sizes the span).
     virtual uint32_t mm_tokens_for(const Bitmap& bitmap) const = 0;
 
+    // The 2-D SHAPE of the soft-token grid this bitmap encodes to, in tokens:
+    // nx columns by ny rows, with nx*ny == mm_tokens_for(bitmap). PURE, like
+    // mm_tokens_for.
+    //
+    // Added for M-RoPE (P4, docs/plan-qwen35-vision-impl.md). Every encoder here
+    // always had a grid — SigLIP's 16×16 pool, Gemma 4's (W/P)×(H/P), Qwen's
+    // merged patch grid — but until a recipe needed 2-D positions, Seam A only
+    // ever had to report the count, so the shape was flattened on the way out.
+    // A recipe whose positions are scalar simply ignores this.
+    //
+    // Callers that need BOTH must not assume nx*ny == mm_tokens_for by faith:
+    // the orchestrator cross-checks them fail-loud.
+    virtual void mm_grid_for(const Bitmap& bitmap,
+                             uint32_t& nx, uint32_t& ny) const = 0;
+
     // Output embedding dim — equals the host text model's embedding_length,
     // verified against the mmproj projection weight at construction.
     virtual uint32_t projection_dim() const = 0;

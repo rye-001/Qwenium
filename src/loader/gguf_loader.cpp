@@ -479,10 +479,8 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
                 metadata_.scores[i] = read_value_from_mem<float>(offset);
             }
         } else {
-            // Unknown key: store supported scalar types in raw_kv so recipe
+            // Unknown key: store supported types in raw_kv so recipe
             // from_metadata factories can read family-specific fields from there.
-            // Array types are deliberately skipped — they belong on typed members.
-            // Extend GGUFValue and add a branch here if a real consumer needs array support.
             switch (type) {
                 case GGUFValueType::UINT32:
                     metadata_.raw_kv.set(key, read_value_from_mem<uint32_t>(offset));
@@ -499,8 +497,26 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
                 case GGUFValueType::STRING:
                     metadata_.raw_kv.set(key, read_string_from_mem(offset));
                     break;
+                case GGUFValueType::ARRAY:
+                    // Arrays of the five element types GGUFValue models are read
+                    // into raw_kv (rope.dimension_sections, clip.vision.image_mean
+                    // / image_std / is_deepstack_layers — see gguf_value.h).
+                    //
+                    // The tokenizer's large arrays never arrive here; they are
+                    // intercepted by key above and live on typed members.
+                    //
+                    // An array of any OTHER element type is skipped, exactly as
+                    // before. That is deliberately permissive rather than
+                    // fail-loud: refusing would turn "we don't model this
+                    // metadata key" into "this model will not load", a
+                    // regression for every existing checkpoint carrying an
+                    // array we have no consumer for. The fail-loud contract
+                    // applies when a consumer ASKS for a key — GGUFKVBag then
+                    // reports it missing or wrong-typed by name.
+                    read_array_into_kv(offset, key);
+                    break;
                 default:
-                    // Narrower integer types, UINT64, INT64, FLOAT64, ARRAY — skip.
+                    // Narrower integer types, UINT64, INT64, FLOAT64 — skip.
                     skip_gguf_value_from_mem(offset, type);
                     break;
             }
@@ -636,6 +652,83 @@ std::string GGUFLoader::read_string_from_mem(size_t& offset)
     std::string s(reinterpret_cast<const char*>(file_mapper_->data() + offset), len);
     offset += len;
     return s;
+}
+
+// Read an ARRAY value into raw_kv. The caller has already consumed the key and
+// the ARRAY type tag; `offset` points at the element-type tag.
+//
+// Fail-loud applies to the SHAPE of the file (a truncated or malformed array is
+// an error) but not to our coverage of it: an element type GGUFValue does not
+// model is skipped silently, because refusing would break checkpoints that
+// merely carry metadata we have no consumer for.
+void GGUFLoader::read_array_into_kv(size_t& offset, const std::string& key)
+{
+    const GGUFValueType elem = read_value_from_mem<GGUFValueType>(offset);
+    const uint64_t      n    = read_value_from_mem<uint64_t>(offset);
+
+    switch (elem) {
+        case GGUFValueType::UINT32: {
+            std::vector<uint32_t> v;
+            v.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) v.push_back(read_value_from_mem<uint32_t>(offset));
+            metadata_.raw_kv.set(key, std::move(v));
+            return;
+        }
+        case GGUFValueType::INT32: {
+            std::vector<int32_t> v;
+            v.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) v.push_back(read_value_from_mem<int32_t>(offset));
+            metadata_.raw_kv.set(key, std::move(v));
+            return;
+        }
+        case GGUFValueType::FLOAT32: {
+            std::vector<float> v;
+            v.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) v.push_back(read_value_from_mem<float>(offset));
+            metadata_.raw_kv.set(key, std::move(v));
+            return;
+        }
+        case GGUFValueType::BOOL: {
+            std::vector<bool> v;
+            v.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) v.push_back(read_value_from_mem<bool>(offset));
+            metadata_.raw_kv.set(key, std::move(v));
+            return;
+        }
+        case GGUFValueType::STRING: {
+            std::vector<std::string> v;
+            v.reserve(n);
+            for (uint64_t i = 0; i < n; ++i) v.push_back(read_string_from_mem(offset));
+            metadata_.raw_kv.set(key, std::move(v));
+            return;
+        }
+        default:
+            break;
+    }
+
+    // Element type we do not model — advance past it without storing. Mirrors
+    // the sizing table in skip_gguf_value_from_mem.
+    size_t element_size = 0;
+    switch (elem) {
+        case GGUFValueType::UINT8:   element_size = sizeof(uint8_t);  break;
+        case GGUFValueType::INT8:    element_size = sizeof(int8_t);   break;
+        case GGUFValueType::UINT16:  element_size = sizeof(uint16_t); break;
+        case GGUFValueType::INT16:   element_size = sizeof(int16_t);  break;
+        case GGUFValueType::UINT64:  element_size = sizeof(uint64_t); break;
+        case GGUFValueType::INT64:   element_size = sizeof(int64_t);  break;
+        case GGUFValueType::FLOAT64: element_size = sizeof(double);   break;
+        default:
+            throw GGUFLoadError(
+                "GGUFLoader: key '" + key + "': expected a known GGUF array "
+                "element type, actual: type tag " +
+                std::to_string(static_cast<int>(elem)));
+    }
+    offset += n * element_size;
+    if (offset > file_mapper_->size())
+        throw GGUFLoadError(
+            "GGUFLoader: key '" + key + "': expected an array ending inside the "
+            "file, actual: end offset " + std::to_string(offset) +
+            " past file size " + std::to_string(file_mapper_->size()));
 }
 
 void GGUFLoader::skip_gguf_value_from_mem(size_t& offset, GGUFValueType type)

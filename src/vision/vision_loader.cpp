@@ -105,10 +105,13 @@ void VisionLoader::parse_metadata(const std::string& path,
         }
     }
 
-    // ── Projector type. Two are supported, each with its own IVisionEncoder
-    //    and its own required tensor set:
-    //      "gemma3"   — 27-layer SigLIP ViT + 4×4 pool + projection + soft-emb-norm.
-    //      "gemma4uv" — blockless im2col projector (Gemma 4 unified vision).
+    // ── Projector type. Three are supported, each with its own required
+    //    tensor set:
+    //      "gemma3"         — 27-layer SigLIP ViT + 4×4 pool + projection + soft-emb-norm.
+    //      "gemma4uv"       — blockless im2col projector (Gemma 4 unified vision).
+    //      "qwen3vl_merger" — Qwen 3.5-family ViT + 2×2 merger (P1). Parsing is
+    //                         supported here; the ENCODER lands in P3, so
+    //                         make_vision_profile still refuses to host one.
     //    Any other projector ships a structurally different head we don't
     //    implement; refuse fail-loud rather than encode and produce garbage.
     auto& cfg = model.config();
@@ -121,20 +124,28 @@ void VisionLoader::parse_metadata(const std::string& path,
             proj_type = meta.raw_kv.get_string_opt("clip.projector_type");
         if (!proj_type.has_value()) {
             throw_slot("clip(.vision).projector_type",
-                       "'gemma3' or 'gemma4uv'", "absent");
+                       "'gemma3', 'gemma4uv' or 'qwen3vl_merger'", "absent");
         } else if (*proj_type == "gemma3") {
             cfg.projector_type = qinf::vision::VisionProjectorType::Gemma3Siglip;
         } else if (*proj_type == "gemma4uv") {
             cfg.projector_type = qinf::vision::VisionProjectorType::Gemma4Uv;
+        } else if (*proj_type == "qwen3vl_merger") {
+            cfg.projector_type = qinf::vision::VisionProjectorType::Qwen3VlMerger;
         } else {
             throw_slot("clip.projector_type",
-                       "'gemma3' or 'gemma4uv'", "'" + *proj_type + "'");
+                       "'gemma3', 'gemma4uv' or 'qwen3vl_merger'",
+                       "'" + *proj_type + "'");
         }
     }
 
     // ── Config population + required tensor set, branched by projector type.
     //    Common clip.vision.* numeric keys are uint32 per llama.cpp's writer.
-    if (cfg.projector_type == qinf::vision::VisionProjectorType::Gemma3Siglip) {
+    //
+    //    This was an if/else whose `else` meant Gemma4Uv. Adding a third type
+    //    is exactly what made that latent defect live, so it is a switch with a
+    //    throwing floor now — same treatment vision_profile got in P0.
+    switch (cfg.projector_type) {
+    case qinf::vision::VisionProjectorType::Gemma3Siglip: {
         cfg.image_size        = meta.raw_kv.get_uint32("clip.vision.image_size");
         cfg.patch_size        = meta.raw_kv.get_uint32("clip.vision.patch_size");
         cfg.num_channels      = 3;  // mmproj is RGB; not exposed as a KV
@@ -185,7 +196,9 @@ void VisionLoader::parse_metadata(const std::string& path,
             throw_slot("tensor:v.position_embd.weight",
                        "present in mmproj inventory", "absent");
         }
-    } else {  // VisionProjectorType::Gemma4Uv
+        break;
+    }
+    case qinf::vision::VisionProjectorType::Gemma4Uv: {
         // Blockless: block_count / head_count / feed_forward_length are all 0.
         cfg.num_channels      = 3;
         cfg.image_size        = meta.raw_kv.get_uint32("clip.vision.image_size");      // 224 (informational; dyn-size per image)
@@ -233,6 +246,123 @@ void VisionLoader::parse_metadata(const std::string& path,
                        "present in mmproj inventory", "absent");
         }
         // mm.a.* audio tensors are intentionally ignored (out of scope).
+        break;
+    }
+    case qinf::vision::VisionProjectorType::Qwen3VlMerger: {
+        // Values below are asserted against models/Qwen3.6-mtp-mmproj-BF16.gguf
+        // (334 tensors), read 2026-08-25 — not transcribed from upstream.
+        cfg.num_channels      = 3;
+        // image_size is the POSITION-EMBEDDING GRID, not a fixed input size:
+        // 768/16 = 48, and v.position_embd.weight is [1152, 48²=2304], resized
+        // bilinearly per image. Resolution is dynamic.
+        cfg.image_size        = meta.raw_kv.get_uint32("clip.vision.image_size");        // 768
+        cfg.patch_size        = meta.raw_kv.get_uint32("clip.vision.patch_size");        // 16
+        cfg.hidden_size       = meta.raw_kv.get_uint32("clip.vision.embedding_length");  // 1152
+        cfg.num_layers        = meta.raw_kv.get_uint32("clip.vision.block_count");       // 27
+        cfg.num_attn_heads    = meta.raw_kv.get_uint32("clip.vision.attention.head_count");   // 16
+        cfg.intermediate_size = meta.raw_kv.get_uint32("clip.vision.feed_forward_length");    // 4304
+        cfg.layer_norm_eps    = meta.raw_kv.get_float ("clip.vision.attention.layer_norm_epsilon");  // 1e-6
+        cfg.projection_dim    = meta.raw_kv.get_uint32("clip.vision.projection_dim");    // 2048
+        // The merge key is spatial_merge_size here — NOT projector.scale_factor,
+        // which Gemma 4 uses and this file does not carry.
+        cfg.n_merge           = meta.raw_kv.get_uint32("clip.vision.spatial_merge_size");     // 2
+        cfg.pool_factor       = 1;  // merge is the 2×2 mm.0 concat, not a pool
+        // Dynamic resolution ⇒ per-image token count, like gemma4uv. The
+        // encoder (P3) derives it from the preprocessed bitmap dims.
+        cfg.mm_tokens_per_image = 0;
+
+        // DeepStack: present as a key, all-false on this file, and no
+        // deepstack_* tensors exist. Refuse loudly if a future mmproj enables
+        // it rather than silently dropping the extra feature injections
+        // (docs/plan-qwen35-vision-impl.md §3.4, §8.5).
+        if (auto ds = meta.raw_kv.get_bool_array_opt("clip.vision.is_deepstack_layers")) {
+            for (size_t i = 0; i < ds->size(); ++i) {
+                if ((*ds)[i]) {
+                    throw_slot("clip.vision.is_deepstack_layers",
+                               "all false (DeepStack unimplemented)",
+                               "true at layer " + std::to_string(i));
+                }
+            }
+        }
+
+        // ── Required tensor presence + shape. 10 non-block + 12·27 = 334.
+        // The 2×2 merger: hidden·merge² = 1152·4 = 4608 in, projection_dim out.
+        const uint32_t merged = cfg.hidden_size * cfg.n_merge * cfg.n_merge;  // 4608
+        require_tensor_shape_2d(meta, "mm.0.weight", merged, merged);
+        require_tensor_shape_1d(meta, "mm.0.bias",   merged);
+        require_tensor_shape_2d(meta, "mm.2.weight", merged, cfg.projection_dim);
+        require_tensor_shape_1d(meta, "mm.2.bias",   cfg.projection_dim);
+
+        // Two rank-4 conv patch embeds (the temporal-merge pair) summed at
+        // build time; presence only, the 2-D check would understate the rank.
+        for (const char* t : {"v.patch_embd.weight", "v.patch_embd.weight.1"}) {
+            if (meta.tensor_inventory.find(t) == meta.tensor_inventory.end())
+                throw_slot(std::string("tensor:") + t,
+                           "present in mmproj inventory", "absent");
+        }
+        require_tensor_shape_1d(meta, "v.patch_embd.bias", cfg.hidden_size);
+
+        // Learned position embeddings on the (image_size/patch_size)² grid.
+        const uint32_t grid = cfg.image_size / cfg.patch_size;              // 48
+        if (grid * cfg.patch_size != cfg.image_size)
+            throw_slot("derive(pos_embd_grid)",
+                       "image_size divisible by patch_size",
+                       std::to_string(cfg.image_size) + " / " +
+                       std::to_string(cfg.patch_size));
+        require_tensor_shape_2d(meta, "v.position_embd.weight",
+                                cfg.hidden_size, grid * grid);              // [1152, 2304]
+
+        // post_ln only — this tower has NO pre_ln (the reference builder
+        // guards on exactly that).
+        require_tensor_shape_1d(meta, "v.post_ln.weight", cfg.hidden_size);
+        require_tensor_shape_1d(meta, "v.post_ln.bias",   cfg.hidden_size);
+
+        // Per-block: fused QKV, LayerNorms WITH biases (not RMSNorm), and a
+        // gate-less GELU MLP (matches clip.use_gelu). Checked on every block,
+        // not just block 0 — a truncated mmproj is a real failure mode and the
+        // inventory is already in memory.
+        for (uint32_t il = 0; il < cfg.num_layers; ++il) {
+            const std::string b = "v.blk." + std::to_string(il) + ".";
+            require_tensor_shape_2d(meta, b + "attn_qkv.weight",
+                                    cfg.hidden_size, cfg.hidden_size * 3);
+            require_tensor_shape_1d(meta, b + "attn_qkv.bias", cfg.hidden_size * 3);
+            require_tensor_shape_2d(meta, b + "attn_out.weight",
+                                    cfg.hidden_size, cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "attn_out.bias", cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "ln1.weight", cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "ln1.bias",   cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "ln2.weight", cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "ln2.bias",   cfg.hidden_size);
+            require_tensor_shape_2d(meta, b + "ffn_up.weight",
+                                    cfg.hidden_size, cfg.intermediate_size);
+            require_tensor_shape_1d(meta, b + "ffn_up.bias", cfg.intermediate_size);
+            require_tensor_shape_2d(meta, b + "ffn_down.weight",
+                                    cfg.intermediate_size, cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "ffn_down.bias", cfg.hidden_size);
+        }
+        break;
+    }
+    }
+
+    // ── Normalization constants, common to every projector. Read into config
+    //    now that GGUFKVBag handles float arrays (P1); the preprocessing
+    //    recipes still carry their own hardcoded copies, and reconciling the
+    //    two is P5 — a pixel-changing step that must move under its own
+    //    byte-faithful gate, not ride along here.
+    //    Verified 2026-08-25: gemma3 + qwen3vl_merger both [0.5,0.5,0.5]/
+    //    [0.5,0.5,0.5]; gemma4uv [0,0,0]/[1,1,1] — which is exactly what
+    //    image_preprocess.cpp hardcodes, so the two agree today.
+    if (auto m = meta.raw_kv.get_float_array_opt("clip.vision.image_mean")) {
+        if (m->size() != 3)
+            throw_slot("clip.vision.image_mean", "3 entries (RGB)",
+                       std::to_string(m->size()) + " entries");
+        for (int c = 0; c < 3; ++c) cfg.image_mean[c] = (*m)[c];
+    }
+    if (auto sd = meta.raw_kv.get_float_array_opt("clip.vision.image_std")) {
+        if (sd->size() != 3)
+            throw_slot("clip.vision.image_std", "3 entries (RGB)",
+                       std::to_string(sd->size()) + " entries");
+        for (int c = 0; c < 3; ++c) cfg.image_std[c] = (*sd)[c];
     }
 
     // ── Token markers are TEXT-MODEL properties (the mmproj is encoder-

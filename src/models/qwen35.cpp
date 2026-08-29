@@ -26,6 +26,18 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
     const uint32_t ssm_conv_kernel         = meta.raw_kv.get_uint32("qwen35.ssm.conv_kernel");
     const uint32_t full_attention_interval = meta.raw_kv.get_uint32("qwen35.full_attention_interval");
     const uint32_t rope_dimension_count    = meta.raw_kv.get_uint32_opt("qwen35.rope.dimension_count").value_or(0u);
+    // M-RoPE sections (P2). Effective n_rot mirrors the use sites below:
+    // rope_dimension_count when declared, else the full head dimension.
+    MRopeSections mrope_sections;
+    {
+        static constexpr const char* kSectionsKey = "qwen35.rope.dimension_sections";
+        if (auto widths = meta.raw_kv.get_int32_array_opt(kSectionsKey)) {
+            const int n_rot = rope_dimension_count > 0
+                ? static_cast<int>(rope_dimension_count)
+                : static_cast<int>(meta.attention_key_length);
+            mrope_sections = MRopeSections::from_widths(*widths, kSectionsKey, n_rot);
+        }
+    }
     // Optional: absent on standard GGUFs ⇒ 0 ⇒ no MTP head, n_main == block_count.
     const uint32_t nextn_predict_layers    = meta.nextn_predict_layers();
 
@@ -60,6 +72,7 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
         ssm_time_step_rank,
         ssm_inner_size,
         rope_dimension_count,
+        mrope_sections,
         full_attention_interval,
         nextn_predict_layers,
     };
@@ -160,14 +173,56 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // armed; per-attention-layer masks are added in the layer loop.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
-    graph_inputs_.add(std::make_unique<PositionsInput>());
+    add_positions_input();
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
     set_tensor_name(gf, inpL, "inpL");
 
-    // Position tensor (for attention layers with RoPE)
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    // 1b. Image-token substitution (Seam B — the one boundary site between this
+    //     recipe and the vision subsystem). Qwen 3.5-family models apply no
+    //     embedding scale, so the image rows go in directly. Image-span
+    //     attention stays CAUSAL: Qwen-VL is causal over image tokens, unlike
+    //     Gemma 3's bidi — so there is no mask parameter here at all.
+    //
+    //     The grid width is handed to set_prefill_inputs via the base's
+    //     mrope_img_grid_w_, where MRopePositionsInput turns it into per-token
+    //     (t, h, w, e) components. Refuse a spatially-unstructured image rather
+    //     than encode it as a 1-D run.
+    if (!image_embd_.empty()) {
+        if (cfg_.mrope_sections.active && image_grid_w_ == 0)
+            throw std::runtime_error(
+                "Qwen35ForwardPass: slot \"set_image_embeddings.grid_w\" "
+                "expected > 0 (this recipe uses M-RoPE and needs the image's "
+                "soft-token grid), actual: 0");
+        if (image_grid_w_ != 0 && image_n_tokens_ % image_grid_w_ != 0)
+            throw std::runtime_error(
+                "Qwen35ForwardPass: slot \"set_image_embeddings\" expected "
+                "n_tokens divisible by grid_w, actual: " +
+                std::to_string(image_n_tokens_) + " % " +
+                std::to_string(image_grid_w_));
+
+        inpL = build_image_substitution(
+            gf, inpL, std::move(image_embd_), image_span_start_,
+            image_n_tokens_, static_cast<int>(meta_.embedding_length), n_tokens);
+        mrope_img_grid_w_ = cfg_.mrope_sections.active ? image_grid_w_ : 0u;
+        image_span_start_ = -1;   // consume-on-use (image_embd_ moved out)
+        image_n_tokens_   = 0;
+        image_grid_w_     = 0;
+        image_grid_h_     = 0;
+    }
+
+    // Under M-RoPE the rope position and the KV row count diverge once an image
+    // has been written (an image writes nx·ny rows but advances the position by
+    // max(nx, ny)). The mask indexes KV rows, so tell it where this batch's rows
+    // start; without it the causal test silently hides most of the image.
+    if (cfg_.mrope_sections.active)
+        mrope_kv_base_ = static_cast<int>(get_cache_pos(slot_idx));
+
+    // Position tensor (for attention layers with RoPE). M-RoPE needs four
+    // position components per token — see MRopePositionsInput.
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(
+        ctx_, GGML_TYPE_I32, n_tokens * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -217,7 +272,8 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
                 n_rot,
                 meta_.rope_freq_base,
                 static_cast<int>(meta_.context_length),
-                meta_.rms_norm_eps);
+                meta_.rms_norm_eps,
+                cfg_.mrope_sections);
 
             // build_gated_attention names this layer's mask "kq_mask.{il}".
             // Qwen3.5 uses one uniform causal mask (no sliding window).
@@ -293,8 +349,9 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     ggml_tensor* inpL = embedding(gf, tokens);
     set_tensor_name(gf, inpL, "inpL");
 
-    // 2. Position tensor
-    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_batch);
+    // 2. Position tensor (four components per row under M-RoPE)
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(
+        ctx_, GGML_TYPE_I32, n_batch * n_pos_per_token());
     ggml_set_input(inp_pos);
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
@@ -335,7 +392,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // SparseHeadInput when the grammar sparse path is armed.
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
-    graph_inputs_.add(std::make_unique<PositionsInput>());
+    add_positions_input();
     graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         kv_cache_->get_n_ctx_max()));
@@ -394,7 +451,8 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
                     meta_.rope_freq_base,
                     static_cast<int>(meta_.context_length),
                     meta_.rms_norm_eps,
-                    kv_write_idx);
+                    kv_write_idx,
+                    cfg_.mrope_sections);
             }
         }
 

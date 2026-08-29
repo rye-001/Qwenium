@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "../core/model.h"
 #include "../state/kv_cache_simple.h"
@@ -96,8 +97,86 @@ public:
     // Standalone at the API; thin parameterization underneath: the internal
     // impl is the existing prefill builder with want_logits=false (exactly
     // one head-guard site per recipe). NOT a forked KV/recurrent write.
+    // `pos_override` (P4): the rope position this batch starts at. Default -1
+    // keeps the historical behaviour of deriving it from the KV row count.
+    //
+    // Those two were always the same number until M-RoPE: an image span
+    // occupies nx·ny KV rows but advances the position by only max(nx, ny), so
+    // after an image the cache length and the rope coordinate DIVERGE and
+    // get_cache_pos is no longer a valid position source. Callers that prefill
+    // across an image must pass the position they are tracking.
+    // ── Per-slot rope coordinate ─────────────────────────────────────────────
+    //
+    // The KV row count and the rope position were the same number until M-RoPE.
+    // An image span occupies nx·ny rows but advances the position by only
+    // max(nx, ny), so from the first image onward `get_cache_pos()` answers
+    // "how many rows" and NOT "what position comes next". Anything feeding a
+    // rotation angle must ask here instead.
+    //
+    // Stored as a per-slot ROW-MINUS-POSITION DELTA rather than an absolute
+    // counter, because the delta is self-maintaining: every ordinary token
+    // advances rows and positions by exactly one, so only an image span ever
+    // changes it. Absent/zero delta ⇒ get_rope_pos() == get_cache_pos(), which
+    // is every recipe and every text path — byte-identical, no new bookkeeping.
+    //
+    // KNOWN LIMIT: a slot truncated back *into* or *before* an image span keeps
+    // the stale delta. The prefix-cache / snapshot paths must carry the rope
+    // coordinate to be VL-safe (docs/plan-qwen35-vision-impl.md §3.2, §4
+    // decision 3); until they do, VL sessions are single-turn-safe only.
+    int32_t get_rope_pos(uint32_t slot) const {
+        const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
+        const auto it = rope_row_delta_.find(slot);
+        if (it == rope_row_delta_.end()) return rows;
+        // The record describes a specific stretch of history. If the slot has
+        // since been cleared or rewound to before that stretch, the delta no
+        // longer applies — and applying it anyway would hand back a position
+        // BELOW where the slot actually is (negative, after a clear). Drop it
+        // and fall back to rows == positions, which is exactly right for a
+        // freshly cleared slot and is the pre-M-RoPE behaviour otherwise.
+        if (rows < it->second.rows_after) {
+            rope_row_delta_.erase(it);
+            return rows;
+        }
+        return rows - it->second.delta;
+    }
+
+    // Record that a span just written to `slot` occupied `n_rows` KV rows while
+    // advancing the sequence position by only `n_pos`. Called by the multimodal
+    // orchestrator, the only place that knows the two differ.
+    void note_span_rows_vs_positions(uint32_t slot, uint32_t n_rows,
+                                     uint32_t n_pos) {
+        if (n_pos > n_rows)
+            throw std::runtime_error(
+                "note_span_rows_vs_positions: slot 'n_pos': expected <= n_rows ("
+                + std::to_string(n_rows) + "), got: " + std::to_string(n_pos));
+        if (n_rows == n_pos) return;  // scalar-position recipe: nothing to track
+        auto& rec = rope_row_delta_[slot];
+        rec.delta += static_cast<int32_t>(n_rows) - static_cast<int32_t>(n_pos);
+        rec.rows_after = static_cast<int32_t>(get_cache_pos(slot)) +
+                         static_cast<int32_t>(n_rows);
+    }
+
+    // True when this slot's rows and rope positions have diverged — i.e. it has
+    // hosted an image span. Snapshot / prefix-cache paths ask before persisting
+    // or restoring: the blob format carries a row count and no rope coordinate,
+    // so a diverged slot cannot be round-tripped faithfully (plan §4 decision 3).
+    bool has_rope_divergence(uint32_t slot) const {
+        const auto it = rope_row_delta_.find(slot);
+        if (it == rope_row_delta_.end()) return false;
+        // Honour the same self-invalidation get_rope_pos applies.
+        if (static_cast<int32_t>(get_cache_pos(slot)) < it->second.rows_after) {
+            rope_row_delta_.erase(it);
+            return false;
+        }
+        return true;
+    }
+
+    // Drop a slot's divergence record explicitly. get_rope_pos also self-heals
+    // (see above), so this is belt-and-braces for callers that clear a slot.
+    void reset_rope_pos(uint32_t slot) { rope_row_delta_.erase(slot); }
+
     void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
-                     ggml_backend_sched_t scheduler) {
+                     ggml_backend_sched_t scheduler, int pos_override = -1) {
         if (!feed_tokens_supported())
             throw std::runtime_error(
                 "feed_tokens: feed_tokens_supported expected=true "
@@ -105,7 +184,9 @@ public:
                 "guard yet. docs/plan-feed-tokens.md is phased (qwen36 "
                 "first); refusing rather than silently building the head.");
 
-        const int pos = static_cast<int>(get_cache_pos(slot));
+        const int pos = pos_override >= 0
+            ? pos_override
+            : static_cast<int>(get_cache_pos(slot));
 
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf =
@@ -160,14 +241,38 @@ public:
     // (clear mirrors the former upload_sparse_indices semantics).
     void set_prefill_inputs(ggml_cgraph* gf,
         const std::vector<int32_t>& tokens, int pos) {
+        // build_image_substitution registers the ImageEmbeddingsInput that
+        // uploads the encoder output into the "image_embeddings" slot. A recipe
+        // that calls graph_inputs_.clear() AFTER the splice silently discards
+        // it: the graph still has the tensor and the splice still overwrites the
+        // residual stream with it, but nothing ever fills it, so the image span
+        // carries whatever the buffer held. The model then reads noise and says
+        // so confidently, with no error anywhere in the engine.
+        //
+        // That was the qwen36 P4 bug (docs/plan-qwen35-vision-impl.md §9) and it
+        // survived weeks of investigation precisely because every component was
+        // correct in isolation. Refuse it instead.
+        if (image_spliced_ && !graph_inputs_.has_slot("image_embeddings"))
+            throw std::runtime_error(
+                "set_prefill_inputs: slot 'image_embeddings': expected the "
+                "ImageEmbeddingsInput registered by build_image_substitution to "
+                "still be present at set_input time, got: absent (the recipe "
+                "called graph_inputs_.clear() AFTER the image splice; clear "
+                "before it)");
+        image_spliced_ = false;
+
         StepContext step;
         step.gf         = gf;
         step.tokens     = &tokens;
         step.pos        = pos;
+        step.img_grid_w = mrope_img_grid_w_;
+        step.kv_base    = mrope_kv_base_;
         step.sparse_ids = sparse_decode_ids_.empty()
             ? nullptr : &sparse_decode_ids_;
         graph_inputs_.set_input(step);
         sparse_decode_ids_.clear();
+        mrope_img_grid_w_ = 0;  // consume-on-use, like sparse_decode_ids_
+        mrope_kv_base_    = -1;
     }
 
     // Populate the current decode graph's typed inputs for a batched step.
@@ -329,6 +434,36 @@ protected:
     // columns wholesale (llama.cpp gemma3: scale = ubatch.token ? sqrt : 1.0).
     // Recipe-specific concerns (e.g. Gemma 3's bidirectional image mask) stay in
     // the recipe; this is only the residual-stream substitution.
+    // P4 (docs/plan-qwen35-vision-impl.md) — set by a recipe's
+    // build_prefill_graph when the batch it just built IS an image chunk and
+    // the recipe uses M-RoPE; the value is the image's soft-token grid width.
+    // Read and cleared by set_prefill_inputs. 0 = ordinary text batch, which is
+    // every batch for every recipe that does not set it.
+    // Per-slot rows-minus-positions divergence; see get_rope_pos. Empty for
+    // every text-only session, which is why the scalar path is untouched.
+    // `rows_after` is the slot's row count just after the span was recorded, so
+    // a later rewind past it can invalidate the record instead of corrupting
+    // every subsequent position. Mutable: get_rope_pos is const and self-heals.
+    struct RopeDivergence {
+        int32_t delta      = 0;  // rows - positions accumulated on this slot
+        int32_t rows_after = 0;  // row count the delta was recorded at
+    };
+    mutable std::unordered_map<uint32_t, RopeDivergence> rope_row_delta_;
+
+    // Set by build_image_substitution, consumed by set_prefill_inputs, cleared
+    // by reset_context. Exists only so the guard above can tell "this graph
+    // spliced an image" from "this is a text graph".
+    bool image_spliced_ = false;
+
+    uint32_t mrope_img_grid_w_ = 0;
+
+    // KV rows already written for the slot this prefill targets, when that
+    // differs from the rope position (i.e. after an image span under M-RoPE).
+    // -1 = they coincide, which is the case for every other recipe and every
+    // text-only batch. Set by build_prefill_graph, consumed by
+    // set_prefill_inputs alongside mrope_img_grid_w_.
+    int mrope_kv_base_ = -1;
+
     ggml_tensor* build_image_substitution(
         ggml_cgraph* gf,
         ggml_tensor* inpL,

@@ -46,11 +46,23 @@ Key principles:
 
 ## Workload Envelope (load-bearing)
 
-This engine targets ≤10 concurrent slots, order-management-style prompts
-(≤4 K context), 12 GB-class quantized models on Apple Silicon unified
-memory. KV memory is not the constraint in this regime. TurboQuant
-(KV-precision compression) and SnapKV (post-prefill KV eviction) were
-removed because they add complexity with no payoff inside this envelope.
+This engine targets ≤10 concurrent slots, ≤10 K context, 12 GB-class
+quantized models on Apple Silicon unified memory.
+
+**Raised from 4 K to 10 K (2026-08-24)** so our own assumption stops
+blocking us. The 4 K figure was written for order-management text prompts
+and never contemplated an image: a Qwen-VL-class encoder sizes its token
+count to the image, so one A4 page at usable scan resolution costs
+2 K–8 K soft tokens and did not fit. 10 K is the smallest ceiling under
+which a single high-resolution document plus its prompt and answer fit.
+
+KV memory is still not expected to be the binding constraint, but the
+margin is thinner: KV bytes scale as **ctx x slots**, so this is a 2.4x
+multiplier on the axis that was previously declared non-binding. The
+TurboQuant / SnapKV deletion rationale ("no payoff inside this envelope")
+now rests on a weaker measurement and should be re-checked, not assumed,
+if a 10-slot host ever runs tight. `--kv-f16` halves KV bytes and is the
+first lever to reach for.
 
 ## Target Models
 

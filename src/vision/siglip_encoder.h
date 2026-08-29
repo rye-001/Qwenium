@@ -92,6 +92,10 @@ public:
     // the bitmap. (IVisionEncoder Seam A: Gemma 4's count is per-image.)
     uint32_t mm_tokens_for(const Bitmap& bitmap) const override;
 
+    // Fixed grid: (image_size/patch)/pool per side — 16×16 = 256 for Gemma 3.
+    void mm_grid_for(const Bitmap& bitmap,
+                     uint32_t& nx, uint32_t& ny) const override;
+
     // Tokens-per-image after the 4×4 average pool (256 for Gemma 3).
     uint32_t mm_tokens_per_image() const;
 
