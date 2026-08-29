@@ -427,9 +427,10 @@ Preprocessing splits along the same grain as the seams. The **recipe** —
 `vision/image_preprocess.h`, `ImagePreprocess` plus one factory per projector —
 is projector knowledge and lives with the encoders. The **pipeline** —
 `cli/image_loader` — is IO: decode, resample, normalize, emit a Bitmap. It is
-byte-gated against captured llama.cpp references, because the encoder must see
-exactly what it saw in training (aspect-preserving letterbox, align-corners
-bilinear, uint8 intermediate).
+byte-gated against captured llama.cpp references — both sizing modes, the
+gemma3 fixed square and the qwen3vl dyn-size canvas (one fixture per branch of
+smart_resize) — because the encoder must see exactly what it saw in training
+(aspect-preserving letterbox, align-corners bilinear, uint8 intermediate).
 
 Which recipe and which encoder a given mmproj gets is **one** decision, made in
 `vision/vision_profile`: projector type → `{encoder, cache tag, marker token
@@ -441,9 +442,27 @@ projector is taught to the system in exactly one place.
 Server-side, `ServerVision` routes `image_url` content through the same seams,
 with an embedding cache (`--image-embed-cache`) and an image-prefix KV cache
 (`--image-prefix-cache`) so a recurring image skips the encode and/or the
-image-span prefill. Image prefill uses a dedicated scheduler — reusing the
-text scheduler's allocation for image-prefill graphs corrupts every request
-after the first ([`server-image-multirequest-bug.md`](server-image-multirequest-bug.md)).
+image-span prefill. `--image-prefix-cache` is **refused at setup on an M-RoPE
+recipe** (both front ends): the snapshot blob carries a row count and no rope
+coordinate, so a VL slot cannot be round-tripped (§12).
+
+Two distinct defects have made "every image request after the first" degenerate
+into token soup, and both fixes live in `ForwardPassBase` — the shared owner —
+so no recipe can miss one:
+
+- **Stale galloc buffer** ([`server-image-multirequest-bug.md`](server-image-multirequest-bug.md)).
+  The image-prefill graph runs on the SAME scheduler as text prefill and decode;
+  galloc re-plans across those alternating shapes and used to hand the
+  substituted residual a reused buffer. Fixed by pinning that node as a graph
+  output (`ggml_set_output` in `build_image_substitution`). The dedicated-image
+  scheduler was the leading candidate and was **tried and reverted** — it did not
+  fix the bug. Do not re-propose it without new evidence.
+- **Accumulated rope divergence** (P6, Qwen-only). The per-slot rows-minus-
+  positions record survived the slot clear between requests, so the second
+  image's delta landed on top of the first's and every decode position after it
+  went negative. Fixed by making the record's staleness test single-sourced
+  (`live_rope_record`), so the writer drops an outlived record exactly as the
+  readers do. Scalar recipes never write a record, so Gemma could not reach it.
 
 ---
 
@@ -675,13 +694,22 @@ Current, verified against the tree at time of writing:
 
 ---
 
-- **Qwen 3.5-family vision is gated by coherence smokes, not by an automated
-  test.** The ViT (`qwen3vl_encoder`) *does* have a numeric reference now —
-  captured encoder-only via `clip_init`/`clip_image_encode` against the vendored
-  mtmd source, cosine 0.999875 whole-block and 0.9999 per-token at two sizes and
-  both grid parities — but that differential lives in a scratch harness, not in
-  `tests/`. End to end, both Qwen recipes are verified only by manual CLI smokes
-  on single images. See `plan-qwen35-vision-impl.md` §8.6.
+- **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
+  automated test** — but the two links most likely to fail quietly are now
+  pinned separately. **Preprocessing is in `tests/`** as of P5:
+  `image-loader-tests::MatchesLlamaCppQwen3VlReference{,Upscaled}` compares the
+  whole `Bitmap` against `mtmd_image_preprocessor_dyn_size`, bit-exact, with one
+  fixture per branch of smart_resize. The ViT (`qwen3vl_encoder`) has a numeric
+  reference — captured encoder-only via `clip_init`/`clip_image_encode` against
+  the vendored mtmd source, cosine 0.999875 whole-block and 0.9999 per-token at
+  two sizes and both grid parities — but **that** differential still lives in a
+  scratch harness, not in `tests/`. End to end, both Qwen recipes are verified
+  only by manual smokes on single images — CLI, and (P6) three consecutive
+  `/v1/chat/completions` image requests that must come back grounded AND
+  byte-identical to each other. The per-slot rope bookkeeping those smokes
+  exercise *is* gated automatically and model-free
+  (`tests/unit/test_rope_divergence.cpp`). See `plan-qwen35-vision-impl.md`
+  §6 (P5, P6) and §8.6.
 - **VL sessions are not snapshottable or prefix-cacheable.** An M-RoPE image
   span occupies nx·ny KV rows while advancing the sequence position by only
   max(nx, ny), and the snapshot blob records a row count with no rope

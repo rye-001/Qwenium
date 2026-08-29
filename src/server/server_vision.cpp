@@ -46,7 +46,8 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
 
     // The text recipe must implement IImageEmbeddable (Seam B) so its image span
     // can be armed; refuse loudly otherwise (opt-in, explicit).
-    if (dynamic_cast<IImageEmbeddable*>(&forward_pass_) == nullptr)
+    auto* img_recipe = dynamic_cast<IImageEmbeddable*>(&forward_pass_);
+    if (img_recipe == nullptr)
         throw std::runtime_error(
             "ServerVision: parameter '--mmproj': expected a recipe "
             "implementing IImageEmbeddable (Gemma 3, Gemma 4, or "
@@ -101,6 +102,24 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
                 "expected a recipe that exposes its KV cache(s) "
                 "(snapshot_kv_caches non-empty), actual: a recipe without L2 "
                 "snapshot support (" + model_label() + ")");
+        // A 2-D image span writes nx*ny KV rows while advancing the position by
+        // only max(nx, ny). The snapshot blob records a row count and no rope
+        // coordinate, so such a slot cannot be round-tripped (plan §4 decision 3
+        // — VL sessions are non-snapshottable in v1). Two things go wrong without
+        // this: the V2 suffix prefill below computes its position as
+        // `start_pos + img_end_local`, which is ROWS, and a restored blob has no
+        // rope coordinate to restore. `capture_slot` refuses too, but only AFTER
+        // a full model load, mmproj load and ViT encode — and once per REQUEST,
+        // which on a server means a 500 per image instead of a refusal to start.
+        // Same refusal the CLI makes at setup (cli/chat.cpp).
+        if (img_recipe->image_span_is_2d())
+            throw std::runtime_error(
+                "ServerVision: parameter '--image-prefix-cache': expected a "
+                "recipe whose image span advances one position per KV row, "
+                "actual: an M-RoPE recipe (" + model_label() + "), whose image "
+                "span occupies nx*ny rows but max(nx, ny) positions. The "
+                "snapshot format carries no rope coordinate, so VL sessions are "
+                "not prefix-cacheable in v1 — drop --image-prefix-cache");
         image_prefix_lib_ = std::make_unique<PrefixLibrary>(
             image_prefix_cache_dir,
             qinf::snapshot::make_snapshot_header(

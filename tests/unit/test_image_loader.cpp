@@ -248,3 +248,105 @@ TEST(ImageLoader, Gemma4UvDynSizeBudgetAndPad) {
     }
     EXPECT_GT(pad_pixels, 0) << "expected a horizontal black pad for a 3:1 image";
 }
+
+// ── Differential vs llama.cpp mtmd reference, qwen3vl (P5) ───────────────────
+//
+// The Gemma 3 gate above locks the FIXED-SQUARE path. This locks the
+// DYN_SMART_RESIZE path as the Qwen 3.5 family's projector parameterizes it —
+// align 32, token budget 8…4096, mean/std 0.5 — against the tensor
+// `mtmd_image_preprocessor_dyn_size` actually produces for the same PNG.
+//
+// §3.7 of docs/plan-qwen35-vision-impl.md calls preprocessing "the highest
+// quiet-failure risk in the port", because wrong preprocessing DEGRADES output
+// instead of erroring. That is why this gate is whole-tensor rather than
+// probe-sampled: unlike Gemma 3's [3,896,896] (9.6 MB), a dyn-size canvas for a
+// small image is ~180 KB, so nothing has to be sampled away.
+//
+// Two fixtures, one per branch of smart_resize:
+//   preproc_input.png       157×97 → 160×96 (15 tokens) — the round-to-align
+//                           branch, plus a 4-column letterbox pad.
+//   preproc_input_tiny.png  21×53  → 64×160 (10 tokens) — the min_pixels
+//                           UPSCALE branch (1113 px < the 8192 px floor),
+//                           which the first fixture never reaches.
+//
+// Reference format: 3 int32 dims (C, H, W) then C·H·W f32 PLANAR — our Bitmap
+// layout, de-interleaved at capture time from clip_image_f32's [H][W][C].
+namespace {
+void check_qwen3vl_reference(const char* png_name, const char* ref_name,
+                             int want_w, int want_h) {
+    const std::string img = find_fixture(png_name);
+    const std::string ref = find_fixture(ref_name);
+    if (img.empty() || ref.empty())
+        GTEST_SKIP() << "vision fixtures not found (set QINF_VISION_FIXTURE_DIR "
+                        "or run from repo root)";
+
+    std::ifstream f(ref, std::ios::binary);
+    ASSERT_TRUE(f.good()) << "cannot open reference " << ref;
+    int32_t dims[3] = {0, 0, 0};
+    f.read(reinterpret_cast<char*>(dims), sizeof(dims));
+    ASSERT_EQ(dims[0], 3) << "reference must be 3-channel";
+    ASSERT_EQ(dims[1], want_h) << "reference height moved — re-capture, don't relax";
+    ASSERT_EQ(dims[2], want_w) << "reference width moved — re-capture, don't relax";
+
+    const size_t n = static_cast<size_t>(dims[0]) * dims[1] * dims[2];
+    std::vector<float> expected(n);
+    f.read(reinterpret_cast<char*>(expected.data()),
+           static_cast<std::streamsize>(n * sizeof(float)));
+    ASSERT_EQ(static_cast<size_t>(f.gcount()), n * sizeof(float))
+        << "reference truncated: " << ref;
+
+    auto bmp = load_image_to_bitmap(img, qinf::vision::qwen3vl_preprocess());
+    ASSERT_EQ(bmp.width, want_w);
+    ASSERT_EQ(bmp.height, want_h);
+    ASSERT_EQ(bmp.pixels.size(), n);
+
+    // Both sides do the same arithmetic in the same order (uint8 intermediate,
+    // then (v/255 − mean)/stddev), and at capture time every value in both
+    // fixtures matched EXACTLY (76,800 in total) — so the gate is bit-equality,
+    // not a tolerance.
+    // If a future toolchain contracts this arithmetic and the gate starts
+    // failing on a last-bit margin, that is a re-capture / documented-ε event
+    // (see tests/fixtures/vision/README.md), not a licence to widen it quietly.
+    constexpr float kEps = 0.0f;
+    double max_diff = 0.0;
+    size_t worst = 0, mismatches = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = std::fabs(static_cast<double>(bmp.pixels[i]) - expected[i]);
+        if (d > max_diff) { max_diff = d; worst = i; }
+        if (d > kEps) ++mismatches;
+    }
+    const size_t plane = static_cast<size_t>(want_w) * want_h;
+    EXPECT_EQ(mismatches, 0u)
+        << png_name << ": " << mismatches << " of " << n
+        << " values differ from the llama.cpp reference; worst at c="
+        << worst / plane << " y=" << (worst % plane) / want_w
+        << " x=" << (worst % plane) % want_w << " (got " << bmp.pixels[worst]
+        << ", want " << expected[worst] << ", |Δ| " << max_diff << ")";
+}
+}  // namespace
+
+// Round-to-align branch, with a letterbox pad: 157×97 → 160×96, 5×3 = 15 tokens.
+TEST(ImageLoader, MatchesLlamaCppQwen3VlReference) {
+    check_qwen3vl_reference("preproc_input.png", "preproc_input.qwen3vl.ref",
+                            /*want_w=*/160, /*want_h=*/96);
+}
+
+// min_pixels UPSCALE branch: 21×53 is 1113 px, below the 8192 px floor, so
+// smart_resize scales UP to 64×160 (2×5 = 10 tokens). Unreachable from the
+// fixture above, and it is the branch with no max(align, ·) clamp.
+TEST(ImageLoader, MatchesLlamaCppQwen3VlReferenceUpscaled) {
+    check_qwen3vl_reference("preproc_input_tiny.png",
+                            "preproc_input_tiny.qwen3vl.ref",
+                            /*want_w=*/64, /*want_h=*/160);
+}
+
+// The budget in `qwen3vl_preprocess` is expressed in TOKENS; smart_resize works
+// in PIXELS. The captured reference reports min_px 8192 / max_px 4194304 for
+// this mmproj, which is exactly budget·align² — the identity image_loader
+// relies on to convert one into the other. Pinned here because a silent change
+// would move every canvas above without failing any shape assertion.
+TEST(ImageLoader, Qwen3VlTokenBudgetMatchesReferencePixelBudget) {
+    const auto pp = qinf::vision::qwen3vl_preprocess();
+    EXPECT_EQ(pp.min_tokens * pp.align * pp.align, 8192);
+    EXPECT_EQ(pp.max_tokens * pp.align * pp.align, 4194304);
+}
