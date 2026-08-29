@@ -1,5 +1,6 @@
-#include "qwen35_layer.h"
+#include "qwen35_family.h"
 
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -12,6 +13,13 @@
 #include "../layers/norm.h"             // build_rms_norm
 #include "../state/deltanet_state.h"
 #include "../state/kv_cache_simple.h"
+
+#include "../graph_inputs/tokens_input.h"
+#include "../graph_inputs/positions_input.h"
+#include "../graph_inputs/mrope_positions_input.h"
+#include "../graph_inputs/attn_mask_input.h"
+#include "../graph_inputs/gather_indices_input.h"
+#include "../graph_inputs/kv_write_indices_input.h"
 
 namespace {
 
@@ -82,6 +90,34 @@ DeltaNetLayer::Hparams deltanet_hparams(const Qwen35LayerCommon& c) {
 }
 
 }  // namespace
+
+// ── Typed graph inputs ──────────────────────────────────────────────────────
+
+void register_qwen35_common_inputs(GraphInputSet& inputs, const Qwen35Config& cfg) {
+    inputs.clear();
+    inputs.add(std::make_unique<TokensInput>());
+    if (cfg.mrope_sections.active)
+        inputs.add(std::make_unique<MRopePositionsInput>());
+    else
+        inputs.add(std::make_unique<PositionsInput>());
+}
+
+void register_qwen35_prefill_masks(GraphInputSet& inputs, const Qwen35Config& cfg,
+                                   uint32_t n_layers) {
+    for (uint32_t il = 0; il < n_layers; ++il)
+        if (!cfg.is_ssm_layer(il))
+            inputs.add(std::make_unique<AttnMaskInput>(
+                "kq_mask." + std::to_string(il), 0u));
+}
+
+void register_qwen35_decode_inputs(GraphInputSet& inputs, const Qwen35Config& cfg,
+                                   uint32_t n_ctx_max, bool with_kv_write_indices) {
+    register_qwen35_common_inputs(inputs, cfg);
+    inputs.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
+    inputs.add(std::make_unique<GatherIndicesInput>(n_ctx_max));
+    if (with_kv_write_indices)
+        inputs.add(std::make_unique<KvWriteIndicesInput>(n_ctx_max));
+}
 
 ggml_tensor* build_qwen35_layer_prefill(
     const Qwen35LayerCommon& c,

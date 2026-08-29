@@ -1,5 +1,5 @@
 #include "qwen36.h"
-#include "qwen35_layer.h"
+#include "qwen35_family.h"
 #include "engine/graph_compute.h"
 
 #include "../layers/attention.h"
@@ -185,13 +185,10 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // clear() after the splice silently discards it and the image span keeps
     // whatever the buffer held — the model then sees periodic noise rather than
     // the image. gemma3, gemma4 and qwen35 all order it this way.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
-    for (uint32_t il = 0; il < n_main_layers_; ++il)
-        if (cfg_.is_full_attention_layer(il))
-            graph_inputs_.add(std::make_unique<AttnMaskInput>(
-                "kq_mask." + std::to_string(il), 0u));
+    register_qwen35_common_inputs(graph_inputs_, cfg_);
+    // Registered BEFORE the image splice, which is where this recipe has always
+    // put them; qwen35 registers them after. Same set either way.
+    register_qwen35_prefill_masks(graph_inputs_, cfg_, n_main_layers_);
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -249,7 +246,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     //  there on why the ordering is load-bearing.)
 
     // 3. Transformer loop (main stack only; NextN head held out — §4)
-    // Layer body shared with qwen35 — models/qwen35_layer.h. The two hybrids
+    // Layer body shared with qwen35 — models/qwen35_family.h. The two hybrids
     // differ only in the FFN, which is the moe_hp parameter (non-null here).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
@@ -372,18 +369,12 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     // Latent rather than live: qwen36 has only ever been driven single-slot (CLI
     // and probes, and the lens pins slot 0). Fixed 2026-08-29; qwen35 and gemma3
     // always did it this way.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
-    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
-    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
-        kv_cache_->get_n_ctx_max()));
-    if (kv_write_idx)
-        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
-            kv_cache_->get_n_ctx_max()));
+    register_qwen35_decode_inputs(graph_inputs_, cfg_,
+                                  kv_cache_->get_n_ctx_max(),
+                                  /*with_kv_write_indices=*/kv_write_idx != nullptr);
 
     // 4. Transformer loop (main stack only; NextN head held out — §4)
-    // Layer body shared with qwen35 — models/qwen35_layer.h.
+    // Layer body shared with qwen35 — models/qwen35_family.h.
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
         &moe_hp_};

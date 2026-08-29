@@ -179,7 +179,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `qwen35_layer` (the layer body shared by the two Qwen 3.5-family hybrids; the FFN is a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
@@ -707,11 +707,20 @@ Current, verified against the tree at time of writing:
   duplication was not theoretical: 11 of the 20 most recent commits touching
   either recipe had to touch both, and it produced the `Stride::NKvLen` gather
   defect (wrong in qwen36, right in qwen35, latent for months).
-  Not done, and optional: collapsing `Qwen36ForwardPass` into
-  `Qwen35ForwardPass`. What remains duplicated is class-surface declarations
-  and graph setup, not layer logic. The asymmetry is the MTP head
-  (`IMtpDraftable`, qwen36 only) — a merged class would implement a capability
-  conditionally, and one file would host both hybrids plus the head.
+  The typed-input declarations are shared too (`register_qwen35_*_inputs`):
+  neither recipe calls `graph_inputs_.add` any more. That is the block the
+  gather defect actually lived in, so the defect class is now structurally
+  impossible here — one declaration site, one stride, pinned by
+  `test_qwen35_family` including a test that the dense and MoE hybrids declare
+  identical decode inputs.
+  **Collapsing the two recipe classes was considered and deliberately rejected.**
+  What is left is not duplication: the image splice, the MoE hparam wiring and
+  the NextN head-out genuinely differ, so a merged class would branch internally
+  rather than share — trading CLAUDE.md's "model zoo" failure mode for its "fat
+  function of orthogonal knobs" one. The MTP head (`IMtpDraftable`, qwen36 only,
+  ~240 lines) would also make a merged class implement a capability
+  conditionally. Two clearly-named classes over a shared config, layer body and
+  input set is the better side of that judgment.
 
 - **`server/inference_server.h` is a 1210-line header-only class.** Past what a
   header should carry, but header-only on purpose: it is what lets the slot and

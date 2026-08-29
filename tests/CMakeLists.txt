@@ -772,6 +772,21 @@ target_link_libraries(layer-tests PRIVATE
 target_compile_features(layer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(layer-tests)
 
+# Qwen 3.5-family shared recipe parts (typed-input declarations; model-free).
+add_executable(qwen35-family-tests
+    unit/test_qwen35_family.cpp
+)
+
+target_link_libraries(qwen35-family-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-engine
+    ggml
+)
+
+target_compile_features(qwen35-family-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen35-family-tests)
+
 # GraphArena — context lifetime, testable without a model or a backend.
 add_executable(graph-arena-tests
     unit/test_graph_arena.cpp

@@ -7,7 +7,7 @@ add_library(qinf-models STATIC
     forward_pass_base.cpp
     qwen3.cpp
     qwen35.cpp
-    qwen35_layer.cpp
+    qwen35_family.cpp
     qwen36.cpp
     gemma1.cpp
     gemma2.cpp

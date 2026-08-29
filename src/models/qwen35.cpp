@@ -1,5 +1,5 @@
 #include "qwen35.h"
-#include "qwen35_layer.h"
+#include "qwen35_family.h"
 
 #include <string>
 #include "../layers/attention.h"
@@ -217,9 +217,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // Typed inputs for this graph (replaces set_inputs). Cleared here so
     // build_output_head can append SparseHeadInput when the sparse path is
     // armed; per-attention-layer masks are added in the layer loop.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
+    register_qwen35_common_inputs(graph_inputs_, cfg_);
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -276,19 +274,12 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     ggml_tensor* cur;
 
     // 2. Layer loop
-    // Per-layer attention masks, registered up front rather than inside the
-    // loop: build_gated_attention names this layer's mask "kq_mask.{il}", and
-    // hoisting the registration keeps the layer body free of side effects on
-    // graph_inputs_ — which is what lets the body be shared with qwen35moe.
-    // Same set, same order (ascending il) as registering inside the loop.
-    // Qwen 3.5 uses one uniform causal mask (no sliding window).
-    for (uint32_t il = 0; il < n_layers; ++il)
-        if (!cfg_.is_ssm_layer(il))
-            graph_inputs_.add(std::make_unique<AttnMaskInput>(
-                "kq_mask." + std::to_string(il), 0u));
+    // Registered AFTER the image splice above, which is where this recipe has
+    // always put them; qwen36 registers them before. Same set either way.
+    register_qwen35_prefill_masks(graph_inputs_, cfg_, n_layers);
 
     // The layer body is shared with qwen35moe (Qwen 3.6) — see
-    // models/qwen35_layer.h. The two recipes ran equivalent copies of it until
+    // models/qwen35_family.h. The two recipes ran equivalent copies of it until
     // 2026-08-29; the FFN choice is the only thing that differed, and it is now
     // a parameter (moe_hp null here ⇒ dense SwiGLU).
     const Qwen35LayerCommon lc{
@@ -390,20 +381,14 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // Typed inputs for the decode graph (replaces set_batched_inputs).
     // Single shared causal mask + KV gather; build_output_head appends
     // SparseHeadInput when the grammar sparse path is armed.
-    graph_inputs_.clear();
-    graph_inputs_.add(std::make_unique<TokensInput>());
-    add_positions_input();
-    graph_inputs_.add(std::make_unique<AttnMaskInput>("kq_mask_b", 0u));
-    graph_inputs_.add(std::make_unique<GatherIndicesInput>(
-        kv_cache_->get_n_ctx_max()));
-    if (kv_write_idx)
-        graph_inputs_.add(std::make_unique<KvWriteIndicesInput>(
-            kv_cache_->get_n_ctx_max()));
+    register_qwen35_decode_inputs(graph_inputs_, cfg_,
+                                  kv_cache_->get_n_ctx_max(),
+                                  /*with_kv_write_indices=*/kv_write_idx != nullptr);
 
     // 4. Layer loop
     ggml_tensor* cur;
 
-    // Shared layer body — see the prefill loop above and qwen35_layer.h.
+    // Shared layer body — see the prefill loop above and qwen35_family.h.
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
         /*moe_hp=*/nullptr};

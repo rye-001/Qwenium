@@ -50,12 +50,6 @@ public:
     int n_pos_per_token() const {
         return cfg_.mrope_sections.active ? MRopePositionsInput::kComponents : 1;
     }
-    void add_positions_input() {
-        if (cfg_.mrope_sections.active)
-            graph_inputs_.add(std::make_unique<MRopePositionsInput>());
-        else
-            graph_inputs_.add(std::make_unique<PositionsInput>());
-    }
 
     Qwen36ForwardPass(const Model&     model,
                       const ModelMetadata*  metadata,
