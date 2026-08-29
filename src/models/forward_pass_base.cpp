@@ -76,22 +76,6 @@ ggml_tensor* ForwardPassBase::build_norm(
     return build_rms_norm(arena_.ctx(), cur, mw, meta_.rms_norm_eps, il);
 }
 
-// Thin wrapper — implementation lives in src/layers/attention.cpp.
-// qwen35.cpp calls this via the base class; all new code
-// should call the free function ::build_attn_mha directly.
-ggml_tensor* ForwardPassBase::build_attn_mha(
-    ggml_cgraph* gf,
-    ggml_tensor* q,
-    ggml_tensor* k,
-    ggml_tensor* v,
-    ggml_tensor* kq_mask,
-    ggml_tensor* sinks,
-    float kq_scale,
-    uint32_t pos,
-    int il) const
-{
-    return ::build_attn_mha(arena_.ctx(), gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
-}
 
 void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx, bool gemma_final_norm, float final_softcap) {
     // Auto-create the sparse row-selection tensor from host-side ids if the

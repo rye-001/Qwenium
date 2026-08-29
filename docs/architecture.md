@@ -179,7 +179,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings), `transformer_block` (standard block assembly) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (shared graph scaffolding: embed, output head, sparse decode ids, opt-in hidden-state output, opt-in attention-row tap), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (the recipe interface plus the graph scaffolding recipes share: embed, output head, the Seam B image splice, decode masks — each of which builds nodes *and* declares the typed input they consume; per-step arming lives here too. Context and run-time policy were extracted out to `graph_arena` / `decode_policy`), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
@@ -679,9 +679,11 @@ Current, verified against the tree at time of writing:
   steps, but that is thin evidence on a checkpoint whose output is already
   incoherent on the probe prompt. Treat Gemma 4 MoE + `--kv-f16` as unvalidated
   until the amplification is explained.
-- `forward_pass_base` remains a shared base class; the blueprint's direction is
-  composition-over-inheritance and it is a known eventual deletion target. The
-  **first extraction landed 2026-08-29**: the ggml context and its metadata
+- **`forward_pass_base` is being shrunk to a cohesive core — not deleted.** The
+  blueprint's direction is composition-over-inheritance, and this was recorded as
+  an eventual deletion target until the primitives were actually measured
+  (below), which does not support that. The **first extraction landed
+  2026-08-29**: the ggml context and its metadata
   buffer are now a `GraphArena` the base *holds* rather than *is*
   (`models/graph_arena.h`, unit-tested without a model or backend). Recipes
   reach it as `arena_.ctx()`. The **second extraction landed the same day**: the
@@ -692,10 +694,28 @@ Current, verified against the tree at time of writing:
   precondition §11's receipts claims rest on; `is_default_byte_reproducible()`
   makes that assertable, and `decode_kv_len`'s bucketing — including its
   cap-at-`n_ctx_max` edge — is now unit-tested without a model.
-  Remaining in the base: the shared graph primitives (embed, output head, image
-  splice), per-step arming (`sparse_decode_ids_`, the rope-divergence record),
-  and the recipe interface itself. The graph primitives are the entangled part —
-  they touch the vision seam — and should be attacked last.
+  **The graph primitives were then measured, and the "delete the base class"
+  framing needs revising.** They are three different things, not one:
+  (a) four already-pure helpers (`set_tensor_name`, the three `get_output_*`) —
+  extractable, but they are the caller-facing interface and moving them would be
+  ~46 call sites of churn for no structural gain;
+  (b) thin wrappers over layer modules — `build_attn_mha` was one and had
+  **zero callers** despite a comment claiming qwen35 used it (deleted
+  2026-08-29); `build_norm`/`embedding` stay, they save 22 and 14 call sites
+  from repeating `meta_.rms_norm_eps` and the token-embedding lookup;
+  (c) `build_output_head`, `build_out_ids_slice`, `build_image_substitution`,
+  `build_decode_layer_masks` — each builds graph nodes AND registers the typed
+  input those nodes consume (`SparseHeadInput`, `OutputIdsInput`,
+  `ImageEmbeddingsInput`, `AttnMaskInput`).
+  That coupling in (c) is **correct, not accidental**: creating the node and its
+  input together is what prevents "node built but input never filled" — which is
+  precisely the qwen36 vision bug (§7). Pulling them out as free functions would
+  mean threading `meta_`, `model_`, the arena, `graph_inputs_`, `policy_`,
+  `sparse_decode_ids_` and `image_spliced_` through 5-6 parameters each, i.e.
+  trading a cohesive class for the fat-parameter smell CLAUDE.md warns about.
+  So the honest end state is a SMALL base class, not none. Per-step arming
+  (`sparse_decode_ids_`, the rope-divergence record) is the remaining candidate
+  to move; the (c) group should stay.
 - **The attention free functions sit at two altitudes under one naming scheme.**
   `build_attention`/`build_batched_attention` take already-projected Q/K/V (an
   attention *core*); `build_gated_attention`/`build_gated_batched_attention` take

@@ -384,19 +384,6 @@ protected:
         ggml_tensor* mw,
         int il) const;
 
-    // Core multi-head attention: Q @ K^T → softmax → @ V
-    // Handles GQA, permutations, stream splitting, and recombination.
-    ggml_tensor* build_attn_mha(
-        ggml_cgraph* gf,
-        ggml_tensor* q,
-        ggml_tensor* k,
-        ggml_tensor* v,
-        ggml_tensor* kq_mask,
-        ggml_tensor* sinks,
-        float kq_scale,
-        uint32_t pos,
-        int il) const;
-
     // Build the output head: final norm → LM head matmul → "logits" tensor
     // valid_idx: [k] int32 input tensor selecting which vocab rows to compute;
     // nullptr = dense (full vocab). Use when the caller knows the candidate set
