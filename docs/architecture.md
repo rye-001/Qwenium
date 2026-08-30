@@ -290,24 +290,25 @@ byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
 `test_decode_graph_cache`).
 
 **Flash attention** (CLI/server `--flash-attn`, `DecodePolicy::AttnImpl`): on
-the **decode path only**, one `ggml_flash_attn_ext` replaces the whole
+**both prefill and decode**, one `ggml_flash_attn_ext` replaces the whole
 `kq` → `soft_max` → `kqv` chain *and* the V transpose — four Metal dispatches
-per attention layer become one. Prefill stays materialized on every recipe:
-its mask is `[n_kv × n_tokens]`, and converting that to the F16 mask
-`ggml_flash_attn_ext` hard-asserts would cost more than flash saves, while
-prefill is already at parity with llama.cpp. The recipe casts its decode mask
-to F16 once per graph (Gemma 3 dedupes by window first); `build_attn_mha`
-refuses an F32 mask and refuses a non-zero softcap, naming the layer — our
-materialized path scales *before* the tanh clamp where llama clamps the raw QK
-product, and the two are not the same function, so Gemma 2 is out of scope
-until that convention is proven against ggml. Token-stable, **not
-byte-identical** (the softmax reduces in registers, in a different order), so
-it is opt-in like `--persistent-graph`. Qwen 3.5, Qwen 3.6, Gemma 3 and Gemma 4
-today (`supports_flash_attn()`); other recipes refuse the flag rather than
-silently running the materialized path. **It is worth far more on Gemma than on
-Qwen** — 19–29% of a decode step against 8–9% — because a Qwen hybrid spends
-most of its step in DeltaNet and MoE, which flash does not touch, while a Gemma
-stack is attention all the way down (§10 of the gap ledger). Qwen 3.6 came almost free — it shares
+per attention layer become one. On decode the recipe casts its mask to F16 once
+per graph (Gemma 2/3/4 dedupe by window first); on prefill the mask is built per
+layer inside the attention helper, so the cast lives there. `build_attn_mha`
+refuses an F32 mask, naming the layer, and forwards softcap — ggml applies the
+scale before the tanh clamp, our convention. **Prefill is where it pays most**:
+materialized attention is O(n²) in the prompt length, so the win grows from ~7%
+at 756 tokens to ~55% at 3000 on attention-heavy recipes, and it is what keeps
+prefill competitive at the 10K envelope. Token-stable, **not byte-identical**
+(the softmax reduces in registers, in a different order), so
+it is opt-in like `--persistent-graph`, and **every recipe supports it**
+(`supports_flash_attn()`). Gemma 2's attention softcap forwards to the kernel:
+ggml pre-divides `scale /= logit_softcap` and computes
+`logit_softcap*tanh(s*scale)` — the scale applied before the clamp, which is
+our convention and HF's. **What flash is worth varies by an order of magnitude
+across models — 4% to 33% of a decode step — and is not predictable from family
+or layer count**; see §16–§17 of the gap ledger for the seven-model measurement
+and why the obvious generalizations are wrong. Qwen 3.6 came almost free — it shares
 `qwen35_family`'s layer body, so the recipe-side change was the F16 mask cast
 and one flag on `Qwen35LayerCommon`. On the MoE hybrid only the 9 attention
 layers change; the 36 MoE routers keep their own `SOFT_MAX` and the experts

@@ -295,7 +295,9 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
 
         inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
-                                       static_cast<uint32_t>(n_tokens));
+                                       static_cast<uint32_t>(n_tokens),
+                                       /*ple_residual=*/nullptr,
+                                       /*use_flash=*/use_flash_attn());
 
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);

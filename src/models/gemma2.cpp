@@ -16,6 +16,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 // ── Gemma2Config::from_metadata ───────────────────────────────────────────────
 
@@ -210,7 +211,9 @@ ggml_cgraph* Gemma2ForwardPass::build_prefill_graph(
 
         inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
-                                       static_cast<uint32_t>(n_tokens));
+                                       static_cast<uint32_t>(n_tokens),
+                                       /*ple_residual=*/nullptr,
+                                       /*use_flash=*/use_flash_attn());
 
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);
@@ -320,6 +323,24 @@ ggml_cgraph* Gemma2ForwardPass::build_decoding_graph(
     graph_inputs_.add(std::make_unique<PositionsInput>());
     std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
         gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
+
+    // Flash attention (opt-in --flash-attn) needs F16 masks —
+    // ggml_flash_attn_ext hard-asserts it. Gemma 2 interleaves local/global
+    // attention, so build_decode_layer_masks already deduplicates to a couple
+    // of DISTINCT tensors; cast each once, not once per layer. The F32 tensors
+    // stay the graph inputs AttnMaskInput fills.
+    if (use_flash_attn()) {
+        std::unordered_map<ggml_tensor*, ggml_tensor*> mask_f16;
+        for (ggml_tensor*& mm : layer_masks) {
+            auto it = mask_f16.find(mm);
+            if (it == mask_f16.end()) {
+                ggml_tensor* c = ggml_cast(arena_.ctx(), mm, GGML_TYPE_F16);
+                ggml_set_name(c, "kq_mask_f16");
+                it = mask_f16.emplace(mm, c).first;
+            }
+            mm = it->second;
+        }
+    }
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(kv_cache_->get_n_ctx_max()));
 
     // 2. Transformer stack — hand-rolled batched decode (mirrors Gemma 1 decode).
@@ -340,7 +361,9 @@ ggml_cgraph* Gemma2ForwardPass::build_decoding_graph(
         Qcur = ggml_rope_ext(arena_.ctx(), Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         Kcur = ggml_rope_ext(arena_.ctx(), Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, layer_masks[il], gather_indices, il, config_.attn_softcap);
+        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, layer_masks[il], gather_indices, il, config_.attn_softcap,
+                                      /*kv_write_indices=*/nullptr,
+                                      /*use_flash=*/use_flash_attn());
         cur = ggml_mul_mat(arena_.ctx(), block.attn_output_weight, cur);
         cur = build_norm(gf, cur, post_attn_norm_[il], il);
         ggml_tensor* ffn_inp = ggml_add(arena_.ctx(), cur, inpSA);

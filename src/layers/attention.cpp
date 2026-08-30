@@ -191,27 +191,22 @@ ggml_tensor* build_attn_mha(
                 " slot 'kq_mask': flash attention expected type F16, got: " +
                 ggml_type_name(kq_mask->type));
         }
-        // Softcap is deliberately refused rather than guessed. Our materialized
-        // path applies the 1/sqrt(d) scale BEFORE the tanh clamp
-        // (cap * tanh(QK^T/sqrt(d) / cap), see the note below); llama applies
-        // the clamp to the raw QK product and scales inside the softmax. The
-        // two are not the same function, so forwarding softcap to
-        // ggml_flash_attn_ext without first proving which convention it
-        // implements would silently change Gemma 2's attention.
-        if (softcap > 0.0f) {
-            throw std::runtime_error(
-                std::string("build_attn_mha: layer ") + std::to_string(il) +
-                " expected softcap 0 with flash attention (scale-before-tanh "
-                "convention is unverified against ggml_flash_attn_ext), got: " +
-                std::to_string(softcap));
-        }
-
+        // Softcap forwards directly, because ggml implements OUR convention.
+        // Verified 2026-08-30 in both backends rather than assumed: the host
+        // pre-divides (`scale /= logit_softcap`) and the kernel then computes
+        // `s*scale` followed by `logit_softcap*tanh(s)` — i.e.
+        // cap * tanh(QK·scale / cap), the scale applied BEFORE the clamp, and
+        // the mask added after. That is exactly build_softcap composed after
+        // ggml_scale(kq, kq_scale) on the materialized path below, and matches
+        // HF Gemma 2. (This was refused until the convention was checked; the
+        // worry was that llama applies the clamp to the raw QK product, which
+        // it can do because it folds the scale into Q beforehand.)
         ggml_tensor* v_flash = ggml_permute(ctx, v, 0, 2, 1, 3);
         set_name(v_flash, "v_permuted", il);
 
         ggml_tensor* cur = ggml_flash_attn_ext(ctx, q, k, v_flash, kq_mask,
                                                kq_scale, 0.0f /* max_bias */,
-                                               0.0f /* logit_softcap */);
+                                               softcap);
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         if (sinks) ggml_flash_attn_ext_add_sinks(cur, sinks);
         set_name(cur, "kqv_flash", il);
@@ -335,8 +330,20 @@ ggml_tensor* build_attention(
     set_name(kq_mask, "kq_mask", il);
     ggml_build_forward_expand(gf, kq_mask);
 
+    // Flash attention needs an F16 mask. Unlike the decode path — where the
+    // recipe owns one mask for the whole graph and casts it once — the prefill
+    // mask is built HERE, per layer, at [n_kv x n_tokens]. So the cast is per
+    // layer too. It is O(n^2) bytes, but so is the kq it replaces, and flash
+    // never materializes that: see docs/decode-gap-status.md §18 for the
+    // measurement rather than the argument.
+    ggml_tensor* mha_mask = kq_mask;
+    if (use_flash) {
+        mha_mask = ggml_cast(ctx, kq_mask, GGML_TYPE_F16);
+        set_name(mha_mask, "kq_mask_f16", il);
+    }
+
     // 5. Run MHA
-    return build_attn_mha(ctx, gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il, softcap, use_flash);
+    return build_attn_mha(ctx, gf, q, k, v, mha_mask, nullptr, kq_scale, pos, il, softcap, use_flash);
 }
 
 // ── build_batched_attention ──────────────────────────────────────────────────
@@ -565,7 +572,19 @@ ggml_tensor* build_gated_attention(
     set_name(kq_mask, "kq_mask", il);
     ggml_build_forward_expand(gf, kq_mask);
 
-    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, cache_pos, il, 0.0f, use_flash);
+    // Flash attention needs an F16 mask. Unlike the decode path — where the
+    // recipe owns one mask for the whole graph and casts it once — the prefill
+    // mask is built HERE, per layer, at [n_kv x n_tokens]. So the cast is per
+    // layer too. It is O(n^2) bytes, but so is the kq it replaces, and flash
+    // never materializes that: see docs/decode-gap-status.md §18 for the
+    // measurement rather than the argument.
+    ggml_tensor* mha_mask = kq_mask;
+    if (use_flash) {
+        mha_mask = ggml_cast(ctx, kq_mask, GGML_TYPE_F16);
+        set_name(mha_mask, "kq_mask_f16", il);
+    }
+
+    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, mha_mask, nullptr, kq_scale, cache_pos, il, 0.0f, use_flash);
 
     // G. Sigmoid gating
     cur = ggml_mul(ctx, cur, ggml_sigmoid(ctx, gate));

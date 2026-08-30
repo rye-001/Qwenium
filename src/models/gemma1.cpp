@@ -131,7 +131,9 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
 
         inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
-                                       static_cast<uint32_t>(n_tokens));
+                                       static_cast<uint32_t>(n_tokens),
+                                       /*ple_residual=*/nullptr,
+                                       /*use_flash=*/use_flash_attn());
         // Diagnostic: keep each layer's output alive so we can compare per-layer.
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);
@@ -242,6 +244,17 @@ ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
     //    Qwen3ForwardPass::build_decoding_graph). Gemma 1 deltas vs Qwen3:
     //    no QKV bias, no QK norm, GeGLU FFN instead of SwiGLU. Same batched
     //    attention kernel (build_batched_attention).
+
+    // Flash attention (opt-in --flash-attn) needs an F16 mask —
+    // ggml_flash_attn_ext hard-asserts it. One causal mask shared by every
+    // layer, so one cast per graph. The F32 tensor stays the graph input
+    // AttnMaskInput fills; only what attention reads changes.
+    ggml_tensor* attn_mask = kq_mask;
+    if (use_flash_attn()) {
+        attn_mask = ggml_cast(arena_.ctx(), kq_mask, GGML_TYPE_F16);
+        ggml_set_name(attn_mask, "kq_mask_b_f16");
+    }
+
     ggml_tensor* cur;
     for (uint32_t il = 0; il < static_cast<uint32_t>(n_layers); ++il) {
         ggml_tensor* inpSA = inpL;
@@ -276,7 +289,10 @@ ggml_cgraph* Gemma1ForwardPass::build_decoding_graph(
         float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
         cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur,
                                       il, kq_scale, slots, positions,
-                                      kq_mask, gather_indices, il);
+                                      attn_mask, gather_indices, il,
+                                      /*softcap=*/0.0f,
+                                      /*kv_write_indices=*/nullptr,
+                                      /*use_flash=*/use_flash_attn());
 
         // E. Output projection + post-attention residual.
         cur = ggml_mul_mat(arena_.ctx(), block.attn_output_weight, cur);

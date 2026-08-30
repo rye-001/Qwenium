@@ -284,7 +284,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // a parameter (moe_hp null here ⇒ dense SwiGLU).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        /*moe_hp=*/nullptr};
+        /*moe_hp=*/nullptr, use_flash_attn()};
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         const uint32_t dn_idx = cfg_.is_ssm_layer(il)

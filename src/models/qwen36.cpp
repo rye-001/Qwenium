@@ -250,7 +250,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // differ only in the FFN, which is the moe_hp parameter (non-null here).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        &moe_hp_};
+        &moe_hp_, use_flash_attn()};
 
     for (uint32_t il = 0; il < n_main_layers_; ++il) {
         const bool ssm = cfg_.is_ssm_layer(il);
@@ -474,7 +474,8 @@ ggml_cgraph* Qwen36ForwardPass::build_mtp_graph(uint32_t n_past)
         n_rot_, m.rope_freq_base,
         static_cast<int>(m.context_length),
         m.rms_norm_eps,
-        cfg_.mrope_sections);
+        cfg_.mrope_sections,
+        use_flash_attn());
     cur = ggml_add(arena_.ctx(), cur, inpSA);
 
     ggml_tensor* ffn_inp = cur;

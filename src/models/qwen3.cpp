@@ -133,7 +133,9 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
 
         inpL = build_transformer_layer(arena_.ctx(), gf, kv_cache_.get(), inpL, inp_pos,
                                        w, blk_hp, il, slot_idx,
-                                       static_cast<uint32_t>(n_tokens));
+                                       static_cast<uint32_t>(n_tokens),
+                                       /*ple_residual=*/nullptr,
+                                       /*use_flash=*/use_flash_attn());
     }
 
     // 3. Final normalization and output projection
@@ -211,6 +213,17 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         kv_cache_->get_n_ctx_max()));
 
+
+    // Flash attention (opt-in --flash-attn) needs an F16 mask —
+    // ggml_flash_attn_ext hard-asserts it. One causal mask shared by every
+    // layer, so one cast per graph. The F32 tensor stays the graph input
+    // AttnMaskInput fills; only what attention reads changes.
+    ggml_tensor* attn_mask = kq_mask;
+    if (use_flash_attn()) {
+        attn_mask = ggml_cast(arena_.ctx(), kq_mask, GGML_TYPE_F16);
+        ggml_set_name(attn_mask, "kq_mask_b_f16");
+    }
+
     // 2. Transformer Blocks
     ggml_tensor * cur;
     for (uint32_t il = 0; il < n_layers; ++il) {
@@ -248,7 +261,10 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // D. Attention (Batched)
         float kq_scale = 1.0f/sqrtf(float(n_embd_head));
-        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, kq_mask, gather_indices, il);
+        cur = build_batched_attention(arena_.ctx(), gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, attn_mask, gather_indices, il,
+                                      /*softcap=*/0.0f,
+                                      /*kv_write_indices=*/nullptr,
+                                      /*use_flash=*/use_flash_attn());
 
         // E. Output Projection & Residual
         cur = ggml_mul_mat(arena_.ctx(), block.attn_output_weight, cur);

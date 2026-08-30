@@ -92,11 +92,11 @@ TEST(MRopeSections, AcceptsAnyWidthConsistentWithNRot) {
 //   * an F32 mask — ggml_flash_attn_ext hard-asserts F16, so without this check
 //     a recipe that forgot the cast would abort inside ggml with no mention of
 //     which recipe or layer;
-//   * a non-zero softcap — our materialized path applies the 1/sqrt(d) scale
-//     BEFORE the tanh clamp, llama applies the clamp to the raw QK product.
-//     Forwarding softcap without proving which convention ggml implements
-//     would silently change Gemma 2's attention.
-// Both are pure graph-build checks, so they need no backend and no model.
+// The F32-mask refusal is load-bearing: ggml_flash_attn_ext hard-asserts F16,
+// so without it a recipe that forgot the cast would abort inside ggml with no
+// mention of which recipe or layer. Softcap, by contrast, is FORWARDED — see
+// ForwardsSoftcapToTheFlashKernel below. Both are pure graph-build checks, so
+// they need no backend and no model.
 
 namespace {
 struct MhaCtx {
@@ -126,12 +126,20 @@ TEST(BuildAttnMhaFlash, RefusesF32MaskNamingTheSlot) {
                  std::runtime_error);
 }
 
-TEST(BuildAttnMhaFlash, RefusesNonZeroSoftcap) {
+TEST(BuildAttnMhaFlash, ForwardsSoftcapToTheFlashKernel) {
+    // Gemma 2's attention softcap used to be refused here, while ggml's clamp
+    // convention was unverified. It was then checked in both backends: the host
+    // pre-divides (scale /= logit_softcap) and the kernel computes
+    // logit_softcap*tanh(s*scale) — the scale applied BEFORE the clamp, which
+    // is what build_softcap composed after ggml_scale does on the materialized
+    // path. So it is forwarded, and a non-zero softcap must NOT throw.
     MhaCtx c;
-    EXPECT_THROW(build_attn_mha(c.ctx, c.gf, c.q, c.k, c.v, c.mask(GGML_TYPE_F16),
-                                nullptr, 0.125f, 0, /*il=*/3, /*softcap=*/30.0f,
-                                /*use_flash=*/true),
-                 std::runtime_error);
+    ggml_tensor* out = nullptr;
+    EXPECT_NO_THROW(out = build_attn_mha(c.ctx, c.gf, c.q, c.k, c.v,
+                                         c.mask(GGML_TYPE_F16), nullptr, 0.125f,
+                                         0, /*il=*/3, /*softcap=*/30.0f,
+                                         /*use_flash=*/true));
+    ASSERT_NE(out, nullptr);
 }
 
 TEST(BuildAttnMhaFlash, MaterializedPathAcceptsF32MaskAndSoftcap) {

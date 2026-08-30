@@ -170,7 +170,8 @@ ggml_tensor* build_qwen35_layer_prefill(
             m.rope_freq_base,
             static_cast<int>(m.context_length),
             m.rms_norm_eps,
-            cfg.mrope_sections);
+            cfg.mrope_sections,
+            c.use_flash);
     }
 
     cur = ggml_add(c.ctx, cur, inpSA);

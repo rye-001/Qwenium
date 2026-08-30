@@ -484,7 +484,8 @@ ggml_tensor* Gemma4ForwardPass::build_block(
                               kq_scale, n_tokens, phase.slot_idx,
                               /*il=*/static_cast<int>(il),
                               head_dim, head_dim, n_kv_heads,
-                              /*softcap=*/0.0f);
+                              /*softcap=*/0.0f,
+                              /*use_flash=*/use_flash_attn());
     }
 
     cur = ggml_mul_mat(arena_.ctx(), w.attn_output, cur);
