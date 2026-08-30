@@ -73,6 +73,12 @@ public:
     // KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
+    // Flash attention on decode. Gemma 2 is the only recipe with a NON-ZERO
+    // attention softcap, and it is forwarded to ggml_flash_attn_ext, whose
+    // clamp convention was verified to match ours (scale before tanh) —
+    // see build_attn_mha.
+    bool supports_flash_attn() const override { return true; }
+
     // build_decoding_graph is implemented (Phase 2 of
     // docs/plan-gemma-batched-decode.md), so Gemma 2 decodes through the
     // batched decode path like every other recipe.

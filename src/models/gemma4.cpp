@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -474,14 +475,17 @@ ggml_tensor* Gemma4ForwardPass::build_block(
                                       (*phase.layer_masks)[il],
                                       phase.gather_indices,
                                       /*il=*/static_cast<int>(il),
-                                      /*softcap=*/0.0f);
+                                      /*softcap=*/0.0f,
+                                      /*kv_write_indices=*/nullptr,
+                                      /*use_flash=*/use_flash_attn());
     } else {
         cur = build_attention(arena_.ctx(), gf, cache, Qcur, Kcur, Vcur,
                               /*layer_idx=*/cache_il,
                               kq_scale, n_tokens, phase.slot_idx,
                               /*il=*/static_cast<int>(il),
                               head_dim, head_dim, n_kv_heads,
-                              /*softcap=*/0.0f);
+                              /*softcap=*/0.0f,
+                              /*use_flash=*/use_flash_attn());
     }
 
     cur = ggml_mul_mat(arena_.ctx(), w.attn_output, cur);
@@ -738,6 +742,26 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     graph_inputs_.add(std::make_unique<PositionsInput>());
     std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(
         gf, layer_windows, n_kv_len, static_cast<uint32_t>(n_tokens));
+
+    // Flash attention (opt-in --flash-attn) needs F16 masks —
+    // ggml_flash_attn_ext hard-asserts it. The masks above are already
+    // deduplicated by window (global + sliding ⇒ 2 distinct tensors repeated
+    // across layers), so cast each DISTINCT one once rather than once per
+    // layer. The F32 tensors stay the graph inputs AttnMaskInput fills; only
+    // what attention reads changes.
+    if (use_flash_attn()) {
+        std::unordered_map<ggml_tensor*, ggml_tensor*> mask_f16;
+        for (ggml_tensor*& m : layer_masks) {
+            auto it = mask_f16.find(m);
+            if (it == mask_f16.end()) {
+                ggml_tensor* c = ggml_cast(arena_.ctx(), m, GGML_TYPE_F16);
+                ggml_set_name(c, "kq_mask_f16");
+                it = mask_f16.emplace(m, c).first;
+            }
+            m = it->second;
+        }
+    }
+
     graph_inputs_.add(std::make_unique<GatherIndicesInput>(
         kv_cache_global_->get_n_ctx_max()));
 

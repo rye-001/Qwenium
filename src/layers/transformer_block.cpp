@@ -25,7 +25,8 @@ ggml_tensor* build_transformer_layer(
     uint32_t                       il,
     uint32_t                       slot_idx,
     uint32_t                       n_tokens,
-    ggml_tensor*                   ple_residual)
+    ggml_tensor*                   ple_residual,
+    bool                           use_flash)
 {
     // G4.2: PLE second-residual injection.
     // Injection point: block entry, before the pre-attention norm.  The
@@ -124,7 +125,7 @@ ggml_tensor* build_transformer_layer(
                           static_cast<int>(il), kq_scale, n_tokens, slot_idx,
                           static_cast<int>(il),
                           head_dim_k, head_dim_v, hp.n_head_kv,
-                          hp.attn_softcap);
+                          hp.attn_softcap, use_flash);
 
     // F. Output projection
     cur = ggml_mul_mat(ctx, w.out, cur);

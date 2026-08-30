@@ -50,6 +50,11 @@ public:
     // recurrent state); still owes its own KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
+    // Flash attention on decode: one causal mask, cast to F16 per graph, and
+    // no attention softcap on this recipe — so build_attn_mha's two refusals
+    // are both satisfied.
+    bool supports_flash_attn() const override { return true; }
+
     // build_decoding_graph is the real batched decode path
     // (docs/plan-gemma-batched-decode.md Phase 1). Before it existed, Gemma
     // decoded one token at a time through a run_prefill bridge in decode_step;

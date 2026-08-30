@@ -35,6 +35,12 @@ public:
         const std::vector<int32_t>& positions
     ) override;
 
+    // Flash attention on decode: one causal mask, cast to F16 per graph, and
+    // no attention softcap on this recipe — so build_attn_mha's two refusals
+    // are both satisfied. Covers both architectures this recipe hosts (qwen2,
+    // qwen3); the QKV-bias and QK-norm forks are upstream of attention.
+    bool supports_flash_attn() const override { return true; }
+
     // --- Cache management ---
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx) override {
         if (kv_cache_) kv_cache_->advance(n_tokens, slot_idx);

@@ -156,12 +156,10 @@ ggml_tensor* build_attn_mha(
     float         kq_scale,
     uint32_t      pos,
     int           il,
-    float         softcap)
+    float         softcap,
+    bool          use_flash)
 {
     (void)gf; (void)pos; // gf/pos unused directly; kept for API symmetry with callers
-
-    const bool v_trans = v->nb[1] > v->nb[2];
-    (void)v_trans;
 
     const auto n_stream = k->ne[3];
 
@@ -172,6 +170,55 @@ ggml_tensor* build_attn_mha(
     set_name(q, "q_permuted", il);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     set_name(k, "k_permuted", il);
+
+    // ── Flash attention (opt-in, --flash-attn) ───────────────────────────────
+    // One ggml_flash_attn_ext replaces kq -> soft_max -> kqv AND the V
+    // transpose: the op consumes V in the same [d, n_kv, n_head_kv] layout as
+    // K, so the ggml_cont below is not needed here. Four dispatches per
+    // attention layer become one.
+    //
+    // NOT byte-identical to the materialized path (the softmax is reduced in
+    // registers, in a different order), and kq_soft never exists — which is
+    // why DecodePolicy pairs this with an empty attention_taps set and the
+    // front ends refuse --flash-attn together with --attention-lens.
+    if (use_flash) {
+        // ggml_flash_attn_ext hard-asserts an F16 mask (ggml.c). The recipe
+        // casts once per graph rather than once per layer; a recipe that
+        // forgets gets this message instead of an abort inside ggml.
+        if (kq_mask->type != GGML_TYPE_F16) {
+            throw std::runtime_error(
+                std::string("build_attn_mha: layer ") + std::to_string(il) +
+                " slot 'kq_mask': flash attention expected type F16, got: " +
+                ggml_type_name(kq_mask->type));
+        }
+        // Softcap forwards directly, because ggml implements OUR convention.
+        // Verified 2026-08-30 in both backends rather than assumed: the host
+        // pre-divides (`scale /= logit_softcap`) and the kernel then computes
+        // `s*scale` followed by `logit_softcap*tanh(s)` — i.e.
+        // cap * tanh(QK·scale / cap), the scale applied BEFORE the clamp, and
+        // the mask added after. That is exactly build_softcap composed after
+        // ggml_scale(kq, kq_scale) on the materialized path below, and matches
+        // HF Gemma 2. (This was refused until the convention was checked; the
+        // worry was that llama applies the clamp to the raw QK product, which
+        // it can do because it folds the scale into Q beforehand.)
+        ggml_tensor* v_flash = ggml_permute(ctx, v, 0, 2, 1, 3);
+        set_name(v_flash, "v_permuted", il);
+
+        ggml_tensor* cur = ggml_flash_attn_ext(ctx, q, k, v_flash, kq_mask,
+                                               kq_scale, 0.0f /* max_bias */,
+                                               softcap);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        if (sinks) ggml_flash_attn_ext_add_sinks(cur, sinks);
+        set_name(cur, "kqv_flash", il);
+
+        // FA already emits [d, n_head, n_q, n_stream] — the layout the
+        // materialized path reaches only after its kqv permute — so this is
+        // the same recombination, one step shorter.
+        cur = ggml_reshape_2d(ctx, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        set_name(cur, "attn_recombined", il);
+        return cur;
+    }
+
     v = ggml_permute(ctx, v, 1, 2, 0, 3);
     set_name(v, "v_permuted", il);
     v = ggml_cont(ctx, v);
@@ -236,7 +283,8 @@ ggml_tensor* build_attention(
     int              head_dim_k,
     int              head_dim_v,
     int              n_head_kv,
-    float            softcap)
+    float            softcap,
+    bool             use_flash)
 {
     const uint32_t pos  = kv_cache->get_pos(slot_idx);
     const uint32_t n_kv = pos + n_tokens;
@@ -282,8 +330,20 @@ ggml_tensor* build_attention(
     set_name(kq_mask, "kq_mask", il);
     ggml_build_forward_expand(gf, kq_mask);
 
+    // Flash attention needs an F16 mask. Unlike the decode path — where the
+    // recipe owns one mask for the whole graph and casts it once — the prefill
+    // mask is built HERE, per layer, at [n_kv x n_tokens]. So the cast is per
+    // layer too. It is O(n^2) bytes, but so is the kq it replaces, and flash
+    // never materializes that: see docs/decode-gap-status.md §18 for the
+    // measurement rather than the argument.
+    ggml_tensor* mha_mask = kq_mask;
+    if (use_flash) {
+        mha_mask = ggml_cast(ctx, kq_mask, GGML_TYPE_F16);
+        set_name(mha_mask, "kq_mask_f16", il);
+    }
+
     // 5. Run MHA
-    return build_attn_mha(ctx, gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il, softcap);
+    return build_attn_mha(ctx, gf, q, k, v, mha_mask, nullptr, kq_scale, pos, il, softcap, use_flash);
 }
 
 // ── build_batched_attention ──────────────────────────────────────────────────
@@ -304,7 +364,8 @@ ggml_tensor* build_batched_attention(
     ggml_tensor*                 gather_indices,
     int                          il,
     float                        softcap,
-    ggml_tensor*                 kv_write_indices)
+    ggml_tensor*                 kv_write_indices,
+    bool                         use_flash)
 {
     const size_t n_batch    = slots.size();
     const int    n_embd_head = k->ne[0];
@@ -339,8 +400,27 @@ ggml_tensor* build_batched_attention(
         set_name(v_stored, "v_stored_b", il);
         ggml_build_forward_expand(gf, v_stored);
 
-        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather on the set_rows path too — see gather_k_single.
+            // The read is a plain view of the cache, so it carries no data edge
+            // to the set_rows write above; ordering rests on the write being
+            // expanded first PLUS the Metal backend's memory-range analysis,
+            // which sees the view and the write aliasing the same cache bytes.
+            // Both of the backend's passes honour that: the encode-time
+            // concurrency check inserts a barrier for overlapping ranges, and
+            // the reorder pass refuses to hoist a node past unprocessed nodes it
+            // overlaps (SET_ROWS is not in its reorderable set at all). This is
+            // exactly what llama.cpp does — its get_k is a bare ggml_view_4d of
+            // the cache next to a set_rows write. Gated by the ordering test in
+            // test_kv_write_setrows.cpp, which runs the persistent shape with
+            // graph-optimize both enabled and disabled.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, layer_idx, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, layer_idx, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        }
     } else {
         ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, k, n_embd_k, 1, n_batch);
         ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, v, n_embd_v, 1, n_batch);
@@ -363,8 +443,25 @@ ggml_tensor* build_batched_attention(
             ggml_build_forward_expand(gf, v_stored);
         }
 
-        k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather: one active slot means the index run is one
+            // contiguous span, so the read is a free view of the cache instead
+            // of two materializing GET_ROWS (docs/decode-gap-status.md §4).
+            // Values, strides and layout are unchanged, so the consuming
+            // mul_mat is bit-identical to the gathered path.
+            //
+            // gather_indices is no longer consumed here, so expand it to keep
+            // it in the graph: GatherIndicesInput still owns the slot and its
+            // require_tensor lookup is fail-loud on an absent tensor. That
+            // costs an n_kv-int32 upload per step, immaterial against the
+            // 2 x n_kv x n_embd copy it removes.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, layer_idx, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, layer_idx, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+        }
     }
 
     // 3. Reshape for attention
@@ -383,7 +480,7 @@ ggml_tensor* build_batched_attention(
         0);
 
     // 4. Run MHA
-    return build_attn_mha(ctx, gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il, softcap);
+    return build_attn_mha(ctx, gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il, softcap, use_flash);
 }
 
 // ── build_gated_attention ─────────────────────────────────────────────────────
@@ -412,7 +509,8 @@ ggml_tensor* build_gated_attention(
     float            freq_base,
     int              context_length,
     float            rms_norm_eps,
-    const MRopeSections& mrope)
+    const MRopeSections& mrope,
+    bool             use_flash)
 {
     // A. Joint Q+Gate projection
     ggml_tensor* Qcur_full = ggml_mul_mat(ctx, w_q, cur);
@@ -474,7 +572,19 @@ ggml_tensor* build_gated_attention(
     set_name(kq_mask, "kq_mask", il);
     ggml_build_forward_expand(gf, kq_mask);
 
-    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, cache_pos, il);
+    // Flash attention needs an F16 mask. Unlike the decode path — where the
+    // recipe owns one mask for the whole graph and casts it once — the prefill
+    // mask is built HERE, per layer, at [n_kv x n_tokens]. So the cast is per
+    // layer too. It is O(n^2) bytes, but so is the kq it replaces, and flash
+    // never materializes that: see docs/decode-gap-status.md §18 for the
+    // measurement rather than the argument.
+    ggml_tensor* mha_mask = kq_mask;
+    if (use_flash) {
+        mha_mask = ggml_cast(ctx, kq_mask, GGML_TYPE_F16);
+        set_name(mha_mask, "kq_mask_f16", il);
+    }
+
+    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, mha_mask, nullptr, kq_scale, cache_pos, il, 0.0f, use_flash);
 
     // G. Sigmoid gating
     cur = ggml_mul(ctx, cur, ggml_sigmoid(ctx, gate));
@@ -516,7 +626,8 @@ ggml_tensor* build_gated_batched_attention(
     int                          context_length,
     float                        rms_norm_eps,
     ggml_tensor*                 kv_write_indices,
-    const MRopeSections&         mrope)
+    const MRopeSections&         mrope,
+    bool                         use_flash)
 {
     const size_t n_batch = slots.size();
 
@@ -572,8 +683,27 @@ ggml_tensor* build_gated_batched_attention(
         ggml_tensor* v_stored = kv_cache->set_rows_v(ctx, v_rows, kv_cache_layer, kv_write_indices);
         ggml_build_forward_expand(gf, k_stored);
         ggml_build_forward_expand(gf, v_stored);
-        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather on the set_rows path too — see gather_k_single.
+            // The read is a plain view of the cache, so it carries no data edge
+            // to the set_rows write above; ordering rests on the write being
+            // expanded first PLUS the Metal backend's memory-range analysis,
+            // which sees the view and the write aliasing the same cache bytes.
+            // Both of the backend's passes honour that: the encode-time
+            // concurrency check inserts a barrier for overlapping ranges, and
+            // the reorder pass refuses to hoist a node past unprocessed nodes it
+            // overlaps (SET_ROWS is not in its reorderable set at all). This is
+            // exactly what llama.cpp does — its get_k is a bare ggml_view_4d of
+            // the cache next to a set_rows write. Gated by the ordering test in
+            // test_kv_write_setrows.cpp, which runs the persistent shape with
+            // graph-optimize both enabled and disabled.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        }
     } else {
         ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, Kcur, n_embd_k, 1, n_batch);
         ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, Vcur, n_embd_v, 1, n_batch);
@@ -588,8 +718,25 @@ ggml_tensor* build_gated_batched_attention(
             ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx, v_slice, kv_cache_layer, slots[b]));
         }
 
-        k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather: one active slot means the index run is one
+            // contiguous span, so the read is a free view of the cache instead
+            // of two materializing GET_ROWS (docs/decode-gap-status.md §4).
+            // Values, strides and layout are unchanged, so the consuming
+            // mul_mat is bit-identical to the gathered path.
+            //
+            // gather_indices is no longer consumed here, so expand it to keep
+            // it in the graph: GatherIndicesInput still owns the slot and its
+            // require_tensor lookup is fail-loud on an absent tensor. That
+            // costs an n_kv-int32 upload per step, immaterial against the
+            // 2 x n_kv x n_embd copy it removes.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+        }
     }
 
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
@@ -605,7 +752,7 @@ ggml_tensor* build_gated_batched_attention(
 
     // H. Attention
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
+    cur = build_attn_mha(ctx, gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il, 0.0f, use_flash);
 
     // I. Sigmoid gating
     cur = ggml_mul(ctx, cur, ggml_sigmoid(ctx, gate));

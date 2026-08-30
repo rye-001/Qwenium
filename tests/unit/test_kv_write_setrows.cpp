@@ -35,6 +35,7 @@
 #include "../../src/models/gemma3.h"
 #include "../../src/graph_inputs/kv_write_indices_input.h"
 #include "../../src/state/kv_cache_simple.h"
+#include "../../src/session/slot_snapshot.h"
 
 // ── Pure-unit: KvWriteIndicesInput ───────────────────────────────────────────
 
@@ -236,6 +237,147 @@ static void run_write_mode_differential(const std::string& path) {
             << "K/V cache span " << i << " (layer " << i / 2 << ", "
             << (i % 2 == 0 ? "K" : "V") << "): written bytes differ between "
             << "Cpy and SetRows writes over rows [0, " << pos_end << ").";
+}
+
+// ── Ordering: the single-slot read must not precede the set_rows write ──────
+//
+// At n_batch == 1 the set_rows path reads the cache through a plain view
+// (simple_kv_cache::gather_k_single) instead of ggml_get_rows, so the read
+// carries NO data edge to the write. Two things make that safe: (a) the write
+// is build_forward_expand'd into the graph before the read is built, and (b)
+// the Metal backend's memory-range analysis sees the two aliasing the same
+// cache bytes and both barriers and refuses to reorder across them.
+//
+// (b) is llama.cpp's own arrangement and belongs to the backend. (a) is OURS,
+// and this pins it: in a built SetRows decode graph, no node may READ the bytes
+// of a KV cache tensor before the SET_ROWS node that writes it. A builder
+// change that emitted the read first would still pass the bitwise differential
+// above whenever scheduling happened to serialize it; this fails deterministically.
+template <typename FP>
+static void run_setrows_order_check(const std::string& path) {
+    if (!file_exists(path))
+        GTEST_SKIP() << "model absent: " << path;
+
+    register_builtin_models();
+    Model model;
+    model.load_metadata(path);
+    model.load_tensors();
+    const auto& meta = model.get_metadata();
+    ggml_backend_sched_t sched = model.get_scheduler();
+
+    // The persistent shape: value-driven write + bucketed read width.
+    FP fp(model, &meta, 1024, 1);
+    fp.set_kv_write_mode(ForwardPassBase::KvWriteMode::SetRows);
+    fp.set_decode_kv_bucket(256);
+    fp.run_prefill(mk_tokens(11, 12), 0, 0, sched);
+
+    const std::vector<int32_t>  tokens{7};
+    const std::vector<uint32_t> slots{0};
+    const std::vector<int32_t>  positions{12};
+    ggml_backend_sched_reset(sched);
+    ggml_cgraph* gf = fp.build_decoding_graph(tokens, slots, positions);
+    ASSERT_NE(gf, nullptr);
+
+    // The tensor whose bytes a view ultimately refers to.
+    const auto base = [](const ggml_tensor* t) -> const ggml_tensor* {
+        return t->view_src ? t->view_src : t;
+    };
+
+    const int n = ggml_graph_n_nodes(gf);
+    int writes_seen = 0;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor* w = ggml_graph_node(gf, i);
+        if (w->op != GGML_OP_SET_ROWS) continue;
+        const ggml_tensor* cache = base(w);
+        ++writes_seen;
+
+        for (int j = 0; j < i; ++j) {
+            const ggml_tensor* r = ggml_graph_node(gf, j);
+            // View nodes (reshape/view/permute/transpose) compute nothing — the
+            // backend encodes no kernel for them — so they are not readers.
+            // set_rows builds its own destination through one of these, which
+            // legitimately sits just before the write.
+            if (r->view_src) continue;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (!r->src[k]) continue;
+                ASSERT_NE(base(r->src[k]), cache)
+                    << "node " << j << " (" << ggml_op_name(r->op) << ") reads "
+                    << "the KV cache bytes that SET_ROWS at node " << i
+                    << " writes. The single-slot read is an edge-free view, so "
+                    << "graph order is the only thing keeping it after the write.";
+            }
+        }
+    }
+    EXPECT_GT(writes_seen, 0)
+        << "expected at least one SET_ROWS node in a SetRows-mode decode graph, "
+        << "got: none — the write mode did not take effect and this test proved nothing.";
+}
+
+// ── --flash-attn must change build_path_tag ─────────────────────────────────
+// Lives here for the model scaffolding. The hazard: flash attention changes
+// prefill's output, so the K/V a prefill writes differ from the materialized
+// path's. A prefix or session blob frozen under one and resumed under the other
+// would not crash — it would quietly continue from a state computed a different
+// way. set_attn_impl stamps every KV cache's path salt so make_snapshot_header
+// separates them; this pins that end to end, through the same header the
+// PrefixLibrary and L2 snapshots compare.
+template <typename FP>
+static void run_flash_path_tag_check(const std::string& path) {
+    if (!file_exists(path))
+        GTEST_SKIP() << "model absent: " << path;
+
+    register_builtin_models();
+    Model model;
+    model.load_metadata(path);
+    model.load_tensors();
+    const auto& meta = model.get_metadata();
+
+    FP fpMat(model, &meta, 1024, 1);
+    FP fpFlash(model, &meta, 1024, 1);
+    ASSERT_TRUE(fpFlash.supports_flash_attn());
+    fpFlash.set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+
+    const auto hMat   = qinf::snapshot::make_snapshot_header(meta, fpMat.snapshot_kv_caches());
+    const auto hFlash = qinf::snapshot::make_snapshot_header(meta, fpFlash.snapshot_kv_caches());
+
+    EXPECT_NE(hMat.build_path_tag, hFlash.build_path_tag)
+        << "build_path_tag is identical for materialized and flash attention. A "
+        << "prefix/session blob frozen under one would be accepted under the "
+        << "other and resumed from a state computed by a different attention "
+        << "implementation.";
+
+    // Everything else about the two passes is the same model, so nothing ELSE
+    // in the header may move — otherwise this test would pass for the wrong
+    // reason and the tag would be over-refusing.
+    EXPECT_EQ(hMat.weights_hash, hFlash.weights_hash);
+    EXPECT_EQ(hMat.arch_id,      hFlash.arch_id);
+    EXPECT_EQ(hMat.block_count,  hFlash.block_count);
+    EXPECT_EQ(hMat.vocab_size,   hFlash.vocab_size);
+
+    // And going back to materialized must restore the original tag.
+    fpFlash.set_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+    EXPECT_EQ(hMat.build_path_tag,
+              qinf::snapshot::make_snapshot_header(meta, fpFlash.snapshot_kv_caches()).build_path_tag);
+}
+
+TEST(KvWriteSetRows, Qwen35_FlashAttnChangesBuildPathTag) {
+    run_flash_path_tag_check<Qwen35ForwardPass>(
+        env_or("QWEN35_MODEL_PATH", "./models/Qwen3.5-0.8B-BF16.gguf"));
+}
+
+TEST(KvWriteSetRows, Gemma3_FlashAttnChangesBuildPathTag) {
+    run_flash_path_tag_check<Gemma3ForwardPass>(
+        env_or("GEMMA3_MODEL_PATH", "./models/gemma-3-1b-it-BF16.gguf"));
+}
+
+TEST(KvWriteSetRows, Qwen35_IdentityGatherOrdersAfterTheWrite) {
+    run_setrows_order_check<Qwen35ForwardPass>(
+        env_or("QWEN35_MODEL_PATH", "./models/Qwen3.5-0.8B-BF16.gguf"));
+}
+
+TEST(KvWriteSetRows, Gemma3_IdentityGatherOrdersAfterTheWrite) {
+    run_setrows_order_check<Gemma3ForwardPass>(
+        env_or("GEMMA3_MODEL_PATH", "./models/gemma-3-1b-it-BF16.gguf"));
 }
 
 TEST(KvWriteSetRows, Qwen35_BitwiseLogitsAndCacheBytes) {

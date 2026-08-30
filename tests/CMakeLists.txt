@@ -127,10 +127,9 @@ gtest_discover_tests(integration-tests)
 # Byte-identical differential harness (compile-identical on main + branch).
 add_executable(logits-dump
     diff/logits_dump.cpp
-    ${CMAKE_SOURCE_DIR}/src/engine/decode_step.cpp
-    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 target_link_libraries(logits-dump PRIVATE
+    qinf-orchestration
     qinf-models
     qinf-engine
     sampling
@@ -181,10 +180,10 @@ gtest_discover_tests(token-trie-tests)
 # rejections from the resolver and re-asserts them here on resolved values.
 add_executable(decode-plan-tests
     unit/test_decode_plan.cpp
-    ${CMAKE_SOURCE_DIR}/src/engine/decode_plan.cpp
 )
 
 target_link_libraries(decode-plan-tests PRIVATE
+    qinf-orchestration
     GTest::gtest_main
     qinf-models
 )
@@ -226,9 +225,9 @@ gtest_discover_tests(http-server-test)
 # parse module directly (header-only consumers + nlohmann json).
 add_executable(image-data-uri-tests
     unit/test_image_data_uri.cpp
-    ${CMAKE_SOURCE_DIR}/src/server/image_data_uri.cpp
 )
 target_link_libraries(image-data-uri-tests PRIVATE
+    qinf-server
     GTest::gtest_main
     nlohmann_json::nlohmann_json
 )
@@ -354,10 +353,10 @@ target_compile_features(test-prefix-library-roundtrip PRIVATE cxx_std_17)
 # a Gemma3 (SigLIP) AND a Gemma4 (gemma4uv) image path.
 add_executable(test-image-prefix-roundtrip
     integration/test_image_prefix_roundtrip.cpp
-    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
 )
 target_link_libraries(test-image-prefix-roundtrip PRIVATE
+    qinf-orchestration
+    qinf-image
     qinf-models
     qinf-vision
     qinf-state
@@ -493,10 +492,10 @@ gtest_discover_tests(forward-pass-base-tests)
 # server_lens.cpp directly; the driver half links the model/grammar libs.
 add_executable(server-lens-tests
     unit/test_server_lens.cpp
-    ${CMAKE_SOURCE_DIR}/src/server/server_lens.cpp
 )
 
 target_link_libraries(server-lens-tests PRIVATE
+    qinf-server
     GTest::gtest_main
     nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
     qinf-models
@@ -586,6 +585,7 @@ add_executable(kv-write-setrows-tests
 
 target_link_libraries(kv-write-setrows-tests PRIVATE
     GTest::gtest_main
+    qinf-snapshot
     qinf-models
     qinf-graph-inputs
     qinf-engine
@@ -1064,14 +1064,12 @@ gtest_discover_tests(gemma4uv-encoder-tests)
 # which both sit above `core`). Self-skips without a Gemma 3 text model + mmproj.
 add_executable(multimodal-prefill-tests
     unit/test_multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/engine/multimodal_prefill.cpp
-    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
     # cli host-side image pipeline, compiled directly (cli is an exe, not a lib)
     # so the e2e gate can decode a real image + expand the marker stream.
-    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
 )
 target_link_libraries(multimodal-prefill-tests PRIVATE
+    qinf-orchestration
+    qinf-image
     GTest::gtest_main
     qinf-vision
     qinf-models
@@ -1090,10 +1088,9 @@ gtest_discover_tests(multimodal-prefill-tests)
 # src/cli/ sources directly (the cli builds an executable, not a lib).
 add_executable(image-loader-tests
     unit/test_image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/image/image_loader.cpp
     ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
 )
-target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main)
+target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main qinf-image)
 target_compile_features(image-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-loader-tests)
 
@@ -1124,9 +1121,8 @@ gtest_discover_tests(image-preprocess-tests)
 
 add_executable(image-prompt-tests
     unit/test_image_prompt.cpp
-    ${CMAKE_SOURCE_DIR}/src/image/image_prompt.cpp
 )
-target_link_libraries(image-prompt-tests PRIVATE GTest::gtest_main)
+target_link_libraries(image-prompt-tests PRIVATE GTest::gtest_main qinf-image)
 target_compile_features(image-prompt-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-prompt-tests)
 
@@ -1171,9 +1167,8 @@ gtest_discover_tests(qwen3vl-encoder-tests)
 # Phase 7 image-embedding reuse cache — no model file needed (counting lambda).
 add_executable(image-embedding-cache-tests
     unit/test_image_embedding_cache.cpp
-    ${CMAKE_SOURCE_DIR}/src/session/image_embedding_cache.cpp
 )
-target_link_libraries(image-embedding-cache-tests PRIVATE GTest::gtest_main)
+target_link_libraries(image-embedding-cache-tests PRIVATE GTest::gtest_main qinf-session)
 target_compile_features(image-embedding-cache-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-embedding-cache-tests)
 
@@ -1450,9 +1445,9 @@ target_compile_features(alloc-reuse PRIVATE cxx_std_17)
 # lookalike. Same source-in-target pattern as server-lens-tests, same libs.
 add_executable(attn-provenance
     perf/attn_provenance.cpp
-    ${CMAKE_SOURCE_DIR}/src/server/server_lens.cpp
 )
 target_link_libraries(attn-provenance PRIVATE
+    qinf-server
     nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
     qinf-models
     qinf-loader

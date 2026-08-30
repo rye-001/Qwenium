@@ -197,12 +197,28 @@ int run_complete(
         // to the normal (non-speculative) decode step below; speculative verify
         // shapes are out of scope for v1. Refused fail-loud on a recipe that is
         // not persistent-capable, so the flag never silently no-ops.
+
+        // Flash attention (opt-in --flash-attn): one ggml_flash_attn_ext per
+        // attention layer on the decode path, replacing kq / soft_max / kqv and
+        // the V transpose. Token-stable, not byte-identical. Refused fail-loud
+        // on a recipe that does not thread it through, rather than silently
+        // running the materialized path the user asked to replace.
+        if (args.flash_attn) {
+            if (!forward_pass->supports_flash_attn()) {
+                std::cerr << "--flash-attn: architecture '"
+                          << model.get_metadata().architecture << "' does not "
+                          << "support flash attention (supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)\n";
+                return 1;
+            }
+            forward_pass->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+        }
+
         std::unique_ptr<DecodeGraphCache> graph_cache;
         if (args.persistent_graph) {
             if (!forward_pass->supports_persistent_decode()) {
                 std::cerr << "--persistent-graph: architecture '"
                           << cmp_meta.architecture << "' is not persistent-"
-                          << "capable (needs qwen35/qwen36/gemma3)\n";
+                          << "capable (supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)\n";
                 return 1;
             }
             enable_persistent_decode(forward_pass.get());

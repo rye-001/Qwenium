@@ -88,7 +88,8 @@ ggml_tensor* build_attn_mha(
     float        kq_scale,
     uint32_t     pos,
     int          il,
-    float        softcap = 0.0f);
+    float        softcap = 0.0f,
+    bool         use_flash = false);
 
 // Prefill / single-slot attention.
 // Writes K/V to the cache at the current slot position, reads the full
@@ -116,7 +117,8 @@ ggml_tensor* build_attention(
     int               head_dim_k,
     int               head_dim_v,
     int               n_head_kv,
-    float             softcap = 0.0f);
+    float             softcap = 0.0f,
+    bool              use_flash = false);
 
 // Decode / batched multi-slot attention.
 // Scatters K/V into each slot, gathers the full KV history via indices,
@@ -145,7 +147,10 @@ ggml_tensor* build_batched_attention(
     ggml_tensor*                    gather_indices,
     int                             il,
     float                           softcap = 0.0f,
-    ggml_tensor*                    kv_write_indices = nullptr);
+    ggml_tensor*                    kv_write_indices = nullptr,
+    // Opt-in flash attention (--flash-attn). Not byte-identical, and kq_soft
+    // never exists on this path — see build_attn_mha.
+    bool                            use_flash = false);
 
 // ── M-RoPE section widths ────────────────────────────────────────────────────
 // P2 of docs/plan-qwen35-vision-impl.md. `<arch>.rope.dimension_sections`
@@ -218,7 +223,8 @@ ggml_tensor* build_gated_attention(
     int              context_length,
     float            rms_norm_eps,
     // Default-inactive so existing call sites keep NEOX behaviour verbatim.
-    const MRopeSections& mrope = MRopeSections{});
+    const MRopeSections& mrope = MRopeSections{},
+    bool                 use_flash = false);
 
 // Decode / batched multi-slot gated attention.
 // Same gated projections/norms/gating as above, but operates on a batch of
@@ -251,4 +257,5 @@ ggml_tensor* build_gated_batched_attention(
     int                             context_length,
     float                           rms_norm_eps,
     ggml_tensor*                    kv_write_indices = nullptr,
-    const MRopeSections&            mrope = MRopeSections{});
+    const MRopeSections&            mrope = MRopeSections{},
+    bool                            use_flash = false);

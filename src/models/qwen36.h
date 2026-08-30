@@ -99,6 +99,7 @@ public:
     // Decode graph is persistent-capable: every step-varying quantity is a
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
     bool supports_persistent_decode() const override { return true; }
+    bool supports_flash_attn() const override { return true; }
 
     ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,

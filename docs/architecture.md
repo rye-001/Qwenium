@@ -26,7 +26,9 @@ one engine:
 - a **CLI** (`qwenium` binary, CMake target `qwenium-cli`): single-user
   chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
-  decode graph (`--persistent-graph`, §5), and session snapshots;
+  decode graph (`--persistent-graph`, §5), opt-in flash attention on decode
+  (`--flash-attn`, §5 — mutually exclusive with the attention lens), and
+  session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
   them into one forward pass.
@@ -186,7 +188,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the fail-loud architecture/tensor-inventory validators), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
-| `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The two services that need `models/`/`graph_inputs/` build into `qinf-engine` or directly into consumers rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). |
+| `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
@@ -286,6 +288,40 @@ capable recipes fall back to the per-step rebuild. Qwen 3.5/3.6 + Gemma 3 are
 persistent-capable today; the write-mode/bucket are a differential seam gated
 byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
 `test_decode_graph_cache`).
+
+**Flash attention** (CLI/server `--flash-attn`, `DecodePolicy::AttnImpl`): on
+**both prefill and decode**, one `ggml_flash_attn_ext` replaces the whole
+`kq` → `soft_max` → `kqv` chain *and* the V transpose — four Metal dispatches
+per attention layer become one. On decode the recipe casts its mask to F16 once
+per graph (Gemma 2/3/4 dedupe by window first); on prefill the mask is built per
+layer inside the attention helper, so the cast lives there. `build_attn_mha`
+refuses an F32 mask, naming the layer, and forwards softcap — ggml applies the
+scale before the tanh clamp, our convention. **Prefill is where it pays most**:
+materialized attention is O(n²) in the prompt length, so the win grows from ~7%
+at 756 tokens to ~55% at 3000 on attention-heavy recipes, and it is what keeps
+prefill competitive at the 10K envelope. Token-stable, **not byte-identical**
+(the softmax reduces in registers, in a different order), so
+it is opt-in like `--persistent-graph`, and **every recipe supports it**
+(`supports_flash_attn()`). Gemma 2's attention softcap forwards to the kernel:
+ggml pre-divides `scale /= logit_softcap` and computes
+`logit_softcap*tanh(s*scale)` — the scale applied before the clamp, which is
+our convention and HF's. **What flash is worth varies by an order of magnitude
+across models — 4% to 33% of a decode step — and is not predictable from family
+or layer count**; see §16–§17 of the gap ledger for the seven-model measurement
+and why the obvious generalizations are wrong. Qwen 3.6 came almost free — it shares
+`qwen35_family`'s layer body, so the recipe-side change was the F16 mask cast
+and one flag on `Qwen35LayerCommon`. On the MoE hybrid only the 9 attention
+layers change; the 36 MoE routers keep their own `SOFT_MAX` and the experts
+their `MUL_MAT_ID`, untouched.
+
+**Flash attention and the receipts identity are mutually exclusive**, and this
+is enforced, not documented-and-hoped: the flash kernel never materializes
+`kq_soft`, which is precisely the tensor the attention lens taps (§1, §11).
+`DecodePolicy::is_attn_impl_coherent()` states the pairing, and the server
+refuses `--flash-attn` together with `--attention-lens` at startup. This is the
+first place where a speed lever and the receipts doctrine are in direct
+conflict; the resolution is a parameter on one operation with two
+implementations (llama's own `-fa on/off` split), not two attention modules.
 
 **Speculative decoding** (CLI `--speculative [pld|mtp]`): drafts come from an
 `IDraftSource` (`sampling/draft_source.h`) and are verified in one batched

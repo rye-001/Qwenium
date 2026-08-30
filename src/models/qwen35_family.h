@@ -53,6 +53,11 @@ struct Qwen35LayerCommon {
     // The FFN seam: non-null ⇒ MoE, null ⇒ dense SwiGLU. Must agree with
     // cfg->is_moe(); the builders check and refuse fail-loud if it does not.
     const MoELayer::Hparams* moe_hp;
+    // Opt-in flash attention (--flash-attn), decode path only. The recipe sets
+    // it from DecodePolicy and casts kq_mask to F16 once per graph, because
+    // ggml_flash_attn_ext requires an F16 mask. Default false keeps the
+    // byte-reproducible materialized path.
+    bool                     use_flash = false;
 };
 
 // ── Typed graph inputs ──────────────────────────────────────────────────────

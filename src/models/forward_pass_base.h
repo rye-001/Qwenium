@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <string>
 #include <vector>
 #include <cstdint>
 #include <memory>
@@ -539,12 +541,45 @@ public:
     void set_kv_write_mode(KvWriteMode m) { policy_.kv_write_mode = m; }
     KvWriteMode kv_write_mode() const { return policy_.kv_write_mode; }
 
+    // ── Attention implementation ─────────────────────────────────────────────
+    // Materialized (default) → kq / kq_soft / kqv are real tensors, the
+    // byte-reproducible path the receipts identity is defined on. Flash → one
+    // ggml_flash_attn_ext per attention layer; drops 3 dispatches (2 of them
+    // matmuls) and the V transpose, at the cost of byte-identity and of
+    // kq_soft ever existing. Opt-in via --flash-attn; only recipes that thread
+    // it into the attention helpers honor it, others stay Materialized.
+    using AttnImpl = DecodePolicy::AttnImpl;
+
+    // Also stamps every KV cache's path salt. Flash changes the attention
+    // output, so it changes the residual stream, so it changes every later
+    // layer's K/V — a prefix or session blob frozen under one implementation is
+    // not valid to resume under the other. Stamping here rather than at each
+    // make_snapshot_header call site means none of the ~10 of them can forget.
+    void set_attn_impl(AttnImpl a) {
+        policy_.attn_impl = a;
+        const uint64_t salt =
+            (a == AttnImpl::Flash)
+                ? static_cast<uint64_t>(std::hash<std::string>{}("attn=flash"))
+                : 0ull;
+        for (simple_kv_cache* c : snapshot_kv_caches())
+            if (c) c->set_path_salt(salt);
+    }
+    AttnImpl attn_impl() const { return policy_.attn_impl; }
+    bool use_flash_attn() const { return policy_.attn_impl == AttnImpl::Flash; }
+
     // True ⇒ this recipe's build_decoding_graph is persistent-graph capable:
     // every step-varying quantity is a graph-input VALUE (tokens, positions,
     // mask, gather indices, KV write rows), so a built+allocated decode graph
     // can be recomputed across steps without rebuild. Consumed by the P3
     // DecodeGraphCache; false keeps the recipe on the rebuild-per-step path.
     virtual bool supports_persistent_decode() const { return false; }
+
+    // True ⇒ this recipe threads use_flash into its decode attention builder
+    // AND casts its kq_mask to F16 (ggml_flash_attn_ext hard-asserts an F16
+    // mask). A recipe that does neither would silently keep the materialized
+    // path, so --flash-attn refuses rather than pretending it applied.
+    // Prefill is materialized on every recipe — see attention.h.
+    virtual bool supports_flash_attn() const { return false; }
 
     // ── Decode n_kv bucketing ────────────────────────────────────────────────
     // Bucket B ⇒ converted recipes size the decode graph's KV read width

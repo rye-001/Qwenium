@@ -319,7 +319,8 @@ uint64_t simple_kv_cache::path_tag() const {
     const std::string s = std::string(buft) + "|tk" +
         std::to_string(static_cast<int>(type_k)) + "|tv" +
         std::to_string(static_cast<int>(type_v)) + "|ctx" +
-        std::to_string(n_ctx_max);
+        std::to_string(n_ctx_max) + "|salt" +
+        std::to_string(path_salt_);
     return static_cast<uint64_t>(std::hash<std::string>{}(s));
 }
 
@@ -444,4 +445,40 @@ ggml_tensor* simple_kv_cache::gather_k_from(ggml_context* ctx_compute, ggml_tens
 ggml_tensor* simple_kv_cache::gather_v_from(ggml_context* ctx_compute, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv) {
     ggml_tensor* gathered_flat = ggml_get_rows(ctx_compute, src_rows, indices);
     return ggml_reshape_3d(ctx_compute, gathered_flat, n_embd_v, n_kv, n_active);
+}
+
+// Identity-gather fast path — see header. One slot's rows are contiguous in the
+// flattened cache ([n_embd, n_ctx_max * n_batch_max], row = slot*n_ctx_max + t),
+// so get_k/get_v's 2-d view already IS the gather result; only the trailing
+// n_active = 1 dimension has to be put back on.
+ggml_tensor* simple_kv_cache::gather_k_single(ggml_context* ctx_compute, int32_t il, uint32_t slot, uint32_t n_kv) {
+    if (slot >= n_batch_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::gather_k_single: layer " + std::to_string(il) +
+            " expected slot < n_batch_max (" + std::to_string(n_batch_max) +
+            "), got: " + std::to_string(slot));
+    }
+    if (n_kv > n_ctx_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::gather_k_single: layer " + std::to_string(il) +
+            " expected n_kv <= n_ctx_max (" + std::to_string(n_ctx_max) +
+            "), got: " + std::to_string(n_kv));
+    }
+    return ggml_reshape_3d(ctx_compute, get_k(ctx_compute, il, n_kv, slot), n_embd_k, n_kv, 1);
+}
+
+ggml_tensor* simple_kv_cache::gather_v_single(ggml_context* ctx_compute, int32_t il, uint32_t slot, uint32_t n_kv) {
+    if (slot >= n_batch_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::gather_v_single: layer " + std::to_string(il) +
+            " expected slot < n_batch_max (" + std::to_string(n_batch_max) +
+            "), got: " + std::to_string(slot));
+    }
+    if (n_kv > n_ctx_max) {
+        throw std::runtime_error(
+            "simple_kv_cache::gather_v_single: layer " + std::to_string(il) +
+            " expected n_kv <= n_ctx_max (" + std::to_string(n_ctx_max) +
+            "), got: " + std::to_string(n_kv));
+    }
+    return ggml_reshape_3d(ctx_compute, get_v(ctx_compute, il, n_kv, slot), n_embd_v, n_kv, 1);
 }

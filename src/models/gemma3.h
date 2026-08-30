@@ -116,6 +116,7 @@ public:
     // Decode graph is persistent-capable: every step-varying quantity is a
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
     bool supports_persistent_decode() const override { return true; }
+    bool supports_flash_attn() const override { return true; }
 
     // build_decoding_graph is implemented (Phase 3 of
     // docs/plan-gemma-batched-decode.md).

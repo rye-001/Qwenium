@@ -123,4 +123,7 @@ ggml_tensor* build_transformer_layer(
     uint32_t                       il,
     uint32_t                       slot_idx,
     uint32_t                       n_tokens,
-    ggml_tensor*                   ple_residual = nullptr);
+    ggml_tensor*                   ple_residual = nullptr,
+    // Opt-in flash attention (--flash-attn) for this PREFILL layer. Not
+    // byte-identical; see build_attn_mha.
+    bool                           use_flash = false);

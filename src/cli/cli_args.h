@@ -66,6 +66,12 @@ struct CliArgs {
     // byte-identical, so receipts baselines are per-kv-type. Recurrent
     // (DeltaNet/SSM) state is unaffected -- it is always F32.
     bool kv_f16 = false;            // --kv-f16
+    // Flash attention on the DECODE path: one ggml_flash_attn_ext replaces
+    // kq / soft_max / kqv and the V transpose. Faster, NOT byte-identical (the
+    // softmax reduces in a different order), and kq_soft never exists — so it
+    // is refused together with the attention lens, whose tap reads exactly
+    // that tensor. Supported by every recipe.
+    bool flash_attn = false;        // --flash-attn
     // Vision: a single image applied to the first user turn. Both
     // must be set together; requires a Gemma multimodal-capable tokenizer.
     std::string image_path;    // --image: JPEG/PNG to attach to the first turn

@@ -13,7 +13,10 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
+
+#include "ggml.h"
 
 #include "../../src/layers/attention.h"
 #include "../../src/layers/layer.h"
@@ -79,4 +82,70 @@ TEST(MRopeSections, RejectsAllZeroLeadingSections) {
 TEST(MRopeSections, AcceptsAnyWidthConsistentWithNRot) {
     const auto m = MRopeSections::from_widths({16, 16, 16, 16}, "k", 128);
     EXPECT_TRUE(m.active);
+}
+
+
+// ── build_attn_mha, flash-attention preconditions (--flash-attn) ─────────────
+//
+// The flash branch refuses two things rather than guessing, and both refusals
+// are load-bearing:
+//   * an F32 mask — ggml_flash_attn_ext hard-asserts F16, so without this check
+//     a recipe that forgot the cast would abort inside ggml with no mention of
+//     which recipe or layer;
+// The F32-mask refusal is load-bearing: ggml_flash_attn_ext hard-asserts F16,
+// so without it a recipe that forgot the cast would abort inside ggml with no
+// mention of which recipe or layer. Softcap, by contrast, is FORWARDED — see
+// ForwardsSoftcapToTheFlashKernel below. Both are pure graph-build checks, so
+// they need no backend and no model.
+
+namespace {
+struct MhaCtx {
+    ggml_context* ctx;
+    ggml_cgraph*  gf;
+    ggml_tensor  *q, *k, *v;
+    MhaCtx() {
+        ggml_init_params p{ 64 * ggml_tensor_overhead() + ggml_graph_overhead(),
+                            nullptr, /*no_alloc=*/true };
+        ctx = ggml_init(p);
+        gf  = ggml_new_graph(ctx);
+        const int d = 64, n_q = 1, n_head = 8, n_head_kv = 4, n_kv = 32;
+        q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head,    n_q);
+        k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_head_kv, n_kv, 1);
+        v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_head_kv, n_kv, 1);
+    }
+    ~MhaCtx() { ggml_free(ctx); }
+    ggml_tensor* mask(ggml_type t) { return ggml_new_tensor_2d(ctx, t, 32, 1); }
+};
+}  // namespace
+
+TEST(BuildAttnMhaFlash, RefusesF32MaskNamingTheSlot) {
+    MhaCtx c;
+    EXPECT_THROW(build_attn_mha(c.ctx, c.gf, c.q, c.k, c.v, c.mask(GGML_TYPE_F32),
+                                nullptr, 0.125f, 0, /*il=*/3, /*softcap=*/0.0f,
+                                /*use_flash=*/true),
+                 std::runtime_error);
+}
+
+TEST(BuildAttnMhaFlash, ForwardsSoftcapToTheFlashKernel) {
+    // Gemma 2's attention softcap used to be refused here, while ggml's clamp
+    // convention was unverified. It was then checked in both backends: the host
+    // pre-divides (scale /= logit_softcap) and the kernel computes
+    // logit_softcap*tanh(s*scale) — the scale applied BEFORE the clamp, which
+    // is what build_softcap composed after ggml_scale does on the materialized
+    // path. So it is forwarded, and a non-zero softcap must NOT throw.
+    MhaCtx c;
+    ggml_tensor* out = nullptr;
+    EXPECT_NO_THROW(out = build_attn_mha(c.ctx, c.gf, c.q, c.k, c.v,
+                                         c.mask(GGML_TYPE_F16), nullptr, 0.125f,
+                                         0, /*il=*/3, /*softcap=*/30.0f,
+                                         /*use_flash=*/true));
+    ASSERT_NE(out, nullptr);
+}
+
+TEST(BuildAttnMhaFlash, MaterializedPathAcceptsF32MaskAndSoftcap) {
+    // The refusals above must be flash-only: the default path is unchanged.
+    MhaCtx c;
+    EXPECT_NO_THROW(build_attn_mha(c.ctx, c.gf, c.q, c.k, c.v, c.mask(GGML_TYPE_F32),
+                                   nullptr, 0.125f, 0, /*il=*/3, /*softcap=*/30.0f,
+                                   /*use_flash=*/false));
 }
