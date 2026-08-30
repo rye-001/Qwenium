@@ -302,9 +302,12 @@ materialized path scales *before* the tanh clamp where llama clamps the raw QK
 product, and the two are not the same function, so Gemma 2 is out of scope
 until that convention is proven against ggml. Token-stable, **not
 byte-identical** (the softmax reduces in registers, in a different order), so
-it is opt-in like `--persistent-graph`. Qwen 3.5, Qwen 3.6 and Gemma 3 today
-(`supports_flash_attn()`); other recipes refuse the flag rather than silently
-running the materialized path. Qwen 3.6 came almost free — it shares
+it is opt-in like `--persistent-graph`. Qwen 3.5, Qwen 3.6, Gemma 3 and Gemma 4
+today (`supports_flash_attn()`); other recipes refuse the flag rather than
+silently running the materialized path. **It is worth far more on Gemma than on
+Qwen** — 19–29% of a decode step against 8–9% — because a Qwen hybrid spends
+most of its step in DeltaNet and MoE, which flash does not touch, while a Gemma
+stack is attention all the way down (§10 of the gap ledger). Qwen 3.6 came almost free — it shares
 `qwen35_family`'s layer body, so the recipe-side change was the F16 mask cast
 and one flag on `Qwen35LayerCommon`. On the MoE hybrid only the 9 attention
 layers change; the 36 MoE routers keep their own `SOFT_MAX` and the experts

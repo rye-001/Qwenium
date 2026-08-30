@@ -328,7 +328,7 @@ public:
             std::cerr << "--flash-attn: architecture '"
                       << model_.get_metadata().architecture
                       << "' does not support flash attention "
-                      << "(needs qwen35/qwen36/gemma3)" << std::endl;
+                      << "(needs qwen35/qwen36/gemma3/gemma4)" << std::endl;
             return false;
         }
         forward_pass_->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
@@ -1558,7 +1558,7 @@ int main(int argc, char* argv[]) {
                       << "  --flash-attn              Opt-in: flash attention on "
                          "the decode path (one fused kernel per attention layer). "
                          "Token-stable, not byte-identical; mutually exclusive "
-                         "with --attention-lens. Qwen3.5/3.6 + Gemma3 only.\n"
+                         "with --attention-lens. Qwen3.5/3.6 + Gemma3/4 only.\n"
                       << "  --attention-lens          Opt-in: enable POST "
                          "/v1/extract — document + complete key vocabulary → "
                          "audited key-value JSON on the attention trust layer "

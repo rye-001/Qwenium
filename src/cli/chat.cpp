@@ -331,7 +331,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             if (!forward_pass->supports_flash_attn()) {
                 std::cerr << "--flash-attn: architecture '"
                           << model.get_metadata().architecture << "' does not "
-                          << "support flash attention (needs qwen35/qwen36/gemma3)\n";
+                          << "support flash attention (needs qwen35/qwen36/gemma3/gemma4)\n";
                 return 1;
             }
             forward_pass->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
@@ -342,7 +342,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             if (!forward_pass->supports_persistent_decode()) {
                 std::cerr << "--persistent-graph: architecture '"
                           << model.get_metadata().architecture << "' is not "
-                          << "persistent-capable (needs qwen35/qwen36/gemma3)\n";
+                          << "persistent-capable (needs qwen35/qwen36/gemma3/gemma4)\n";
                 return 1;
             }
             enable_persistent_decode(forward_pass.get());

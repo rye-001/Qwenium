@@ -164,6 +164,12 @@ public:
     // recurrent state); still owes its own KV-append mid-stream differential.
     bool feed_tokens_supported() const override { return true; }
 
+    // Flash attention on decode: the recipe casts its window-deduplicated masks
+    // to F16 and threads use_flash into build_batched_attention. Gemma 4's
+    // attention softcap is 0 (QK-norm replaces it), so the softcap refusal in
+    // build_attn_mha does not apply here — unlike Gemma 2.
+    bool supports_flash_attn() const override { return true; }
+
     // ── Vision: image-token embedding substitution (IImageEmbeddable, Seam B) ─
     // Arm precomputed image-token embeddings before the next prefill build.
     // `embd` is [hidden_dim · n_tokens] row-major (hidden_dim fastest) — the

@@ -207,7 +207,7 @@ int run_complete(
             if (!forward_pass->supports_flash_attn()) {
                 std::cerr << "--flash-attn: architecture '"
                           << model.get_metadata().architecture << "' does not "
-                          << "support flash attention (needs qwen35/qwen36/gemma3)\n";
+                          << "support flash attention (needs qwen35/qwen36/gemma3/gemma4)\n";
                 return 1;
             }
             forward_pass->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
@@ -218,7 +218,7 @@ int run_complete(
             if (!forward_pass->supports_persistent_decode()) {
                 std::cerr << "--persistent-graph: architecture '"
                           << cmp_meta.architecture << "' is not persistent-"
-                          << "capable (needs qwen35/qwen36/gemma3)\n";
+                          << "capable (needs qwen35/qwen36/gemma3/gemma4)\n";
                 return 1;
             }
             enable_persistent_decode(forward_pass.get());

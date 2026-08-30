@@ -70,7 +70,7 @@ struct CliArgs {
     // kq / soft_max / kqv and the V transpose. Faster, NOT byte-identical (the
     // softmax reduces in a different order), and kq_soft never exists — so it
     // is refused together with the attention lens, whose tap reads exactly
-    // that tensor. Qwen3.5/3.6 + Gemma3 only (recipes that thread it through).
+    // that tensor. Qwen3.5/3.6 + Gemma3/4 only (recipes that thread it through).
     bool flash_attn = false;        // --flash-attn
     // Vision: a single image applied to the first user turn. Both
     // must be set together; requires a Gemma multimodal-capable tokenizer.
