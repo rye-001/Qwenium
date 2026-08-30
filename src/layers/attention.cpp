@@ -363,8 +363,25 @@ ggml_tensor* build_batched_attention(
             ggml_build_forward_expand(gf, v_stored);
         }
 
-        k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather: one active slot means the index run is one
+            // contiguous span, so the read is a free view of the cache instead
+            // of two materializing GET_ROWS (docs/decode-gap-status.md §4).
+            // Values, strides and layout are unchanged, so the consuming
+            // mul_mat is bit-identical to the gathered path.
+            //
+            // gather_indices is no longer consumed here, so expand it to keep
+            // it in the graph: GatherIndicesInput still owns the slot and its
+            // require_tensor lookup is fail-loud on an absent tensor. That
+            // costs an n_kv-int32 upload per step, immaterial against the
+            // 2 x n_kv x n_embd copy it removes.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, layer_idx, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, layer_idx, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v(ctx, gf, layer_idx, gather_indices, n_batch, n_kv_len);
+        }
     }
 
     // 3. Reshape for attention
@@ -588,8 +605,25 @@ ggml_tensor* build_gated_batched_attention(
             ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx, v_slice, kv_cache_layer, slots[b]));
         }
 
-        k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather: one active slot means the index run is one
+            // contiguous span, so the read is a free view of the cache instead
+            // of two materializing GET_ROWS (docs/decode-gap-status.md §4).
+            // Values, strides and layout are unchanged, so the consuming
+            // mul_mat is bit-identical to the gathered path.
+            //
+            // gather_indices is no longer consumed here, so expand it to keep
+            // it in the graph: GatherIndicesInput still owns the slot and its
+            // require_tensor lookup is fail-loud on an absent tensor. That
+            // costs an n_kv-int32 upload per step, immaterial against the
+            // 2 x n_kv x n_embd copy it removes.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v(ctx, gf, kv_cache_layer, gather_indices, n_batch, n_kv_len);
+        }
     }
 
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,

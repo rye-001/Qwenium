@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 #include "../../src/state/kv_cache_simple.h"
@@ -113,6 +114,91 @@ TEST_F(KVCacheTest, GetKAndVTensorsAreNonNull) {
     ggml_free(ctx);
 }
 
+
+// ── Identity gather: single-slot view ≡ the batched gather ───────────────────
+// gather_k_single replaces a materializing GET_ROWS with a view whenever one
+// slot is active (docs/decode-gap-status.md §4). The whole claim is that the
+// two produce THE SAME ROWS, so the test computes both in one graph and
+// compares them elementwise — and also pins the absolute values, so a change
+// that broke both identically could not pass.
+
+TEST_F(KVCacheTest, SingleSlotGatherEqualsBatchedGather) {
+    constexpr uint32_t SLOT = 1, N_KV = 5;
+
+    // Fill layer 0's K cache with row-identifying values.
+    ggml_tensor* kc = cache_->get_k_cache_tensor(0);
+    const size_t n_rows_total = static_cast<size_t>(N_CTX) * N_BATCH;
+    std::vector<float> fill(n_rows_total * N_EMBD_KV);
+    for (size_t r = 0; r < n_rows_total; ++r)
+        for (int e = 0; e < N_EMBD_KV; ++e)
+            fill[r * N_EMBD_KV + e] = static_cast<float>(r * 1000 + e);
+    ggml_backend_tensor_set(kc, fill.data(), 0, fill.size() * sizeof(float));
+
+    ggml_init_params p{ 256 * ggml_tensor_overhead() + ggml_graph_overhead(),
+                        nullptr, true };
+    ggml_context* ctx = ggml_init(p);
+    ASSERT_NE(ctx, nullptr);
+
+    ggml_tensor* idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N_KV);
+    ggml_set_input(idx);
+    ggml_set_name(idx, "gather_indices");
+
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* gathered = cache_->gather_k(ctx, gf, 0, idx, 1, N_KV);
+    ggml_tensor* viewed   = cache_->gather_k_single(ctx, 0, SLOT, N_KV);
+    ggml_build_forward_expand(gf, gathered);
+    ggml_build_forward_expand(gf, viewed);
+
+    // Same shape, or the comparison below would be meaningless.
+    ASSERT_EQ(gathered->ne[0], viewed->ne[0]);
+    ASSERT_EQ(gathered->ne[1], viewed->ne[1]);
+    ASSERT_EQ(gathered->ne[2], viewed->ne[2]);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+    // The indices GatherIndicesInput would build for one active slot.
+    std::vector<int32_t> indices(N_KV);
+    for (uint32_t t = 0; t < N_KV; ++t)
+        indices[t] = static_cast<int32_t>(SLOT * N_CTX + t);
+    ggml_backend_tensor_set(idx, indices.data(), 0, indices.size() * sizeof(int32_t));
+
+    ASSERT_EQ(ggml_backend_graph_compute(backend_, gf), GGML_STATUS_SUCCESS);
+
+    std::vector<float> got_gather(N_KV * N_EMBD_KV), got_view(N_KV * N_EMBD_KV);
+    ggml_backend_tensor_get(gathered, got_gather.data(), 0, got_gather.size() * sizeof(float));
+    ggml_backend_tensor_get(viewed,   got_view.data(),   0, got_view.size()   * sizeof(float));
+
+    for (uint32_t t = 0; t < N_KV; ++t) {
+        for (int e = 0; e < N_EMBD_KV; ++e) {
+            const size_t i = t * N_EMBD_KV + e;
+            const float expected = static_cast<float>((SLOT * N_CTX + t) * 1000 + e);
+            EXPECT_FLOAT_EQ(got_gather[i], expected) << "gather t=" << t << " e=" << e;
+            EXPECT_FLOAT_EQ(got_view[i],   expected) << "view   t=" << t << " e=" << e;
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+}
+
+TEST_F(KVCacheTest, SingleSlotGatherFailsLoudOnBadSlot) {
+    ggml_init_params p{ 32 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context* ctx = ggml_init(p);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_THROW(cache_->gather_k_single(ctx, 0, N_BATCH, 4), std::runtime_error);
+    EXPECT_THROW(cache_->gather_v_single(ctx, 0, N_BATCH, 4), std::runtime_error);
+    ggml_free(ctx);
+}
+
+TEST_F(KVCacheTest, SingleSlotGatherFailsLoudOnOversizedNKv) {
+    ggml_init_params p{ 32 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context* ctx = ggml_init(p);
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_THROW(cache_->gather_k_single(ctx, 0, 0, N_CTX + 1), std::runtime_error);
+    EXPECT_THROW(cache_->gather_v_single(ctx, 0, 0, N_CTX + 1), std::runtime_error);
+    ggml_free(ctx);
+}
 
 // ── KV element type is selectable (--kv-f16) ─────────────────────────────────
 // simple_kv_cache has always taken type_k/type_v; these pin the two properties

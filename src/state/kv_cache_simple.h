@@ -119,6 +119,23 @@ public:
     ggml_tensor* gather_k_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
     ggml_tensor* gather_v_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
 
+    // Single-slot KV read: [n_embd, n_kv, 1] — the identity-gather fast path.
+    //
+    // gather_k builds indices[t] = slot * n_ctx_max + t. With exactly ONE
+    // active slot that is a single contiguous run, so the "gather" copies the
+    // whole K/V history into scratch only to reproduce the layout it already
+    // had. ggml_view_2d expresses the same rows for free: same values, same
+    // contiguous strides, so the consuming mul_mat sees a bit-identical
+    // operand and the GET_ROWS dispatch disappears. Worth ~0.97 ms/step on
+    // Qwen3.5-0.8B at n_kv 756 — see docs/decode-gap-status.md §4.
+    //
+    // NOT usable on the set_rows write path. There the read must go through
+    // gather_k_from so the graph carries a read-after-write edge to the write
+    // node; ggml_view of a view re-points view_src at the underlying cache and
+    // would silently drop that edge (see gather_k_from's note above).
+    ggml_tensor* gather_k_single(ggml_context* ctx, int32_t il, uint32_t slot, uint32_t n_kv);
+    ggml_tensor* gather_v_single(ggml_context* ctx, int32_t il, uint32_t slot, uint32_t n_kv);
+
     uint32_t get_n_ctx_max() const { return n_ctx_max; }
     uint32_t get_n_layers() const { return n_layers; }
 
