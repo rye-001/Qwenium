@@ -26,7 +26,9 @@ one engine:
 - a **CLI** (`qwenium` binary, CMake target `qwenium-cli`): single-user
   chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
-  decode graph (`--persistent-graph`, §5), and session snapshots;
+  decode graph (`--persistent-graph`, §5), opt-in flash attention on decode
+  (`--flash-attn`, §5 — mutually exclusive with the attention lens), and
+  session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
   them into one forward pass.
@@ -286,6 +288,32 @@ capable recipes fall back to the per-step rebuild. Qwen 3.5/3.6 + Gemma 3 are
 persistent-capable today; the write-mode/bucket are a differential seam gated
 byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
 `test_decode_graph_cache`).
+
+**Flash attention** (CLI/server `--flash-attn`, `DecodePolicy::AttnImpl`): on
+the **decode path only**, one `ggml_flash_attn_ext` replaces the whole
+`kq` → `soft_max` → `kqv` chain *and* the V transpose — four Metal dispatches
+per attention layer become one. Prefill stays materialized on every recipe:
+its mask is `[n_kv × n_tokens]`, and converting that to the F16 mask
+`ggml_flash_attn_ext` hard-asserts would cost more than flash saves, while
+prefill is already at parity with llama.cpp. The recipe casts its decode mask
+to F16 once per graph (Gemma 3 dedupes by window first); `build_attn_mha`
+refuses an F32 mask and refuses a non-zero softcap, naming the layer — our
+materialized path scales *before* the tanh clamp where llama clamps the raw QK
+product, and the two are not the same function, so Gemma 2 is out of scope
+until that convention is proven against ggml. Token-stable, **not
+byte-identical** (the softmax reduces in registers, in a different order), so
+it is opt-in like `--persistent-graph`. Qwen 3.5 + Gemma 3 today
+(`supports_flash_attn()`); other recipes refuse the flag rather than silently
+running the materialized path.
+
+**Flash attention and the receipts identity are mutually exclusive**, and this
+is enforced, not documented-and-hoped: the flash kernel never materializes
+`kq_soft`, which is precisely the tensor the attention lens taps (§1, §11).
+`DecodePolicy::is_attn_impl_coherent()` states the pairing, and the server
+refuses `--flash-attn` together with `--attention-lens` at startup. This is the
+first place where a speed lever and the receipts doctrine are in direct
+conflict; the resolution is a parameter on one operation with two
+implementations (llama's own `-fa on/off` split), not two attention modules.
 
 **Speculative decoding** (CLI `--speculative [pld|mtp]`): drafts come from an
 `IDraftSource` (`sampling/draft_source.h`) and are verified in one batched

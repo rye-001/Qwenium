@@ -127,6 +127,7 @@ public:
     // Decode graph is persistent-capable: every step-varying quantity is a
     // graph-input value (P1, docs/plan-persistent-decode-graph.md).
     bool supports_persistent_decode() const override { return true; }
+    bool supports_flash_attn() const override { return true; }
 
     // ── Seam B (docs/plan-qwen35-vision-impl.md) ─────────────────────────────
     // Identical in shape to Qwen36ForwardPass: both host the same projector

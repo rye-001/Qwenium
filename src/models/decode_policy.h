@@ -17,6 +17,9 @@
 //     kv_write_mode      — Cpy (default, baked-offset ggml_cpy) vs SetRows
 //       (value-driven, position is a graph input).
 //     decode_kv_bucket   — 0 (default, exact n_kv) vs B (round up to B).
+//     attn_impl          — Materialized (default, kq/soft_max/kqv written out)
+//       vs Flash (one ggml_flash_attn_ext). Flash never materializes kq_soft,
+//       so it is mutually exclusive with attention_taps — see below.
 //
 // Invariant worth stating loudly: the DEFAULTS ARE THE BYTE-REPRODUCIBLE PATH.
 //   The opt-in seams are byte-inert when disarmed — an empty tap set marks no
@@ -47,10 +50,21 @@ struct DecodePolicy {
     // batched attention helpers honor it; others are Cpy-only regardless.
     enum class KvWriteMode { SetRows, Cpy };
 
+    // How the attention core is built. Materialized (default) writes kq,
+    // kq_soft and kqv as real tensors — the byte-reproducible path, and the
+    // one the receipts identity depends on: kq_soft IS the lens tap's read
+    // surface (architecture.md §1, §11). Flash replaces that whole chain with
+    // one ggml_flash_attn_ext, which keeps the softmax in registers and never
+    // writes it out. Faster, and NOT byte-identical (different accumulation
+    // order), and it makes attention_taps impossible to honor — hence the
+    // fail-loud pairing check in is_attn_impl_coherent().
+    enum class AttnImpl { Materialized, Flash };
+
     bool             slice_prefill_head = true;
     bool             output_hidden      = false;
     std::vector<int> attention_taps;
     KvWriteMode      kv_write_mode      = KvWriteMode::Cpy;
+    AttnImpl         attn_impl          = AttnImpl::Materialized;
 
     // Bucket B ⇒ converted recipes size the decode graph's KV read width
     // (mask / gather / gathered views) at the next multiple of B instead of
@@ -76,6 +90,15 @@ struct DecodePolicy {
     // The receipts claims in §11 are made about a pass in this state.
     bool is_default_byte_reproducible() const {
         return slice_prefill_head && !output_hidden && attention_taps.empty()
-            && kv_write_mode == KvWriteMode::Cpy && decode_kv_bucket == 0;
+            && kv_write_mode == KvWriteMode::Cpy && decode_kv_bucket == 0
+            && attn_impl == AttnImpl::Materialized;
+    }
+
+    // Flash attention and the lens tap cannot both be armed: Flash never
+    // materializes kq_soft, so a tap on it would read a node that does not
+    // exist. Callers check this and fail loud rather than silently dropping
+    // one of the two — see the --flash-attn / --attention-lens pairing.
+    bool is_attn_impl_coherent() const {
+        return attn_impl == AttnImpl::Materialized || attention_taps.empty();
     }
 };

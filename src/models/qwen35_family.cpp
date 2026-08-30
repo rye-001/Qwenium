@@ -239,7 +239,8 @@ ggml_tensor* build_qwen35_layer_decode(
             static_cast<int>(m.context_length),
             m.rms_norm_eps,
             kv_write_idx,
-            cfg.mrope_sections);
+            cfg.mrope_sections,
+            c.use_flash);
     }
 
     cur = ggml_add(c.ctx, cur, inpSA);

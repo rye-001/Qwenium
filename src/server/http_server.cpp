@@ -319,6 +319,26 @@ public:
     }
     bool attention_lens_enabled() const { return attention_lens_enabled_; }
 
+    // ── Flash attention (--flash-attn) ───────────────────────────────────────
+    // Decode-path only. Refused fail-loud on a recipe that does not thread it
+    // through, rather than accepting the flag and silently running the
+    // materialized path the operator asked to replace.
+    bool enable_flash_attn() {
+        if (!forward_pass_->supports_flash_attn()) {
+            std::cerr << "--flash-attn: architecture '"
+                      << model_.get_metadata().architecture
+                      << "' does not support flash attention "
+                      << "(needs qwen35/gemma3)" << std::endl;
+            return false;
+        }
+        forward_pass_->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+        std::cout << "Flash attention ON (--flash-attn): decode path, one fused "
+                     "kernel per attention layer. Token-stable, NOT "
+                     "byte-identical; attention receipts unavailable."
+                  << std::endl;
+        return true;
+    }
+
     // Run one extraction and return the lens-format JSON. EXCLUSIVE: holds the
     // model lock for the whole tapped decode and uses slot 0 (the only slot with
     // a correct qwen36 decode KV gather — architecture.md §12 / plan A3), so it
@@ -1468,6 +1488,7 @@ int main(int argc, char* argv[]) {
     bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
     bool attention_lens = false;         // opt-in: enable POST /v1/extract (Qemmi-Lens)
+    bool flash_attn = false;             // opt-in: flash attention on decode (excludes --attention-lens)
     bool kv_f16 = false;                 // opt-in: F16 attention KV cache (halves KV memory)
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
@@ -1500,6 +1521,8 @@ int main(int argc, char* argv[]) {
             conversational = true;
         } else if (arg == "--attention-lens") {
             attention_lens = true;
+        } else if (arg == "--flash-attn") {
+            flash_attn = true;
         } else if (arg == "--kv-f16") {
             kv_f16 = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -1532,6 +1555,10 @@ int main(int argc, char* argv[]) {
                          "server. A conversation_id ('new' to start) retains KV "
                          "across turns and appends only the new turn (chat.cpp-grade; "
                          "warm != cold). Excludes --chat-prefix-cache; text path\n"
+                      << "  --flash-attn              Opt-in: flash attention on "
+                         "the decode path (one fused kernel per attention layer). "
+                         "Token-stable, not byte-identical; mutually exclusive "
+                         "with --attention-lens. Qwen3.5 + Gemma3 only.\n"
                       << "  --attention-lens          Opt-in: enable POST "
                          "/v1/extract — document + complete key vocabulary → "
                          "audited key-value JSON on the attention trust layer "
@@ -1539,6 +1566,17 @@ int main(int argc, char* argv[]) {
                       << "  --help,   -h       Show this help\n";
             return 0;
         }
+    }
+
+    // The lens taps kq_soft; flash attention never materializes it. Refuse the
+    // pair BEFORE the model load — this is pure argument validation, and making
+    // the operator wait out a multi-GB load to be told their flags conflict is
+    // the kind of late failure the fail-loud contract is meant to prevent.
+    if (attention_lens && flash_attn) {
+        std::cerr << "expected at most one of --attention-lens / --flash-attn, "
+                     "got: both. Flash attention never materializes kq_soft, "
+                     "which is exactly the tensor the lens reads." << std::endl;
+        return 1;
     }
 
     // Setup signal handling
@@ -1551,6 +1589,7 @@ int main(int argc, char* argv[]) {
                                           image_embed_cache_dir, image_prefix_cache_dir,
                                           prefix_cache_dir, kv_f16);
         if (attention_lens) integration.enable_attention_lens();
+        if (flash_attn && !integration.enable_flash_attn()) return 1;
 
         // Create inference server
         qinf::InferenceServer::Config config;

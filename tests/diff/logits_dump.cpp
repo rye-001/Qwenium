@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     bool want_tf  = false;
     bool want_dtopk = false;
     bool want_bench = false;
+    bool want_flash = false;
     bool want_mem   = false;
     bool want_kv_f16= false;
     int  n_slots    = 1;    // --slots N: forward-pass max_batch_size (slot count).
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
         else if (opt == "--tf")     want_tf    = true;
         else if (opt == "--dtopk")  want_dtopk = true;
         else if (opt == "--bench")  want_bench = true;
+        else if (opt == "--flash-attn") want_flash = true;
         else if (opt == "--mem")    want_mem   = true;
         else if (opt == "--kv-f16") want_kv_f16= true;
         else if (opt == "--slots")  n_slots    = std::atoi(need("--slots"));
@@ -164,6 +166,14 @@ int main(int argc, char** argv) {
     }
     auto fp = create_forward_pass(model, &meta, 4096, static_cast<uint32_t>(n_slots),
                                   want_kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    if (want_flash) {
+        if (!fp->supports_flash_attn()) {
+            std::fprintf(stderr, "error: --flash-attn: expected a flash-capable recipe "
+                                 "(qwen35/gemma3), got: unsupported architecture\n");
+            return 2;
+        }
+        fp->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+    }
     ggml_backend_sched_t sched = model.get_scheduler();
 
     const auto vocab = model.get_tokenizer()->get_vocabulary();
