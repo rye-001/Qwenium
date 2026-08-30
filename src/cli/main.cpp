@@ -61,7 +61,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
     std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
-    std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; Qwen3.5 + Gemma3\n";
+    std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";
     std::cout << "  --mmproj FILE           Vision projector GGUF (required with --image);\n";

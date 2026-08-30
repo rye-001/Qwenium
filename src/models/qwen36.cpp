@@ -373,11 +373,21 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
                                   kv_cache_->get_n_ctx_max(),
                                   /*with_kv_write_indices=*/kv_write_idx != nullptr);
 
+    // Flash attention (opt-in --flash-attn) needs an F16 mask —
+    // ggml_flash_attn_ext hard-asserts it. Cast ONCE per graph, not once per
+    // layer: the F32 tensor above stays the graph input AttnMaskInput fills,
+    // and every attention layer shares this one converted view.
+    ggml_tensor* attn_mask = kq_mask;
+    if (use_flash_attn()) {
+        attn_mask = ggml_cast(arena_.ctx(), kq_mask, GGML_TYPE_F16);
+        ggml_set_name(attn_mask, "kq_mask_b_f16");
+    }
+
     // 4. Transformer loop (main stack only; NextN head held out — §4)
     // Layer body shared with qwen35 — models/qwen35_family.h.
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        &moe_hp_};
+        &moe_hp_, use_flash_attn()};
 
     for (uint32_t il = 0; il < n_main_layers_; ++il) {
         const bool ssm = cfg_.is_ssm_layer(il);
@@ -385,7 +395,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
             ssm ? static_cast<uint32_t>(dn_layer_map_[il]) : 0u;
         const int kv_idx = ssm ? 0 : kv_layer_map_[il];
         inpL = build_qwen35_layer_decode(lc, inpL, model_.get_block(il),
-                                         inp_pos, kq_mask, gather_indices,
+                                         inp_pos, attn_mask, gather_indices,
                                          kv_write_idx, slots, positions,
                                          dn_idx, kv_idx, il);
     }
