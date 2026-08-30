@@ -112,10 +112,21 @@ public:
     // Gather from an EXPLICIT rows-view source instead of the raw cache tensor.
     // The set_rows write returns a view of the whole cache (rows shape); passing
     // that view here makes the gather a data-DEPENDENT of the write, so the
-    // scheduler orders write-before-read (read-after-write edge). Gathering from
-    // the raw cache tensor omits that edge — safe only when node insertion order
-    // happens to serialize them, which bucketed decode graphs break. Used by the
-    // set_rows decode write path. src_rows: [n_embd, n_ctx_max*n_batch_max].
+    // scheduler orders write-before-read (read-after-write edge). Used by the
+    // set_rows decode write path when MORE THAN ONE slot is active; the
+    // single-slot case takes gather_k_single instead (2026-08-30).
+    // src_rows: [n_embd, n_ctx_max*n_batch_max].
+    //
+    // This comment used to add that reading the raw cache "is safe only when
+    // node insertion order happens to serialize them, which bucketed decode
+    // graphs break." That is stronger than what is observed: the persistent
+    // (set_rows + bucketed) shape reading through a plain view is token-identical
+    // to this path with the Metal graph-optimize pass BOTH enabled and disabled,
+    // on qwen35 and gemma3, and over 300 steps of real graph reuse across a
+    // bucket boundary — a reordering hazard would have shown up as a difference
+    // between those. The explicit edge is kept here anyway: it costs the
+    // multi-slot path nothing, and an edge the compiler can see beats an
+    // ordering argument that depends on one backend's optimizer.
     ggml_tensor* gather_k_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
     ggml_tensor* gather_v_from(ggml_context* ctx, ggml_tensor* src_rows, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
 
@@ -129,10 +140,19 @@ public:
     // operand and the GET_ROWS dispatch disappears. Worth ~0.97 ms/step on
     // Qwen3.5-0.8B at n_kv 756 — see docs/decode-gap-status.md §4.
     //
-    // NOT usable on the set_rows write path. There the read must go through
-    // gather_k_from so the graph carries a read-after-write edge to the write
-    // node; ggml_view of a view re-points view_src at the underlying cache and
-    // would silently drop that edge (see gather_k_from's note above).
+    // Usable on BOTH write paths, including set_rows. This carries no data edge
+    // to the write, because ggml_view of a view re-points view_src at the
+    // underlying cache — write-before-read rests instead on the write being
+    // build_forward_expand'd first PLUS the Metal backend's memory-range
+    // analysis, which sees the view and the write aliasing the same cache
+    // bytes. Both backend passes honour that: the encode-time concurrency check
+    // emits a barrier for overlapping ranges, and the reorder pass refuses to
+    // hoist a node past unprocessed nodes it overlaps (and does not treat
+    // SET_ROWS as reorderable at all). llama.cpp relies on exactly this — its
+    // get_k is a bare ggml_view_4d of the cache sitting next to a set_rows
+    // write. Gated by KvWriteSetRows.IdentityGatherOrdersAfterTheWrite, which
+    // runs the persistent shape with graph-optimize enabled AND disabled: a
+    // reordering bug would show up as a difference between the two.
     ggml_tensor* gather_k_single(ggml_context* ctx, int32_t il, uint32_t slot, uint32_t n_kv);
     ggml_tensor* gather_v_single(ggml_context* ctx, int32_t il, uint32_t slot, uint32_t n_kv);
 

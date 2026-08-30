@@ -47,6 +47,7 @@
 
 #include "ggml-backend.h"
 #include "engine/model.h"
+#include "engine/decode_graph_cache.h"
 #include "../../src/models/model_registry.h"
 #include "engine/decode_step.h"
 #include "../../src/sampling/sampling.h"
@@ -97,7 +98,7 @@ void print_topk(const float* row, uint32_t vocab_size, int k,
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <model.gguf> <out.bin> [--tokens a,b,c] [--text S] [--topk N] [--steps N] [--bos] [--tf] [--bench] [--slots N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model.gguf> <out.bin> [--tokens a,b,c] [--text S] [--topk N] [--steps N] [--bos] [--tf] [--bench] [--slots N] [--flash-attn] [--persistent-graph]\n", argv[0]);
         return 2;
     }
     const std::string model_path = argv[1];
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
     bool want_dtopk = false;
     bool want_bench = false;
     bool want_flash = false;
+    bool want_persist = false;
     bool want_mem   = false;
     bool want_kv_f16= false;
     int  n_slots    = 1;    // --slots N: forward-pass max_batch_size (slot count).
@@ -136,11 +138,12 @@ int main(int argc, char** argv) {
         else if (opt == "--dtopk")  want_dtopk = true;
         else if (opt == "--bench")  want_bench = true;
         else if (opt == "--flash-attn") want_flash = true;
+        else if (opt == "--persistent-graph") want_persist = true;
         else if (opt == "--mem")    want_mem   = true;
         else if (opt == "--kv-f16") want_kv_f16= true;
         else if (opt == "--slots")  n_slots    = std::atoi(need("--slots"));
         else {
-            std::fprintf(stderr, "error: argv[%d]: expected one of --tokens/--text/--topk/--steps/--bos/--tf/--dtopk/--bench/--mem/--kv-f16/--slots, got '%s'\n",
+            std::fprintf(stderr, "error: argv[%d]: expected one of --tokens/--text/--topk/--steps/--bos/--tf/--dtopk/--bench/--mem/--kv-f16/--slots/--flash-attn/--persistent-graph, got '%s'\n",
                          a, opt.c_str());
             return 2;
         }
@@ -166,6 +169,17 @@ int main(int argc, char** argv) {
     }
     auto fp = create_forward_pass(model, &meta, 4096, static_cast<uint32_t>(n_slots),
                                   want_kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    // Persistent-graph SHAPE (set_rows write + bucketed n_kv). The graph is
+    // still rebuilt per step here — DecodeGraphCache's reuse is exercised by the
+    // CLI — so this isolates the graph-shape interaction with --flash-attn.
+    if (want_persist) {
+        if (!fp->supports_persistent_decode()) {
+            std::fprintf(stderr, "error: --persistent-graph: expected a "
+                                 "persistent-capable recipe, got: unsupported\n");
+            return 2;
+        }
+        enable_persistent_decode(fp.get());
+    }
     if (want_flash) {
         if (!fp->supports_flash_attn()) {
             std::fprintf(stderr, "error: --flash-attn: expected a flash-capable recipe "

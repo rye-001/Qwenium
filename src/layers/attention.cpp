@@ -393,8 +393,27 @@ ggml_tensor* build_batched_attention(
         set_name(v_stored, "v_stored_b", il);
         ggml_build_forward_expand(gf, v_stored);
 
-        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather on the set_rows path too — see gather_k_single.
+            // The read is a plain view of the cache, so it carries no data edge
+            // to the set_rows write above; ordering rests on the write being
+            // expanded first PLUS the Metal backend's memory-range analysis,
+            // which sees the view and the write aliasing the same cache bytes.
+            // Both of the backend's passes honour that: the encode-time
+            // concurrency check inserts a barrier for overlapping ranges, and
+            // the reorder pass refuses to hoist a node past unprocessed nodes it
+            // overlaps (SET_ROWS is not in its reorderable set at all). This is
+            // exactly what llama.cpp does — its get_k is a bare ggml_view_4d of
+            // the cache next to a set_rows write. Gated by the ordering test in
+            // test_kv_write_setrows.cpp, which runs the persistent shape with
+            // graph-optimize both enabled and disabled.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, layer_idx, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, layer_idx, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        }
     } else {
         ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, k, n_embd_k, 1, n_batch);
         ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, v, n_embd_v, 1, n_batch);
@@ -645,8 +664,27 @@ ggml_tensor* build_gated_batched_attention(
         ggml_tensor* v_stored = kv_cache->set_rows_v(ctx, v_rows, kv_cache_layer, kv_write_indices);
         ggml_build_forward_expand(gf, k_stored);
         ggml_build_forward_expand(gf, v_stored);
-        k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
-        v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        if (n_batch == 1) {
+            // Identity gather on the set_rows path too — see gather_k_single.
+            // The read is a plain view of the cache, so it carries no data edge
+            // to the set_rows write above; ordering rests on the write being
+            // expanded first PLUS the Metal backend's memory-range analysis,
+            // which sees the view and the write aliasing the same cache bytes.
+            // Both of the backend's passes honour that: the encode-time
+            // concurrency check inserts a barrier for overlapping ranges, and
+            // the reorder pass refuses to hoist a node past unprocessed nodes it
+            // overlaps (SET_ROWS is not in its reorderable set at all). This is
+            // exactly what llama.cpp does — its get_k is a bare ggml_view_4d of
+            // the cache next to a set_rows write. Gated by the ordering test in
+            // test_kv_write_setrows.cpp, which runs the persistent shape with
+            // graph-optimize both enabled and disabled.
+            ggml_build_forward_expand(gf, gather_indices);
+            k_gathered = kv_cache->gather_k_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+            v_gathered = kv_cache->gather_v_single(ctx, kv_cache_layer, slots[0], n_kv_len);
+        } else {
+            k_gathered = kv_cache->gather_k_from(ctx, k_stored, gather_indices, n_batch, n_kv_len);
+            v_gathered = kv_cache->gather_v_from(ctx, v_stored, gather_indices, n_batch, n_kv_len);
+        }
     } else {
         ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx, Kcur, n_embd_k, 1, n_batch);
         ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx, Vcur, n_embd_v, 1, n_batch);
