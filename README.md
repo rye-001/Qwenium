@@ -13,9 +13,10 @@ Every answer comes with the working notes behind it: which parts of your input
 it used, which parts it never touched, and a byte-identical re-run whenever you
 want to check. No other local engine does this.
 
-Prefill throughput and memory footprint match llama.cpp on the same file, and
-the forward pass agrees token-for-token with HuggingFace `transformers` — the
-model's own definition — not merely with another engine.
+With `--flash-attn` decode is within **7%** of llama.cpp on the same file (23%
+behind without it); prefill and memory footprint match it, and the forward pass
+agrees token-for-token with HuggingFace `transformers` — the model's own
+definition — not merely with another engine.
 
 Three things it is built to be:
 
@@ -54,12 +55,16 @@ volunteer:**
 
 ### How that is actually done
 
-- **Where it looked — attention.** Every decode step's attention is
+- **Where it looked — attention.** By default every decode step's attention is
   materialized in the graph (not fused away) and tappable at zero extra
   compute. Calibrated, it becomes receipts: per-value **source citations**, a
   whole-document **coverage audit** ("this line was never consulted"), and an
   **ungrounded-value flag** — served via `/v1/extract` with
-  `--attention-lens`.
+  `--attention-lens`. This is the one place where speed and auditability
+  genuinely conflict: `--flash-attn` fuses the attention softmax into a single
+  kernel that never writes those rows down, so the two flags are mutually
+  exclusive and the server refuses them together at startup rather than
+  silently dropping the receipts.
 - **What decided it — determinism.** Greedy decode is byte-deterministic, with
   forkable state (warm prefix restore + recurrent-state checkpoints). Remove
   one line of the input, re-run, and the diff is fact, not sampling noise —
@@ -81,6 +86,7 @@ volunteer:**
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
 - **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
+- **Flash attention (`--flash-attn`)** — opt-in, on prefill *and* decode, every recipe. One fused kernel replaces the materialized `kq → softmax → kqv` chain and the V transpose. Worth 5–32% of a decode step depending on the model, and it grows with prompt length on prefill (~7% at 756 tokens, ~55% at 3000) because materialized attention is O(n²) and this is not. Token-stable, not byte-identical — so it stays opt-in, and it is mutually exclusive with `--attention-lens`.
 - **Metal acceleration** — Apple Silicon via ggml's Metal backend, with custom fused DeltaNet kernels (`patches/`) for Qwen 3.5 / 3.6 decode.
 
 ## Supported Models
@@ -116,6 +122,7 @@ make -j$(nproc)
 ./bin/http_server --model path/to/model.gguf --port 8080
 # optional: --mmproj vision.gguf (image input) · --slots N · --ctx N
 #           --prefix-cache DIR | --chat-prefix-cache | --conversational
+#           --flash-attn (faster; excludes --attention-lens)
 ```
 
 ```bash
@@ -144,6 +151,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ```bash
 ./bin/qwenium model.gguf --chat                  # interactive
+./bin/qwenium model.gguf --chat --flash-attn     # fused attention (prefill + decode)
 ./bin/qwenium model.gguf --chat --speculative    # with speculative decoding
 ./bin/qwenium model.gguf -p "Hello, world!"      # single prompt
 ./bin/qwenium model.gguf --chat \
@@ -205,15 +213,48 @@ The small, modular codebase makes this useful for research that's painful in lar
 ## Performance
 
 Head-to-head against llama.cpp, both Release + Metal, same GGUF file, same
-token IDs, one engine resident at a time. M1 Pro (32 GB), Qwen3.5-0.8B BF16,
-756-token prompt, 128 decode steps, 3–6 runs per leg, run-to-run spread ~8%
-(2026-08-23; llama.cpp `e85caa81e`, ours on the same ggml revision):
+token IDs. M1 Pro (32 GB), Qwen3.5-0.8B BF16, 756-token prompt, 128 decode
+steps. Each of our runs is immediately followed by llama's, so every ratio comes
+from one thermal moment — this machine's per-step cost drifts ~8% with
+temperature and ours drifts more than llama's, which makes un-paired numbers
+worthless (2026-08-30; llama.cpp `e85caa81e`, ours on the same ggml revision):
 
 | Metric | Qwenium | llama.cpp |
 |---|---|---|
-| Prefill | ~2096 tok/s | ~2157 tok/s |
-| Decode (batch 1) | ~55.8 tok/s | ~73.7 tok/s |
+| Prefill, 756 tok | ~2150 tok/s | ~2110 tok/s |
+| Prefill, 3000 tok | 2155 tok/s (`--flash-attn`) · 1676 without | 2263 tok/s |
+| Decode (batch 1) | **73.8 tok/s** (`--flash-attn`) · 64.6 without | 79.1 tok/s |
 | Steady-state RSS | 1.75 GB | 1.72 GB |
+
+**Decode is 1.07× behind llama.cpp with `--flash-attn`, 1.23× without.** The
+remaining gap is unattributed; the standing analysis is in
+[`docs/decode-gap-status.md`](docs/decode-gap-status.md).
+
+**Prefill parity depends on prompt length.** At 756 tokens the two engines
+match. At 3000 tokens Qwenium is 0.95× of llama with `--flash-attn` and 0.74×
+without — llama runs flash attention by default, and the materialized path pays
+an O(n²) `kq` that flash does not. Longer prompts widen the difference, which
+is what makes the flag worth setting inside the 10K-context envelope, where a
+single high-resolution document page costs 2K–8K soft tokens.
+
+What `--flash-attn` is worth varies by an order of magnitude and **does not sort
+by family or by attention-layer count** — measure your model rather than
+extrapolating:
+
+| Model | Shape | Decode gain |
+|---|---|---|
+| Gemma 1-2B | transformer, MQA | +4.9% |
+| Qwen 3.6-35B-A3B | DeltaNet + attention + MoE | +7.7% |
+| Qwen 3.5-0.8B | attention + SSM | +9.0% |
+| Gemma 2-2B | transformer + attn soft-cap | +16.5% |
+| Gemma 3-1B | transformer, sliding-window | +18.6% |
+| Gemma 4-12B | transformer + PLE | +28.8% |
+| Qwen 3-1.7B | transformer | **+32.4%** |
+
+Sorted by payoff the families interleave: the best result is a Qwen and the
+worst is a Gemma. What predicts it is the share of the step the materialized
+attention core occupies — diluted by hybrid DeltaNet/MoE layers that flash never
+touches, and by weight-bandwidth-bound models with few KV heads.
 
 
 Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
@@ -222,7 +263,9 @@ Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
 |--------|-------|
 | Throughput (10 concurrent) | ~4× vs sequential |
 | Warm chat prefix hit (`--chat-prefix-cache`) | 2.4× per turn at 4K context (flat vs quadratic re-prefill) |
-| Persistent decode graph (`--persistent-graph`) | 1.32× on Qwen 3.6 35B-A3B; ~1.0× on small models — the win is model-specific |
+| Persistent decode graph (`--persistent-graph`) | 1.32× on Qwen 3.6 35B-A3B; ~parity on small models — the win is model-specific |
+| Flash attention (`--flash-attn`) | +5–32% decode, +7–55% prefill (grows with prompt length); see above |
+| The two together | Compose cleanly — token-identical to either alone, and the fastest configuration measured |
 | DSL code generation | 100% pass rate (10 concurrent) |
 
 ## Build Options

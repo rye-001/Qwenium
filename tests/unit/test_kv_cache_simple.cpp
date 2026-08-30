@@ -200,6 +200,33 @@ TEST_F(KVCacheTest, SingleSlotGatherFailsLoudOnOversizedNKv) {
     ggml_free(ctx);
 }
 
+// ── path_tag folds the owner's salt ──────────────────────────────────────────
+// path_tag() decides whether a frozen KV blob may be memcpy'd into this cache
+// and resumed. Its own configuration (backend, dtypes, ctx) is not the whole
+// story: the BYTES depend on the compute path that produced them, which the
+// cache cannot see. --flash-attn is the case that forced this — flash changes
+// the attention output, hence the residual stream, hence every later layer's
+// K/V, so a prefill done under flash is not interchangeable with one done
+// materialized. Without the salt, such a blob would be silently resumed under
+// the wrong implementation instead of refused.
+
+TEST_F(KVCacheTest, PathTagFoldsTheOwnerSalt) {
+    const uint64_t base = cache_->path_tag();
+
+    cache_->set_path_salt(0x9e3779b97f4a7c15ull);
+    const uint64_t salted = cache_->path_tag();
+    EXPECT_NE(base, salted)
+        << "path_tag ignored the salt: a blob built under a different compute "
+        << "path would be accepted and resumed rather than refused.";
+
+    // Deterministic, and reversible — the same salt must give the same tag, or
+    // a blob would be refused against the build that wrote it.
+    cache_->set_path_salt(0x9e3779b97f4a7c15ull);
+    EXPECT_EQ(salted, cache_->path_tag());
+    cache_->set_path_salt(0);
+    EXPECT_EQ(base, cache_->path_tag());
+}
+
 // ── KV element type is selectable (--kv-f16) ─────────────────────────────────
 // simple_kv_cache has always taken type_k/type_v; these pin the two properties
 // the F16 option depends on, so a future change cannot silently break the

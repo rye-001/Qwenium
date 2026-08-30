@@ -174,14 +174,26 @@ public:
     void deserialize_slot(qinf::session::SnapshotReader& r, uint32_t slot);
 
     // Kernel-path identity of this cache: a hash of the backend (CPU / Metal —
-    // the decode kernel path), the K/V dtypes, and the context width. These are
-    // exactly the determinants of whether a frozen KV blob is valid to memcpy
-    // into and resume here. Feeds CompatHeader::build_path_tag so an L2 blob
-    // built under a different path is refused fail-loud rather than producing a
-    // divergent resume. See docs/plan-session-snapshot.md (build_path_tag).
+    // the kernel path), the K/V dtypes, the context width, and any salt the
+    // owner has stamped in. These are the determinants of whether a frozen KV
+    // blob is valid to memcpy into and resume here. Feeds
+    // CompatHeader::build_path_tag so an L2 blob built under a different path is
+    // refused fail-loud rather than producing a divergent resume. See
+    // docs/plan-session-snapshot.md (build_path_tag).
     uint64_t path_tag() const;
 
+    // Fold an owner-defined value into path_tag(). The cache does not interpret
+    // it: it exists because the bytes in a KV cache depend on more than the
+    // cache's own configuration. --flash-attn is the case that forced it —
+    // flash changes the attention output, hence the residual stream, hence
+    // every later layer's K/V, so a prefill done under flash is NOT
+    // interchangeable with one done materialized. Stamped by
+    // ForwardPassBase::set_attn_impl so no snapshot call site can forget it.
+    void set_path_salt(uint64_t salt) { path_salt_ = salt; }
+
 private:
+    uint64_t path_salt_ = 0;
+
     const uint32_t n_layers;
     const uint32_t n_ctx_max;
     const uint32_t n_batch_max;

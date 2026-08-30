@@ -319,7 +319,8 @@ uint64_t simple_kv_cache::path_tag() const {
     const std::string s = std::string(buft) + "|tk" +
         std::to_string(static_cast<int>(type_k)) + "|tv" +
         std::to_string(static_cast<int>(type_v)) + "|ctx" +
-        std::to_string(n_ctx_max);
+        std::to_string(n_ctx_max) + "|salt" +
+        std::to_string(path_salt_);
     return static_cast<uint64_t>(std::hash<std::string>{}(s));
 }
 

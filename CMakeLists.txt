@@ -95,6 +95,7 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
+add_subdirectory(src/image)
 add_subdirectory(src/engine)
 
 # Deferred from the OpenMP block near the top: qinf-engine exists only now.

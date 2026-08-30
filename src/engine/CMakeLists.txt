@@ -43,3 +43,37 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
         $<$<CXX_COMPILER_ID:MSVC>:/O2>
     )
 endif()
+
+# ── Orchestration: driving a built forward pass ─────────────────────────────
+# decode_plan (which kind of step), decode_step (run one), multimodal_prefill
+# (run an image prefill). All three take a ForwardPassBase, so they sit ABOVE
+# qinf-models and cannot join qinf-engine — qinf-models links qinf-engine, and
+# folding them in would close a cycle. Same rule the two session sources above
+# follow: directory = concept, target = layering.
+#
+# Before 2026-08-30 these were compiled directly into cli/, server/ and four
+# test targets.
+add_library(qinf-orchestration STATIC
+    decode_plan.cpp
+    decode_step.cpp
+    multimodal_prefill.cpp
+)
+
+target_include_directories(qinf-orchestration PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(qinf-orchestration PUBLIC
+    qinf-models
+    qinf-vision
+    qinf-session
+    sampling
+    ggml
+)
+
+set_target_properties(qinf-orchestration PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)

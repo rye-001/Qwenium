@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <string>
 #include <vector>
 #include <cstdint>
 #include <memory>
@@ -547,7 +549,21 @@ public:
     // kq_soft ever existing. Opt-in via --flash-attn; only recipes that thread
     // it into the attention helpers honor it, others stay Materialized.
     using AttnImpl = DecodePolicy::AttnImpl;
-    void set_attn_impl(AttnImpl a) { policy_.attn_impl = a; }
+
+    // Also stamps every KV cache's path salt. Flash changes the attention
+    // output, so it changes the residual stream, so it changes every later
+    // layer's K/V — a prefix or session blob frozen under one implementation is
+    // not valid to resume under the other. Stamping here rather than at each
+    // make_snapshot_header call site means none of the ~10 of them can forget.
+    void set_attn_impl(AttnImpl a) {
+        policy_.attn_impl = a;
+        const uint64_t salt =
+            (a == AttnImpl::Flash)
+                ? static_cast<uint64_t>(std::hash<std::string>{}("attn=flash"))
+                : 0ull;
+        for (simple_kv_cache* c : snapshot_kv_caches())
+            if (c) c->set_path_salt(salt);
+    }
     AttnImpl attn_impl() const { return policy_.attn_impl; }
     bool use_flash_attn() const { return policy_.attn_impl == AttnImpl::Flash; }
 
