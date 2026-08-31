@@ -62,6 +62,9 @@ docs/demo
 # Everything else under docs/*.md stays local unless `git add -f`-ed.
 !docs/note-batch-scaling-cross-family.md
 !docs/plan-deltanet-batched-decode.md
+!docs/note-image-lens-probe.md
+!docs/img-lens-probe-figs
+!docs/img-lens-probe-figs/*.png
 *.jpg
 *.jpeg
 
