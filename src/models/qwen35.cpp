@@ -159,6 +159,11 @@ Qwen35ForwardPass::Qwen35ForwardPass(
         }
     }
 
+    // Fail loud, before any allocation, if this checkpoint's DeltaNet layer
+    // count and the requested slot count would overflow the shared decode
+    // graph node budget (qwen35_family.h — was a raw GGML_ASSERT abort).
+    validate_deltanet_decode_batch_size(n_ssm_layers, cfg_.is_moe(), max_batch_size);
+
     std::cout << "[qwen35] Hybrid cache: " << n_attn_layers
               << " attention layers (KV), " << n_ssm_layers
               << " SSM layers (recurrent state)";

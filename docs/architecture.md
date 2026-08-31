@@ -33,6 +33,50 @@ one engine:
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
   them into one forward pass.
 
+**"~10 concurrent" is a slot count, not a throughput promise, and what it buys
+is family-dependent (measured 2026-08-30).** Batching B requests into one pass
+returns between ~1.6× and ~9.6× the tokens/wall of running them serially,
+depending entirely on the recipe:
+
+| recipe | cost of one extra lane, as a fraction of a B=1 step | what batching buys |
+|---|---|---|
+| `gemma4` dense 12B-it Q8_0 | **0.25** (and only **~0.02** above B=8) | **9.60× at B=32, still flat** |
+| `qwen35` 9B Q4_K_M | **0.52** | ceiling **1.91×** |
+| `qwen35moe` 35B-A3B Q2_K_XL | **0.63** | ceiling **1.59×** *as currently built* |
+
+*As currently built* is load-bearing: the hybrid figures are set by two pieces
+of software, not by the hardware — `DeltaNetLayer::build_decode` builds a full
+chain per slot (`src/layers/deltanet.cpp`), and ggml-metal's `MUL_MAT_ID` has
+no small-batch kernel and does not reach `mul_mm_id` below `ne21 = 32`, so the
+**entire ≤10-slot envelope sits below the MoE batched-kernel threshold**.
+A further consequence worth knowing before tuning the server: **8 slots is in
+the trough between two ggml-metal kernel regimes** — past the `mul_mv_ext`
+small-batch path (B≤8, and B≤5 before its rows-per-threadgroup table halves)
+and below the `mul_mm` crossover (`ne11_mm_min = 8`, engaged only *above* 8).
+On Gemma 4 both **B=5 and B=16 are materially better than B=8**. Provenance:
+[`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md).
+
+> **CORRECTED 2026-08-31 — replication does not support acting on the B=5
+> claim.** Replicated on the same Gemma 4-12B-it Q8_0 leg, speedup vs serial:
+>
+> | B | plain | server-realistic (per-lane logits readback + argmax) |
+> |---|---:|---:|
+> | 5 | 2.89× | 2.64× |
+> | 8 | 2.96× | 2.48× |
+> | 16 | 5.16× | 4.54× |
+>
+> In **plain** mode B=5 is *not* materially better than B=8 — a wash, arguably
+> a slight edge to B=8. Under **server-realistic** per-lane work B=8 does drop
+> below B=5, so B=8 is a genuine local bad spot there — but B=5 is still not an
+> actionable improvement over it, it's just less bad. B=16 robustly beats B=8
+> in both modes, and always did, but it sits outside the declared ≤10-slot
+> envelope and past the qwen36 DeltaNet node-count abort (§12: confirmed abort
+> at B=11). **Net: do not act on slot-count guidance from this paragraph.**
+> Full replication, including the structural confirmations behind the
+> above-B=8 marginal-cost collapse and the caveat that none of this is
+> established for any Qwen or K-quant model:
+> [`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md).
+
 The **workload envelope** is load-bearing and explains many "missing" features:
 ≤10 concurrent slots, ≤10K context, ~12 GB quantized models on unified memory.
 KV-cache *memory* is not the constraint in this regime — which is why KV
@@ -624,6 +668,32 @@ doctrine, each rule earned by a measurement:
   (`deltanet_post_state`, `deltanet_pre_state`, ~+7% tok/s combined) had to
   show up in both per-step timing and end-to-end tok/s — Metal per-step
   numbers swing ±25%.
+- **Read the dispatch source before the stopwatch — it predicts, and a
+  wall-clock number only describes.** The 2026-08-30 batch-scaling sweep is the
+  doctrine's own counterexample and its best instrument at once. *Amdahl before
+  code* and *two signals* both held — nothing below was called on a single
+  reading. What was new is that **every discontinuity in the curves was located
+  in `ggml-metal-ops.cpp` and predicted before it was measured**, then found:
+  the `mul_mv_ext` gate at `ne11 ∈ [4,8]` for K-quants predicted that **B=4
+  would be absolutely cheaper than B=3** on Q4_K_M (measured 137.4 vs 143.8 ms,
+  3/3 passes, against 2.2% spread); the kernel's rows-per-threadgroup table
+  (`…5→5, 6→3…`) predicted a free 3rd lane and a cliff at B=5→6 (measured
+  108.2→106.7, then **+46.3 ms for one lane**); `ne11_mm_min = 8` predicted the
+  marginal collapse above B=8 (measured ~2 ms/lane from B=10). A source-read
+  that names *where* the step will be is a stronger instrument than a
+  wall-clock number that only says *how big* — and it is what turned an
+  ambiguous null into a diagnosis: the July `QINF_BATCH_IDENTICAL` control read
+  as "MoE decode is not weight-read bound" was in fact `mul_mv_id`'s
+  per-*(expert, token)* grid being structurally unable to share a weight load,
+  confirmed by the same control running as a clean no-op on a dense recipe.
+  **The corollary is the inherited-number rule:** `ms/step ≈ 20 + 25.6·B` and
+  its "1.76× ceiling" were a Qwen 3.6 measurement propagated into six documents
+  as a cross-family constant — by a probe that was hard-gated to `qwen35moe`
+  and *could not have taken the comparison*. Re-measured, the same recipe fits
+  `12.3 + 21.0·B` and its ceiling **fell** to 1.59×, while a dense recipe
+  reaches 9.60× at B=32. Point-in-time numbers get a named model, not just a
+  named setup. Provenance:
+  [`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md).
 - **Deleting is optimizing.** TurboQuant/SnapKV removed (wrong constraint for
   the envelope); norm fusion never attempted (1.7% ceiling); conv fusion
   deferred below the agreed µs bar.
@@ -704,6 +774,56 @@ used only for the output-head matmul, overlapping with the next token's body.
 
 Current, verified against the tree at time of writing:
 
+- **`qwen35moe` aborts at B=16 on a node-count assert.**
+  `GGML_ASSERT(cgraph->n_nodes < cgraph->size)` fires in `build_deltanet_layer`,
+  reached from `Qwen36ForwardPass::build_decoding_graph`. Cause is structural
+  and known: `DeltaNetLayer::build_decode` builds a **full DeltaNet chain per
+  slot** and concatenates, so the decode graph's node count is **O(B)** —
+  it overflows the preallocated graph somewhere in `8 < B < 16`. Pre-existing
+  and **just outside the declared ≤10-slot envelope**, which is why it has never
+  been hit in production; found 2026-08-30 while sweeping batch sizes past the
+  envelope
+  ([`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md)
+  §7). It is a hard abort, not a degradation, so the failure mode is at least
+  loud. Two things to know before relying on it staying benign: the envelope's
+  own ceiling (10) is close enough to the failure band that a modest raise
+  crosses it, and the fix and the batching work are the same fix — batching the
+  per-slot loop removes the O(B) node growth along with the O(B) dispatches.
+
+  > **CORRECTED 2026-08-31 — the crossing point above is wrong, and it was
+  > wrong in the more dangerous direction (too optimistic).** Node-count
+  > census (`GGML_METAL_GRAPH_DEBUG=1`, exact integers, not wall-clock):
+  > `n_nodes = 1320·B + 2144` on `qwen35moe` (30 DeltaNet + 10 attention
+  > layers), exact for B≥2. **Confirmed directly: B=10 builds (15344 of 16384
+  > nodes — 94% of the limit), B=11 aborts.** That is **one slot of margin**
+  > against the declared ≤10-slot envelope, not "just outside" it. The
+  > mechanism is unchanged: each DeltaNet layer contributes exactly 44 graph
+  > nodes per slot (≈14.3 `VIEW`, 10 `RESHAPE`, 5 `MUL_MAT`, 2 `CONCAT`, ~2.7
+  > `CPY`, plus one each of `DELTANET_PRE_STATE`, `DELTANET_POST_STATE`,
+  > `GATED_DELTA_NET`, `SSM_CONV`, `TRANSPOSE`, `ADD`, `MUL`, `SIGMOID`,
+  > `SILU`, `SOFTPLUS`); `MUL_MAT_ID` stays exactly constant in B (120 nodes),
+  > confirming the CLAUDE.md claim that MoE dispatch is O(1) in expert count
+  > and batch.
+  >
+  > **`qwen35` (the dense hybrid) has the same defect, previously
+  > unrecorded.** `n_nodes = 1056·B + 596` (24 DeltaNet + 8 attention layers),
+  > exact for B≥2. **Confirmed directly: B=14 builds (15380 nodes), B=15
+  > aborts.** Five slots of margin above the ≤10 envelope, unlike qwen36's one.
+  >
+  > **The crash itself is fixed, the node-growth defect is not.** As of
+  > 2026-08-31, `create_forward_pass` refuses an over-limit `max_batch_size`
+  > fail-loud (`validate_deltanet_decode_batch_size`,
+  > `src/models/qwen35_family.{h,cpp}`, called from both `Qwen35ForwardPass`
+  > and `Qwen36ForwardPass`'s constructors) — before any graph is built or
+  > state allocated, naming the parameter, the derived limit, and the actual
+  > value. The underlying O(B) growth this bullet describes is untouched: the
+  > batching fix that removes it is scoped in
+  > [`plan-deltanet-batched-decode.md`](plan-deltanet-batched-decode.md), which
+  > is **PARKED by user decision (2026-08-31)** — the remaining work is ggml
+  > kernel engineering needing a dedicated measurement bench, for a payoff
+  > (concurrent-user throughput) with no present demand. Provenance for both
+  > formulas:
+  > [`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md).
 - **`--kv-f16` on Gemma 4 MoE is unexplained and ungated.** F32→F16 shifts the
   step-0 top-1 logit by 0.93 on `gemma-4-26B-A4B-it-Q2_K` (later steps drift
   0.06–0.3), against 0.0007–0.0387 on every other recipe including Gemma 4
