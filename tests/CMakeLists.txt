@@ -95,6 +95,18 @@ target_link_libraries(draft-source-tests PRIVATE
 target_compile_features(draft-source-tests PRIVATE cxx_std_17)
 add_test(NAME draft-source-tests COMMAND draft-source-tests)
 
+# SuffixDecoding — the third draft source (session-scoped, adaptive-length
+# lookup). Header+impl under src/sampling, same standalone-harness style as
+# speculative-tests / draft-source-tests. Model-free: pure token-vector tests.
+add_executable(suffix-decoding-tests
+    unit/test_suffix_decoding.cpp
+)
+target_link_libraries(suffix-decoding-tests PRIVATE
+    sampling
+)
+target_compile_features(suffix-decoding-tests PRIVATE cxx_std_17)
+add_test(NAME suffix-decoding-tests COMMAND suffix-decoding-tests)
+
 # Sampler semantics, co-located with src/sampling/sampling.cpp. Pins "greedy
 # means argmax" -- see the comment at the top of the test file.
 add_executable(sampling-tests

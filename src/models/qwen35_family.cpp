@@ -21,6 +21,42 @@
 #include "../graph_inputs/gather_indices_input.h"
 #include "../graph_inputs/kv_write_indices_input.h"
 
+#include "graph_arena.h"                // FP_GRAPH_SIZE
+#include "../qinf_error.h"              // QINF_ASSERT
+
+void validate_deltanet_decode_batch_size(uint32_t n_dn_layers,
+                                         bool     is_moe,
+                                         uint32_t max_batch_size) {
+    if (n_dn_layers == 0) return;  // no per-slot DeltaNet chain to overflow
+
+    // See the declaration in qwen35_family.h for the full derivation and its
+    // caveats. Both constants are exact node-count census measurements, not
+    // curve fits (docs/note-batch-scaling-cross-family.md).
+    constexpr uint32_t kNodesPerDeltaNetLayerPerSlot = 44;
+    constexpr uint32_t kDenseGraphNodesBase = 596;   // qwen35 9B: 24 DN + 8 attn
+    constexpr uint32_t kMoeGraphNodesBase   = 2144;  // qwen35moe: 30 DN + 10 attn
+
+    const uint32_t base     = is_moe ? kMoeGraphNodesBase : kDenseGraphNodesBase;
+    const uint32_t per_slot = kNodesPerDeltaNetLayerPerSlot * n_dn_layers;
+
+    // The abort this guards against is `n_nodes < cgraph->size`, i.e. n_nodes
+    // must be STRICTLY less than FP_GRAPH_SIZE, so the largest legal
+    // predicted node count is FP_GRAPH_SIZE - 1.
+    const uint32_t max_predicted_nodes = static_cast<uint32_t>(FP_GRAPH_SIZE) - 1;
+    const uint32_t max_batch_for_graph =
+        base >= max_predicted_nodes ? 0 : (max_predicted_nodes - base) / per_slot;
+
+    QINF_ASSERT(max_batch_size <= max_batch_for_graph,
+        "validate_deltanet_decode_batch_size: max_batch_size expected <= " +
+        std::to_string(max_batch_for_graph) + " (FP_GRAPH_SIZE=" +
+        std::to_string(FP_GRAPH_SIZE) + " node budget, " +
+        std::to_string(n_dn_layers) + " DeltaNet layers x " +
+        std::to_string(kNodesPerDeltaNetLayerPerSlot) +
+        " nodes/layer/slot, " + std::string(is_moe ? "MoE" : "dense") +
+        " base " + std::to_string(base) + " nodes), actual " +
+        std::to_string(max_batch_size));
+}
+
 namespace {
 
 void name_layer_tensor(ggml_tensor* t, const char* base, uint32_t il) {

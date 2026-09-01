@@ -8,6 +8,7 @@
 #include <string>
 
 #include "prompt_lookup.h"
+#include "suffix_decoding.h"
 
 namespace qinf {
 
@@ -19,7 +20,9 @@ namespace qinf {
 // answers "given where this slot is, what do you think comes next?".
 //
 // The seam exists because two genuinely different things answer that question:
-//   - PromptLookupDraft — a pure function of token history (n-gram lookup).
+//   - PromptLookupDraft / SuffixDecodingDraft — pure functions of token
+//     history (n-gram lookup; SuffixDecoding generalizes PLD's fixed-n,
+//     prompt-only match to an adaptive-n, session-scoped one).
 //   - MtpDraft (Phase 4) — the model's trained NextN head, driven by the last
 //     hidden state, not by token history.
 // They read *disjoint* inputs, so the context carries a superset and each
@@ -85,6 +88,29 @@ public:
 
 private:
     PromptLookup lookup_;
+};
+
+// ============================================================================
+// SuffixDecodingDraft: SuffixDecoding behind the seam. Session-scoped,
+// adaptive-length n-gram lookup over prompt + everything generated so far;
+// last_hidden unused — same class of source as PLD (pure function of token
+// history), just a bigger haystack and a smarter match length.
+// ============================================================================
+class SuffixDecodingDraft : public IDraftSource {
+public:
+    explicit SuffixDecodingDraft(SuffixDecodingConfig config = {})
+        : index_(config) {}
+
+    std::vector<int32_t> propose(const DraftContext& ctx) override {
+        return index_.find_draft(ctx.prompt_tokens, ctx.generated_tokens);
+    }
+
+    bool needs_hidden_state() const override { return false; }
+
+    const SuffixDecoding& index() const { return index_; }
+
+private:
+    SuffixDecoding index_;
 };
 
 // ============================================================================

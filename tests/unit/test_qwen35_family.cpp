@@ -9,6 +9,9 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+#include <string>
+
 #include "../../src/models/qwen35_family.h"
 
 namespace {
@@ -119,4 +122,58 @@ TEST(Qwen35Family, DenseAndMoeDeclareIdenticalDecodeInputs) {
                 << "hybrids (armed=" << armed << ") — they must not diverge";
         }
     }
+}
+
+// ── validate_deltanet_decode_batch_size ─────────────────────────────────────
+//
+// Pins the node-count guard against the two exact, directly-measured crossing
+// points in docs/note-batch-scaling-cross-family.md (arithmetic only, no
+// model file: n_nodes = 44*n_dn_layers*B + base).
+
+// qwen35moe: 30 DeltaNet layers, MoE base 2144. n_nodes = 1320*B + 2144.
+// Measured directly: B=10 -> 15344 nodes (builds), B=11 -> 16664 (aborts).
+TEST(Qwen35FamilyBatchGuard, Qwen36MatchesMeasuredCrossingAtEleven) {
+    EXPECT_NO_THROW(validate_deltanet_decode_batch_size(30, /*is_moe=*/true, 10));
+    EXPECT_THROW(validate_deltanet_decode_batch_size(30, /*is_moe=*/true, 11),
+                 std::runtime_error);
+}
+
+// qwen35: 24 DeltaNet layers, dense base 596. n_nodes = 1056*B + 596.
+// Measured directly: B=14 -> 15380 nodes (builds), B=15 -> 16436 (aborts).
+TEST(Qwen35FamilyBatchGuard, Qwen35MatchesMeasuredCrossingAtFifteen) {
+    EXPECT_NO_THROW(validate_deltanet_decode_batch_size(24, /*is_moe=*/false, 14));
+    EXPECT_THROW(validate_deltanet_decode_batch_size(24, /*is_moe=*/false, 15),
+                 std::runtime_error);
+}
+
+// The message must name the parameter, the expected limit, and the actual
+// value, in that order (qinf_error.h's contract).
+TEST(Qwen35FamilyBatchGuard, ErrorNamesParameterExpectedThenActual) {
+    try {
+        validate_deltanet_decode_batch_size(30, /*is_moe=*/true, 11);
+        FAIL() << "expected std::runtime_error";
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        const auto param_pos    = msg.find("max_batch_size");
+        const auto expected_pos = msg.find("expected <= 10");
+        const auto actual_pos   = msg.find("actual 11");
+        ASSERT_NE(param_pos, std::string::npos);
+        ASSERT_NE(expected_pos, std::string::npos);
+        ASSERT_NE(actual_pos, std::string::npos);
+        EXPECT_LT(param_pos, expected_pos);
+        EXPECT_LT(expected_pos, actual_pos);
+    }
+}
+
+// n_dn_layers == 0 is out of this guard's failure mode (no per-slot DeltaNet
+// chain) — accepted unconditionally rather than dividing by zero.
+TEST(Qwen35FamilyBatchGuard, ZeroDeltaNetLayersIsAlwaysAccepted) {
+    EXPECT_NO_THROW(validate_deltanet_decode_batch_size(0, false, 10000));
+}
+
+// A single active slot never triggers the guard on either shipped config —
+// the O(B) failure mode does not exist at B=1.
+TEST(Qwen35FamilyBatchGuard, SingleSlotAlwaysAccepted) {
+    EXPECT_NO_THROW(validate_deltanet_decode_batch_size(24, false, 1));
+    EXPECT_NO_THROW(validate_deltanet_decode_batch_size(30, true, 1));
 }

@@ -94,6 +94,7 @@ target_link_libraries(http_server PRIVATE
     qinf-models
     qinf-vision
     qinf-engine
+    qinf-state
     sampling
     ggml
     Threads::Threads

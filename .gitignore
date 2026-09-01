@@ -57,6 +57,14 @@ temp/
 docs/book
 docs/*.md
 docs/demo
+
+# Force-tracked docs (provenance that must not live on one machine only).
+# Everything else under docs/*.md stays local unless `git add -f`-ed.
+!docs/note-batch-scaling-cross-family.md
+!docs/plan-deltanet-batched-decode.md
+!docs/note-image-lens-probe.md
+!docs/img-lens-probe-figs
+!docs/img-lens-probe-figs/*.png
 *.jpg
 *.jpeg
 

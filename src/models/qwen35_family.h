@@ -99,6 +99,52 @@ ggml_tensor* build_qwen35_layer_prefill(
     int                      kv_idx,     // index into the KV cache (attention layers)
     uint32_t                 il);
 
+// ── Decode graph node-count guard ───────────────────────────────────────────
+//
+// DeltaNetLayer::build_decode (src/layers/deltanet.cpp) builds a full
+// per-slot chain and concatenates — O(n_slots) graph nodes, not O(1)
+// (docs/plan-deltanet-batched-decode.md, PARKED: the batching fix is scoped
+// but not built). That makes the decode graph's node count grow linearly in
+// the batch size B, and it can exceed FP_GRAPH_SIZE (graph_arena.h), which
+// previously surfaced as a raw GGML_ASSERT(cgraph->n_nodes < cgraph->size)
+// abort deep inside graph building instead of a named, fail-loud refusal.
+//
+// This computes the same limit ahead of time, from FP_GRAPH_SIZE and the
+// checkpoint's own DeltaNet layer count, so construction refuses an
+// over-limit max_batch_size before any graph is built or state is allocated.
+//
+// Confirmed by direct GGML_METAL_GRAPH_DEBUG=1 node-count census (exact
+// integers, not a curve fit — docs/note-batch-scaling-cross-family.md):
+// build_deltanet_layer's per-slot chain contributes exactly 44 graph nodes
+// per DeltaNet layer per slot, identically on both shipped checkpoints
+// (qwen35 9B: 24 layers, 44*24=1056; qwen35moe/Qwen 3.6: 30 layers,
+// 44*30=1320). That per-layer count is a property of the C++ code that
+// builds one DeltaNet layer for one slot, so it is expected to hold for any
+// DeltaNet layer count, not just the two measured.
+//
+// The B-independent remainder of the decode graph (embedding, output head,
+// attention layers, and — for qwen35moe — the MoE routers/experts, which are
+// O(1) in B per CLAUDE.md's MoE dispatch invariant) was measured at 596
+// nodes on the dense checkpoint (8 attention layers) and 2144 on the MoE one
+// (10 attention layers, 40 MoE layers). Two data points cannot separate how
+// much of that remainder tracks attention-layer count vs. MoE-router count
+// vs. a fixed base, so rather than guess at a further decomposition this
+// keys the remainder on is_moe() alone and uses the measured constant for
+// that bucket. For a future Qwen 3.5-family checkpoint with a different
+// attention-layer count than either measured config, this may refuse a
+// max_batch_size that would technically still fit — that is the safe
+// direction. The alternative is an under-estimated remainder that lets a
+// batch size through that overflows the graph, which is the exact bug this
+// guard exists to close.
+//
+// Fail-loud, no clamping: throws std::runtime_error naming the parameter,
+// the expected limit, and the actual value, per qinf_error.h's contract.
+// n_dn_layers == 0 is not this family's failure mode (no per-slot DeltaNet
+// chain to overflow) and is accepted unconditionally.
+void validate_deltanet_decode_batch_size(uint32_t n_dn_layers,
+                                         bool     is_moe,
+                                         uint32_t max_batch_size);
+
 // Decode: one token per active slot, batched.
 ggml_tensor* build_qwen35_layer_decode(
     const Qwen35LayerCommon&     c,

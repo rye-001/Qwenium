@@ -17,10 +17,12 @@
 //
 //   QWEN36_MODEL_PATH=models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf ./bin/batch-scaling
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,15 +33,37 @@
 
 using Clock = std::chrono::steady_clock;
 
+static int env_int(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::atoi(v) : fallback;
+}
+
 int main() {
     const char* env = std::getenv("QWEN36_MODEL_PATH");
     std::string path = env ? env : "models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf";
 
-    const uint32_t MAXB    = 10;   // largest batch tested
-    const uint32_t CTX     = 1024; // KV ctx per slot (enough for prompt + decode)
-    const int      WARMUP  = 6;    // steps to absorb galloc reserve/first-run cost
-    const int      TIMED   = 24;   // timed steps
-    const std::vector<uint32_t> batches = {1, 2, 4, 8, 10};
+    // Batch list, e.g. QINF_BS_BATCHES=1,2,4,8
+    std::vector<uint32_t> batches;
+    if (const char* bl = std::getenv("QINF_BS_BATCHES")) {
+        std::string s(bl), cur;
+        for (char c : s + ",") {
+            if (c == ',') { if (!cur.empty()) batches.push_back((uint32_t)std::atoi(cur.c_str())); cur.clear(); }
+            else cur += c;
+        }
+    }
+    if (batches.empty()) batches = {1, 2, 4, 8, 10};
+
+    uint32_t max_b = 1;
+    for (uint32_t b : batches) max_b = std::max(max_b, b);
+
+    const uint32_t MAXB   = (uint32_t)env_int("QINF_BS_MAXB", (int)max_b);
+    const uint32_t CTX    = (uint32_t)env_int("QINF_BS_CTX", 1024);
+    const int      WARMUP = env_int("QINF_BS_WARMUP", 6);
+    const int      TIMED  = env_int("QINF_BS_TIMED", 24);
+    const int      PASSES = env_int("QINF_BS_PASSES", 1);
+    // 0 => use the historical text prompt; N>0 => N synthetic ids (tokenizer-free,
+    // so prompt length is exactly equal across model families).
+    const int      PTOK   = env_int("QINF_BS_PROMPT_TOKENS", 0);
 
     register_builtin_models();
     std::cerr << "Loading " << path << " ...\n";
@@ -47,21 +71,24 @@ int main() {
     model.load_metadata(path);
     model.load_tensors();
     const auto& meta = model.get_metadata();
-    if (meta.architecture != "qwen35moe") {
-        std::cerr << "batch-scaling: expected qwen35moe, got " << meta.architecture << "\n";
-        return 1;
-    }
+    std::cerr << "arch=" << meta.architecture << " ctx=" << CTX << " maxb=" << MAXB
+              << " warmup=" << WARMUP << " timed=" << TIMED << " passes=" << PASSES << "\n";
     auto fp = create_forward_pass(model, &meta, CTX, MAXB);
     ggml_backend_sched_t sched = model.get_scheduler();
     Tokenizer* tok = model.get_tokenizer();
 
     // A short prompt — decode cost is what we measure, prefill is one-off.
-    std::vector<int32_t> prompt = tok->encode("Summarize the following order:");
+    std::vector<int32_t> prompt;
+    if (PTOK > 0) { for (int i = 0; i < PTOK; ++i) prompt.push_back((int32_t)((i * 7 + 3) % 1000)); }
+    else          { prompt = tok->encode("Summarize the following order:"); }
     const auto vsz = (int32_t)meta.vocab_size;
+    std::fprintf(stderr, "prompt_tokens=%zu\n", prompt.size());
 
-    std::printf("\n batch |  ms/step | ms/step/lane | vs B=1 (step) | speedup vs serial\n");
-    std::printf("-------+----------+--------------+---------------+------------------\n");
+    volatile long long sink = 0;
+    std::printf("\n pass | batch |  ms/step | ms/step/lane | vs B=1 (step) | speedup vs serial\n");
+    std::printf("------+-------+----------+--------------+---------------+------------------\n");
 
+    for (int pass = 0; pass < PASSES; ++pass) {
     double ms_step_b1 = 0.0;
     for (uint32_t B : batches) {
         // Fresh state: clear every slot, prefill slot 0, clone into 1..B-1.
@@ -72,6 +99,34 @@ int main() {
 
         std::vector<uint32_t> slots(B);
         for (uint32_t s = 0; s < B; ++s) slots[s] = s;
+
+        // Phase 0.1 of plan-deltanet-batched-decode: the decode graph's node
+        // count as a function of B. Free — the graph is built anyway — and it
+        // is the structural, thermally-immune half of that plan's evidence.
+        // QINF_BS_NODES_ONLY=1 stops after this, so the sweep costs one graph
+        // build per B instead of a full timed cell.
+        {
+            std::vector<int32_t> tk(B), ps(B);
+            for (uint32_t s = 0; s < B; ++s) { tk[s] = (int32_t)((1000 + s * 131) % vsz); ps[s] = P; }
+            ggml_backend_sched_reset(sched);
+            ggml_cgraph* gn = fp->build_decoding_graph(tk, slots, ps);
+            std::printf("NODES,%s,%u,%d\n", meta.architecture.c_str(), B, ggml_graph_n_nodes(gn));
+            // Per-op node histogram, so the O(B) growth can be attributed to
+            // specific ops rather than inferred from a total.
+            if (std::getenv("QINF_BS_NODE_OPS")) {
+                std::map<std::string, int> hist;
+                for (int i = 0; i < ggml_graph_n_nodes(gn); ++i) {
+                    ggml_tensor* n = ggml_graph_node(gn, i);
+                    std::string op = ggml_op_name(n->op);
+                    if (n->op == GGML_OP_UNARY) op += std::string("/") + ggml_unary_op_name(ggml_get_unary_op(n));
+                    hist[op]++;
+                }
+                for (const auto& kv : hist)
+                    std::printf("NODEOP,%u,%s,%d\n", B, kv.first.c_str(), kv.second);
+            }
+            std::fflush(stdout);
+        }
+        if (std::getenv("QINF_BS_NODES_ONLY")) continue;
 
         auto run_step = [&](int step) {
             std::vector<int32_t> tokens(B);
@@ -92,6 +147,22 @@ int main() {
             ggml_backend_sched_alloc_graph(sched, gf);
             fp->set_decode_inputs(gf, tokens, slots, positions);
             ggml_backend_sched_graph_compute(sched, gf);
+            // QINF_BS_SERVERLIKE=1 adds the per-lane work the *product* loop does
+            // and this probe historically did not: a full-vocabulary device->host
+            // logits readback plus a full-vocabulary CPU argmax, once per lane
+            // (http_server.cpp run_batched_decode). Phase 0.3 of
+            // plan-deltanet-batched-decode names this as the reason the server's
+            // marginal lane cost must exceed the probe's; this switch is how that
+            // claim is tested here rather than only against a live server.
+            static const bool serverlike = std::getenv("QINF_BS_SERVERLIKE");
+            if (serverlike) {
+                for (uint32_t s = 0; s < B; ++s) {
+                    std::vector<float> lg = fp->get_output_logits_for_slot(gf, s);
+                    int best = 0; float bv = lg.empty() ? 0.0f : lg[0];
+                    for (size_t k = 1; k < lg.size(); ++k) if (lg[k] > bv) { bv = lg[k]; best = (int)k; }
+                    sink += best;
+                }
+            }
             for (uint32_t s = 0; s < B; ++s) fp->advance_cache(1, s);
         };
 
@@ -102,10 +173,12 @@ int main() {
 
         double ms_step = std::chrono::duration<double, std::milli>(t1 - t0).count() / TIMED;
         if (B == 1) ms_step_b1 = ms_step;
-        std::printf(" %5u | %8.2f | %12.2f | %13.2fx | %15.2fx\n",
-                    B, ms_step, ms_step / B, ms_step / ms_step_b1,
+        std::printf(" %4d | %5u | %8.2f | %12.2f | %13.2fx | %15.2fx\n",
+                    pass, B, ms_step, ms_step / B, ms_step / ms_step_b1,
                     (ms_step_b1 * B) / ms_step);
+        std::printf("RESULT,%s,%d,%u,%.4f\n", meta.architecture.c_str(), pass, B, ms_step);
         std::fflush(stdout);
+    }
     }
     std::printf("\nHeadline: ms/step(B) grows as ~1x if seats are free, ~Bx if full.\n"
                 "'speedup vs serial' = tokens/wall you'd get running B futures batched\n"

@@ -173,6 +173,26 @@ is the intercept, and the per-lane 25.6 ms/B dominates at high batch (probe
 fit `ms/step ≈ 20 + 25.6·B`). Gate: existing server smokes green + A/B tok/s
 at B=1/2/4/8.
 
+> **CORRECTED 2026-08-30 — the fit above is superseded; the P4 expectation
+> survives, and gets sharper.** Re-measured on Qwen 3.6:
+> **`12.3 + 21.0·B`** (R² 0.9995), not `20 + 25.6·B`. Intercept −43% and slope
+> −18% — and part of that intercept drop is *this work landing*, so quoting the
+> old intercept as the size of the prize P4 is chasing now double-counts. The
+> normalized lane cost nevertheless got **worse** (0.54 → **0.63**) and the
+> amortization ceiling fell **1.85× → 1.59×**: a smaller intercept over a slope
+> that shrank less means the per-lane term dominates *sooner*, so the "tapering
+> to ~1.05× at B=8" shape holds and if anything arrives earlier.
+>
+> Two things the P4 A/B should know before it is run. First, the sweep points
+> `B=1/2/4/8` land on ggml-metal kernel-regime boundaries, not on a smooth
+> curve — `mul_mv_ext` gates at `ne11 ∈ [2,8]` (dense) / `[4,8]` (K-quants) and
+> `mul_mm` only engages **above** `ne11_mm_min = 8`, so **B=8 sits in the trough
+> between two regimes**. Any A/B that reports a single ratio "at B=8" is
+> reporting the worst point on the curve. Second, the fit is only near-linear on
+> the MoE recipe; on dense Gemma 4 it is a staircase (R² 0.965, ±19 ms residual
+> that is structure, not noise). Evidence of record:
+> [`note-batch-scaling-cross-family.md`](note-batch-scaling-cross-family.md).
+
 ### 2.5 P5 — MTP head persistence (unlocks the loop restructure)
 
 `mtp_draft` (`qwen36.cpp:644-647`) pays reset+build+alloc per head step —

@@ -3,8 +3,8 @@
 **The inference engine that shows its work.**
 
 A self-contained C++ engine for the Qwen and Gemma families on
-[ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml), serving 10
-concurrent users from a single 32 GB Mac. Two model families on one
+[ggml](https://github.com/ggerganov/llama.cpp/tree/master/ggml), serving up to
+10 concurrent users from a single 32 GB Mac. Two model families on one
 cross-family architecture. Vision. Speculative decoding with a trained MTP
 head. Grammar-leashed output. Portable session snapshots. Warm conversational
 serving. Metal throughout, with custom fused DeltaNet kernels.
@@ -53,6 +53,12 @@ volunteer:**
 3. **"Check me if you like."** Ask again and get the identical answer, byte for
    byte. It cannot quietly change its story.
 
+This is a **calibrated capability, not a blanket property of every model
+here** — the same status as vision or MTP. The attention tap is
+recipe-agnostic (any recipe naming its `kq_soft` tensor can host it), but the
+citation/coverage calibration behind it is per-model, and today only Qwen 3.6
+has been calibrated; there are no lens claims for Gemma yet.
+
 ### How that is actually done
 
 - **Where it looked — attention.** By default every decode step's attention is
@@ -60,11 +66,11 @@ volunteer:**
   compute. Calibrated, it becomes receipts: per-value **source citations**, a
   whole-document **coverage audit** ("this line was never consulted"), and an
   **ungrounded-value flag** — served via `/v1/extract` with
-  `--attention-lens`. This is the one place where speed and auditability
-  genuinely conflict: `--flash-attn` fuses the attention softmax into a single
-  kernel that never writes those rows down, so the two flags are mutually
-  exclusive and the server refuses them together at startup rather than
-  silently dropping the receipts.
+  `--attention-lens`, **Qwen 3.6-pinned and single-slot today**. This is the
+  one place where speed and auditability genuinely conflict: `--flash-attn`
+  fuses the attention softmax into a single kernel that never writes those
+  rows down, so the two flags are mutually exclusive and the server refuses
+  them together at startup rather than silently dropping the receipts.
 - **What decided it — determinism.** Greedy decode is byte-deterministic, with
   forkable state (warm prefix restore + recurrent-state checkpoints). Remove
   one line of the input, re-run, and the diff is fact, not sampling noise —
@@ -76,16 +82,16 @@ volunteer:**
 
 ## What it does
 
-- **Multi-family support** — Qwen 2/2.5/3/3.5/3.6 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
-- **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
-- **Vision (multimodal)** — Image input for Gemma 3 (SigLIP encoder) and Gemma 4 (`gemma4uv` projector) via a `--mmproj` GGUF, in both the CLI (`--image`) and the server (OpenAI `image_url` content).
-- **Batched inference** — Slot-based KV cache with batched decode. ~4× throughput over sequential processing for 10 concurrent users.
+- **Multi-family support** — Qwen 2/2.5/3/3.5/3.6/3.8 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
+- **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5/3.8, one recipe), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
+- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute. Qwen 3.6-pinned and single-slot today; see [Answers, with receipts](#answers-with-receipts).
+- **Vision (multimodal)** — Image input for Gemma 3 (SigLIP encoder), Gemma 4 (`gemma4uv` projector), and the Qwen 3.5/3.6/3.8 family (`qwen3vl` encoder + merger, in-ViT M-RoPE) via a `--mmproj` GGUF, in both the CLI (`--image`) and the server (OpenAI `image_url` content).
+- **Batched inference** — Slot-based KV cache with batched decode, up to 10 concurrent slots; the Qwen DeltaNet hybrids enforce that ceiling with a fail-loud guard rather than a silent degradation (aborts at 11 slots on Qwen 3.6, 15 on Qwen 3.5/3.8). Throughput gain is strongly model-dependent — ~4× measured on Qwen 2.5 Coder 14B Q4 (dense transformer), only a ~1.6× ceiling on the Qwen 3.6 hybrid; see [Performance](#performance).
 - **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.
 - **OpenAI-compatible API** — `/v1/completions` and `/v1/chat/completions` with SSE streaming, per-request sampling params, and a `grammar` field for constrained output. Drop-in for existing tools.
-- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute.
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
 - **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
-- **Speculative decoding** — Prompt-lookup based, no draft model needed.
+- **Speculative decoding** — Two draft sources: prompt-lookup (`--speculative` / `--speculative pld`, no draft model needed) and a trained MTP/NextN head (`--speculative mtp`, `--mtp-max-draft`, Qwen 3.6 only). MTP is experimental: 74–92% acceptance, ~3.3 tokens/step, but end-to-end throughput is only ~baseline on M1 Pro until the per-head dispatch overhead is addressed.
 - **Flash attention (`--flash-attn`)** — opt-in, on prefill *and* decode, every recipe. One fused kernel replaces the materialized `kq → softmax → kqv` chain and the V transpose. Worth 5–32% of a decode step depending on the model, and it grows with prompt length on prefill (~7% at 756 tokens, ~55% at 3000) because materialized attention is O(n²) and this is not. Token-stable, not byte-identical — so it stays opt-in, and it is mutually exclusive with `--attention-lens`.
 - **Metal acceleration** — Apple Silicon via ggml's Metal backend, with custom fused DeltaNet kernels (`patches/`) for Qwen 3.5 / 3.6 decode.
 
@@ -95,12 +101,13 @@ volunteer:**
 |-------|--------------|-------|--------|--------|
 | Qwen 2.5 Coder 14B Instruct | Transformer | Q4_0 | ~9 GB | ✅ Primary target |
 | Qwen 3 1.7B / 0.6B | Transformer | BF16 / Q8_0 | ~3.4 GB / ~0.6 GB | ✅ Tested |
-| Qwen 3.5 27B | Attention + SSM | Q4 / Q8 | ~16 GB | ✅ |
-| Qwen 3.6 35B-A3B | DeltaNet + Attention + MoE | Q4 / Q8 | ~20 GB | ✅ |
+| Qwen 3.5 (9B / 4B / 0.8B) | Attention + SSM | Q4 / Q8 / BF16 | ~9 GB / ~4 GB / ~1.4 GB | ✅ |
+| Qwen 3.8 (27B / 9B) | Attention + SSM, same `qwen35` recipe as 3.5; 27B carries a NextN/MTP head (not yet used for drafting) and vision (`qwen3vl` mmproj) | Q3_K_M / Q8_0 | ~14 GB / ~9 GB | ✅ |
+| Qwen 3.6 35B-A3B | DeltaNet + Attention + MoE; vision via `qwen3vl` mmproj | Q2 / Q3 | ~13–16 GB | ✅ |
 | Gemma 1 (2B / 7B) | Transformer | Q4 / Q8 | ~1.5 GB / ~5 GB | ✅ |
 | Gemma 2 (2B / 9B) | Transformer + logit soft-cap | Q4 / Q8 | ~1.5 GB / ~6 GB | ✅ |
 | Gemma 3 (4B) | Transformer + sliding-window; vision via SigLIP mmproj | Q4 / Q8 | ~3 GB | ✅ |
-| Gemma 4 (4B / 12B) | Transformer + PLE + pruned RoPE (dense & MoE); vision via `gemma4uv` mmproj | Q4 / Q8 | ~3–8 GB | ✅ |
+| Gemma 4 (12B / 26B-A4B) | Transformer + PLE + pruned RoPE (dense / MoE); vision via `gemma4uv` mmproj | Q8 (12B) / Q2–Q4 (MoE) | ~12 GB / ~10–16 GB | ✅ |
 
 ## Quick Start
 
@@ -152,10 +159,10 @@ curl -s http://localhost:8080/v1/chat/completions \
 ```bash
 ./bin/qwenium model.gguf --chat                  # interactive
 ./bin/qwenium model.gguf --chat --flash-attn     # fused attention (prefill + decode)
-./bin/qwenium model.gguf --chat --speculative    # with speculative decoding
+./bin/qwenium model.gguf --chat --speculative    # with speculative decoding (PLD; add "mtp" on Qwen 3.6)
 ./bin/qwenium model.gguf -p "Hello, world!"      # single prompt
 ./bin/qwenium model.gguf --chat \
-    --mmproj vision.gguf --image photo.jpg       # ask about an image (Gemma 3/4, Qwen 3.5/3.6)
+    --mmproj vision.gguf --image photo.jpg       # ask about an image (Gemma 3/4, Qwen 3.5/3.6/3.8)
 ```
 
 ## Architecture
@@ -181,7 +188,7 @@ src/
 │   ├── forward_pass_base.*      #   Shared graph scaffolding + the recipe interface
 │   ├── model_registry.*         #   GGUF arch string → factory + inventory validator
 │   ├── qwen3.*                  #   Qwen2/2.5/3 (pure transformer)
-│   ├── qwen35.*                 #   Qwen3.5 (attention + SSM)
+│   ├── qwen35.*                 #   Qwen3.5 / 3.8 (attention + SSM)
 │   ├── qwen36.*                 #   Qwen3.6 (DeltaNet + attention + MoE)
 │   └── gemma1-4.*               #   Gemma family (logit soft-cap, sliding-window, PLE, pruned RoPE)
 ├── graph_inputs/                # Typed graph inputs (tokens, positions, masks, image embeddings)
@@ -256,12 +263,27 @@ worst is a Gemma. What predicts it is the share of the step the materialized
 attention core occupies — diluted by hybrid DeltaNet/MoE layers that flash never
 touches, and by weight-bandwidth-bound models with few KV heads.
 
+**Where this sits beside faster engines.** The fastest published Apple Silicon
+engine today is BaseRT (["Best-in-Class LLM Inference on Apple Silicon via
+Native Metal"](https://arxiv.org/abs/2607.00501), July 2026), and its own
+limitations section is the useful part: **single-device inference only, no
+continuous batching, no parallel decoding across multiple requests, no tensor
+parallelism** — confirmed by its future-work section, which lists continuous
+batching and speculative decoding as not yet present. Its margin over
+llama.cpp also narrows sharply on the model classes this engine targets:
+**1.04×** on Qwen3-30B-A3B Q4, **1.07×** on Gemma-4-26B-A4B Q4 (and **0.90×** —
+a loss — against MLX on that same model); the larger margins, up to 1.56×, are
+on sub-1B dense models. MLX's own continuous batching exists only as a
+third-party vLLM port, not in its core runtime. Qwenium is not faster than
+llama.cpp (see above) or BaseRT. What it does that neither does natively, on
+the same hardware class: serve up to 10 concurrent requests as one batched
+forward pass, with per-slot sampling and per-slot grammar.
 
 Engine-level numbers, M1 Pro (32 GB), Qwen 2.5 Coder 14B Q4:
 
 | Metric | Value |
 |--------|-------|
-| Throughput (10 concurrent) | ~4× vs sequential |
+| Throughput (10 concurrent) | ~4× vs sequential — measured on this one dense model; strongly model-dependent, down to a ~1.6× amortization ceiling on the Qwen 3.6 hybrid ([`note-batch-scaling-cross-family.md`](docs/note-batch-scaling-cross-family.md)) |
 | Warm chat prefix hit (`--chat-prefix-cache`) | 2.4× per turn at 4K context (flat vs quadratic re-prefill) |
 | Persistent decode graph (`--persistent-graph`) | 1.32× on Qwen 3.6 35B-A3B; ~parity on small models — the win is model-specific |
 | Flash attention (`--flash-attn`) | +5–32% decode, +7–55% prefill (grows with prompt length); see above |

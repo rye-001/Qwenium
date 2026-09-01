@@ -45,6 +45,21 @@
 #include "session/prefix_library.h"
 #include "session/slot_snapshot.h"
 
+// Speculative decoding (--speculative [pld|mtp|suffix]): reuses the CLI's
+// exact draft-source seam and verify/rewind/checkpoint machinery
+// (docs/architecture.md §5/§6) — no second verify path. The verify/rewind
+// adapter itself (make_speculative_verify/rewind below) is intentionally
+// NOT pulled in from cli/speculative_bridge.h: that header lives under the
+// OTHER front end, and including it here would put a server -> cli
+// dependency edge in the tree for ~15 lines of glue. Reimplemented inline;
+// flagged in the task report as a smell worth a real home (sampling/ or
+// models/) if a third front end ever needs it too.
+#include "sampling/speculative.h"
+#include "sampling/draft_source.h"
+#include "models/i_mtp_draftable.h"
+#include "models/graph_arena.h"     // FP_GRAPH_SIZE (MTP head's dedicated scheduler)
+#include "state/deltanet_state.h"   // DeltaNetState::checkpoint/restore/release
+
 #include <iostream>
 #include <thread>
 #include <csignal>
@@ -225,6 +240,14 @@ public:
         std::cout << "Model loaded successfully" << std::endl;
     }
 
+    // Only owns a raw resource when --speculative mtp built a dedicated
+    // scheduler for the NextN head (mirrors cli/complete.cpp's own
+    // ggml_backend_sched_free at end of run_complete; the server's instance
+    // lives for the process, so this is the equivalent teardown point).
+    ~QweniumServerIntegration() {
+        if (mtp_sched_) ggml_backend_sched_free(mtp_sched_);
+    }
+
     void reserve_max_batch() {
         std::cout << "Reserving memory for max batch size: " << max_slots_ << " and max ctx: " << max_ctx_per_slot_ << std::endl;
 
@@ -339,6 +362,106 @@ public:
         return true;
     }
 
+    // ── Speculative decoding (--speculative [pld|mtp|suffix]) ───────────────
+    // Builds the CLI's own draft source + SpeculativeDecoder (sampling/
+    // speculative.h, sampling/draft_source.h) — same construction as
+    // cli/main.cpp and cli/complete.cpp, just at server startup instead of
+    // per-run. Engages only when exactly one slot is active (decode_step()
+    // in inference_server.h); off (spec_ null) is the default and leaves the
+    // decode path byte-identical. Returns false with a printed reason on any
+    // failure (bad --suffix-* value, or an MTP GGUF/recipe mismatch) — same
+    // shape as enable_flash_attn, so main() can just `return 1`.
+    bool enable_speculative(const std::string& mode, int pld_ngram, int pld_max_draft,
+                            int suffix_max_match, int suffix_min_match,
+                            int suffix_max_draft, size_t suffix_max_indexed,
+                            int mtp_max_draft) {
+        const auto& meta = model_.get_metadata();
+        if (mode == "pld") {
+            qinf::PromptLookupConfig cfg;
+            cfg.ngram_size = pld_ngram;
+            cfg.max_draft = pld_max_draft;
+            spec_ = std::make_unique<qinf::SpeculativeDecoder>(cfg, (int)meta.vocab_size);
+        } else if (mode == "suffix") {
+            try {
+                qinf::SuffixDecodingConfig cfg;
+                cfg.max_match_len = suffix_max_match;
+                cfg.min_match_len = suffix_min_match;
+                cfg.max_draft = suffix_max_draft;
+                cfg.max_indexed_tokens = suffix_max_indexed;
+                spec_ = std::make_unique<qinf::SpeculativeDecoder>(
+                    std::make_unique<qinf::SuffixDecodingDraft>(cfg), (int)meta.vocab_size);
+            } catch (const std::exception& e) {
+                std::cerr << "--speculative suffix: " << e.what() << std::endl;
+                return false;
+            }
+        } else if (mode == "mtp") {
+            // Same two-failure split as cli/complete.cpp: the recipe never
+            // implements IMtpDraftable, vs. it does but this GGUF carries no
+            // head (nextn_predict_layers == 0).
+            auto* mtp_cap = dynamic_cast<IMtpDraftable*>(forward_pass_.get());
+            const uint32_t nextn = meta.nextn_predict_layers();
+            if (!mtp_cap) {
+                std::cerr << "--speculative mtp: MTP drafting expected implemented "
+                             "by the recipe for architecture '" << meta.architecture
+                          << "', actual not implemented (no IMtpDraftable)";
+                if (nextn > 0) {
+                    std::cerr << " -- note this GGUF does carry a NextN head ("
+                              << meta.architecture << ".nextn_predict_layers=" << nextn
+                              << "): the head is loaded and held out of the decode "
+                                 "stack, but no recipe-side draft path exists to use it";
+                }
+                std::cerr << std::endl;
+                return false;
+            }
+            if (!mtp_cap->mtp_supported()) {
+                std::cerr << "--speculative mtp: field '" << meta.architecture
+                          << ".nextn_predict_layers' expected > 0, actual " << nextn
+                          << " -- this GGUF carries no NextN head; use an "
+                             "MTP-converted GGUF for architecture '"
+                          << meta.architecture << "'" << std::endl;
+                return false;
+            }
+            forward_pass_->set_output_hidden(true);
+            // Dedicated scheduler: the head's graph shape must not share
+            // galloc state with the main graphs (server-image-multirequest-
+            // bug.md precedent, same reasoning cli/complete.cpp applies).
+            if (model_.has_metal_backend()) {
+                ggml_backend_t backends[] = {model_.get_backend_metal(),
+                                             model_.get_backend_cpu()};
+                mtp_sched_ = ggml_backend_sched_new(backends, nullptr, 2,
+                                                    FP_GRAPH_SIZE, true, false);
+            } else {
+                ggml_backend_t backends[] = {model_.get_backend_cpu()};
+                mtp_sched_ = ggml_backend_sched_new(backends, nullptr, 1,
+                                                    FP_GRAPH_SIZE, false, false);
+            }
+            auto bridge_fn = [mtp_cap, sched = mtp_sched_](
+                    uint32_t slot, const std::vector<float>& h, int32_t t, int p,
+                    uint32_t k) {
+                return mtp_cap->mtp_draft(slot, h, t, p, k, sched);
+            };
+            spec_ = std::make_unique<qinf::SpeculativeDecoder>(
+                std::make_unique<qinf::MtpDraft>(bridge_fn, mtp_max_draft),
+                (int)meta.vocab_size);
+        } else {
+            std::cerr << "--speculative: expected one of pld|mtp|suffix, got '"
+                      << mode << "'" << std::endl;
+            return false;
+        }
+        speculative_mode_ = mode;
+        std::cout << "Speculative decoding ON (--speculative " << mode << "): "
+                     "engages only when exactly one slot is active (server's "
+                     "batch axis is slots, speculation's is draft positions -- "
+                     "they don't compose under the decode-graph node-count "
+                     "ceiling); falls back to batched decode otherwise, and on "
+                     "any slot running a per-request grammar (matches the CLI, "
+                     "which disables speculative decoding outright under "
+                     "--grammar-file). Token-stable, not byte-identical, vs "
+                     "speculation off." << std::endl;
+        return true;
+    }
+    bool speculative_enabled() const { return spec_ != nullptr; }
+
     // Run one extraction and return the lens-format JSON. EXCLUSIVE: holds the
     // model lock for the whole tapped decode and uses slot 0 (the only slot with
     // a correct qwen36 decode KV gather — architecture.md §12 / plan A3), so it
@@ -426,6 +549,28 @@ public:
                                          const std::vector<int>& slot_ids) {
             return run_batched_decode(tokens, slot_ids);
         });
+
+        // Speculative decoding (--speculative): only registered when spec_ was
+        // built (enable_speculative succeeded), so a server started without
+        // the flag leaves both callbacks unset — decode_step() never takes
+        // the speculative branch and the batched path above is untouched.
+        if (spec_) {
+            server.set_speculative_decode(
+                [this](int slot_id, int32_t last_token,
+                       const std::vector<int32_t>& prompt_tokens,
+                       const std::vector<int32_t>& generated_tokens) {
+                    return run_speculative_step(slot_id, last_token,
+                                                prompt_tokens, generated_tokens);
+                });
+            // A per-request GBNF grammar excludes speculative decoding on
+            // that slot, matching the CLI (--speculative + --grammar-file
+            // disables speculation outright): draft tokens are never checked
+            // against the grammar, so accepting one could emit something the
+            // grammar would have masked out.
+            server.set_speculative_eligible([this](int slot_id) {
+                return slot_grammars_[slot_id] == nullptr;
+            });
+        }
 
         server.set_clear_slot([this](int slot_id) {
             forward_pass_->clear_slot(slot_id);
@@ -741,8 +886,129 @@ private:
             // Advance cache for each slot in the batch
             forward_pass_->advance_cache(1, slot_ids[i]);
         }
-        
+
         return next_tokens;
+    }
+
+    // ── Speculative decoding: verify/rewind adapters ─────────────────────────
+    // Turn forward_pass_ + scheduler_ into the two callables SpeculativeDecoder
+    // needs (sampling/speculative.h). Same shape as cli/speculative_bridge.h's
+    // SpeculativeBridge, reimplemented here rather than included across the
+    // cli/<->server front-end boundary — see the include-site comment.
+    qinf::SpeculativeDecoder::VerifyFunc make_speculative_verify(uint32_t slot) {
+        return [this, slot](int /*slot_id*/, const std::vector<int32_t>& draft,
+                            int start_pos) -> std::vector<float> {
+            // Verification needs logits at ALL K draft positions, not just the
+            // last — the prefill head slice (default ON for a plain decode
+            // step) must be off for this call.
+            const bool prev = forward_pass_->slice_prefill_head();
+            forward_pass_->set_slice_prefill_head(false);
+            std::vector<float> logits =
+                forward_pass_->run_prefill(draft, start_pos, slot, scheduler_);
+            forward_pass_->set_slice_prefill_head(prev);
+            return logits;
+        };
+    }
+    qinf::SpeculativeDecoder::RewindCacheFunc make_speculative_rewind(uint32_t slot) {
+        return [this, slot](int /*slot_id*/, int new_pos) {
+            forward_pass_->set_cache_pos(static_cast<uint32_t>(new_pos), slot);
+        };
+    }
+
+    // One speculative decode step for slot_id (the SpeculativeDecodeFunc body
+    // registered in configure_server). Mirrors cli/complete.cpp's per-
+    // iteration speculative block exactly: feed last_token, sample the
+    // fallback/first-token-guard candidate `y`, checkpoint recurrent state on
+    // hybrids, draft + verify, then restore + feed_tokens on a partial reject.
+    // Locked like every other model-touching call on this integration —
+    // extract_lens_json runs the same tapped-decode-under-lock pattern from
+    // an HTTP thread, and this runs from the inference thread, so the lock is
+    // what keeps them from ever overlapping.
+    qinf::InferenceServer::SpeculativeStepResult run_speculative_step(
+            int slot_id, int32_t last_token,
+            const std::vector<int32_t>& prompt_tokens,
+            const std::vector<int32_t>& generated_tokens) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        const uint32_t slot = static_cast<uint32_t>(slot_id);
+        const auto& md = model_.get_metadata();
+        const int32_t eos_token_id = md.eos_token_id;
+        const size_t vocab_size = md.vocab_size;
+        const bool mtp_mode = (speculative_mode_ == "mtp");
+
+        std::vector<int32_t> current_token_vec{last_token};
+        const int decode_pos = forward_pass_->get_rope_pos(slot);
+
+        std::vector<float> last_hidden;
+        std::vector<float> decode_logits = forward_pass_->run_prefill(
+            current_token_vec, decode_pos, slot, scheduler_,
+            mtp_mode ? &last_hidden : nullptr);
+
+        // Two different numbers once M-RoPE lands on a slot (an image span
+        // writes nx*ny KV rows while advancing the rope position by only
+        // max(nx, ny)) -- verify/feed_tokens need the POSITION, rewind needs
+        // the ROW COUNT. Mirrors cli/complete.cpp exactly.
+        const int after_decode_pos  = forward_pass_->get_rope_pos(slot);
+        const int after_decode_rows =
+            static_cast<int>(forward_pass_->get_cache_pos(slot));
+
+        std::vector<float> last_token_logits(
+            decode_logits.begin(), decode_logits.begin() + vocab_size);
+        // Empty history: matches run_batched_decode's own convention above
+        // (no decode-time repetition penalty on this server path). No
+        // accept_token() call either -- this slot is grammar-free by
+        // construction (speculative_eligible_ excludes grammar slots), so
+        // there is no grammar cursor to advance, matching the CLI's own
+        // "grammar is mutually exclusive with speculative" comment.
+        const int y = slot_samplers_[slot_id]->sample(last_token_logits, {}, vocab_);
+
+        // Hybrid safety: verify advances the recurrent state over ALL draft
+        // tokens, and overwrite semantics can't rewind -- checkpoint before,
+        // restore + refeed the accepted prefix on partial reject. dn ==
+        // nullptr on pure-attention recipes, so all of this is skipped there.
+        DeltaNetState* dn = forward_pass_->snapshot_recurrent();
+        CheckpointId dn_cp = kInvalidCheckpoint;
+        if (dn) dn_cp = dn->checkpoint((int)slot);
+
+        auto result = spec_->try_speculative_step(
+            prompt_tokens, generated_tokens, slot_id, after_decode_pos,
+            make_speculative_verify(slot), make_speculative_rewind(slot),
+            eos_token_id, last_hidden, /*expected_first=*/y,
+            /*current_rows=*/after_decode_rows);
+
+        qinf::InferenceServer::SpeculativeStepResult out;
+        if (result.attempted() && result.total_tokens() > 0) {
+            const int accepted_n = (int)result.accepted_tokens.size();
+            if (dn) {
+                if (accepted_n < result.draft_length) {
+                    forward_pass_->set_cache_pos(after_decode_rows, slot);
+                    dn->restore(dn_cp);
+                    if (accepted_n > 0)
+                        forward_pass_->feed_tokens(result.accepted_tokens, slot,
+                                                   scheduler_, after_decode_pos);
+                }
+                dn->release(dn_cp);
+            }
+            out.delivered_tokens = result.accepted_tokens;
+            if (result.has_bonus) {
+                out.has_next = true;
+                out.next_token = result.bonus_token;
+            } else {
+                // Generation ended on eos. try_speculative_step never puts
+                // eos IN accepted_tokens (it's excluded by construction, both
+                // on a mismatch-produces-eos and an all-accepted-then-eos
+                // verify row) -- append it so the engine's is_stop_token_
+                // check fires this same step, the same as it would for an
+                // eos produced by a plain (non-speculative) decode step.
+                out.delivered_tokens.push_back(eos_token_id);
+            }
+        } else {
+            // No draft (none found, or it contradicted the sampled y): a
+            // plain single-token step. The checkpoint above was never used.
+            if (dn) dn->release(dn_cp);
+            out.has_next = true;
+            out.next_token = y;
+        }
+        return out;
     }
 
     Model model_;
@@ -780,6 +1046,14 @@ private:
     // The lens holds no grammar state at all now.
     bool attention_lens_enabled_ = false;
     ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-f16 selects F16
+
+    // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
+    // ⇒ configure_server registers neither speculative callback, and
+    // decode_step() never leaves the batched path — the byte-identical gate.
+    std::unique_ptr<qinf::SpeculativeDecoder> spec_;
+    std::string speculative_mode_;  // "pld" | "mtp" | "suffix"; empty if off
+    // MTP's dedicated scheduler (--speculative mtp only); freed in ~QweniumServerIntegration.
+    ggml_backend_sched_t mtp_sched_ = nullptr;
 };
 
 // =============================================================================
@@ -1496,6 +1770,17 @@ int main(int argc, char* argv[]) {
     int max_slots = 10;  // concurrent slots. KV cache = ctx × slots × F32, so
                          // dropping to 1 frees ~10× context headroom — the right
                          // trade for one-request-at-a-time delegation.
+    // Speculative decoding (--speculative [pld|mtp|suffix]). Off by default;
+    // mirrors the CLI's spelling and defaults (cli/main.cpp / cli/cli_args.h).
+    bool speculative = false;
+    std::string speculative_mode = "pld";  // "pld" | "mtp" | "suffix"
+    int pld_ngram_size = 3;
+    int pld_max_draft = 5;
+    int mtp_max_draft = 2;
+    int suffix_max_match_len = 12;
+    int suffix_min_match_len = 2;
+    int suffix_max_draft = 4;
+    size_t suffix_max_indexed_tokens = 8192;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -1525,6 +1810,29 @@ int main(int argc, char* argv[]) {
             flash_attn = true;
         } else if (arg == "--kv-f16") {
             kv_f16 = true;
+        } else if (arg == "--speculative") {
+            speculative = true;
+            // Optional mode argument, mirroring the CLI: bare --speculative
+            // == pld (back-compat).
+            if (i + 1 < argc && (std::string(argv[i + 1]) == "pld" ||
+                                 std::string(argv[i + 1]) == "mtp" ||
+                                 std::string(argv[i + 1]) == "suffix")) {
+                speculative_mode = argv[++i];
+            }
+        } else if (arg == "--pld-ngram" && i + 1 < argc) {
+            pld_ngram_size = std::stoi(argv[++i]);
+        } else if (arg == "--pld-max-draft" && i + 1 < argc) {
+            pld_max_draft = std::stoi(argv[++i]);
+        } else if (arg == "--mtp-max-draft" && i + 1 < argc) {
+            mtp_max_draft = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-max-match" && i + 1 < argc) {
+            suffix_max_match_len = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-min-match" && i + 1 < argc) {
+            suffix_min_match_len = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-max-draft" && i + 1 < argc) {
+            suffix_max_draft = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-max-indexed" && i + 1 < argc) {
+            suffix_max_indexed_tokens = (size_t)std::stoul(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
@@ -1563,6 +1871,28 @@ int main(int argc, char* argv[]) {
                          "/v1/extract — document + complete key vocabulary → "
                          "audited key-value JSON on the attention trust layer "
                          "(single-slot; Qwen3.6). OpenAI endpoints untouched\n"
+                      << "  --speculative [pld|mtp|suffix]  Opt-in: speculative "
+                         "decoding; bare/pld = Prompt Lookup, mtp = trained "
+                         "NextN head (MTP GGUFs only), suffix = session-scoped "
+                         "adaptive-length lookup. Engages only when exactly one "
+                         "slot is active (falls back to batched decode otherwise, "
+                         "logged once) and never on a slot running a per-request "
+                         "grammar. Token-stable, not byte-identical; mutually "
+                         "exclusive with --attention-lens.\n"
+                      << "  --pld-ngram N             PLD n-gram match size "
+                         "(default: 3)\n"
+                      << "  --pld-max-draft K         PLD max draft tokens "
+                         "(default: 5)\n"
+                      << "  --mtp-max-draft K         MTP head draft depth per "
+                         "step (default: 2)\n"
+                      << "  --suffix-max-match N      Suffix: longest n-gram "
+                         "tried first (default: 12)\n"
+                      << "  --suffix-min-match N      Suffix: shortest n-gram "
+                         "tried (default: 2)\n"
+                      << "  --suffix-max-draft K      Suffix: draft width B "
+                         "(default: 4; wider measured worse)\n"
+                      << "  --suffix-max-indexed N    Suffix: cap on indexed "
+                         "session tokens (default: 8192)\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
         }
@@ -1578,6 +1908,18 @@ int main(int argc, char* argv[]) {
                      "which is exactly the tensor the lens reads." << std::endl;
         return 1;
     }
+    // Same refusal shape as the pair above, same reason class: the lens is
+    // single-slot and receipts-grade determinism is B=1 (docs/architecture.md
+    // §1/§11), while speculative decoding is token-stable-not-byte-identical
+    // and (v1) only ever engages on exactly one slot -- which would be
+    // whichever slot the lens is mid-extraction on.
+    if (attention_lens && speculative) {
+        std::cerr << "expected at most one of --attention-lens / --speculative, "
+                     "got: both. The lens is single-slot and receipts-grade "
+                     "determinism is B=1; speculative decoding is token-stable, "
+                     "not byte-identical." << std::endl;
+        return 1;
+    }
 
     // Setup signal handling
     std::signal(SIGINT, signal_handler);
@@ -1590,6 +1932,11 @@ int main(int argc, char* argv[]) {
                                           prefix_cache_dir, kv_f16);
         if (attention_lens) integration.enable_attention_lens();
         if (flash_attn && !integration.enable_flash_attn()) return 1;
+        if (speculative && !integration.enable_speculative(
+                speculative_mode, pld_ngram_size, pld_max_draft,
+                suffix_max_match_len, suffix_min_match_len, suffix_max_draft,
+                suffix_max_indexed_tokens, mtp_max_draft))
+            return 1;
 
         // Create inference server
         qinf::InferenceServer::Config config;

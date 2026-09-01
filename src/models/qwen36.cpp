@@ -69,6 +69,12 @@ Qwen36ForwardPass::Qwen36ForwardPass(
     const int n_kv_layers = kv_idx;  // 10
     const int n_dn_layers = dn_idx;  // 30
 
+    // Fail loud, before any allocation, if this checkpoint's DeltaNet layer
+    // count and the requested slot count would overflow the shared decode
+    // graph node budget (qwen35_family.h — was a raw GGML_ASSERT abort).
+    validate_deltanet_decode_batch_size(
+        static_cast<uint32_t>(n_dn_layers), cfg_.is_moe(), max_batch_size);
+
     std::cout << "[qwen36] Hybrid cache: " << n_kv_layers
               << " attention layers (KV), " << n_dn_layers
               << " DeltaNet layers (recurrent state)" << std::endl;

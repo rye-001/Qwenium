@@ -4,6 +4,7 @@ add_library(sampling STATIC
     grammar_vocab.cpp
     token_trie.cpp
     sampling_snapshot.cpp
+    suffix_decoding.cpp
 )
 
 target_include_directories(sampling PUBLIC
