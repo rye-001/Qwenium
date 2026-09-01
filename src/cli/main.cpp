@@ -55,11 +55,16 @@ void print_usage(const char* program_name) {
     std::cout << "  --grammar-file FILE     Path to a GBNF grammar file for constrained sampling\n";
     std::cout << "  --hide-thinking         (chat) Suppress the Gemma 4 thought channel (shown dimmed by default)\n";
     std::cout << "  --log-tokens-to FILE    Append all processed token IDs to a file\n";
-    std::cout << "  --speculative [pld|mtp] Speculative decoding; bare/pld = Prompt Lookup,\n";
-    std::cout << "                          mtp = trained NextN head (MTP GGUFs only)\n";
+    std::cout << "  --speculative [pld|mtp|suffix] Speculative decoding; bare/pld = Prompt Lookup,\n";
+    std::cout << "                          mtp = trained NextN head (MTP GGUFs only),\n";
+    std::cout << "                          suffix = session-scoped adaptive-length lookup\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
     std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
+    std::cout << "  --suffix-max-match N    Suffix: longest n-gram tried first (default: 12)\n";
+    std::cout << "  --suffix-min-match N    Suffix: shortest n-gram tried (default: 2)\n";
+    std::cout << "  --suffix-max-draft K    Suffix: draft width B (default: 4; wider measured worse)\n";
+    std::cout << "  --suffix-max-indexed N  Suffix: cap on indexed session tokens (default: 8192)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
     std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
@@ -140,9 +145,22 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
             args.speculative = true;
             // Optional mode argument: bare --speculative == pld (back-compat).
             if (i + 1 < argc && (std::string(argv[i + 1]) == "pld" ||
-                                 std::string(argv[i + 1]) == "mtp")) {
+                                 std::string(argv[i + 1]) == "mtp" ||
+                                 std::string(argv[i + 1]) == "suffix")) {
                 args.speculative_mode = argv[++i];
             }
+        } else if (arg == "--suffix-max-match") {
+            if (i + 1 >= argc) return false;
+            args.suffix_max_match_len = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-min-match") {
+            if (i + 1 >= argc) return false;
+            args.suffix_min_match_len = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-max-draft") {
+            if (i + 1 >= argc) return false;
+            args.suffix_max_draft = std::stoi(argv[++i]);
+        } else if (arg == "--suffix-max-indexed") {
+            if (i + 1 >= argc) return false;
+            args.suffix_max_indexed_tokens = (size_t)std::stoul(argv[++i]);
         } else if (arg == "--persistent-graph") {
             args.persistent_graph = true;
         } else if (arg == "--kv-f16") {
@@ -311,6 +329,34 @@ int main(int argc, char** argv) {
             pld_config, (int)model.get_metadata().vocab_size);
         std::cout << "Prompt Lookup Decoding enabled (ngram=" << pld_config.ngram_size
                   << ", max_draft=" << pld_config.max_draft << ")" << std::endl;
+    }
+    // --speculative suffix: SuffixDecoding is a pure function of token
+    // history like PLD (no forward pass needed to build it), so — unlike
+    // mtp — it's constructed here rather than deferred to run_complete. This
+    // sits above the try{} that wraps generation (below), so a bad
+    // --suffix-* value (fail-loud in SuffixDecoding's ctor) must be caught
+    // here explicitly, or it would abort the process instead of exiting 1
+    // with a message — the MTP validation path gets this for free because
+    // its construction lives inside run_complete's try block.
+    if (use_speculative && args.speculative_mode == "suffix") {
+        try {
+            qinf::SuffixDecodingConfig suffix_config;
+            suffix_config.max_match_len = args.suffix_max_match_len;
+            suffix_config.min_match_len = args.suffix_min_match_len;
+            suffix_config.max_draft = args.suffix_max_draft;
+            suffix_config.max_indexed_tokens = args.suffix_max_indexed_tokens;
+            spec = std::make_unique<qinf::SpeculativeDecoder>(
+                std::make_unique<qinf::SuffixDecodingDraft>(suffix_config),
+                (int)model.get_metadata().vocab_size);
+            std::cout << "Suffix Decoding enabled (match_len=" << suffix_config.min_match_len
+                      << ".." << suffix_config.max_match_len
+                      << ", max_draft=" << suffix_config.max_draft
+                      << ", indexed_tokens<=" << suffix_config.max_indexed_tokens << ")"
+                      << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error configuring --speculative suffix: " << e.what() << std::endl;
+            return 1;
+        }
     }
     // --speculative mtp: the MtpDraft source needs the forward pass (the head
     // lives on the recipe), which run_complete constructs — so the MTP-backed

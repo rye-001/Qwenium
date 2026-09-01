@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 #include <sstream>
 #include <iostream>
 
@@ -45,14 +46,22 @@ struct CliArgs {
     bool show_thinking = true;  // --hide-thinking to suppress
     // Speculative decoding (docs/plan-mtp-decode.md D5). Bare `--speculative`
     // and `--speculative pld` mean PLD (back-compat); `--speculative mtp`
-    // drafts with the model's trained NextN head (MTP-converted GGUFs only).
+    // drafts with the model's trained NextN head (MTP-converted GGUFs only);
+    // `--speculative suffix` drafts with SuffixDecoding (session-scoped,
+    // adaptive-length n-gram lookup — sampling/suffix_decoding.h).
     bool speculative = false;
-    std::string speculative_mode = "pld";  // "pld" | "mtp"
+    std::string speculative_mode = "pld";  // "pld" | "mtp" | "suffix"
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
     // --mtp-max-draft: tokens drafted BY THE HEAD per step (the sampled token
     // rides the verify batch in addition); upstream guidance: start at 2.
     int mtp_max_draft = 2;
+    // SuffixDecoding config (docs/architecture.md §5). Defaults match the
+    // offline replay's measured settings — see suffix_decoding.h for why.
+    int suffix_max_match_len = 12;
+    int suffix_min_match_len = 2;
+    int suffix_max_draft = 4;              // draft width B; do not default to 8
+    size_t suffix_max_indexed_tokens = 8192;
     // Persistent decode graph (docs/plan-persistent-decode-graph.md). Opt-in:
     // build+alloc the decode graph once per n_kv bucket and reuse it across
     // steps, skipping the per-step galloc replan (measured 1.32× on Qwen 3.6,

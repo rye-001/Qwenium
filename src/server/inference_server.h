@@ -201,6 +201,15 @@ struct Slot {
     // The stop token this turn ended on (a clean turn closer for conversational
     // continuation), or -1 if it ended on length / stop-string / grammar.
     int end_token = -1;
+    // True when `last_token` was drafted/verified by a PRIOR speculative step
+    // but never delivered — the engine's analogue of the CLI printing
+    // next_token_id at the top of each loop iteration before feeding it
+    // onward (cli/complete.cpp). decode_step_speculative() delivers it (via
+    // deliver_token, same as every other path) before feeding it back through
+    // the model. False for every non-speculative token: the batched path and
+    // a slot's first token (activate_slot) always deliver immediately, so
+    // last_token is already part of context_tokens by the time it's read.
+    bool last_token_pending = false;
 
     void reset() {
         request.reset();
@@ -209,6 +218,7 @@ struct Slot {
         tokens_generated = 0;
         active = false;
         end_token = -1;
+        last_token_pending = false;
     }
 };
 
@@ -303,6 +313,51 @@ public:
     // have it ignored, and run past the turn boundary to the max_tokens cap.
     using IsStopTokenFunc = std::function<bool(int)>;
 
+    // ── Speculative decoding (--speculative, optional) ───────────────────────
+    // The server's batch axis is SLOTS (one forward pass advances every active
+    // slot); speculation's batch axis is DRAFT POSITIONS. They multiply, and
+    // that multiplication is not affordable here (Gemma 4-12B: 4 verify lanes
+    // = 1.41x a single step, 8 = 2.64x, 16 = 2.98x — cost grows faster than
+    // acceptance with width; the Qwen hybrids fail-loud-abort a decode graph
+    // above 10 slots on node count, and 5 slots x 4 drafts = 20 lanes would
+    // walk straight into that). So: speculation engages ONLY when exactly one
+    // slot is active; two or more falls back to the unchanged batched path.
+    // See docs/architecture.md §6.
+
+    // What one speculative decode step produced. `delivered_tokens` are
+    // ALREADY model-verified (accepted draft tokens, plus the model's own eos
+    // id appended when generation ended on it) — the engine delivers each via
+    // deliver_token(), in order, stopping at the first one that completes the
+    // slot (mirrors the CLI's per-accepted-token stop check, cli/complete.cpp).
+    // `has_next`/`next_token`: when generation continues without terminating,
+    // the trailing token is the model's own next-position prediction — already
+    // computed by the same verify pass, but NOT YET fed through the model or
+    // delivered. It becomes the slot's pending last_token for the FOLLOWING
+    // step (Slot::last_token_pending), exactly mirroring the CLI deferring
+    // next_token_id to the top of its next loop iteration.
+    struct SpeculativeStepResult {
+        std::vector<int32_t> delivered_tokens;
+        bool    has_next   = false;
+        int32_t next_token = -1;
+    };
+    // Run one speculative step for the single active slot: feed `last_token`
+    // through the model, draft + verify a continuation in one batched pass,
+    // and return every token it produced. `prompt_tokens` / `generated_tokens`
+    // mirror the CLI's own two vectors (draft sources read them; `generated_tokens`
+    // already includes `last_token` — the engine delivers it before calling in).
+    // Reuses SpeculativeDecoder::try_speculative_step (sampling/speculative.h)
+    // end to end — the same verify/rewind/checkpoint machinery the CLI uses,
+    // not a second implementation.
+    using SpeculativeDecodeFunc = std::function<SpeculativeStepResult(
+        int slot_id, int32_t last_token,
+        const std::vector<int32_t>& prompt_tokens,
+        const std::vector<int32_t>& generated_tokens)>;
+    // False => this slot must not speculate this step (today: a per-request
+    // GBNF grammar is active — matches the CLI, which disables speculative
+    // decoding outright when a grammar is set; draft tokens are never checked
+    // against the grammar). Optional — unset means every slot is eligible.
+    using SpeculativeEligibleFunc = std::function<bool(int slot_id)>;
+
     InferenceServer(const Config& config)
         : config_(config), slots_(config.max_slots),
           slot_resident_tokens_(config.max_slots) {
@@ -329,6 +384,12 @@ public:
     // prefill text prompts whole (the stateless default).
     void set_cached_text_prefill(CachedTextPrefillFunc fn) { cached_text_prefill_ = std::move(fn); }
     void set_batched_decode(BatchedDecodeFunc fn) { batched_decode_ = std::move(fn); }
+    // Optional: enables single-slot speculative decoding (--speculative). Unset
+    // (the default) leaves decode_step() exactly as it was — the byte-identical
+    // gate depends on that. Set together; speculative_eligible_ alone with no
+    // decode fn is a no-op (decode_step() only branches on the decode fn).
+    void set_speculative_decode(SpeculativeDecodeFunc fn) { speculative_decode_ = std::move(fn); }
+    void set_speculative_eligible(SpeculativeEligibleFunc fn) { speculative_eligible_ = std::move(fn); }
     void set_clear_slot(ClearSlotFunc fn) { clear_slot_ = std::move(fn); }
     // Required when Config::chat_prefix_cache is on; harmless otherwise.
     void set_get_cache_pos(GetCachePosFunc fn) { get_cache_pos_ = std::move(fn); }
@@ -1093,6 +1154,32 @@ private:
     }
 
     void decode_step() {
+        // Speculative decoding (--speculative): engage ONLY when exactly one
+        // slot is active. speculative_decode_ unset (the default) leaves this
+        // whole branch dead — decode_step() falls straight through to the
+        // unchanged batched path below, which is what the byte-identical
+        // gate (speculation OFF) depends on. See the SpeculativeDecodeFunc
+        // comment above for why >1 slot is never attempted.
+        if (speculative_decode_) {
+            if (active_slot_ids_.size() == 1) {
+                const int slot_id = *active_slot_ids_.begin();
+                const bool eligible =
+                    !speculative_eligible_ || speculative_eligible_(slot_id);
+                if (eligible) {
+                    spec_fallback_logged_ = false;  // re-arm the edge-triggered log
+                    decode_step_speculative(slot_id);
+                    return;
+                }
+                log_speculative_fallback(
+                    "grammar active on slot " + std::to_string(slot_id));
+            } else {
+                log_speculative_fallback(
+                    std::to_string(active_slot_ids_.size()) +
+                    " active slots (>1) — speculation's draft-position batch "
+                    "axis does not compose with the slot batch axis");
+            }
+        }
+
         // Gather tokens from all active slots
         std::vector<int32_t> batch_tokens;
         std::vector<int> batch_slot_ids;
@@ -1184,6 +1271,126 @@ private:
         stats_.active_slots = active_slot_ids_.size();
     }
 
+    // Edge-triggered operator log: prints once when the engine ENTERS a
+    // fallback stretch (was speculating, now isn't — or never got to start),
+    // and stays silent while it continues, however many steps that takes.
+    // decode_step() clears the latch the moment speculation resumes, so a
+    // later re-entry logs again. This is a policy choice (batch axes don't
+    // compose past one slot, or a grammar request), not an error: the
+    // request is served correctly by the batched path either way.
+    void log_speculative_fallback(const std::string& reason) {
+        if (spec_fallback_logged_) return;
+        std::cout << "[speculative] fallback to batched decode: " << reason
+                  << std::endl;
+        spec_fallback_logged_ = true;
+    }
+
+    // One speculative decode step for the single active slot (decode_step()
+    // has already confirmed eligibility). Delivers 0..K+1 tokens through the
+    // same deliver_token() every other path uses, so termination (stop token,
+    // stop string, grammar, max_tokens) is decided identically regardless of
+    // how many tokens a step produces.
+    void decode_step_speculative(int slot_id) {
+        Slot& slot = slots_[slot_id];
+        auto teardown = [this, slot_id]() {
+            release_slot_kv(slot_id);
+            slots_[slot_id].reset();
+            active_slot_ids_.erase(slot_id);
+            stats_.active_slots = active_slot_ids_.size();
+        };
+
+        // A token drafted/verified by the PRIOR speculative step but not yet
+        // delivered must be delivered now — see Slot::last_token_pending.
+        // Cleared unconditionally: whether or not it turns out to be a stop
+        // token, this step is done deciding its fate.
+        if (slot.last_token_pending) {
+            slot.last_token_pending = false;
+            slot.tokens_generated++;
+            if (deliver_token(slot, slot.last_token)) {
+                log_slot_end(slot, "deliver-speculative");
+                slot.request->token_queue->finish();
+                teardown();
+                stats_.requests_completed++;
+                return;
+            }
+        }
+
+        // Draft sources read the same two vectors the CLI passes them
+        // (sampling/draft_source.h DraftContext): the original prompt, and
+        // everything generated since — INCLUDING the token just delivered
+        // above, which is what this step is about to feed through the model
+        // and draft a continuation from.
+        std::vector<int32_t> prompt_tokens(
+            slot.context_tokens.begin(),
+            slot.context_tokens.begin() + slot.request->prompt_tokens);
+        std::vector<int32_t> generated_tokens(
+            slot.context_tokens.begin() + slot.request->prompt_tokens,
+            slot.context_tokens.end());
+
+        SpeculativeStepResult result;
+        try {
+            result = speculative_decode_(slot_id, slot.last_token,
+                                         prompt_tokens, generated_tokens);
+        } catch (const std::exception& e) {
+            // Same fail-loud contract as the batched path's compute failure:
+            // this slot's request gets a named error, the slot is released.
+            slot.request->error_message = e.what();
+            slot.request->finish_reason = "error";
+            slot.request->token_queue->finish();
+            teardown();
+            return;
+        }
+
+        // Cancellation / timeout: checked once per step, same contract as
+        // the batched path. A step here can now cover several tokens (up to
+        // the draft width), so a cancelled/timed-out request may discard
+        // that many already-computed-but-undelivered tokens instead of at
+        // most one — the compute already happened either way (the batched
+        // path also discards one already-computed token on the same check);
+        // this bounds the discard at the draft width, not an unbounded
+        // amount. Detection itself is not delayed: still checked every step.
+        if (slot.request->cancelled) {
+            slot.request->finish_reason = "cancelled";
+            log_slot_end(slot, "cancelled");
+            slot.request->token_queue->finish();
+            stats_.requests_cancelled++;
+            teardown();
+            return;
+        }
+        auto elapsed = std::chrono::steady_clock::now() - slot.request->started_at;
+        if (elapsed > config_.request_timeout) {
+            slot.request->finish_reason = "timeout";
+            log_slot_end(slot, "timeout");
+            slot.request->token_queue->finish();
+            stats_.requests_cancelled++;
+            teardown();
+            return;
+        }
+
+        for (int32_t tok : result.delivered_tokens) {
+            slot.tokens_generated++;
+            if (deliver_token(slot, tok)) {
+                log_slot_end(slot, "deliver-speculative");
+                slot.request->token_queue->finish();
+                teardown();
+                stats_.requests_completed++;
+                return;
+            }
+        }
+
+        if (result.has_next) {
+            slot.last_token = result.next_token;
+            slot.last_token_pending = true;
+        }
+        // !has_next with no delivered token having completed the slot would
+        // mean the integration returned a result that neither continues nor
+        // terminates — a wiring bug in the SpeculativeDecodeFunc, not a
+        // request-level condition. try_speculative_step's contract (an
+        // attempted draft always yields either an accepted prefix ending on
+        // eos, or a bonus token to continue with) rules this out; nothing
+        // else to do here.
+    }
+
     Config config_;
     RequestQueue request_queue_;
     std::vector<Slot> slots_;
@@ -1204,6 +1411,13 @@ private:
     ClearSlotFunc clear_slot_;
     GetCachePosFunc get_cache_pos_;   // engine KV append position (chat prefix cache)
     IsStopTokenFunc is_stop_token_;
+    SpeculativeDecodeFunc speculative_decode_;      // optional; --speculative
+    SpeculativeEligibleFunc speculative_eligible_;  // optional; false => grammar active
+    // Edge-triggered latch for log_speculative_fallback: true once the
+    // operator has been told about the CURRENT fallback stretch, reset the
+    // moment speculation resumes. Inference-thread-only, like everything else
+    // decode_step() touches.
+    bool spec_fallback_logged_ = false;
 
     // Warm chat-prefix cache (Config::chat_prefix_cache). Per slot: the exact
     // BOS-free token stream the slot's KV currently materializes ([0,pos) minus

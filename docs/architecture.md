@@ -228,7 +228,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (the recipe interface plus the graph scaffolding recipes share: embed, output head, the Seam B image splice, decode masks — each of which builds nodes *and* declares the typed input they consume; per-step arming lives here too. Context and run-time policy were extracted out to `graph_arena` / `decode_policy`), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
-| `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD), `sampling_snapshot` |
+| `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD) + `suffix_decoding` (SuffixDecoding: session-scoped, adaptive-length lookup, §5), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the fail-loud architecture/tensor-inventory validators), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
@@ -367,27 +367,45 @@ first place where a speed lever and the receipts doctrine are in direct
 conflict; the resolution is a parameter on one operation with two
 implementations (llama's own `-fa on/off` split), not two attention modules.
 
-**Speculative decoding** (CLI `--speculative [pld|mtp]`): drafts come from an
-`IDraftSource` (`sampling/draft_source.h`) and are verified in one batched
-pass (head slice off — verification needs logits at every draft position); a
-first-token guard ensures draft[0] matches the token the sampler actually
-chose. On mismatch the KV cache truncates (O(1) pointer move) and, on
-hybrids, the recurrent state restores a pre-verify checkpoint and the
+**Speculative decoding** (CLI `--speculative [pld|mtp|suffix]`): drafts come
+from an `IDraftSource` (`sampling/draft_source.h`) and are verified in one
+batched pass (head slice off — verification needs logits at every draft
+position); a first-token guard ensures draft[0] matches the token the sampler
+actually chose. On mismatch the KV cache truncates (O(1) pointer move) and,
+on hybrids, the recurrent state restores a pre-verify checkpoint and the
 accepted prefix is re-fed (`feed_tokens`) — overwrite semantics can't rewind
-(§9). Two draft sources: **PLD** (bare `--speculative`; no model — the draft
-is an n-gram match of recent output against the prompt) and the **MTP head**
-(`--speculative mtp`, depth `--mtp-max-draft`; Qwen 3.6 NextN: an extra
-trained attention+MoE block held out of the main stack, drafting recursively
-from the last position's hidden state via `models/i_mtp_draftable.h` on a
-private KV + dedicated scheduler; the hidden is exposed by an opt-in,
-default-off graph output). MTP is a capability of MTP-converted GGUFs,
-mirroring how vision is a capability of `--mmproj` — Qwen-only, as vision is
-Gemma-only. Status: **experimental** — 74–92% acceptance, ~3.3 tokens/step,
-but end-to-end ≈ baseline on M1 Pro until the per-head-step dispatch overhead
-is attacked; measurements and the five speculative-machinery bugs fixed en
-route live in `plan-mtp-decode.md` §7/§9. Emitted tokens are model-verified
-under the kernel path that computed them; batch-shape numerical forks (§11)
-mean speculative-on is token-stable, not byte-identical, vs speculative-off.
+(§9). Three draft sources, all sharing that one verify/rewind path:
+
+- **PLD** (bare `--speculative` or `--speculative pld`; no model — the draft
+  is a fixed-length n-gram match of recent output against the *prompt only*).
+- **SuffixDecoding** (`--speculative suffix`, `sampling/suffix_decoding.h`;
+  no model — generalizes PLD along the two axes an offline 110-session replay
+  of the order-management DSL corpus showed PLD losing draft *availability*
+  on: the haystack is the whole session (prompt + everything generated so
+  far, capped to the most recent 8192 tokens — session output grows
+  without bound, the cap keeps the per-step scan O(1) in session length,
+  not persisted across sessions, see suffix_decoding.h for the rationale),
+  and the match length is adaptive — tried longest first from 12 down to a
+  floor of 2, a longer match standing in for higher confidence. Measured:
+  62% hit rate vs PLD's 26%, 2.64 tokens/step vs 1.61. Draft width defaults
+  to 4 (`--suffix-max-draft`) — measured worse at 8 on Gemma 4-12B, the
+  opposite of the usual wider-batch-is-cheaper intuition.
+- **MTP head** (`--speculative mtp`, depth `--mtp-max-draft`; Qwen 3.6 NextN:
+  an extra trained attention+MoE block held out of the main stack, drafting
+  recursively from the last position's hidden state via
+  `models/i_mtp_draftable.h` on a private KV + dedicated scheduler; the
+  hidden is exposed by an opt-in, default-off graph output). MTP is a
+  capability of MTP-converted GGUFs, mirroring how vision is a capability of
+  `--mmproj` — Qwen-only, as vision is Gemma-only. Status: **experimental** —
+  74–92% acceptance, ~3.3 tokens/step, but end-to-end ≈ baseline on M1 Pro
+  until the per-head-step dispatch overhead is attacked; measurements and the
+  five speculative-machinery bugs fixed en route live in `plan-mtp-decode.md`
+  §7/§9.
+
+Emitted tokens are model-verified under the kernel path that computed them;
+batch-shape numerical forks (§11) mean speculative-on is token-stable, not
+byte-identical, vs speculative-off — true for all three draft sources, since
+they share verification.
 
 ---
 
@@ -407,9 +425,12 @@ The server is two classes of thread with exactly two lock boundaries:
 
 The engine seam is dependency-inverted: `InferenceServer` holds no reference
 to the model or ggml — it calls `std::function` callbacks (`prefill`,
-`batched_decode`, `clear_slot`, `tokenize`, …) wired at startup. The shared
-vocabulary across the seam is `slot_id` + token vectors, which is what makes
-the queueing/slot logic unit-testable with fake engines.
+`batched_decode`, `clear_slot`, `tokenize`, `speculative_decode`,
+`speculative_eligible`, …) wired at startup. The shared vocabulary across the
+seam is `slot_id` + token vectors, which is what makes the queueing/slot logic
+unit-testable with fake engines. The two speculative callbacks
+(`InferenceServer::set_speculative_decode` / `set_speculative_eligible`) are
+new to this seam — see below.
 
 Production edges, all converging on the same slot-release path: full queue →
 503; cooperative cancellation checked once per step; per-request timeout;
@@ -434,6 +455,95 @@ warm reuse there is honest only as an explicit opt-in handle. Details:
 Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text + OpenAI `image_url` when `--mmproj` is loaded),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
+
+**Speculative decoding (opt-in `--speculative [pld|mtp|suffix]`, off by
+default).** The draft sources, the verify/rewind mechanics, and the
+per-source measurements are §5's — this covers only what's server-specific:
+how it engages here, why it's restricted the way it is, and how it sits
+inside the request lifecycle above.
+
+`decode_step()` takes the speculative branch only when **exactly one slot is
+active**; two or more active slots fall back to the unchanged batched path.
+This is a deliberate ceiling, not an oversight: the server's batch axis is
+*slots* — one forward pass advances every active slot — while speculation's
+batch axis is *draft positions* — one verify pass checks every drafted
+token. Running both at once would multiply the two axes, and that
+multiplication is unaffordable on two independent, measured grounds:
+
+- **Verify cost grows faster than draft width helps.** Batching more draft
+  positions into one verify pass is, mechanically, the same batch-axis
+  operation §10 already measured across slot counts: on Gemma 4-12B-it Q8_0,
+  a batched pass costs 1.41× a single step at width 4, 2.64× at width 8, and
+  2.98× at width 16 (`note-batch-scaling-cross-family.md` §3 — 126.3/235.7/
+  266.2 ms against a 89.4 ms B=1 step). Cost keeps climbing past the point
+  where a wider draft stops finding more correct tokens to accept, which is
+  also why §5's suffix decoder defaults its own draft width to 4 and measured
+  8 as worse, not better.
+- **The Qwen hybrids' decode graph is O(batch) in node count and now aborts
+  above the envelope, fail-loud.** §12 records `n_nodes = 1320·B + 2144` on
+  `qwen35moe`, confirmed to build at B=10 (94% of the graph-size limit) and
+  abort at B=11 — one slot of margin above the declared ≤10-slot envelope —
+  and the fail-loud guard (`validate_deltanet_decode_batch_size`,
+  `models/qwen35_family.{h,cpp}`) that now refuses an over-limit batch before
+  any graph is built. 5 concurrent slots × a 4-wide speculative draft is 20
+  lanes on the exact axis that guard is watching; letting speculation run
+  across slots would walk straight into it.
+
+Single-slot is therefore the considered ceiling, not a placeholder: lifting
+it needs the O(B) node-growth defect fixed first (§12's `qwen35moe`/`qwen35`
+bullet — the batching fix is scoped but **PARKED** by user decision), and
+even then the Gemma 4 cost curve above says a wider verify batch is not free
+just because it fits in the graph. Someone revisiting this restriction should
+read both grounds before lifting it, not just the one that happens to be
+fixed.
+
+The fallback is **edge-triggered and logged once**, not per step:
+`log_speculative_fallback` prints the reason the moment the engine leaves a
+speculating stretch — a second slot activated, or the one active slot is now
+running a grammar — then stays silent for as long as the stretch continues,
+however many steps that is, and re-arms the instant speculation resumes.
+This is a policy log, not an error: the request is served correctly by the
+batched path either way.
+
+**A per-request GBNF grammar disables speculation on that slot.** The server
+mechanism is `speculative_eligible_`
+(`InferenceServer::SpeculativeEligibleFunc`, wired via
+`set_speculative_eligible`), which the integration implements as `slot_id`
+having no grammar (`slot_grammars_[slot_id] == nullptr`) — the same rule as
+the CLI's `bool use_speculative = args.speculative && !grammar;`
+(`src/cli/main.cpp:322`). Draft tokens are never checked against a grammar,
+so accepting one could emit something the grammar would have masked out;
+disabling speculation outright avoids that rather than trying to validate
+drafts against the grammar mask.
+
+**Two new callbacks on the server engine seam:**
+`InferenceServer::set_speculative_decode` takes a `SpeculativeDecodeFunc`
+that runs one speculative step for the single active slot — feed the last
+token, draft, verify in one batched pass, and return every token the step
+produced (tokens already model-verified, plus optionally a still-pending
+"bonus" token carried to the following step as `Slot::last_token_pending`);
+`set_speculative_eligible` takes the grammar gate above. Both are unset by
+default (`speculative_decode_` / `speculative_eligible_` default-null), which
+is what keeps a server started without `--speculative` on the exact
+pre-existing batched path — `decode_step()` never evaluates the branch, so
+the byte-identical-with-speculation-off gate holds structurally, not by
+convention.
+
+Cancellation and the per-request timeout are still checked **once per decode
+step**, unchanged from the batched path — but a speculative step can now
+discard up to `draft_width` already-computed, undelivered tokens on a
+cancel/timeout instead of at most one. The compute already happened either
+way (the batched path also discards one computed-but-undelivered token on
+the same check); a speculative step just widens how much can be thrown away
+per check, not how often the check runs.
+
+**`--speculative` is refused together with `--attention-lens` at server
+startup**, mirroring the existing `--flash-attn`/`--attention-lens` refusal
+and for the same class of reason (§11's receipts constraints): receipts-grade
+determinism is single-slot and byte-identical, and speculative decoding is
+token-stable, **not** byte-identical — and, today, only ever engages on a
+single slot in the first place, which would be whichever slot the lens is
+mid-extraction on.
 
 **Attention Lens (opt-in `--attention-lens`, `POST /v1/extract`).** A dedicated
 endpoint — separate from the OpenAI surface by design (its inputs are a

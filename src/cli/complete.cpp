@@ -396,11 +396,16 @@ int run_complete(
                       << std::endl;
         }
 
-        // Print PLD stats
+        // Print speculative stats. Label by source: was a PLD-only "PLD"/"MTP"
+        // ternary; SuffixDecoding needs a third label, so this is now an
+        // explicit map from args.speculative_mode (PLD's own printed text is
+        // unchanged).
         if (use_speculative) {
             auto& s = spec->stats();
-            std::cout << "\n[Speculative Stats — "
-                      << (mtp_mode ? "MTP" : "PLD") << "]"
+            const char* mode_label = mtp_mode ? "MTP"
+                : args.speculative_mode == "suffix" ? "Suffix"
+                : "PLD";
+            std::cout << "\n[Speculative Stats — " << mode_label << "]"
                       << " drafts_attempted=" << s.drafts_attempted
                       << " drafts_found=" << s.drafts_found
                       << " tokens_drafted=" << s.tokens_drafted

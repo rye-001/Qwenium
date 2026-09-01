@@ -76,7 +76,64 @@ public:
         server.set_is_stop_token([this](int token_id) {
             return token_id == eos_token_;
         });
+
+        // Speculative decoding wiring (--speculative). Only registered when a
+        // test explicitly opts in (enable_speculative), mirroring
+        // QweniumServerIntegration: spec_ null => neither callback is
+        // registered => decode_step() never leaves the batched path above.
+        // Every pre-existing test in this file configures nothing here and
+        // still passes unmodified — that IS the byte-identical-when-off gate.
+        if (speculative_enabled_) {
+            server.set_speculative_decode(
+                [this](int slot_id, int32_t /*last_token*/,
+                       const std::vector<int32_t>& /*prompt_tokens*/,
+                       const std::vector<int32_t>& /*generated_tokens*/) {
+                    speculative_step_count_++;
+                    qinf::InferenceServer::SpeculativeStepResult out;
+                    // Same index convention set_batched_decode uses:
+                    // slot_positions_[slot_id] == index of the most recently
+                    // DELIVERED token in response_tokens_ (0 right after
+                    // prefill, which always delivers index 0). "Verification"
+                    // here is trivial — the mock knows its own ground-truth
+                    // sequence — this exercises the ENGINE's multi-token
+                    // delivery + deferred-next contract, not real speculative
+                    // verification (that's sampling/speculative.h's job,
+                    // covered by tests/unit/test_speculative.cpp).
+                    int& pos = slot_positions_[slot_id];
+                    for (int i = 0; i < speculative_draft_width_; ++i) {
+                        if (pos + 1 >= (int)response_tokens_.size()) break;
+                        ++pos;
+                        int tok = response_tokens_[pos];
+                        out.delivered_tokens.push_back(tok);
+                        if (tok == eos_token_) return out;  // never a next_token past eos
+                    }
+                    if (pos + 1 < (int)response_tokens_.size()) {
+                        ++pos;
+                        out.has_next = true;
+                        out.next_token = response_tokens_[pos];
+                    } else {
+                        out.delivered_tokens.push_back(eos_token_);
+                    }
+                    return out;
+                });
+            server.set_speculative_eligible([this](int /*slot_id*/) {
+                return speculative_eligible_;
+            });
+        }
     }
+
+    // Test-only opt-in, mirroring QweniumServerIntegration::enable_speculative
+    // (server startup, not per-request). `draft_width` caps how many tokens
+    // one speculative_decode_ call delivers before deferring — analogous to
+    // --suffix-max-draft / --mtp-max-draft.
+    void enable_speculative(int draft_width = 4) {
+        speculative_enabled_ = true;
+        speculative_draft_width_ = draft_width;
+    }
+    // Toggle whether the (single) active slot is speculative-eligible —
+    // stands in for "no grammar active on this slot" (the real gate).
+    void set_speculative_eligible(bool eligible) { speculative_eligible_ = eligible; }
+    int speculative_step_count() const { return speculative_step_count_; }
 
     // Set the response that will be generated
     void set_response(const std::vector<int>& tokens) {
@@ -114,7 +171,176 @@ private:
     int eos_token_;
     std::atomic<int> prefill_count_{0};
     std::atomic<int> decode_count_{0};
+
+    // Speculative decoding test wiring (see enable_speculative above).
+    bool speculative_enabled_ = false;
+    bool speculative_eligible_ = true;
+    int speculative_draft_width_ = 4;
+    std::atomic<int> speculative_step_count_{0};
 };
+
+// =============================================================================
+// Speculative decoding wiring (--speculative). Gates 2/3 of the server
+// speculative-decoding task: single-slot engagement produces the SAME output
+// as the batched path, and a concurrent (multi-slot) run behaves correctly.
+// Gate 1 (byte-identical when OFF) is every HttpServerTest below: none of
+// them touch speculative decoding at all, and they all still pass unmodified
+// — decode_step()'s speculative branch is dead code unless
+// set_speculative_decode() was called, which only enable_speculative() does.
+//
+// Speculative decoding test harness (bypasses HTTP entirely)
+//
+// Drives qinf::InferenceServer directly against MockInferenceBackend: submit
+// a request, drain its token_queue, read output_text/finish_reason off it.
+// Used only by the speculative tests below, which need
+// MockInferenceBackend::enable_speculative() to run BEFORE configure_server()
+// wires the callbacks — exactly like QweniumServerIntegration's
+// enable_speculative() must run before configure_server() in production
+// (registration is a one-time, startup-only decision, not a live toggle).
+// The HTTP fixture above starts its server inside SetUp(), before a test
+// body gets a chance to touch mock_, so it can't express that ordering
+// without restarting httplib on a fixed port mid-test — which races the
+// OS's socket teardown and was flaky in practice; this sidesteps it.
+// =============================================================================
+struct SpeculativeHarness {
+    std::unique_ptr<MockInferenceBackend> mock;
+    std::unique_ptr<qinf::InferenceServer> server;
+    std::thread inference_thread;
+
+    SpeculativeHarness() : mock(std::make_unique<MockInferenceBackend>()) {}
+
+    ~SpeculativeHarness() {
+        if (server) server->stop();
+        if (inference_thread.joinable()) inference_thread.join();
+    }
+
+    // Call once mock is fully configured (set_response, enable_speculative,
+    // set_speculative_eligible, ...).
+    void start(int max_slots = 4) {
+        qinf::InferenceServer::Config config;
+        config.max_slots = max_slots;
+        config.max_queue_depth = 10;
+        config.max_context = 64;
+        config.request_timeout = std::chrono::seconds(5);
+        server = std::make_unique<qinf::InferenceServer>(config);
+        mock->configure_server(*server);
+        inference_thread = std::thread([this]() { server->run(); });
+    }
+
+    // Build + submit a request; returns immediately (does not wait for it).
+    std::shared_ptr<qinf::InferenceRequest> submit(const std::string& prompt,
+                                                    int max_tokens = 50) {
+        auto req = std::make_shared<qinf::InferenceRequest>();
+        req->prompt = prompt;
+        req->max_tokens = max_tokens;
+        server->submit(req);
+        return req;
+    }
+
+    // Block until a submitted request completes (mirrors the HTTP fixture's
+    // non-streaming drain loop, minus the HTTP/JSON wrapping).
+    static void drain(const std::shared_ptr<qinf::InferenceRequest>& req) {
+        while (req->token_queue->pop_blocking() != qinf::TokenQueue::QUEUE_END) {
+        }
+    }
+
+    // submit() + drain() for the common single-request case.
+    std::shared_ptr<qinf::InferenceRequest> run(const std::string& prompt,
+                                                int max_tokens = 50) {
+        auto req = submit(prompt, max_tokens);
+        drain(req);
+        return req;
+    }
+};
+
+// Single active slot, speculative eligible: the engine must engage
+// decode_step_speculative() (speculative_step_count() > 0) and the resulting
+// text must be identical to what the batched path produces for the same
+// response sequence.
+TEST(SpeculativeDecoding, SingleSlotMatchesBatchedOutput) {
+    SpeculativeHarness h;
+    h.mock->set_response({'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', 0});
+    h.mock->enable_speculative(/*draft_width=*/4);
+    h.start();
+
+    auto req = h.run("hi");
+    EXPECT_EQ(req->output_text, "Hello, world!");
+    EXPECT_EQ(req->finish_reason, "stop");
+    // Engaged at least once, and delivered more than one token per step at
+    // least once (13 response tokens over 13+ steps would mean it never
+    // actually batched anything).
+    EXPECT_GT(h.mock->speculative_step_count(), 0);
+    EXPECT_LT(h.mock->speculative_step_count(), 13);
+}
+
+// Same response, same request, run once with speculative off and once on (two
+// separate harnesses — MockInferenceBackend has no live on/off toggle, by
+// design: production doesn't either): the two completions must be
+// token-identical (gate 2, greedy).
+TEST(SpeculativeDecoding, OnMatchesOff) {
+    SpeculativeHarness off;
+    off.mock->set_response({'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', 0});
+    off.start();
+    auto off_req = off.run("hi");
+
+    SpeculativeHarness on;
+    on.mock->set_response({'H', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', 0});
+    on.mock->enable_speculative(4);
+    on.start();
+    auto on_req = on.run("hi");
+
+    EXPECT_EQ(off_req->output_text, on_req->output_text);
+    EXPECT_EQ(off_req->finish_reason, on_req->finish_reason);
+    EXPECT_EQ(off_req->completion_tokens, on_req->completion_tokens);
+    EXPECT_GT(on.mock->speculative_step_count(), 0);
+}
+
+// Ineligible slot (stands in for a per-request grammar): speculative is
+// enabled server-wide but must never engage on this slot — the batched path
+// serves the request instead, and the output is still correct. Matches the
+// CLI's own behavior (--speculative + --grammar-file disables speculation
+// outright).
+TEST(SpeculativeDecoding, IneligibleSlotFallsBackToBatched) {
+    SpeculativeHarness h;
+    h.mock->set_response({'H', 'e', 'l', 'l', 'o', '!', 0});
+    h.mock->enable_speculative(4);
+    h.mock->set_speculative_eligible(false);
+    h.start();
+
+    auto req = h.run("hi");
+    EXPECT_EQ(req->output_text, "Hello!");
+    EXPECT_EQ(h.mock->speculative_step_count(), 0);
+    EXPECT_GT(h.mock->decode_count(), 0);
+}
+
+// Two concurrent requests of EQUAL response length, submitted back-to-back
+// from ONE thread (so both land in the request queue together — assign_
+// requests_to_slots() drains the whole queue per iteration, so this makes it
+// overwhelmingly likely both are assigned in the SAME iteration rather than
+// racing each other in): once both are assigned, both slots stay active until
+// they complete on the same batched step, so the >1-active-slot fallback in
+// decode_step() covers the whole run — the multi-slot path is exactly what
+// it was before this task (gate 3). Both completions still have to be
+// correct, and the batched path (not the speculative one) must be what
+// served them.
+TEST(SpeculativeDecoding, MultiSlotStillCorrect) {
+    SpeculativeHarness h;
+    h.mock->set_response({'A', 'A', 'A', 'A', 0});
+    h.mock->enable_speculative(4);
+    h.start();
+
+    auto req0 = h.submit("concurrent");
+    auto req1 = h.submit("concurrent");
+    std::thread t0([&]() { SpeculativeHarness::drain(req0); });
+    std::thread t1([&]() { SpeculativeHarness::drain(req1); });
+    t0.join();
+    t1.join();
+
+    EXPECT_EQ(req0->output_text, "AAAA");
+    EXPECT_EQ(req1->output_text, "AAAA");
+    EXPECT_GT(h.mock->decode_count(), 0);
+    EXPECT_EQ(h.mock->speculative_step_count(), 0);
+}
 
 // =============================================================================
 // Test Fixture
@@ -127,7 +353,7 @@ protected:
 
     void SetUp() override {
         mock_ = std::make_unique<MockInferenceBackend>();
-        
+
         // Set default response: "Hello!"
         mock_->set_response({'H', 'e', 'l', 'l', 'o', '!', 0});
 
@@ -148,7 +374,7 @@ protected:
         // Start HTTP server thread
         http_server_ = std::make_unique<httplib::Server>();
         setup_test_routes();
-        
+
         http_thread_ = std::thread([this]() {
             http_server_->listen("127.0.0.1", TEST_PORT);
         });
