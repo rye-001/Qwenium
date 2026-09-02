@@ -63,6 +63,10 @@ docs/demo
 !docs/note-batch-scaling-cross-family.md
 !docs/plan-deltanet-batched-decode.md
 !docs/note-image-lens-probe.md
+!docs/note-lens-qwen38-probe.md
+!docs/note-lens-gemma4-probe.md
+!docs/note-ggml-b10582-opportunities.md
+!docs/note-kv-quant-flash.md
 !docs/img-lens-probe-figs
 !docs/img-lens-probe-figs/*.png
 *.jpg
@@ -71,3 +75,5 @@ docs/demo
 # Qemmi Files
 qemmi.config.*
 .qemmi/
+
+.session-results/

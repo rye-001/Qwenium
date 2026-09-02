@@ -90,7 +90,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         const auto& chat_meta = model.get_metadata();
         std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
             model, &chat_meta, args.context_length, 2,
-            args.kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            args.kv_type);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
 

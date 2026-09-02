@@ -77,6 +77,33 @@ struct PromptRun {
 };
 
 static const std::vector<int32_t>* g_attn_layers = nullptr;
+// GGUF architecture of the loaded model; selects the chat template in
+// qdocs_chat_prompt so the QDOCS legs are not silently Qwen-shaped.
+static std::string g_arch;
+// Model metadata for prompt encoding (BOS contract). Set in main().
+static const ModelMetadata* g_meta = nullptr;
+
+// Encode a PROMPT, honouring the model's own add_bos_token contract — the same
+// thing cli/complete.cpp and cli/session_mode.cpp do before prefill.
+// tok->encode() alone does NOT prepend BOS, and a Gemma -it model without a
+// leading BOS degenerates (it repeats a single token; see the server BOS bug).
+// Every Gemma number this probe produced before this existed was measured on
+// that degenerate state. Qwen GGUFs carry add_bos_token=false, so this is inert
+// on the qwen legs.
+// The BOS as TEXT, not as a bare token id. Every span in this probe is found by
+// searching the prompt STRING and mapping byte offsets back through
+// cum_bytes(decode(prefix)); prepending a bare token id shifts that map by the
+// BOS's decoded width and silently corrupts every span (the roundtrip guard in
+// run_prompt catches it, which is how this was found). Putting the BOS in the
+// text keeps tokens and bytes in lockstep, so the guard and the offsets stay
+// honest. Empty string on models whose contract does not want a BOS.
+static std::string g_bos_text;
+
+static std::string prompt_with_bos(const std::string& text) { return g_bos_text + text; }
+
+static std::vector<int32_t> encode_prompt(Tokenizer* tok, const std::string& text) {
+    return tok->encode(text);   // callers pass prompt_with_bos(...) text
+}
 
 // Build cumulative byte offsets: cum[k] = bytes of decode(tokens[0:k]).
 // Byte-level BPE roundtrips losslessly, so cum aligns with the original text.
@@ -151,12 +178,13 @@ static PromptRun run_prompt(ForwardPassBase* fp, ggml_backend_sched_t sched,
     R.label = label;
     R.fields = std::move(fields);
 
-    R.prompt_tokens = tok->encode(prompt_text);
+    const std::string ptext = prompt_with_bos(prompt_text);
+    R.prompt_tokens = encode_prompt(tok, ptext);
     R.comp_tokens   = tok->encode(comp_text);
 
     // Roundtrip sanity: byte-level BPE must reproduce the text, or our byte
     // offsets are meaningless — fail loud (CLAUDE.md fail-loud contract).
-    if (tok->decode(R.prompt_tokens) != prompt_text)
+    if (tok->decode(R.prompt_tokens) != ptext)
         throw std::runtime_error("prompt roundtrip mismatch — token offsets unreliable");
     if (tok->decode(R.comp_tokens) != comp_text)
         throw std::runtime_error("completion roundtrip mismatch");
@@ -165,7 +193,7 @@ static PromptRun run_prompt(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
     // Locate each field's source span in the prompt.
     for (auto& f : R.fields) {
-        if (!find_token_span(tok, R.prompt_tokens, prompt_text, f.value, f.lo, f.hi))
+        if (!find_token_span(tok, R.prompt_tokens, ptext, f.value, f.lo, f.hi))
             throw std::runtime_error("field value not found in prompt: " + f.value);
     }
 
@@ -308,8 +336,17 @@ static Score score_lh(const PromptRun& R, int ls, int h, int tol) {
 // ═════════════════════════════════════════════════════════════════════════
 
 // Frozen head from N3 (tap-slot index into g_attn_layers, and head).
-static const int FROZEN_SLOT = 0, FROZEN_HEAD = 13;  // layer 3
-static const int ENS_SLOT    = 1, ENS_HEAD    = 8;   // layer 7 (ensemble stretch)
+// Defaults are the Qwen 3.6 coordinates the shipped LensConstants carry.
+// ATTN_FROZEN_SLOT / ATTN_FROZEN_HEAD override them so the confirmation legs
+// (QDOCS_C, ATTN_UNGROUNDED, COVERAGE) can be pointed at a candidate found on
+// ANOTHER model without editing this file — the second corpus is the whole
+// point of the search, and a hardcoded head made it unaskable off qwen36.
+// Unset ⇒ byte-identical to the committed qwen36 behaviour.
+static int FROZEN_SLOT = 0, FROZEN_HEAD = 13;  // layer 3
+static int ENS_SLOT    = 1, ENS_HEAD    = 8;   // layer 7 (ensemble stretch)
+
+// Defined below, after L3H13_SLOT / L11_SLOT — it sets those too.
+static void apply_frozen_head_overrides();
 
 enum Region { R_IDX0 = 0, R_BODY, R_INSTR, R_OWN };
 static const char* region_name(Region r) {
@@ -372,15 +409,18 @@ static FreeRun run_freegen(ForwardPassBase* fp, ggml_backend_sched_t sched,
     FreeRun R;
     R.body_text = body_text;
     R.n_head = (int)meta.attention_head_count;
-    std::string prompt_text = body_text + instr_text;
-    R.prompt_tokens = tok->encode(prompt_text);
+    // BOS lives in the TEXT so tokens and byte offsets stay in lockstep; the
+    // body/instruction boundary below must therefore clear the BOS too.
+    std::string prompt_text = prompt_with_bos(body_text + instr_text);
+    const size_t body_end = g_bos_text.size() + body_text.size();
+    R.prompt_tokens = encode_prompt(tok, prompt_text);
     if (tok->decode(R.prompt_tokens) != prompt_text)
         throw std::runtime_error("freegen: prompt roundtrip mismatch");
     R.P = (int)R.prompt_tokens.size();
 
     std::vector<size_t> cum = cum_bytes(tok, R.prompt_tokens);
     R.instr_tok = R.P;
-    for (int k = 0; k < R.P; ++k) if (cum[k] >= body_text.size()) { R.instr_tok = k; break; }
+    for (int k = 0; k < R.P; ++k) if (cum[k] >= body_end) { R.instr_tok = k; break; }
 
     fp->clear_slot(0); fp->set_cache_pos(0, 0);
     std::vector<float> logits = fp->run_prefill(R.prompt_tokens, 0, 0, sched);
@@ -1396,7 +1436,13 @@ static void span_scalars(const FreeRun& R, int lo, int hi, double sc[12][4],
                 if (mp > layer_ms) layer_ms = mp;
                 if (slot == 0 && h == FROZEN_HEAD) { step_src[0] = s; ms_src[0] = mp; }  // L3H13
             }
-            step_src[1 + slot] = layer_best; ms_src[1 + slot] = layer_ms;   // per-layer
+            // Indices 1..10 are the per-layer slots and 11 is the all-layer max,
+            // so only the first 10 tapped layers get their own entry. On qwen36
+            // (nslot=10) that is every layer and this guard never fires; on a
+            // 48-layer gemma4 it is what stops `step_src[1+slot]` running off the
+            // end of a double[12] and corrupting the stack. The all-layer max
+            // below still accumulates over ALL slots.
+            if (1 + slot < 11) { step_src[1 + slot] = layer_best; ms_src[1 + slot] = layer_ms; }
             if (layer_best > glob) glob = layer_best;
             if (layer_ms > glob_ms) glob_ms = layer_ms;
         }
@@ -2430,8 +2476,36 @@ value ::= ([^"\\\n] | "\\" [^])+
 ws    ::= [ \n\t]*
 )GBNF";
 
-static const int L3H13_SLOT = 0;   // tap-slot for physical layer 3 (attn_layers[0])
-static const int L11_SLOT   = 2;   // physical layer 11 = attn_layers[2]; span_scalars sc index 1+2=3
+// Tap-slot (index into attn_layers) for the CITATION layer and the COVERAGE
+// layer. Defaults are the Qwen 3.6 coordinates: slot 0 = physical layer 3,
+// slot 2 = physical layer 11 (span_scalars sc index 1+2=3).
+// These are a SECOND pair of slot constants alongside FROZEN_SLOT/ENS_SLOT, and
+// they are the ones the QDOCS legs actually read — qdocs_eval_field takes its
+// layer from L3H13_SLOT and only its head from FROZEN_HEAD. So overriding
+// FROZEN_SLOT alone silently leaves leg C scoring layer 3, which is exactly the
+// kind of "the flag did nothing and the label lied" trap that makes a probe
+// report a confirmation it never ran. apply_frozen_head_overrides keeps them in
+// sync; ATTN_COV_SLOT moves the coverage layer independently.
+static int L3H13_SLOT = 0;
+static int L11_SLOT   = 2;
+
+static void apply_frozen_head_overrides() {
+    if (const char* s = std::getenv("ATTN_FROZEN_SLOT")) FROZEN_SLOT = std::atoi(s);
+    if (const char* h = std::getenv("ATTN_FROZEN_HEAD")) FROZEN_HEAD = std::atoi(h);
+    if (const char* s = std::getenv("ATTN_ENS_SLOT"))    ENS_SLOT    = std::atoi(s);
+    if (const char* h = std::getenv("ATTN_ENS_HEAD"))    ENS_HEAD    = std::atoi(h);
+    // The QDOCS legs read the citation LAYER from L3H13_SLOT, so it must follow
+    // ATTN_FROZEN_SLOT or the override is a no-op there (see the note above).
+    L3H13_SLOT = FROZEN_SLOT;
+    if (const char* c = std::getenv("ATTN_COV_SLOT")) L11_SLOT = std::atoi(c);
+    if (std::getenv("ATTN_FROZEN_SLOT") || std::getenv("ATTN_FROZEN_HEAD") ||
+        std::getenv("ATTN_COV_SLOT")) {
+        std::fprintf(stderr,
+                     "[override] citation tap-slot=%d head=%d, coverage tap-slot=%d "
+                     "(defaults 0/13/2 = Qwen 3.6 L3H13 + layer 11)\n",
+                     FROZEN_SLOT, FROZEN_HEAD, L11_SLOT);
+    }
+}
 
 // Render a document + extraction task through Qwen's ChatML template with
 // thinking OFF (the model goes straight to the JSON answer). This is the
@@ -2445,8 +2519,21 @@ static const char* QDOCS_TASK =
     "verbatim from the email. Output ONLY the JSON object, nothing else.";
 static std::string qdocs_chat_prompt(const std::string& document,
                                      const std::string& task = QDOCS_TASK) {
-    QwenChatTemplate ct;
+    // Pick the template by the loaded architecture. Hardcoding QwenChatTemplate
+    // here made every QDOCS leg silently Qwen-shaped: on a gemma4 model it would
+    // wrap the document in ChatML the model has never seen, and any resulting
+    // "no citation head" reading would be measuring the wrapper, not the model.
+    // g_arch is set in main() from the GGUF.
     std::vector<ChatMessage> hist = {{"user", document + task}};
+    if (g_arch.rfind("gemma4", 0) == 0) {
+        Gemma4ChatTemplate ct;
+        return ct.render(hist, /*add_assistant_prompt=*/true, /*enable_thinking=*/false);
+    }
+    if (g_arch.rfind("gemma", 0) == 0) {
+        GemmaChatTemplate ct;
+        return ct.render(hist, /*add_assistant_prompt=*/true, /*enable_thinking=*/false);
+    }
+    QwenChatTemplate ct;
     return ct.render(hist, /*add_assistant_prompt=*/true, /*enable_thinking=*/false);
 }
 
@@ -2475,14 +2562,17 @@ static FreeRun run_freegen_grammar(ForwardPassBase* fp, ggml_backend_sched_t sch
     FreeRun R;
     R.body_text = body_text;
     R.n_head = (int)meta.attention_head_count;
-    std::string prompt_text = body_text + instr_text;
-    R.prompt_tokens = tok->encode(prompt_text);
+    // BOS lives in the TEXT so tokens and byte offsets stay in lockstep; the
+    // body/instruction boundary below must therefore clear the BOS too.
+    std::string prompt_text = prompt_with_bos(body_text + instr_text);
+    const size_t body_end = g_bos_text.size() + body_text.size();
+    R.prompt_tokens = encode_prompt(tok, prompt_text);
     if (tok->decode(R.prompt_tokens) != prompt_text)
         throw std::runtime_error("freegen_grammar: prompt roundtrip mismatch");
     R.P = (int)R.prompt_tokens.size();
     std::vector<size_t> cum = cum_bytes(tok, R.prompt_tokens);
     R.instr_tok = R.P;
-    for (int k = 0; k < R.P; ++k) if (cum[k] >= body_text.size()) { R.instr_tok = k; break; }
+    for (int k = 0; k < R.P; ++k) if (cum[k] >= body_end) { R.instr_tok = k; break; }
 
     gr->reset();
     fp->clear_slot(0); fp->set_cache_pos(0, 0);
@@ -3276,7 +3366,10 @@ static int run_qdocs_leg_c(ForwardPassBase* fp, ggml_backend_sched_t sched,
         return v[v.size() / 2]; };
     auto report = [&](const char* label, const Acc& A) {
         std::printf("\n──────── %s ────────\n", label);
-        std::printf("  citation (frozen L3H13) on value tokens: top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [bar top3 ≥90%%]\n",
+        // Name the head that was ACTUALLY scored, not the qwen36 default: with
+        // ATTN_FROZEN_SLOT/HEAD set, a hardcoded "L3H13" label makes the log lie.
+        std::printf("  citation (frozen L%dH%d) on value tokens: top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [bar top3 ≥90%%]\n",
+                    (*g_attn_layers)[FROZEN_SLOT], FROZEN_HEAD,
                     A.t1, A.cite_n, A.cite_n ? 100.0 * A.t1 / A.cite_n : 0,
                     A.t3, A.cite_n, A.cite_n ? 100.0 * A.t3 / A.cite_n : 0);
         std::printf("  coverage: used spans clearing 0.705 = %d/%d (%.0f%%)  median used-peak %.3f  [COV1 USED median 0.937]\n",
@@ -3860,6 +3953,7 @@ int main() {
     const uint32_t CTX = (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1")) ? 5120 : 2048;
     const int TOL = 2;
 
+    apply_frozen_head_overrides();
     register_builtin_models();
     std::cerr << "Loading " << path << " ...\n";
     Model model;
@@ -3870,17 +3964,84 @@ int main() {
     ggml_backend_sched_t sched = model.get_scheduler();
     Tokenizer* tok = model.get_tokenizer();
 
-    // Derive attention-layer indices from metadata (fai, nextn).
-    const uint32_t fai   = meta.raw_kv.get_uint32("qwen35moe.full_attention_interval");
-    const uint32_t nextn = meta.raw_kv.get_uint32_opt("qwen35moe.nextn_predict_layers").value_or(0);
-    const uint32_t n_main = meta.block_count - nextn;
+    // ── Discover attention layers from the BUILT DECODE GRAPH ────────────────
+    // Was: `meta.raw_kv.get_uint32("qwen35moe.full_attention_interval")`, a key
+    // only a qwen35moe GGUF carries — so this probe could not even load any
+    // other architecture, and was structurally incapable of asking whether the
+    // lens constants transfer. Same defect, same fix as the P1 gate
+    // (tests/unit/test_forward_pass_base.cpp): the seam is the TENSOR NAME
+    // `kq_soft.<il>` that layers/attention.cpp assigns inside build_attn_mha,
+    // the single funnel every attention builder passes through. Scanning for it
+    // needs no per-family knowledge and automatically excludes blocks held out
+    // of the decode stack (a qwen35 GGUF's trailing NextN/MTP head builds no
+    // nodes). On qwen36 this yields exactly the old fai-derived list.
     std::vector<int32_t> attn_layers;
-    for (uint32_t il = 0; il < n_main; ++il)
-        if (fai > 0 && (il % fai) == (fai - 1)) attn_layers.push_back((int)il);
+    {
+        std::vector<int32_t> warm = tok->encode("Hello");
+        if (warm.empty()) {
+            std::fprintf(stderr, "tap discovery: expected a non-empty warm-up "
+                                 "tokenization, actual 0 tokens\n");
+            return 1;
+        }
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        fp->run_prefill(warm, 0, 0, sched);
+        std::vector<int32_t>  t = {warm.back()};
+        std::vector<uint32_t> s = {0};
+        std::vector<int32_t>  p = {(int32_t)fp->get_cache_pos(0)};
+        ggml_cgraph* gscan = fp->build_decoding_graph(t, s, p);
+        for (uint32_t il = 0; il < meta.block_count; ++il) {
+            const std::string nm = "kq_soft." + std::to_string(il);
+            if (ggml_graph_get_tensor(gscan, nm.c_str())) attn_layers.push_back((int32_t)il);
+        }
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+    }
+    if (attn_layers.empty()) {
+        std::fprintf(stderr, "tap discovery: expected ≥1 `kq_soft.<il>` tensor in "
+                             "the decode graph, actual 0 (arch '%s' does not "
+                             "materialize attention and cannot host the lens tap)\n",
+                     meta.architecture.c_str());
+        return 1;
+    }
     g_attn_layers = &attn_layers;
+    g_arch = meta.architecture;
+    g_meta = &meta;
+    // Honour the model's own add_bos_token contract, as cli/complete.cpp and
+    // cli/session_mode.cpp do before prefill. A Gemma -it model without a
+    // leading BOS degenerates (repeats a single token), so every Gemma number
+    // measured without this was taken on a broken state. Qwen GGUFs carry
+    // add_bos_token=false, so g_bos_text stays empty and the qwen legs are
+    // byte-identical.
+    if (meta.add_bos_token && meta.bos_token_id >= 0) {
+        g_bos_text = tok->decode({(int32_t)meta.bos_token_id});
+        std::printf("prompt BOS: add_bos_token=true id=%d text=\"%s\" (%zu bytes)\n",
+                    meta.bos_token_id, g_bos_text.c_str(), g_bos_text.size());
+        if (g_bos_text.empty()) {
+            std::fprintf(stderr, "prompt BOS: expected a non-empty decoding for "
+                                 "bos_token_id %d, actual empty string — the "
+                                 "text-level BOS scheme cannot represent it\n",
+                         meta.bos_token_id);
+            return 1;
+        }
+    }
 
-    std::printf("\nqwen36 map: block_count=%u nextn=%u n_main=%u fai=%u\n",
-                meta.block_count, nextn, n_main, fai);
+    // Validate the slot overrides against the model actually loaded: a stale
+    // ATTN_FROZEN_SLOT from a deeper model would otherwise index past the tap
+    // vector and read garbage that still looks like a probability row.
+    for (auto& sv : {std::make_pair("ATTN_FROZEN_SLOT/ATTN_COV_SLOT citation", FROZEN_SLOT),
+                     std::make_pair("ATTN_COV_SLOT coverage", L11_SLOT)}) {
+        if (sv.second < 0 || sv.second >= (int)attn_layers.size()) {
+            std::fprintf(stderr, "%s: expected a tap slot in [0,%zu) for arch '%s' "
+                                 "(%zu attention layers), actual %d\n",
+                         sv.first, attn_layers.size(), meta.architecture.c_str(),
+                         attn_layers.size(), sv.second);
+            return 1;
+        }
+    }
+
+    std::printf("\nmodel map: arch=%s block_count=%u\n",
+                meta.architecture.c_str(), meta.block_count);
     std::printf("attention layers (%zu): ", attn_layers.size());
     for (int il : attn_layers) std::printf("%d ", il);
     std::printf("\nn_head_q=%u n_head_kv=%u\n\n",
@@ -4035,6 +4196,55 @@ int main() {
         std::printf("  %5d | h=%-2d      %2d/%-2d   %2d/%-2d  |   %.2f          %.3f\n",
                     attn_layers[ls], lbest_h, lbest_t1, lbest_n, lbest_t3, lbest_n,
                     mean_t1, mean_bos);
+    }
+
+    // ── Full ranked (layer,head) table ───────────────────────────────────────
+    // The per-layer summary above shows only each layer's winner, which hides
+    // the shape of the field: whether ONE head stands out (a retrieval head) or
+    // the top of the ranking is a flat crowd of near-ties (no head, just noise
+    // with a lucky argmax). That distinction is the whole go/no-go question when
+    // asking whether the lens constants transfer to another model, so print the
+    // ranking itself rather than its argmax.
+    {
+        struct Cand { int layer, head, top1, top3, n; double frac, bos; };
+        std::vector<Cand> cands;
+        for (int ls = 0; ls < (int)attn_layers.size(); ++ls)
+            for (int h = 0; h < A.n_head; ++h) {
+                Score sc = score_lh(A, ls, h, TOL);
+                cands.push_back({attn_layers[ls], h, sc.top1, sc.top3, sc.n,
+                                 sc.n ? (double)sc.top1 / sc.n : 0.0,
+                                 sc.n ? sc.bos_mass / sc.n : 0.0});
+            }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            if (a.frac != b.frac) return a.frac > b.frac;
+            return a.top3 > b.top3;
+        });
+        const int SHOW = 20;
+        std::printf("\n  === RANKED (layer,head) on A — top %d of %zu candidates ===\n",
+                    SHOW, cands.size());
+        std::printf("  rank | layer head | top1/N  (in-span)  top3/N | bos_mass\n");
+        std::printf("  -----+------------+--------------------------+---------\n");
+        for (int i = 0; i < SHOW && i < (int)cands.size(); ++i) {
+            const Cand& c = cands[i];
+            std::printf("  %4d | L%-4d H%-3d | %2d/%-2d   (%5.1f%%)   %2d/%-2d | %.3f\n",
+                        i + 1, c.layer, c.head, c.top1, c.n, 100.0 * c.frac,
+                        c.top3, c.n, c.bos);
+        }
+        // The Qwen 3.6 frozen coordinates, scored HERE as a control — on the
+        // pinned model this must be at/near the top; on any other model it is
+        // the direct measurement of whether the shipped constants transfer.
+        for (int ls = 0; ls < (int)attn_layers.size(); ++ls) {
+            if (attn_layers[ls] != 3) continue;
+            if (13 >= A.n_head) break;
+            Score sc = score_lh(A, ls, 13, TOL);
+            int rank = 1;
+            for (const Cand& c : cands)
+                if (c.frac > (sc.n ? (double)sc.top1 / sc.n : 0.0)) rank++;
+            std::printf("  CONTROL L3H13 (the shipped LensConstants coordinates): "
+                        "top1 %d/%d (%.1f%%), top3 %d/%d — rank %d of %zu\n",
+                        sc.top1, sc.n, sc.n ? 100.0 * sc.top1 / sc.n : 0.0,
+                        sc.top3, sc.n, rank, cands.size());
+        }
     }
 
     Score bA = score_lh(A, best_ls, best_h, TOL);

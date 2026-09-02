@@ -145,10 +145,10 @@ public:
                           const std::string& image_embed_cache_dir = "",
                           const std::string& image_prefix_cache_dir = "",
                           const std::string& prefix_cache_dir = "",
-                          bool kv_f16 = false)
+                          ggml_type kv_type = GGML_TYPE_F32)
         : max_ctx_per_slot_(max_ctx_per_slot),
           max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)),
-          kv_type_(kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32) {
+          kv_type_(kv_type) {
 
         std::cout << "Loading model from: " << model_path << std::endl;
         // Register architectures BEFORE load_metadata: the GGUF loader validates
@@ -199,7 +199,8 @@ public:
         // that term; recurrent state is unaffected.
         const auto& srv_meta = model_.get_metadata();
         std::cout << "KV cache type: "
-                  << (kv_type_ == GGML_TYPE_F16 ? "F16 (--kv-f16)" : "F32 (default)")
+                  << (kv_type_ == GGML_TYPE_F32 ? "f32 (default)"
+                      : (std::string(kv_type_name(kv_type_)) + " (--kv-type)"))
                   << std::endl;
         forward_pass_ = create_forward_pass(
             model_, &srv_meta, max_ctx_per_slot_, max_slots_, kv_type_);
@@ -334,11 +335,24 @@ public:
     // docs/note-nogrammar-refutation.md). This does not touch the per-request
     // `grammar` field on /v1/completions and /v1/chat/completions, which is a
     // separate shipped feature and still works exactly as before.
-    void enable_attention_lens() {
+    //
+    // Refused fail-loud on any architecture but the one LensConstants was
+    // calibrated on (server_lens.h). Same shape and same reason class as
+    // enable_flash_attn: accepting the flag on an uncalibrated model would not
+    // degrade the lens, it would make it lie — a shaped report whose citations
+    // and badges come from coordinates measured on a different model. Returns
+    // false with a printed reason so main() can just `return 1`.
+    bool enable_attention_lens() {
+        const std::string& arch = model_.get_metadata().architecture;
+        if (!qinf::lens_architecture_supported(arch)) {
+            std::cerr << qinf::lens_architecture_refusal(arch) << std::endl;
+            return false;
+        }
         attention_lens_enabled_ = true;
         std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
                      "(single-slot; document → audited key-value JSON; free decode, "
                      "tolerant parse, 422 on unparseable output)" << std::endl;
+        return true;
     }
     bool attention_lens_enabled() const { return attention_lens_enabled_; }
 
@@ -703,6 +717,36 @@ private:
     int run_prefill(int slot_id, const std::vector<int32_t>& tokens, int start_pos) {
         std::lock_guard<std::mutex> lock(model_mutex_);
 
+        // ── Slot-hygiene invariant (fail-loud) ───────────────────────────────
+        // start_pos == 0 means "this slot begins a fresh sequence", so its KV
+        // must already be empty. Nothing here clears it: in the default
+        // stateless config InferenceServer::clear_retained_if_any is a no-op (it
+        // fires only when a conversation or retained warm prefix owns the slot),
+        // so a pos-0 prefill is clean ONLY because the PREVIOUS request's release
+        // cleared it. A path that drives a slot outside that lifecycle leaves it
+        // dirty, and since advance_cache() ADDS rather than sets, the corruption
+        // is silent: the decode runs with an inflated n_kv and attends over the
+        // previous occupant's KV, giving a plausible but different answer.
+        //
+        // Not hypothetical — it shipped: /v1/extract drove slot 0 directly and
+        // left cache_pos at 138, so the next 24-token request decoded at n_kv 162
+        // (ledger D8, fixed in server_lens.cpp). This makes the class loud.
+        // Safe to throw only because the caller now wraps this: the stateless
+        // prefill_ call in inference_server.h had NO try/catch until 2026-09-02,
+        // and an escaping throw hung the client on pop_blocking instead of
+        // failing the request.
+        if (start_pos == 0) {
+            const uint32_t pos = forward_pass_->get_cache_pos(slot_id);
+            if (pos != 0)
+                throw std::runtime_error(
+                    "slot " + std::to_string(slot_id) +
+                    ": prefill at start_pos 0 expected cache_pos 0 (a fresh slot), "
+                    "actual cache_pos " + std::to_string(pos) +
+                    " — the slot was left dirty by a path that bypassed the slot "
+                    "lifecycle; advance_cache() adds rather than sets, so this "
+                    "decode would silently attend over the previous occupant's KV");
+        }
+
         // Gemma-family -it models go DEGENERATE (greedy repeats one token) when
         // the sequence does not start with BOS — and encode() does not prepend
         // it. Honor the model's add_bos_token contract at this single text-
@@ -1045,7 +1089,7 @@ private:
     // extraction grammar and the yes/no presence grammar — with the presence gate.
     // The lens holds no grammar state at all now.
     bool attention_lens_enabled_ = false;
-    ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-f16 selects F16
+    ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-type / --kv-f16 select otherwise
 
     // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
     // ⇒ configure_server registers neither speculative callback, and
@@ -1761,9 +1805,12 @@ int main(int argc, char* argv[]) {
     std::string prefix_cache_dir;        // text: opt-in disk system-prefix KV cache
     bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
+    std::string token_log_path;          // --token-log: append token ids per completed request (off by default)
     bool attention_lens = false;         // opt-in: enable POST /v1/extract (Qemmi-Lens)
     bool flash_attn = false;             // opt-in: flash attention on decode (excludes --attention-lens)
-    bool kv_f16 = false;                 // opt-in: F16 attention KV cache (halves KV memory)
+    // --kv-type <f32|f16|q8_0|q4_0> (--kv-f16 is the kept alias). Quantized
+    // types are flash-only; see state/kv_cache_simple.h.
+    ggml_type kv_type = GGML_TYPE_F32;
     int max_ctx = 2048;  // per-slot context ceiling (KV cache size + fail-loud
                          // prompt guard). Raise for agent clients (e.g. Qwen
                          // Code) whose system prompt exceeds 2048 tokens.
@@ -1802,6 +1849,8 @@ int main(int argc, char* argv[]) {
             prefix_cache_dir = argv[++i];
         } else if (arg == "--chat-prefix-cache") {
             chat_prefix_cache = true;
+        } else if (arg == "--token-log" && i + 1 < argc) {
+            token_log_path = argv[++i];
         } else if (arg == "--conversational") {
             conversational = true;
         } else if (arg == "--attention-lens") {
@@ -1809,7 +1858,14 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--flash-attn") {
             flash_attn = true;
         } else if (arg == "--kv-f16") {
-            kv_f16 = true;
+            kv_type = GGML_TYPE_F16;   // alias, kept so existing invocations work
+        } else if (arg == "--kv-type" && i + 1 < argc) {
+            const std::string want = argv[++i];
+            if (kv_type_from_string(want, &kv_type) != KvTypeSupport::Ok) {
+                std::cerr << "--kv-type: expected one of " << kv_type_choices()
+                          << ", actual '" << want << "'" << std::endl;
+                return 1;
+            }
         } else if (arg == "--speculative") {
             speculative = true;
             // Optional mode argument, mirroring the CLI: bare --speculative
@@ -1902,6 +1958,17 @@ int main(int argc, char* argv[]) {
     // pair BEFORE the model load — this is pure argument validation, and making
     // the operator wait out a multi-GB load to be told their flags conflict is
     // the kind of late failure the fail-loud contract is meant to prevent.
+    // A quantized KV cache is readable ONLY by the flash attention kernel. The
+    // materialized path transposes V (ggml_permute + ggml_cont), which moves the
+    // block dimension of a quantized type out of position; Metal's CPY/CONT has
+    // no quantized source case, so that node would take ggml's SILENT CPU
+    // fallback (architecture.md section 3) rather than fail. Refuse before load.
+    // Note this also excludes --attention-lens transitively, via --flash-attn.
+    if (kv_type_is_quantized(kv_type) && !flash_attn) {
+        std::cerr << kv_type_requires_flash_refusal(kv_type) << std::endl;
+        return 1;
+    }
+
     if (attention_lens && flash_attn) {
         std::cerr << "expected at most one of --attention-lens / --flash-attn, "
                      "got: both. Flash attention never materializes kq_soft, "
@@ -1929,8 +1996,8 @@ int main(int argc, char* argv[]) {
         // Initialize model integration
         QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
                                           image_embed_cache_dir, image_prefix_cache_dir,
-                                          prefix_cache_dir, kv_f16);
-        if (attention_lens) integration.enable_attention_lens();
+                                          prefix_cache_dir, kv_type);
+        if (attention_lens && !integration.enable_attention_lens()) return 1;
         if (flash_attn && !integration.enable_flash_attn()) return 1;
         if (speculative && !integration.enable_speculative(
                 speculative_mode, pld_ngram_size, pld_max_draft,
@@ -1945,6 +2012,12 @@ int main(int argc, char* argv[]) {
         config.max_context = integration.max_ctx_per_slot();  // fail-loud guard on prompt size
         config.request_timeout = std::chrono::seconds(300);
         config.chat_prefix_cache = chat_prefix_cache;  // opt-in warm per-slot KV reuse
+        config.token_log_path = token_log_path;        // opt-in token-id request log
+        if (!token_log_path.empty())
+            std::cout << "Token log ON (--token-log " << token_log_path
+                      << "): one JSON object per completed request. Token IDS are "
+                         "reversible to prompt text -- treat this file as sensitive."
+                      << std::endl;
         if (chat_prefix_cache)
             std::cout << "Text: chat prefix cache ON (--chat-prefix-cache): warm "
                          "per-slot KV reuse for growing conversations" << std::endl;

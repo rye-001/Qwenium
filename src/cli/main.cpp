@@ -22,6 +22,7 @@
 #include "../sampling/speculative.h"
 #include "../sampling/vocab_utils.h"
 #include "../sampling/grammar_vocab.h"
+#include "../state/kv_cache_simple.h"
 
 #include "../models/model_registry.h"
 
@@ -67,7 +68,8 @@ void print_usage(const char* program_name) {
     std::cout << "  --suffix-max-indexed N  Suffix: cap on indexed session tokens (default: 8192)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
-    std::cout << "  --kv-f16                Store the attention KV cache as F16 instead of F32 (halves KV memory); token-stable, not byte-identical\n";
+    std::cout << "  --kv-type <t>           Attention KV cache element type: f32|f16|q8_0|q4_0 (default f32); token-stable, not byte-identical. q8_0/q4_0 REQUIRE --flash-attn\n";
+    std::cout << "  --kv-f16                Alias for --kv-type f16 (halves KV memory)\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";
     std::cout << "  --mmproj FILE           Vision projector GGUF (required with --image);\n";
     std::cout << "                          gemma3, gemma4uv or qwen3vl_merger\n";
@@ -164,7 +166,14 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--persistent-graph") {
             args.persistent_graph = true;
         } else if (arg == "--kv-f16") {
-            args.kv_f16 = true;
+            args.kv_type = GGML_TYPE_F16;   // alias, kept so existing invocations work
+        } else if (arg == "--kv-type" && i + 1 < argc) {
+            const std::string want = argv[++i];
+            if (kv_type_from_string(want, &args.kv_type) != KvTypeSupport::Ok) {
+                std::cerr << "--kv-type: expected one of " << kv_type_choices()
+                          << ", actual '" << want << "'" << std::endl;
+                return false;   // parse_args returns bool: `return 1` would mean SUCCESS
+            }
         } else if (arg == "--flash-attn") {
             args.flash_attn = true;
         } else if (arg == "--mtp-max-draft") {
@@ -248,6 +257,17 @@ int main(int argc, char** argv) {
         }
     }
 
+
+    // A quantized KV cache is readable ONLY by the flash attention kernel: the
+    // materialized path transposes V (ggml_permute + ggml_cont), which moves the
+    // block dimension of a quantized type out of position, and Metal's CPY/CONT
+    // has no quantized source case -- so the node would take ggml's silent CPU
+    // fallback (docs/architecture.md section 3) instead of failing. Refuse it here,
+    // before any weights are loaded, rather than degrade quietly.
+    if (kv_type_is_quantized(args.kv_type) && !args.flash_attn) {
+        std::cerr << kv_type_requires_flash_refusal(args.kv_type) << std::endl;
+        return 1;
+    }
 
  ggml_log_set([](ggml_log_level level, const char * text, void * user_data) {
     if (level == GGML_LOG_LEVEL_ERROR) {

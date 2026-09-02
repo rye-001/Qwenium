@@ -670,3 +670,47 @@ TEST(LensShapeContract, FencedOutputStillLocatesTheValueSpan) {
     EXPECT_EQ(f.value_byte_lo, 5u);              // located in the DOCUMENT, not the fence
     EXPECT_EQ(count_confident_false_receipts(r), 0);
 }
+
+// ── Architecture guard ───────────────────────────────────────────────────────
+// LensConstants is a set of coordinates measured on ONE model (Qwen 3.6,
+// `qwen35moe`). Before this guard existed, --attention-lens was accepted on any
+// loaded model and /v1/extract answered with a confidently-shaped report
+// computed from constants that were never calibrated there. These tests pin the
+// predicate the startup refusal is built on, and the fail-loud SHAPE of its
+// message (parameter, then expected, then actual — in that order).
+//
+// The refusal itself lives in QweniumServerIntegration::enable_attention_lens()
+// in src/server/http_server.cpp, which is a main()-local type in a binary
+// target; it is not linkable from a unit test. The predicate and the message
+// are shipped code in server_lens.h and are what that call site consists of.
+
+TEST(LensArchitectureGuard, AcceptsOnlyTheCalibratedArchitecture) {
+    EXPECT_STREQ(kLensCalibratedArchitecture, "qwen35moe");
+    EXPECT_TRUE(lens_architecture_supported("qwen35moe"));
+
+    // Every other architecture the engine hosts is uncalibrated, including the
+    // near neighbour qwen35 (Qwen 3.5/3.8) — same family, different head layout.
+    for (const char* arch : {"qwen2", "qwen3", "qwen35", "gemma1", "gemma2",
+                             "gemma3", "gemma4", "gemma4uv", ""}) {
+        EXPECT_FALSE(lens_architecture_supported(arch)) << "arch: " << arch;
+    }
+}
+
+TEST(LensArchitectureGuard, RefusalNamesParameterExpectedActualInThatOrder) {
+    const std::string msg = lens_architecture_refusal("qwen35");
+
+    const size_t param    = msg.find("--attention-lens");
+    const size_t expected = msg.find("qwen35moe");
+    const size_t actual   = msg.find("'qwen35'");
+
+    ASSERT_NE(param,    std::string::npos) << msg;
+    ASSERT_NE(expected, std::string::npos) << msg;
+    ASSERT_NE(actual,   std::string::npos) << msg;
+    EXPECT_LT(param,    expected) << msg;   // parameter before expected
+    EXPECT_LT(expected, actual)   << msg;   // expected before actual
+
+    // It must say WHY, not just that it refused: an operator who is told only
+    // "wrong architecture" will reasonably assume the lens is merely untested
+    // here, rather than uncalibrated.
+    EXPECT_NE(msg.find("calibrated"), std::string::npos) << msg;
+}

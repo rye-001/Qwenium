@@ -100,7 +100,32 @@ int run_complete(
         register_builtin_models();
         std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
             model, &cmp_meta, args.context_length, 1,
-            args.kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            args.kv_type);
+
+        // Flash attention (opt-in --flash-attn): one ggml_flash_attn_ext per
+        // attention layer, replacing kq / soft_max / kqv and the V transpose.
+        // Token-stable, not byte-identical. Refused fail-loud on a recipe that
+        // does not thread it through, rather than silently running the
+        // materialized path the user asked to replace.
+        //
+        // THIS MUST PRECEDE THE FIRST run_prefill. It used to sit ~40 lines
+        // below it, so `-p` prefill silently ran MATERIALIZED attention while
+        // only the decode steps got flash — i.e. the flag half-applied, without
+        // any diagnostic. architecture.md section 5 says flash covers "both
+        // prefill and decode" and that "prefill is where it pays most", so the
+        // gap was invisible and contradicted the documented contract. It was
+        // found because a quantized KV cache (--kv-type q8_0), which ONLY the
+        // flash kernel can read, aborted inside build_prefill_graph's
+        // ggml_mul_mat -- the materialized path it should never have reached.
+        if (args.flash_attn) {
+            if (!forward_pass->supports_flash_attn()) {
+                std::cerr << "--flash-attn: architecture '"
+                          << model.get_metadata().architecture << "' does not "
+                          << "support flash attention (supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)\n";
+                return 1;
+            }
+            forward_pass->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+        }
 
         // --speculative mtp: build the MtpDraft-backed decoder here — the head
         // lives on the recipe, which only now exists. Fail-loud if the loaded
@@ -198,20 +223,6 @@ int run_complete(
         // shapes are out of scope for v1. Refused fail-loud on a recipe that is
         // not persistent-capable, so the flag never silently no-ops.
 
-        // Flash attention (opt-in --flash-attn): one ggml_flash_attn_ext per
-        // attention layer on the decode path, replacing kq / soft_max / kqv and
-        // the V transpose. Token-stable, not byte-identical. Refused fail-loud
-        // on a recipe that does not thread it through, rather than silently
-        // running the materialized path the user asked to replace.
-        if (args.flash_attn) {
-            if (!forward_pass->supports_flash_attn()) {
-                std::cerr << "--flash-attn: architecture '"
-                          << model.get_metadata().architecture << "' does not "
-                          << "support flash attention (supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)\n";
-                return 1;
-            }
-            forward_pass->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
-        }
 
         std::unique_ptr<DecodeGraphCache> graph_cache;
         if (args.persistent_graph) {
