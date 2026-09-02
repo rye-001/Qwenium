@@ -39,9 +39,15 @@
 // per-request `grammar` field on /v1/completions and /v1/chat/completions —
 // that is a separate, shipped, unaffected feature.
 //
-// The frozen constants are Qwen3.6-pinned; the driver runs a startup
-// known-answer sanity check and fails loud if the citation head has drifted
-// (plan §1.6). No lens claims for other model families yet.
+// The frozen constants are Qwen3.6-pinned. What guards that pin is an
+// ARCHITECTURE REFUSAL at server startup, not a numeric self-check: if the
+// loaded model is not `qwen35moe`, --attention-lens is refused fail-loud before
+// the server binds (lens_architecture_supported / lens_architecture_refusal
+// below, called from main() in http_server.cpp). There is NO known-answer
+// sanity check on the citation head — an earlier version of this comment
+// claimed one and was wrong. Drift of the head WITHIN Qwen 3.6 is therefore
+// unguarded at runtime; it is caught, if at all, by the offline probe
+// (tests/perf/attn_provenance.cpp). No lens claims for other model families.
 
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +73,30 @@ struct LensConstants {
     double ungrounded_body_mass = 0.538;  // mean body_mass ≥ this ⇒ grounded (N3b)
     int    citation_topk        = 8;      // source positions reported per token/field
 };
+
+// ── The architecture the constants above are calibrated on ───────────────────
+// Every number in LensConstants was measured on ONE model: Qwen 3.6 (GGUF arch
+// `qwen35moe`). They are coordinates and thresholds, not a mechanism — layer 3
+// head 13 is a retrieval head *of that model*, and nothing about it transfers.
+// Run the lens on another architecture and /v1/extract returns a
+// confidently-shaped report computed from constants that were never calibrated
+// there: citations pointing at whatever L3H13 happens to be, grounded/ungrounded
+// badges off an unvalidated threshold. That is a false receipt, so the flag is
+// REFUSED rather than best-efforted. Uncalibrated everywhere else means exactly
+// that: no head has been identified on any other model (docs/note-lens-qwen38-probe.md).
+constexpr const char* kLensCalibratedArchitecture = "qwen35moe";
+
+inline bool lens_architecture_supported(const std::string& arch) {
+    return arch == kLensCalibratedArchitecture;
+}
+
+// The refusal text. Fail-loud contract order: parameter, expected, actual.
+inline std::string lens_architecture_refusal(const std::string& arch) {
+    return std::string("--attention-lens: expected a ") + kLensCalibratedArchitecture +
+           " model (the lens constants are calibrated on Qwen 3.6 only and are "
+           "uncalibrated on every other architecture), actual architecture '" +
+           arch + "'";
+}
 
 // ── Pure-computation input: one tapped decode run ────────────────────────────
 // One decode step's tapped rows, flat [n_head * n_kv] row-major [head][kv].

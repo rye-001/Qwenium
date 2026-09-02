@@ -727,6 +727,18 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
         }
     }
     fp->set_attention_taps({});  // disarm — leave the engine byte-inert for the next request
+    // ...and restore the SLOT too, not just the tap. This driver runs slot 0
+    // directly (clear_slot/set_cache_pos/run_prefill above), so the
+    // InferenceServer's slot lifecycle never learns slot 0 was used and no
+    // release ever fires for it. Without this, the slot is left at
+    // cache_pos = prompt+generated, and the NEXT request — which prefills at
+    // start_pos 0 but calls advance_cache(), which ADDS — decodes with an n_kv
+    // inflated by our leftovers and attends over stale lens KV. Measured: an
+    // extract left cache_pos=138, the next 24-token request decoded at n_kv=162,
+    // and its output differed from the same request run before the extract
+    // (exactly one request deep, since that request's own release then cleared
+    // the slot). Symmetric with the disarm above: leave the engine as found.
+    fp->clear_slot(0);
 
     run.gen_tok_text.resize(gen_tokens.size());
     for (size_t i = 0; i < gen_tokens.size(); ++i) run.gen_tok_text[i] = tok->decode(gen_tokens[i]);

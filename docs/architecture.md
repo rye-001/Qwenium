@@ -26,8 +26,9 @@ one engine:
 - a **CLI** (`qwenium` binary, CMake target `qwenium-cli`): single-user
   chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
-  decode graph (`--persistent-graph`, §5), opt-in flash attention on decode
-  (`--flash-attn`, §5 — mutually exclusive with the attention lens), and
+  decode graph (`--persistent-graph`, §5), opt-in flash attention
+  (`--flash-attn`, §5 — mutually exclusive with the attention lens), a
+  selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), and
   session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
@@ -340,7 +341,26 @@ per attention layer become one. On decode the recipe casts its mask to F16 once
 per graph (Gemma 2/3/4 dedupe by window first); on prefill the mask is built per
 layer inside the attention helper, so the cast lives there. `build_attn_mha`
 refuses an F32 mask, naming the layer, and forwards softcap — ggml applies the
-scale before the tanh clamp, our convention. **Prefill is where it pays most**:
+scale before the tanh clamp, our convention.
+
+> **CORRECTED 2026-09-02 — "both prefill and decode" was not true of the CLI.**
+> `cli/complete.cpp` called `run_prefill` ~40 lines BEFORE
+> `set_attn_impl(AttnImpl::Flash)`, so on the `-p` completion path flash applied
+> to decode only and prefill silently ran materialized attention, with no
+> diagnostic. `cli/chat.cpp` had the same ordering for its system-prompt prefill
+> alone (per-turn prefills come after, hence were always fine); **the server was
+> always correct** (`enable_flash_attn()` runs at startup). Fixed by moving the
+> arming to immediately after `create_forward_pass`. Measured on Qwen3-0.6B-Q8_0
+> with a 2601-token prompt, interleaved A/B, cold run discarded: prefill
+> **3546–3747 ms flash-off vs 3683/3636 ms flash-on before the fix — no win at
+> all** — and **1940/2033 ms after**, ~1.83×. It surfaced only because a
+> quantized KV cache, which only the flash kernel can read, aborted inside
+> `build_prefill_graph`'s `ggml_mul_mat`. **Consequence for the numbers below:**
+> any prefill figure taken through the CLI `-p` path before this date measured a
+> no-op. Whether the 7%→55% range came from that path or from a bench binary is
+> unverified — treat it as an inherited number until re-measured.
+
+**Prefill is where it pays most**:
 materialized attention is O(n²) in the prompt length, so the win grows from ~7%
 at 756 tokens to ~55% at 3000 on attention-heavy recipes, and it is what keeps
 prefill competitive at the 10K envelope. Token-stable, **not byte-identical**
@@ -451,6 +471,23 @@ The third exists because the second measurably can't help thinking models:
 reusing an answer's KV is inseparable from retaining its scaffold's KV, so any
 warm reuse there is honest only as an explicit opt-in handle. Details:
 [`plan-warm-conversational-server.md`](plan-warm-conversational-server.md).
+
+**Token-id request log (`--token-log <path>`, off by default).** One JSON object
+appended per completed request: prompt ids, generated ids, counts, finish reason,
+whether a grammar was active. Written from `log_slot_end`, which every completion
+path already converges on, so no exit route silently skips it; fail-loud if the
+path cannot be appended to, because a logging flag that quietly does nothing is
+worse than no flag.
+
+It records **ids, not text, and that is the point**: re-tokenizing logged text
+yields a different sequence than the model saw (chat-template rendering, special
+tokens, thinking scaffold), while every analysis this log exists to serve —
+draft hit rate and accepted length for a speculative source, strict-prefix reuse
+for `--chat-prefix-cache`, how much of `max_tokens` the thought channel spends —
+turns on exact token boundaries. It converts those from experiments that need a
+model and a machine into scripts that replay a file. Two caveats: `n_generated`
+counts the stop token where the OpenAI `usage.completion_tokens` does not, and
+the ids are losslessly reversible to the prompt text, which is why it is opt-in.
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text + OpenAI `image_url` when `--mmproj` is loaded),
@@ -582,7 +619,10 @@ and "the document has none of these concepts" are different facts.
 **Single-slot and exclusive**: `extract_lens_json` holds the model lock for the
 whole tapped decode and uses slot 0 (the only correct qwen36 decode KV gather,
 §12); do not drive concurrent OpenAI traffic on slot 0 while extracting.
-Qwen3.6-pinned constants; fail-loud on empty concepts or an oversized document.
+Qwen3.6-pinned constants; `--attention-lens` is **refused at startup on any
+architecture but `qwen35moe`** (the constants are uncalibrated elsewhere, so a
+report computed with them would be shaped but false); fail-loud on empty
+concepts or an oversized document.
 Off ⇒ the route 404s and no lens code runs.
 [`plan-qemmi-lens.md`](plan-qemmi-lens.md), [`lens-format.md`](lens-format.md),
 [`note-nogrammar-refutation.md`](note-nogrammar-refutation.md),
@@ -727,18 +767,48 @@ The single most load-bearing distinction in the engine:
 | Update | **append** a column per token | **overwrite** one fixed-size matrix |
 | Size | grows with context | constant |
 | Rollback | move the position pointer (O(1) truncate) | restore a checkpoint (copy) |
-| Element type | F32, or F16 via `--kv-f16` | always F32 |
+| Element type | F32 default; F16/Q8_0/Q4_0 via `--kv-type` | always F32 |
 
 **KV element type.** `simple_kv_cache` takes `type_k`/`type_v`; every recipe
 passes what `create_forward_pass` was given, defaulting to **F32** (the
-historical, byte-identical behaviour). `--kv-f16` halves KV bytes and is
+historical, byte-identical behaviour). **`--kv-type f32|f16|q8_0|q4_0`** selects
+it on both front ends; `--kv-f16` remains as an alias. Each step down is
 token-stable but *not* byte-identical, so it carries the same status as
 `--persistent-graph` (§10). Recurrent state is unaffected — always F32.
+
+**The quantized types are flash-only, and that is structural, not policy.** The
+materialized path transposes V (`ggml_permute(v,1,2,0,3)` then `ggml_cont`),
+which moves `ne[0]` — the block dimension of every quantized type — out of
+position, and Metal's `CPY`/`CONT` has no quantized *source* case, so the node
+would take ggml's silent CPU fallback (§3) rather than fail. Both front ends
+therefore refuse `q8_0`/`q4_0` without `--flash-attn`, fail-loud, before any
+weights load (`kv_type_requires_flash_refusal`, `state/kv_cache_simple.h`) — and
+that transitively excludes the attention lens, via the existing flash/lens
+refusal. Measured KV bytes on Qwen3-0.6B at ctx 2048: **896 / 448 / 238 /
+126 MB** for f32 / f16 / q8_0 / q4_0. This is a **capacity** lever on the
+`ctx × slots` axis, not a speed one: KV is ~1% of decode bandwidth against the
+weights, so the decode ceiling is ~1% (§10, Amdahl). Note the ggml b10582
+dequant-to-F16 flash pre-pass is **prefill-only** — it gates on
+`src[0]->ne[1] < 32`, i.e. n_batch < 32, above our slot count.
 Measured on both families at ctx 4096: Qwen3.5-0.8B 96 -> 48 MB, Gemma 3 1B
 208 -> 104 MB, Qwen 3.6 160 -> 80 MB, with the greedy token sequence and the
 top-5 ordering unchanged. Attention reads the cache through views whose
 strides are derived from the tensor's own type, never `sizeof(float)`;
 hardcoding the stride silently mis-reads a non-F32 cache instead of failing.
+**That sentence described an intent the decode side did not honour until
+2026-09-02**, and the gap was invisible because the two gather branches return
+different types: `gather_k`/`gather_v` (multi-slot) go through `ggml_get_rows`,
+which always emits F32, so a float stride is correct there; `gather_k_single`
+(the B==1 fast path) returns a *view* of the cache and keeps its element type,
+where the same literal mis-reads it. `build_batched_attention` and
+`build_gated_batched_attention` hardcoded `sizeof(float)` in both, so `--kv-f16`
+had been silently corrupting single-slot decode since it shipped — degenerate
+output, not a failure. Both now use `ggml_row_size(k_gathered->type, …)`, which
+is exact-identity for F32 (`4n`) and therefore byte-identical on the default
+path; gated before/after on `qwen35` + `gemma3` + `qwen3` (identical output) and
+by the existing `Gemma3`/`Gemma4 Tier1SingleSlotBitwise` logit memcmps. The type
+contract itself is now pinned model-free by
+`test_kv_cache_simple.cpp::KVCacheGatherTypeTest`.
 The dtype is part of `path_tag()` and of each slot's serialized header, so a
 snapshot or prefix blob captured under one KV dtype is refused fail-loud
 rather than resumed under another.
@@ -945,6 +1015,12 @@ Current, verified against the tree at time of writing:
   steps, but that is thin evidence on a checkpoint whose output is already
   incoherent on the probe prompt. Treat Gemma 4 MoE + `--kv-f16` as unvalidated
   until the amplification is explained.
+  **A candidate mechanism appeared 2026-09-02 and has NOT been tested against
+  this bullet:** single-slot decode was reading a non-F32 cache with a hardcoded
+  float stride (§9), so every `--kv-f16` figure taken before that fix — the ones
+  above included — was measured on a corrupted read. Re-measure before treating
+  any of them as real; the anomaly may simply dissolve. A hypothesis, not a
+  finding.
 - **`forward_pass_base` is being shrunk to a cohesive core — not deleted.** The
   blueprint's direction is composition-over-inheritance, and this was recorded as
   an eventual deletion target until the primitives were actually measured

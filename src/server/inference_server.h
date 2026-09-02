@@ -12,6 +12,7 @@
 #include <future>
 #include <chrono>
 #include <string>
+#include <fstream>
 #include <functional>
 #include <cstdint>
 #include <stdexcept>
@@ -210,6 +211,11 @@ struct Slot {
     // a slot's first token (activate_slot) always deliver immediately, so
     // last_token is already part of context_tokens by the time it's read.
     bool last_token_pending = false;
+    // --token-log bookkeeping. prompt_n marks how much of context_tokens was
+    // prompt at slot start (context_tokens may grow past it); generated_ids
+    // accumulates exactly what this request emitted.
+    size_t prompt_n = 0;
+    std::vector<int32_t> generated_ids;
 
     void reset() {
         request.reset();
@@ -219,6 +225,8 @@ struct Slot {
         active = false;
         end_token = -1;
         last_token_pending = false;
+        prompt_n = 0;
+        generated_ids.clear();
     }
 };
 
@@ -259,6 +267,23 @@ public:
         // conversation_id is rejected fail-loud. See
         // docs/plan-warm-conversational-server.md.
         bool conversational = false;
+        // Token-id request log (--token-log <path>). Empty = disabled, and
+        // disabled is the DEFAULT: token ids are losslessly reversible to the
+        // prompt text, so this is opt-in, not on by accident.
+        //
+        // Ids, not text, and that is the whole point: re-tokenizing logged text
+        // yields a DIFFERENT sequence than the model actually saw (chat-template
+        // rendering, special tokens, thinking scaffold), and every offline
+        // analysis this log exists to serve -- draft hit rate / accepted length
+        // for a speculative source, strict-prefix reuse for --chat-prefix-cache,
+        // how much of max_tokens the thought channel spends -- depends on exact
+        // token boundaries. One JSON object per completed request, appended.
+        //
+        // n_generated COUNTS THE STOP TOKEN; the OpenAI usage.completion_tokens
+        // in the response does not. The log is deliberately the wider of the two
+        // -- a replay needs the turn terminator -- so the two numbers differ by
+        // one on a "stop" finish. Do not treat them as the same quantity.
+        std::string token_log_path;
     };
 
     // Callback types for integration with your existing code
@@ -641,6 +666,7 @@ private:
         auto& slot = slots_[slot_id];
         slot.request = req;
         slot.context_tokens = std::move(tokens);
+        slot.prompt_n = slot.context_tokens.size();
         slot.last_token = first_token;
         slot.tokens_generated = 1;
         slot.active = true;
@@ -1077,7 +1103,29 @@ private:
             // conversation binding first (no-op unless a cache/mode left some) so
             // the pos-0 prefill — and hybrid recurrent state — starts clean.
             clear_retained_if_any(slot_id);
-            first_token = prefill_(slot_id, tokens, /*start_pos=*/0);
+            // Wrapped like every sibling prefill above (multimodal :1004,
+            // cached-text :1025). It was NOT, and that was a real defect: this is
+            // the ordinary /v1/completions path, and prefill_ genuinely throws
+            // here — the oversize-prompt guard and any engine fail-loud both
+            // surface as exceptions. Unwrapped, such a throw escaped
+            // assign_to_slot, so the request was never activated, its TokenQueue
+            // was never finish()ed, and the HTTP thread blocked forever in
+            // pop_blocking: the client hung instead of getting an error. Found
+            // 2026-09-02 while testing a slot-hygiene assertion on this path.
+            try {
+                first_token = prefill_(slot_id, tokens, /*start_pos=*/0);
+            } catch (const std::exception& e) {
+                // Leave the SLOT recoverable, not just the server. A prefill can
+                // fail part-way with KV already written, and nothing else clears
+                // it: the slot is never activated, so no release fires, and every
+                // later request routed here would fail on the same debris —
+                // one failure would poison the slot for the process lifetime.
+                if (clear_slot_) clear_slot_(slot_id);
+                req->error_message = e.what();
+                req->finish_reason = "error";
+                req->token_queue->finish();  // slot not consumed
+                return;
+            }
         }
 
         activate_slot(slot_id, req, std::move(tokens), first_token);
@@ -1094,6 +1142,7 @@ private:
         // Always deliver the raw token id to streaming consumers.
         req.token_queue->push(token);
         stats_.tokens_generated++;
+        if (!config_.token_log_path.empty()) slot.generated_ids.push_back(token);
 
         if (is_stop_token_(token)) {
             req.finish_reason = "stop";
@@ -1151,6 +1200,35 @@ private:
                   << " elapsed=" << elapsed_s << "s"
                   << " timeout=" << config_.request_timeout.count() << "s"
                   << std::endl;
+        write_token_log(slot);
+    }
+
+    // One JSON object per completed request, appended to config_.token_log_path.
+    // Called from log_slot_end, which every completion path already converges on,
+    // so no exit route can silently skip it. Fail-loud on an unopenable path:
+    // a logging flag that silently does nothing is worse than no flag.
+    void write_token_log(const Slot& slot) {
+        if (config_.token_log_path.empty()) return;
+        std::ofstream out(config_.token_log_path, std::ios::app);
+        if (!out) {
+            throw std::runtime_error(
+                "write_token_log: token_log_path expected an appendable file, actual '"
+                + config_.token_log_path + "' (slot " + std::to_string(slot.slot_id) + ")");
+        }
+        const auto& req = *slot.request;
+        const size_t pn = std::min(slot.prompt_n, slot.context_tokens.size());
+        out << "{\"slot\":" << slot.slot_id
+            << ",\"finish_reason\":\"" << req.finish_reason << "\""
+            << ",\"n_prompt\":" << pn
+            << ",\"n_generated\":" << slot.generated_ids.size()
+            << ",\"max_tokens\":" << req.max_tokens
+            << ",\"grammar\":" << (req.grammar.empty() ? "false" : "true")
+            << ",\"prompt\":[";
+        for (size_t i = 0; i < pn; ++i) out << (i ? "," : "") << slot.context_tokens[i];
+        out << "],\"generated\":[";
+        for (size_t i = 0; i < slot.generated_ids.size(); ++i)
+            out << (i ? "," : "") << slot.generated_ids[i];
+        out << "]}\n";
     }
 
     void decode_step() {

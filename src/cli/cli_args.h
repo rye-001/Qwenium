@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ggml.h"
 // cli_args.h — the parsed command line, one struct.
 //
 // Responsibility: hold every CLI flag's resolved value so chat/complete/
@@ -74,7 +76,10 @@ struct CliArgs {
     // historical behaviour; F16 halves KV memory and is token-stable but not
     // byte-identical, so receipts baselines are per-kv-type. Recurrent
     // (DeltaNet/SSM) state is unaffected -- it is always F32.
-    bool kv_f16 = false;            // --kv-f16
+    // --kv-type <f32|f16|q8_0|q4_0> (and the --kv-f16 alias). Default F32 is
+    // the historical, byte-identical path. Quantized types are flash-only --
+    // see kv_type_requires_flash_refusal in state/kv_cache_simple.h.
+    ggml_type kv_type = GGML_TYPE_F32;
     // Flash attention on the DECODE path: one ggml_flash_attn_ext replaces
     // kq / soft_max / kqv and the V transpose. Faster, NOT byte-identical (the
     // softmax reduces in a different order), and kq_soft never exists — so it

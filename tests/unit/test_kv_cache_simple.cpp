@@ -286,3 +286,86 @@ TEST(KVCacheTypeTest, RestoreSameKvTypeRoundTrips) {
     EXPECT_EQ(b.get_pos(0), 4u);
     ggml_backend_free(backend);
 }
+
+// ── The two gather branches do NOT return the same element type ──────────────
+//
+// This is the trap that produced a real, months-latent defect (2026-09-02):
+//
+//   * gather_k/gather_v (multi-slot) go through ggml_get_rows, whose result type
+//     is ALWAYS F32 unless the source is I32 -- i.e. it dequantizes.
+//   * gather_k_single/gather_v_single (the B==1 fast path) return a VIEW of the
+//     cache, so the result keeps the cache's own element type.
+//
+// A caller that builds a view over the gathered tensor with a hardcoded
+// `n * sizeof(float)` stride is therefore correct for the first and silently
+// mis-reads the second under --kv-type f16/q8_0/q4_0. That is exactly what
+// layers/attention.cpp's build_batched_attention and build_gated_batched_attention
+// did, and the symptom was degenerate output rather than a failure -- the
+// silent-mis-read architecture.md section 9 warns about in as many words. Strides
+// must come from the gathered tensor's own type (ggml_row_size), never sizeof(float).
+//
+// Model-free: this pins the type contract itself, so the defect class cannot
+// come back without a red test, on any recipe.
+// A quantized row must be a whole number of BLOCKS: Q8_0 and Q4_0 both block at
+// 32 elements, so this fixture cannot reuse the 16-wide N_EMBD_KV above -- a
+// 16-element row is less than one block and ggml aborts building the view.
+// 64 is block-aligned for every type under test.
+static constexpr int N_EMBD_KV_BLOCKED = 64;
+
+class KVCacheGatherTypeTest : public ::testing::TestWithParam<ggml_type> {
+protected:
+    void SetUp() override {
+        backend_ = ggml_backend_cpu_init();
+        cache_ = std::make_unique<simple_kv_cache>(
+            N_LAYERS, N_CTX, N_BATCH, N_EMBD_KV_BLOCKED, N_EMBD_KV_BLOCKED,
+            GetParam(), GetParam(), backend_);
+        ggml_init_params ip{};
+        ip.mem_size   = 16u * 1024 * 1024;
+        ip.no_alloc   = true;
+        ctx_ = ggml_init(ip);
+    }
+    void TearDown() override {
+        if (ctx_) ggml_free(ctx_);
+        cache_.reset();
+        if (backend_) ggml_backend_free(backend_);
+    }
+    ggml_backend_t backend_ = nullptr;
+    ggml_context*  ctx_     = nullptr;
+    std::unique_ptr<simple_kv_cache> cache_;
+};
+
+TEST_P(KVCacheGatherTypeTest, SingleSlotGatherKeepsTheCacheElementType) {
+    ggml_tensor* k = cache_->gather_k_single(ctx_, /*il=*/0, /*slot=*/0, /*n_kv=*/4);
+    ggml_tensor* v = cache_->gather_v_single(ctx_, /*il=*/0, /*slot=*/0, /*n_kv=*/4);
+    ASSERT_NE(k, nullptr);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(k->type, GetParam())
+        << "gather_k_single is a VIEW of the cache and must keep its element "
+           "type; a caller striding it as F32 would silently mis-read it";
+    EXPECT_EQ(v->type, GetParam());
+}
+
+TEST_P(KVCacheGatherTypeTest, AViewOverTheGatheredTensorMustUseRowSizeNotFloat) {
+    ggml_tensor* k = cache_->gather_k_single(ctx_, /*il=*/0, /*slot=*/0, /*n_kv=*/4);
+    ASSERT_NE(k, nullptr);
+    // What the fixed callers compute, vs the hardcoded stride they used to.
+    const size_t row_size   = ggml_row_size(k->type, N_EMBD_KV_BLOCKED);
+    const size_t float_size = static_cast<size_t>(N_EMBD_KV_BLOCKED) * sizeof(float);
+    EXPECT_EQ(row_size, ggml_row_size(k->type, N_EMBD_KV_BLOCKED));
+    if (GetParam() == GGML_TYPE_F32) {
+        // The identity that makes the fix byte-identical on the default path.
+        EXPECT_EQ(row_size, float_size);
+    } else {
+        EXPECT_NE(row_size, float_size)
+            << "a non-F32 cache must NOT have a float row stride — if these are "
+               "equal the test has stopped discriminating and the regression it "
+               "guards could return unnoticed";
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ElementTypes, KVCacheGatherTypeTest,
+    ::testing::Values(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0),
+    [](const ::testing::TestParamInfo<ggml_type>& i) {
+        return std::string(ggml_type_name(i.param));
+    });

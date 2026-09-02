@@ -8,11 +8,75 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <string>
 
 namespace qinf::session {
 class SnapshotWriter;
 class SnapshotReader;
 }  // namespace qinf::session
+
+// ── KV element type vocabulary (--kv-type) ───────────────────────────────────
+// Which ggml types an attention KV cache may be stored as, and which of those
+// are quantized. This lives here rather than in a front end because the cache
+// is what the type is a property OF: `path_tag()` folds type_k/type_v and the
+// snapshot header round-trips them, so a blob captured under one element type
+// is already refused fail-loud under another. Adding a type here is therefore
+// the whole change on the state side.
+//
+// F32 is the default and the historical, byte-identical behaviour. F16 halves
+// KV bytes. Q8_0/Q4_0 quarter and eighth them, and are the lever on the
+// ctx x slots axis that the workload envelope is written in.
+//
+// THE QUANTIZED TYPES ARE FLASH-ONLY, and that is a hard structural fact, not a
+// policy preference: the materialized attention path transposes V with
+// ggml_permute(v, 1,2,0,3) followed by ggml_cont (src/layers/attention.cpp),
+// which moves ne[0] -- the block dimension of every quantized type -- out of
+// position. Metal's CPY/CONT accepts only F32 and F16 sources, so a quantized
+// cont is not supported and would take ggml's SILENT CPU fallback. ggml's
+// flash_attn_ext consumes Q8_0/Q4_0 K/V natively (K and V must be the SAME
+// type) and needs no transpose at all. Callers must refuse a quantized KV
+// without flash attention rather than let it degrade quietly.
+enum class KvTypeSupport { Ok, Unknown };
+
+// Parse a --kv-type spelling. Returns Unknown (and leaves `out` untouched) for
+// anything not listed; the caller owns the error text so it can name its own
+// flag. Accepted: f32, f16, q8_0, q4_0.
+inline KvTypeSupport kv_type_from_string(const std::string& s, ggml_type* out) {
+    if (s == "f32")  { *out = GGML_TYPE_F32;  return KvTypeSupport::Ok; }
+    if (s == "f16")  { *out = GGML_TYPE_F16;  return KvTypeSupport::Ok; }
+    if (s == "q8_0") { *out = GGML_TYPE_Q8_0; return KvTypeSupport::Ok; }
+    if (s == "q4_0") { *out = GGML_TYPE_Q4_0; return KvTypeSupport::Ok; }
+    return KvTypeSupport::Unknown;
+}
+
+// The accepted spellings, for error messages and --help. One source, so a new
+// type cannot be added to the parser and forgotten in the diagnostics.
+inline const char* kv_type_choices() { return "f32|f16|q8_0|q4_0"; }
+
+// True for the element types the materialized attention path cannot read.
+inline bool kv_type_is_quantized(ggml_type t) {
+    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+}
+
+inline const char* kv_type_name(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return "f32";
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_Q8_0: return "q8_0";
+        case GGML_TYPE_Q4_0: return "q4_0";
+        default:             return "unknown";
+    }
+}
+
+// The refusal for a quantized KV cache without flash attention. Fail-loud
+// contract order: parameter, expected, actual.
+inline std::string kv_type_requires_flash_refusal(ggml_type t) {
+    return std::string("--kv-type ") + kv_type_name(t) +
+           ": expected --flash-attn to be enabled as well (a quantized KV cache "
+           "is readable only by the flash attention kernel; the materialized "
+           "path transposes V, which a quantized type cannot represent), "
+           "actual: --flash-attn is off";
+}
 
 class simple_kv_cache : public LayerState {
 public:

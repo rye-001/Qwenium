@@ -465,18 +465,28 @@ ggml_tensor* build_batched_attention(
     }
 
     // 3. Reshape for attention
+    // Strides come from the GATHERED tensor's own type, never sizeof(float).
+    // The two gather branches above return DIFFERENT types: gather_k (multi-slot)
+    // goes through ggml_get_rows, which always emits F32; gather_k_single (the
+    // B==1 fast path) returns a VIEW of the cache and therefore keeps the cache's
+    // element type. Hardcoding a float stride is correct for the first and
+    // silently mis-reads the second under --kv-type f16/q8_0/q4_0 -- exactly the
+    // failure architecture.md section 9 warns about ("hardcoding the stride
+    // silently mis-reads a non-F32 cache instead of failing"). ggml_row_size is
+    // byte-identical to n*sizeof(float) when the type IS F32, so the default
+    // path is unchanged.
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_k    * sizeof(float),
-        n_embd_k    * n_kv_len * sizeof(float),
+        ggml_row_size(k_gathered->type, n_embd_head),
+        ggml_row_size(k_gathered->type, n_embd_k),
+        ggml_row_size(k_gathered->type, n_embd_k * n_kv_len),
         0);
 
     ggml_tensor* v_view = ggml_view_4d(ctx, v_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_v    * sizeof(float),
-        n_embd_v    * n_kv_len * sizeof(float),
+        ggml_row_size(v_gathered->type, n_embd_head),
+        ggml_row_size(v_gathered->type, n_embd_v),
+        ggml_row_size(v_gathered->type, n_embd_v * n_kv_len),
         0);
 
     // 4. Run MHA
@@ -739,16 +749,26 @@ ggml_tensor* build_gated_batched_attention(
         }
     }
 
+    // Strides come from the GATHERED tensor's own type, never sizeof(float).
+    // The two gather branches above return DIFFERENT types: gather_k (multi-slot)
+    // goes through ggml_get_rows, which always emits F32; gather_k_single (the
+    // B==1 fast path) returns a VIEW of the cache and therefore keeps the cache's
+    // element type. Hardcoding a float stride is correct for the first and
+    // silently mis-reads the second under --kv-type f16/q8_0/q4_0 -- exactly the
+    // failure architecture.md section 9 warns about ("hardcoding the stride
+    // silently mis-reads a non-F32 cache instead of failing"). ggml_row_size is
+    // byte-identical to n*sizeof(float) when the type IS F32, so the default
+    // path is unchanged.
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_k    * sizeof(float),
-        n_embd_k    * n_kv_len * sizeof(float), 0);
+        ggml_row_size(k_gathered->type, n_embd_head),
+        ggml_row_size(k_gathered->type, n_embd_k),
+        ggml_row_size(k_gathered->type, n_embd_k * n_kv_len), 0);
     ggml_tensor* v_view = ggml_view_4d(ctx, v_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_v    * sizeof(float),
-        n_embd_v    * n_kv_len * sizeof(float), 0);
+        ggml_row_size(v_gathered->type, n_embd_head),
+        ggml_row_size(v_gathered->type, n_embd_v),
+        ggml_row_size(v_gathered->type, n_embd_v * n_kv_len), 0);
 
     // H. Attention
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
