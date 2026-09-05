@@ -3400,6 +3400,1500 @@ static int run_qdocs_leg_c(ForwardPassBase* fp, ggml_backend_sched_t sched,
     return 0;
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// SS2 — the coverage-free stale-source alarm, on a grammar-constrained thread
+// extractor, at genuinely long (4K-8K token) context. Supersedes SS1
+// (docs/note-stale-source-probe.md), which was blocked by three walls: no
+// natural STALE at short context, an attended-but-ignored STALE mode that
+// COV1 coverage structurally cannot see, and long context never reached
+// (max 764 tokens). SS1's own §5 named this follow-up: "the coverage-free
+// alarm (citation-of-emitted-value + structural turn-order), on a
+// grammar-constrained thread extractor, at genuinely long context."
+//
+// Design (three deliberate changes from SS1):
+//  (a) COVERAGE-FREE. Alarm = citation + structural turn order only. For each
+//      emitted field value, the frozen citation head's top-1 gives the prompt
+//      span it came from; that span is mapped to WHICH EMAIL in the thread it
+//      sits in (byte-range containment, computed at thread-construction time
+//      — see the trap note below); ALARM fires iff that email is superseded
+//      by a later email that corrects the field. Never asks "was the
+//      correction consulted" (coverage's question) — asks "which email did
+//      the emitted value cite."
+//  (b) GRAMMAR-CONSTRAINED extraction (QDOCS_GBNF, the same fixed KV grammar
+//      as Leg C) — SS1's thread-scale citation was confounded by garbage
+//      keys and echoed structure; the grammar pins the key set so field
+//      parsing cannot break.
+//  (c) STRONGER HEAD + MODEL: Qwen3.8-9B, L27H13 (98% top-3 / 89% top-1 on
+//      the messy corpus per docs/note-lens-qwen38-probe.md), vs SS1's
+//      Qwen3.6 Q2_K_XL L3H13 (84% top-3). Set via ATTN_FROZEN_SLOT=6
+//      ATTN_FROZEN_HEAD=13 (defaults stay Qwen 3.6-shaped; unset ⇒ untouched).
+//
+// TRAP (the one this leg is warned is most dangerous): real threads quote
+// their own history, so the SAME field value can appear more than once in
+// the final rendered document (original statement + every later quote of
+// it). A naive `text.find(value)` search — which qdocs_span_in_prompt/
+// qdocs_cite/qdocs_eval_field all use for SHORT single documents — would
+// silently grab the WRONG occurrence here and make the alarm look correct
+// when it isn't. SS2 sidesteps this by construction instead of by
+// disambiguation: s2_build() tracks the EXACT byte span of every field
+// mention and every message's own envelope as the nested-quote document is
+// assembled bottom-up (oldest message innermost, exactly how a real mail
+// client renders a reply chain), remapping spans through each quoting/
+// prefixing step. No text search over the assembled document ever happens
+// for a short value string; the only `.find()` calls are (1) each message's
+// OWN new content against itself (unique by construction, one call site,
+// authored to be single-occurrence — verified by hand for this corpus), and
+// (2) locating the whole multi-KB document blob within the ChatML-wrapped
+// prompt once (safe: long unique blob, not a short repeatable value).
+//
+// Threads are built on the SAME 15-doc EN+DE messy corpus Leg C uses
+// (qdocs_messy_corpus()) — one seed document per thread becomes the oldest
+// (innermost) message; a correction reply is added; realistic filler replies
+// (logistics/admin chatter, no digits, cannot collide with tracked field
+// values) pad the thread to 4K-8K tokens, verified against the actual
+// tokenizer, not assumed. Explicit ("Correction: ...") and indirect ("prices
+// went up...") phrasing, and early/mid/late correction position, are varied
+// across the 8 threads. Four of the eight threads also carry a natural
+// distractor reply — a later, unrelated-sender message that restates the
+// PRE-correction value (mirrors SS1's t4/h1/h2/h4/h5 threads, which SS1
+// itself treated as natural, not induced) — to test whether the model is
+// pulled back to stale values the way SS1's 35B model sometimes was.
+//
+// Gated SS2=1. Zero engine edits; all prior probe paths (N3/N3b/CG1/DP1/
+// COV1/CF1/SS1/LENS/QDOCS A-D/S1/NORM_WEIGHTED) untouched.
+// ═════════════════════════════════════════════════════════════════════════
+
+// One message in a reconstructed reply chain. `pre` = header/greeting (no
+// field text, never searched); `body` = this message's own new content
+// (may state 0+ field values, must contain each verbatim exactly once);
+// `post` = signoff; `quote_lead` = the "On <date>, X wrote:" line introducing
+// the quoted prior message (empty for the root/oldest message).
+struct S2Msg {
+    std::string pre, body, post, quote_lead;
+    std::vector<std::pair<std::string, std::string>> fields;   // concept -> value (in `body`)
+};
+
+// Prefix every line of `s` with `prefix` (email-style quoting), remapping
+// byte spans given in `s`'s own coordinates into the new (quoted) string's
+// coordinates. This is the span-tracking primitive that lets SS2 avoid ever
+// re-searching the assembled document for a short, possibly-repeated value.
+static std::string s2_quote(const std::string& s, const std::string& prefix,
+                            std::vector<std::pair<size_t, size_t>>& spans) {
+    std::vector<size_t> map(s.size() + 1);
+    std::string out; out.reserve(s.size() * 2 + prefix.size());
+    out += prefix;
+    for (size_t i = 0; i < s.size(); ++i) {
+        map[i] = out.size();
+        out += s[i];
+        if (s[i] == '\n' && i + 1 < s.size()) out += prefix;
+    }
+    map[s.size()] = out.size();
+    for (auto& sp : spans) { sp.first = map[sp.first]; sp.second = map[sp.second]; }
+    return out;
+}
+
+// One tracked byte span in the fully-assembled document: a field mention
+// (tag = concept name) or a whole message's own envelope (tag = "__msg__",
+// used to classify an arbitrary cited byte position to "which message").
+struct S2Span { int msg_idx; std::string tag; size_t lo, hi; };
+struct S2Built { std::string text; std::vector<S2Span> spans; };
+
+// Assemble `msgs` (oldest first) into the final nested-quote document a
+// recipient would see (newest message on top, each reply quoting everything
+// before it in full — real client behaviour, and why the OLD value
+// naturally reappears below a correction with no extra engineering: msg0's
+// content is nested, unmodified, inside every later message).
+static S2Built s2_build(const std::vector<S2Msg>& msgs) {
+    S2Built out;
+    std::vector<std::pair<size_t, size_t>> live;
+    std::vector<std::pair<int, std::string>> tags;
+    std::string cur;
+    for (size_t i = 0; i < msgs.size(); ++i) {
+        const S2Msg& m = msgs[i];
+        std::string top = m.pre + m.body + m.post + m.quote_lead;
+        if (i == 0) {
+            cur = top;
+        } else {
+            std::string quoted = s2_quote(cur, "> ", live);
+            for (auto& sp : live) { sp.first += top.size(); sp.second += top.size(); }
+            cur = top + quoted;
+        }
+        size_t body_off = m.pre.size();
+        for (auto& fv : m.fields) {
+            size_t p = m.body.find(fv.second);
+            if (p == std::string::npos)
+                throw std::runtime_error("SS2 s2_build: value \"" + fv.second +
+                    "\" not found in its own message body (msg " + std::to_string(i) +
+                    ", concept " + fv.first + ") — thread corpus authoring bug");
+            live.push_back({body_off + p, body_off + p + fv.second.size()});
+            tags.push_back({(int)i, fv.first});
+        }
+        live.push_back({0, top.size()});
+        tags.push_back({(int)i, "__msg__"});
+    }
+    out.text = cur;
+    for (size_t k = 0; k < live.size(); ++k)
+        out.spans.push_back({tags[k].first, tags[k].second, live[k].first, live[k].second});
+    return out;
+}
+
+static std::string s2_qname(bool de, int i) {
+    static const char* EN[4] = {"Priya", "Alex", "Sam", "Jordan"};
+    static const char* DE[4] = {"Jonas", "Mira", "Tobias", "Katrin"};
+    return (de ? DE : EN)[i % 4];
+}
+static std::string s2_qdate(int i) {
+    // 2026-02-xx: disjoint from every tracked field value (no field uses this
+    // range, so a filler/reply date can never collide with a field value) AND
+    // chronologically AFTER every date that appears in any seed document or
+    // correction (latest is 2026-01-29, t_en5's corrected delivery_date) — a
+    // first version used 2024 dates, which are EARLIER than the seed orders'
+    // own 2025/2026 dates despite being replies later in the thread; the
+    // model correctly flagged that as a chronological contradiction and
+    // refused to extract on 2 of 8 threads (disclosed in the deliverable).
+    static const char* D[8] = {"2026-02-03", "2026-02-05", "2026-02-07", "2026-02-10",
+                               "2026-02-12", "2026-02-14", "2026-02-17", "2026-02-19"};
+    return D[i % 8];
+}
+// Realistic, unrelated reply chatter — zero digits by construction, so it
+// can never collide with a tracked (numeric or date) field value. Cycled;
+// senders/dates vary per instance so the thread doesn't look mechanical.
+static const char* S2_FILLER_EN[8] = {
+    "Just a quick note that the loading dock will be repainted next week, so please use the "
+    "side entrance for any deliveries until further notice. Nothing about this order changes on our end.",
+    "Heads up — our usual courier is switching regional depots, so tracking links might look a "
+    "little different for a while. Everything else stays exactly the same, so no action needed from you.",
+    "FYI the office is quieter than usual this week because of a company retreat, so replies might "
+    "be a touch slower than normal. We still have everything on file and nothing else needs to change.",
+    "Reminder from the compliance team: please keep using the standard packaging slips going forward, "
+    "no exceptions. This is unrelated to your order and is just a routine note to all our supplier contacts.",
+    "Just letting you know our warehouse system had a scheduled maintenance window over the weekend. "
+    "Everything is back online now and the details already on file are unaffected.",
+    "Also wanted to say thanks again for being such an easy partner to work with — the whole team "
+    "really appreciates the smooth back and forth on this account.",
+    "Small heads up, our accounting team switched over to a new invoicing portal, so future paperwork "
+    "will look a little different, but the underlying order information stays unchanged.",
+    "One more housekeeping note: our support line hours are shifting slightly for the season, opening "
+    "a bit later in the morning. That does not affect anything already agreed here.",
+};
+static const char* S2_FILLER_DE[8] = {
+    "Nur kurz zur Info: die Ladezone wird nächste Woche neu gestrichen, bitte nutzen Sie solange den "
+    "Seiteneingang für Lieferungen. An dieser Bestellung ändert sich dadurch nichts.",
+    "Kurze Notiz — unser gewohnter Kurierdienst wechselt gerade den regionalen Standort, daher können "
+    "Sendungsverfolgungen vorübergehend anders aussehen. Alles andere bleibt wie gehabt.",
+    "Zur Information: bei uns ist es diese Woche wegen einer Teamklausur etwas ruhiger, Antworten "
+    "können daher etwas länger dauern. Die Bestellung liegt uns weiterhin vollständig vor.",
+    "Erinnerung von der Compliance-Abteilung: bitte weiterhin die üblichen Verpackungshinweise "
+    "verwenden, ohne Ausnahme. Das betrifft nicht Ihre Bestellung, sondern ist eine routinemäßige "
+    "Erinnerung an alle Lieferantenkontakte.",
+    "Kurzer Hinweis: unser Lagerverwaltungssystem hatte am Wochenende ein geplantes Wartungsfenster. "
+    "Alles läuft wieder normal und die hinterlegten Daten sind davon nicht betroffen.",
+    "Noch etwas — vielen Dank für die weiterhin angenehme Zusammenarbeit, das ganze Team schätzt die "
+    "reibungslose Kommunikation sehr.",
+    "Kleiner Hinweis: unsere Buchhaltung ist auf ein neues Rechnungsportal umgestiegen, künftige "
+    "Unterlagen sehen daher etwas anders aus, die zugrunde liegenden Angaben bleiben aber unverändert.",
+    "Eine letzte organisatorische Notiz: unsere Erreichbarkeit verschiebt sich saisonal leicht nach "
+    "hinten am Morgen. Das hat keinen Einfluss auf das hier bereits Vereinbarte.",
+};
+
+// A thread specification: one seed document from qdocs_messy_corpus() (the
+// oldest/innermost message), one correction reply, and (optionally) one
+// distractor reply that restates the pre-correction value.
+struct S2ThreadDef {
+    std::string tag; bool de; std::string seed_tag;
+    std::string corr_concept, corr_body, corr_new;
+    std::string position;   // "early" | "mid" | "late"
+    bool explicit_ph;
+    bool has_distractor; std::string distr_body;
+    int target_tokens;
+};
+
+static std::vector<S2ThreadDef> ss2_thread_defs() {
+    return {
+      {"t_en1", false, "m_en1", "quantity",
+       "Correction on the Brightwork order: we actually need 60 units of the Matte Black Easel "
+       "Stand — please update the paperwork accordingly.", "60", "early", true, true,
+       "Warehouse note: confirming 45 units of the Matte Black Easel Stand are already palletised "
+       "and ready for the Brightwork pickup, right on schedule.", 4600},
+      {"t_en3", false, "m_en3", "unit_price",
+       "heads up, the galvanising supplier put their rates up again this month, so it works out "
+       "to 0.42 eur each on our side now for the coach bolts.", "0.42", "mid", false, false, "", 5800},
+      {"t_en5", false, "m_en5", "delivery_date",
+       "One correction on the Arctic Gear order: the requested delivery date is now 2026-01-29 — "
+       "our dock schedule shifted, please plan around the new date.", "2026-01-29", "late", true, true,
+       "Logistics note: the carrier still has 2026-01-15 pencilled in for the Arctic Gear pickup "
+       "and everything looks on track for that slot.", 5600},
+      {"t_en7", false, "m_en7", "quantity",
+       "quick update from the lab — turns out we only need enough Anti-Reflective Lens Blanks to "
+       "cover 130 units this run, the rest of the batch got reassigned elsewhere.", "130", "mid", false, false, "", 5000},
+      {"t_de1", true, "m_de1", "unit_price",
+       "Korrektur zur Bergblick-Bestellung: der Einzelpreis für den Wanderstock Alu Pro beträgt "
+       "jetzt 27,50 EUR — der Hersteller hat die Preise angepasst.", "27,50", "early", true, false, "", 4400},
+      {"t_de3", true, "m_de3", "delivery_date",
+       "kurz zur info, die spedition kann den termin diese woche nicht mehr schaffen, das rutscht "
+       "jetzt eher richtung 2025-10-07.", "2025-10-07", "late", false, true,
+       "Kurzer Zwischenstand von der Filiale: für 2025-09-30 ist die Anlieferung der Schrauben "
+       "weiterhin so im System eingetragen, sieht soweit gut aus.", 5400},
+      {"t_de5", true, "m_de5", "quantity",
+       "Korrektur: wir benötigen jetzt 96 Stück der Isolierflasche 750ml statt vorher, ein "
+       "zweites Team ist dazugekommen.", "96", "mid", true, false, "", 5200},
+      {"t_de7", true, "m_de7", "unit_price",
+       "achso, der Großhändler hat das Griffband teurer gemacht, das kommt jetzt eher auf 2,10 "
+       "EUR raus.", "2,10", "early", false, true,
+       "Kurze Rückmeldung vom Lager: für das Griffband steht bei uns weiterhin 1,95 EUR pro Rolle "
+       "in der Preisliste, falls das noch relevant ist.", 4800},
+    };
+}
+
+// Build the message chain for one thread def, padding with filler replies
+// (position-aware: growth happens on the side that preserves the requested
+// early/mid/late placement) until the ChatML-rendered prompt reaches
+// `def.target_tokens`, verified against the real tokenizer each step.
+static std::vector<S2Msg> s2_build_thread(Tokenizer* tok, const std::string& task,
+                                          const S2ThreadDef& def, const QMessy& seed,
+                                          int& corr_idx_out, std::string& corr_old_out) {
+    bool de = def.de;
+    std::vector<S2Msg> msgs;
+    S2Msg m0; m0.body = seed.document;
+    for (auto& f : seed.fields) m0.fields.push_back({f.concept, f.value});
+    msgs.push_back(m0);
+
+    corr_old_out.clear();
+    for (auto& f : seed.fields) if (f.concept == def.corr_concept) corr_old_out = f.value;
+    if (corr_old_out.empty())
+        throw std::runtime_error("SS2: corr_concept '" + def.corr_concept + "' not found in seed " + def.tag);
+
+    int fi = 0;
+    std::string prev_name = "the original sender";
+    auto mk_filler = [&]() -> S2Msg {
+        const char* txt = (de ? S2_FILLER_DE : S2_FILLER_EN)[fi % 8];
+        std::string name = s2_qname(de, fi), date = s2_qdate(fi);
+        S2Msg m;
+        m.pre = "From: " + name + "\nDate: " + date + "\n\n" + (de ? "Hallo,\n\n" : "Hi,\n\n");
+        m.body = txt;
+        m.post = de ? "\n\nViele Grüße\n" + name + "\n" : "\n\nBest,\n" + name + "\n";
+        m.quote_lead = de ? ("\nAm " + date + " schrieb " + prev_name + ":\n")
+                          : ("\nOn " + date + ", " + prev_name + " wrote:\n");
+        prev_name = name; fi++;
+        return m;
+    };
+    auto mk_named = [&](const std::string& body, const std::string& concept,
+                        const std::string& value) -> S2Msg {
+        std::string name = s2_qname(de, fi), date = s2_qdate(fi);
+        S2Msg m;
+        m.pre = "From: " + name + "\nDate: " + date + "\n\n" + (de ? "Hallo,\n\n" : "Hi,\n\n");
+        m.body = body;
+        m.post = de ? "\n\nViele Grüße\n" + name + "\n" : "\n\nBest,\n" + name + "\n";
+        m.quote_lead = de ? ("\nAm " + date + " schrieb " + prev_name + ":\n")
+                          : ("\nOn " + date + ", " + prev_name + " wrote:\n");
+        if (!concept.empty()) m.fields = {{concept, value}};
+        prev_name = name; fi++;
+        return m;
+    };
+
+    int pre_seed = def.position == "late" ? 6 : def.position == "mid" ? 3 : 1;
+    for (int i = 0; i < pre_seed; ++i) msgs.push_back(mk_filler());
+
+    msgs.push_back(mk_named(def.corr_body, def.corr_concept, def.corr_new));
+    int corr_pos = (int)msgs.size() - 1;
+
+    if (def.has_distractor) {
+        msgs.push_back(mk_filler());
+        msgs.push_back(mk_named(def.distr_body, def.corr_concept, corr_old_out));
+    }
+
+    auto token_len = [&]() {
+        S2Built b = s2_build(msgs);
+        return (int)tok->encode(qdocs_chat_prompt(b.text, task)).size();
+    };
+    bool toggle = true;
+    for (int guard = 0; guard < 300 && token_len() < def.target_tokens; ++guard) {
+        S2Msg f = mk_filler();
+        if (def.position == "late") { msgs.insert(msgs.begin() + corr_pos, f); corr_pos++; }
+        else if (def.position == "early") { msgs.push_back(f); }
+        else {
+            if (toggle) { msgs.insert(msgs.begin() + corr_pos, f); corr_pos++; }
+            else { msgs.push_back(f); }
+            toggle = !toggle;
+        }
+    }
+    corr_idx_out = corr_pos;
+    return msgs;
+}
+
+static bool s2_bytes_to_toks(const std::vector<size_t>& cum, int n, size_t b0, size_t b1,
+                             int& lo, int& hi) {
+    lo = hi = -1;
+    for (int k = 0; k < n; ++k) if (cum[k] < b1 && cum[k + 1] > b0) { if (lo < 0) lo = k; hi = k; }
+    return lo >= 0;
+}
+static int s2_classify(const std::vector<std::pair<size_t, size_t>>& env, size_t pos) {
+    for (size_t i = 0; i < env.size(); ++i)
+        if (pos >= env[i].first && pos < env[i].second) return (int)i;
+    return -1;
+}
+
+// One scored field instance (the corrected field, one per thread).
+struct S2AlarmRec {
+    std::string thread, position; bool de, explicit_ph, has_distractor;
+    int label = -1;           // 1 FRESH (emitted current), 0 STALE (emitted superseded), -1 excluded
+    bool alarm = false;
+    int cited_msg = -1, current_msg = -1;
+};
+
+static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                   Tokenizer* tok, const ModelMetadata& meta,
+                   const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ SS2 — coverage-free thread stale-source alarm (grammar, long) ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("citation tap: L%dH%d (slot %d)  [defaults 0/13 = Qwen3.6 L3H13; override via "
+                "ATTN_FROZEN_SLOT/ATTN_FROZEN_HEAD]\n", (*g_attn_layers)[FROZEN_SLOT], FROZEN_HEAD, FROZEN_SLOT);
+
+    const int TOL = 2;
+    // NO GRAMMAR. The fixed KV grammar was REFUTED by measurement 2026-07-16 and
+    // REMOVED from the product path in Stage 2 (docs/note-nogrammar-refutation.md);
+    // the shipped lens decodes free in one prefill with a tolerant parse
+    // (server_lens.h; http_server.cpp: "Builds NO grammar").
+    // SS1 §5 recommended a grammar-constrained thread extractor — but SS1 is dated
+    // 2026-07-12, FOUR DAYS BEFORE that refutation, so the recommendation is stale.
+    // Measured cost of having followed it: the fixed-KV grammar bounds each pair's
+    // SHAPE but not the NUMBER of pairs, so a looping model emits syntactically
+    // valid infinite JSON (t_en1 invented ~20 nested key variants, never closed).
+    // Free decode terminates on '}' — the stopping rule the grammar never had.
+    static const std::vector<std::string> S2_KEYS = {
+        "customer","product","quantity","unit_price","total",
+        "order_date","delivery_date","order_number"};
+    std::vector<int> tap(attn_layers.begin(), attn_layers.end());
+    // Deliberately tighter than Leg C's "extract every fact" hint: Leg C's
+    // single-email documents bound "every fact" naturally, but SS2's threads
+    // carry many pages of realistic-but-irrelevant filler (logistics/admin
+    // chatter) whose whole purpose is padding length, not being extracted.
+    // A first run with Leg C's looser hint spiraled into a repetitive,
+    // never-closing key explosion over that filler on long threads — a real,
+    // disclosed finding (see docs/note-ss2-thread-alarm.md "What was NOT
+    // done"), not a scoring bug, but avoided here by naming the exact ORDER
+    // key set and explicitly excluding admin/courtesy content.
+    const char* TASK = "\n\nThis is an email thread about ONE order, with possibly one or more "
+        "corrections later in the thread, plus unrelated administrative/logistics/courtesy "
+        "remarks mixed in. Extract ONLY the order's CURRENT field values (after applying any "
+        "corrections) as a flat JSON object with exactly these keys, omitting any that never "
+        "appear: customer, product, quantity, unit_price, total, order_date, delivery_date, "
+        "order_number. Copy each value verbatim from the email it currently holds. Ignore all "
+        "administrative, logistics, and courtesy remarks — do not create keys for them. Output "
+        "ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+    auto find_seed = [&](const std::string& tag) -> const QMessy& {
+        for (auto& d : corpus) if (d.tag == tag) return d;
+        throw std::runtime_error("SS2: seed tag not found: " + tag);
+    };
+
+    struct CiteAcc { int n = 0, t1 = 0, t3 = 0; };
+    CiteAcc cite_all;
+    std::vector<S2AlarmRec> alarms;
+    int excluded = 0, labeled_total = 0;
+
+    for (auto& def : ss2_thread_defs()) {
+        const QMessy& seed = find_seed(def.seed_tag);
+        int corr_idx = -1; std::string corr_old;
+        std::vector<S2Msg> msgs = s2_build_thread(tok, TASK, def, seed, corr_idx, corr_old);
+        S2Built built = s2_build(msgs);
+        std::string prompt = qdocs_chat_prompt(built.text, TASK);
+        size_t base = prompt.find(built.text);
+        if (base == std::string::npos)
+            throw std::runtime_error("SS2: assembled thread text not found verbatim in its own "
+                                     "ChatML prompt (thread " + def.tag + ") — cannot locate spans");
+
+        FreeRun R = run_freegen(fp, sched, tok, meta, prompt, "", tap, 380);
+        int actual_tokens = R.P;
+        std::printf("\n[%s%s] msgs=%zu corr@%d/%zu (%.0f%%) pos=%s phrasing=%s distractor=%s "
+                    "target=%d actual=%d tok\n  gen: %s\n",
+                    def.tag.c_str(), def.de ? " DE" : "", msgs.size(), corr_idx, msgs.size() - 1,
+                    100.0 * corr_idx / std::max<size_t>(1, msgs.size() - 1), def.position.c_str(),
+                    def.explicit_ph ? "explicit" : "indirect", def.has_distractor ? "yes" : "no",
+                    def.target_tokens, actual_tokens, R.gen_text.c_str());
+
+        std::vector<size_t> pcum = cum_bytes(tok, R.prompt_tokens);
+        // Tolerant parse of the free output — the shipped lens contract.
+        auto gfs = parse_fields(tok, R, S2_KEYS);
+        std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+
+        // message envelopes, absolute byte ranges in the prompt
+        std::vector<std::pair<size_t, size_t>> env(msgs.size());
+        std::map<std::string, std::vector<std::pair<int, std::pair<size_t, size_t>>>> field_spans;
+        for (auto& sp : built.spans) {
+            if (sp.tag == "__msg__") env[sp.msg_idx] = {base + sp.lo, base + sp.hi};
+            else field_spans[sp.tag].push_back({sp.msg_idx, {base + sp.lo, base + sp.hi}});
+        }
+
+        auto score_field = [&](const std::string& concept, const std::string& emitted_value,
+                               const std::vector<std::pair<size_t, size_t>>& target_spans) -> int {
+            // returns the classified msg_idx of the top-1 citation on the LAST
+            // scored gen-token (majority not needed for single/short values;
+            // multi-token values use the final token, which is where the
+            // value's identity is fully resolved).
+            size_t gb = R.gen_text.find(emitted_value);
+            if (gb == std::string::npos) return -2;   // normalized away
+            size_t ge = gb + emitted_value.size();
+            int last_cited = -1;
+            for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+                if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+                if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+                int n_kv = R.n_kv_at_step[g - 1];
+                auto tk = topk_head(R.rows[g - 1][L3H13_SLOT], FROZEN_HEAD, n_kv, 3);
+                cite_all.n++;
+                bool t1 = false, t3 = false;
+                for (auto& [tlo, thi] : target_spans) {
+                    int slo, shi;
+                    if (!s2_bytes_to_toks(pcum, R.P, tlo, thi, slo, shi)) continue;
+                    auto in = [&](int p) { return p >= slo - TOL && p <= shi + TOL; };
+                    if (!tk.empty() && in(tk[0].first)) t1 = true;
+                    for (auto& pr : tk) if (in(pr.first)) { t3 = true; break; }
+                }
+                if (t1) cite_all.t1++;
+                if (t3) cite_all.t3++;
+                if (!tk.empty()) last_cited = s2_classify(env, pcum[tk[0].first]);
+            }
+            return last_cited;
+        };
+
+        for (auto& f : seed.fields) {
+            labeled_total++;
+            if (f.concept == def.corr_concept) {
+                // "superseded" = every OTHER message that stated a value for
+                // this concept (msg0's original, plus the distractor if it
+                // restates the old value too) — the alarm's ground-truth
+                // predicate, independent of which value was actually emitted.
+                std::vector<int> superseded_msgs;
+                for (auto& [mi, span] : field_spans[f.concept]) if (mi != corr_idx) superseded_msgs.push_back(mi);
+
+                // Which value did the model emit UNDER THIS KEY? Deliberately NOT a
+                // whole-output substring search. That was a real false negative: on
+                // t_en3 the model emitted the STALE "unit_price":"0.35 eur" while the
+                // fresh 0.42 sat under an invented key, and because has_new is tested
+                // first the run scored a genuinely stale emission as FRESH — silently
+                // inverting the one error class this alarm exists to catch.
+                std::string emitted_here;
+                for (auto& gf : gfs) if (gf.name == f.concept) { emitted_here = gf.value; break; }
+                bool has_new = !emitted_here.empty() &&
+                               emitted_here.find(def.corr_new) != std::string::npos;
+                bool has_old = !emitted_here.empty() &&
+                               emitted_here.find(corr_old)    != std::string::npos;
+                std::string emitted; int label; std::vector<std::pair<size_t, size_t>> target;
+                if (has_new) {
+                    emitted = def.corr_new; label = 1;
+                    for (auto& [mi, span] : field_spans[f.concept]) if (mi == corr_idx) target.push_back(span);
+                } else if (has_old) {
+                    emitted = corr_old; label = 0;
+                    for (auto& [mi, span] : field_spans[f.concept]) if (mi != corr_idx) target.push_back(span);
+                } else { excluded++; continue; }
+                int cited = score_field(f.concept, emitted, target);
+                if (cited == -2) { excluded++; continue; }
+                S2AlarmRec r; r.thread = def.tag; r.position = def.position; r.de = def.de;
+                r.explicit_ph = def.explicit_ph; r.has_distractor = def.has_distractor;
+                r.label = label; r.cited_msg = cited; r.current_msg = corr_idx;
+                // ALARM fires iff the citation lands in a message that is
+                // superseded for THIS field — not merely "not the current
+                // message" (a filler-message citation is noise, not a
+                // stale-source finding, and must not count as either).
+                r.alarm = std::find(superseded_msgs.begin(), superseded_msgs.end(), cited) != superseded_msgs.end();
+                alarms.push_back(r);
+                std::printf("  [ALARM FIELD] %-13s emitted=%-12s label=%-5s cited_msg=%-3d "
+                            "current_msg=%-3d -> %s\n", f.concept.c_str(), emitted.c_str(),
+                            label ? "FRESH" : "STALE", cited, corr_idx, r.alarm ? "ALARM" : "silent");
+            } else {
+                std::string ev;
+                for (auto& gf : gfs) if (gf.name == f.concept) { ev = gf.value; break; }
+                if (ev.find(f.value) == std::string::npos) { excluded++; continue; }
+                std::vector<std::pair<size_t, size_t>> target;
+                for (auto& [mi, span] : field_spans[f.concept]) if (mi == 0) target.push_back(span);
+                score_field(f.concept, f.value, target);
+            }
+        }
+    }
+
+    // ── Gate 0: is thread-scale citation measurable? ─────────────────────────
+    double t1p = cite_all.n ? 100.0 * cite_all.t1 / cite_all.n : 0;
+    double t3p = cite_all.n ? 100.0 * cite_all.t3 / cite_all.n : 0;
+    std::printf("\n================ GATE 0 — citation at thread scale ================\n");
+    std::printf("  value tokens scored: %d  top1=%.0f%% (%d/%d)  top3=%.0f%% (%d/%d)  [bar top3>=85%%]\n",
+                cite_all.n, t1p, cite_all.t1, cite_all.n, t3p, cite_all.t3, cite_all.n);
+    std::printf("  excluded (normalized / not emitted verbatim): %d / %d labeled fields\n",
+                excluded, labeled_total);
+    bool gate0 = cite_all.n > 0 && t3p >= 85.0;
+    std::printf("  => %s\n", gate0 ? "GATE 0 PASS" : "GATE 0 FAIL — citation not measurable at thread scale");
+
+    // ── Gate 1: natural STALE rate ────────────────────────────────────────────
+    int fresh = 0, stale = 0;
+    for (auto& r : alarms) { if (r.label == 1) fresh++; else if (r.label == 0) stale++; }
+    std::printf("\n================ GATE 1 — natural STALE rate ================\n");
+    std::printf("  correction instances scored: %d (FRESH %d, STALE %d)\n", (int)alarms.size(), fresh, stale);
+    std::printf("  %-8s %-6s %-9s %-9s %-6s %-6s\n", "thread", "lang", "position", "phrasing", "distr", "label");
+    for (auto& r : alarms)
+        std::printf("  %-8s %-6s %-9s %-9s %-6s %-6s\n", r.thread.c_str(), r.de ? "DE" : "EN",
+                    r.position.c_str(), r.explicit_ph ? "explicit" : "indirect",
+                    r.has_distractor ? "yes" : "no", r.label ? "FRESH" : "STALE");
+    bool gate1 = stale > 0;
+    std::printf("  => %s\n", gate1 ? "STALE occurs naturally at length" :
+                "NO natural STALE at 4K-8K tokens (model honored every correction)");
+
+    // ── Gate 2: does the alarm work? ──────────────────────────────────────────
+    std::printf("\n================ GATE 2 — alarm precision/recall ================\n");
+    if (!gate1) {
+        std::printf("  (skipped: Gate 1 yielded 0 natural STALE — nothing to detect)\n");
+        int fp_n = 0, fp_fired = 0;
+        for (auto& r : alarms) if (r.label == 1) { fp_n++; if (r.alarm) fp_fired++; }
+        std::printf("  FRESH false-alarm rate (fired despite correct answer): %d/%d (%.0f%%)\n",
+                    fp_fired, fp_n, fp_n ? 100.0 * fp_fired / fp_n : 0);
+    } else {
+        int tp = 0, fn = 0, fp_n = 0, tn = 0;
+        for (auto& r : alarms) {
+            if (r.label == 0) { if (r.alarm) tp++; else fn++; }
+            else { if (r.alarm) fp_n++; else tn++; }
+        }
+        double precision = (tp + fp_n) ? 100.0 * tp / (tp + fp_n) : 0;
+        double recall = (tp + fn) ? 100.0 * tp / (tp + fn) : 0;
+        double falarm = (fp_n + tn) ? 100.0 * fp_n / (fp_n + tn) : 0;
+        std::printf("  TP=%d FN=%d FP=%d TN=%d\n", tp, fn, fp_n, tn);
+        std::printf("  precision=%.0f%%  recall=%.0f%%  FRESH false-alarm rate=%.0f%%\n",
+                    precision, recall, falarm);
+    }
+
+    std::printf("\n================ VERDICT (SS2) ================\n");
+    if (!gate0) std::printf("  => STILL BLOCKED: Gate 0 failed (top3 %.0f%% < 85%% bar) — citation "
+                            "not measurable at thread scale.\n", t3p);
+    else if (!gate1) std::printf("  => NO JOB: Gate 0 passed but natural STALE is 0/%d at 4K-8K "
+                                 "tokens — the model honored every correction; the alarm has no "
+                                 "job on this model at this envelope.\n", (int)alarms.size());
+    else std::printf("  => ALARM VALIDATED (see Gate 2 precision/recall above) — but n is small "
+                     "(%d STALE case%s); read the numbers as a signal, not a settled rate.\n",
+                     stale, stale == 1 ? "" : "s");
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Norm-weighted attention (Metric B) — a calibration probe, gated by
+// NORM_WEIGHTED=1. docs/note-lens-norm-weighted-metric.md.
+//
+// Metric A (shipped): score_j = alpha_j (the raw post-softmax kq_soft row).
+// Metric B (candidate): score_j = alpha_j * ||V_j||, renormalized over j so
+// the row sums to 1 -- the standard correction for what a head actually
+// contributes to `output = sum_j alpha_j * V_j`.
+//
+// ||V_j|| is read straight off the persisted V cache
+// (simple_kv_cache::get_v_cache_tensor) -- no graph change, no new tap. Every
+// symbol above this point (Leg C, COV1, N3, ...) is untouched; this section
+// only ADDS reader functions and two new driver legs.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ‖V_j‖ for KV positions [0, n_kv) of one (cache-layer, kv-head).
+//
+// `cache_layer` is NOT the GGUF block index `il` (e.g. 27 for L27H13).
+// simple_kv_cache is built ATTENTION-LAYERS-ONLY: qwen35.cpp assigns
+// `kv_layer_map_[il] = n_attn_layers++` while walking blocks 0..block_count-1
+// in increasing order and skipping non-attention blocks, so the compact cache
+// index for tap slot `s` is `s` itself -- `attn_layers` (main()) is built by
+// the identical increasing-il scan over `kq_soft.<il>` tensors, so slot index
+// and cache index coincide by construction. Passing the block number here
+// instead would silently read a DIFFERENT layer's V cache under the citation
+// head's own printed name -- the exact trap this probe was warned about.
+//
+// Quantized KV (Q8_0/Q4_0) is out of reach here by construction, not by
+// omission: this probe requires --flash-attn OFF (kq_soft never materializes
+// under flash -- DecodePolicy::is_attn_impl_coherent() enforces the pairing
+// elsewhere), and a quantized KV cache is refused without flash attention
+// (kv_type_requires_flash_refusal, kv_cache_simple.h). So any run that reaches
+// this function already has an F32 or F16 V cache; anything else fails loud
+// instead of silently misreading quantized blocks as floats.
+static std::vector<float> value_norms(simple_kv_cache* kv, int cache_layer, int kv_head,
+                                      int head_dim, int n_head_kv, int n_kv) {
+    ggml_tensor* vt = kv->get_v_cache_tensor(cache_layer);
+    if (!vt)
+        throw std::runtime_error("value_norms: expected a V cache tensor for cache layer " +
+                                 std::to_string(cache_layer) + ", actual nullptr");
+    if (vt->type != GGML_TYPE_F32 && vt->type != GGML_TYPE_F16)
+        throw std::runtime_error("value_norms: expected V cache type f32 or f16 (quantized KV "
+            "requires --flash-attn, which this probe forbids), actual " +
+            std::string(ggml_type_name(vt->type)));
+    const int n_embd_v = n_head_kv * head_dim;
+    if ((int)vt->ne[0] != n_embd_v)
+        throw std::runtime_error("value_norms: expected V cache ne[0]=" +
+            std::to_string(n_embd_v) + " (n_head_kv*head_dim), actual " + std::to_string(vt->ne[0]));
+    if (kv_head < 0 || kv_head >= n_head_kv)
+        throw std::runtime_error("value_norms: expected kv_head in [0," + std::to_string(n_head_kv) +
+            "), actual " + std::to_string(kv_head));
+    // Slot 0 (the only slot this single-slot probe ever uses): byte offset
+    // within the tensor is just position * nb[1]. A freshly-allocated ggml
+    // tensor is contiguous, so nb[1] must equal n_embd_v * element_size --
+    // asserted explicitly (from the tensor's own nb[], not assumed) rather
+    // than trusted, per the layout trap this probe was warned about.
+    const size_t elem = ggml_type_size(vt->type);
+    if (vt->nb[1] != (size_t)n_embd_v * elem)
+        throw std::runtime_error("value_norms: expected V cache row stride " +
+            std::to_string((size_t)n_embd_v * elem) + " bytes (contiguous), actual " +
+            std::to_string(vt->nb[1]));
+    std::vector<uint8_t> raw((size_t)n_kv * n_embd_v * elem);
+    ggml_backend_tensor_get(vt, raw.data(), 0, raw.size());
+
+    std::vector<float> out(n_kv, 0.0f);
+    for (int j = 0; j < n_kv; ++j) {
+        double ss = 0;
+        const uint8_t* rowb = raw.data() + (size_t)j * n_embd_v * elem;
+        if (vt->type == GGML_TYPE_F32) {
+            const float* row = reinterpret_cast<const float*>(rowb);
+            for (int d = 0; d < head_dim; ++d) { double x = row[(size_t)kv_head * head_dim + d]; ss += x * x; }
+        } else {
+            const ggml_fp16_t* row = reinterpret_cast<const ggml_fp16_t*>(rowb);
+            for (int d = 0; d < head_dim; ++d) {
+                double x = ggml_fp16_to_fp32(row[(size_t)kv_head * head_dim + d]);
+                ss += x * x;
+            }
+        }
+        out[j] = (float)std::sqrt(ss);
+    }
+    return out;
+}
+
+// Sanity check (trap #3): ||V_j|| should be smooth and positive with no zeros
+// in the populated interior -- a block of exact zeros means the read is past
+// the populated rows, or striding wrong. Position 0 (BOS) and the very last
+// written row are excluded: BOS can legitimately be a near-zero-norm sink,
+// and there is no guarantee here about what lies immediately after the
+// current write cursor.
+static void sanity_check_norms(const std::vector<float>& vnorm, const char* where) {
+    if (vnorm.size() < 4) return;
+    for (size_t j = 1; j + 2 < vnorm.size(); ++j) {
+        if (vnorm[j] <= 0.0f)
+            throw std::runtime_error(std::string("value_norms sanity: expected every populated "
+                "interior position to have ||V||>0, actual 0 at position ") + std::to_string(j) +
+                " of " + std::to_string(vnorm.size()) + " (" + where + ")");
+    }
+}
+
+// Metric B's analogue of topk_head: rank KV positions by alpha_j * ||V_j||
+// instead of alpha_j, renormalized over j so the row sums to 1 (a positive
+// rescale of every candidate, so it does not change the ranking by itself --
+// done anyway so the reported score is on the same 0..1 "mass" scale as
+// Metric A, for honest side-by-side printing). Same BOS-sink exclusion
+// (j starts at 1) as Metric A, for the same reason: an attention sink would
+// otherwise win every top-1 by construction regardless of ||V||.
+static std::vector<std::pair<int, float>> topk_head_weighted(
+        const std::vector<float>& row, int h, int n_kv, int k,
+        const std::vector<float>& vnorm) {
+    const float* r = row.data() + (size_t)h * n_kv;
+    double tot = 0;
+    for (int j = 0; j < n_kv; ++j) tot += (double)r[j] * vnorm[j];
+    const float inv = tot > 0 ? (float)(1.0 / tot) : 0.0f;
+    std::vector<std::pair<int, float>> v;
+    for (int j = 1; j < n_kv; ++j) v.push_back({j, (float)((double)r[j] * vnorm[j] * inv)});
+    std::partial_sort(v.begin(), v.begin() + std::min((size_t)k, v.size()), v.end(),
+                      [](auto& a, auto& b) { return a.second > b.second; });
+    if ((int)v.size() > k) v.resize(k);
+    return v;
+}
+
+// Metric B's analogue of the raw-alpha span-mass sum used throughout (topk
+// excepted): renormalized weighted mass on [lo,hi], as a fraction of the
+// row's total renormalized mass over ALL j in [0,n_kv) (mirroring how Metric
+// A's raw row already sums to 1 over all j including the BOS position).
+static double span_mass_weighted(const std::vector<float>& row, int h, int n_kv,
+                                 int lo, int hi, const std::vector<float>& vnorm) {
+    const float* r = row.data() + (size_t)h * n_kv;
+    double tot = 0;
+    for (int j = 0; j < n_kv; ++j) tot += (double)r[j] * vnorm[j];
+    if (tot <= 0) return 0;
+    double s = 0;
+    for (int q = lo; q <= hi && q < n_kv; ++q) s += (double)r[q] * vnorm[q];
+    return s / tot;
+}
+
+// Rank-based AUC (Mann-Whitney U / (n_pos*n_neg)): P(random positive scores
+// higher than random negative), with average-rank tie handling. A model-free
+// separation figure, independent of any chosen threshold.
+static double auc_of(const std::vector<std::pair<double, bool>>& data) {
+    std::vector<std::pair<double, bool>> v = data;
+    std::sort(v.begin(), v.end());
+    const int n = (int)v.size();
+    std::vector<double> rank(n);
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && v[j].first == v[i].first) j++;
+        double avg_rank = (i + j - 1) / 2.0 + 1.0;  // 1-indexed
+        for (int k2 = i; k2 < j; ++k2) rank[k2] = avg_rank;
+        i = j;
+    }
+    double sum_rank_pos = 0; int n_pos = 0, n_neg = 0;
+    for (int k2 = 0; k2 < n; ++k2) { if (v[k2].second) { sum_rank_pos += rank[k2]; n_pos++; } else n_neg++; }
+    if (n_pos == 0 || n_neg == 0) return -1;
+    double u = sum_rank_pos - n_pos * (n_pos + 1) / 2.0;
+    return u / ((double)n_pos * n_neg);
+}
+
+// Paired A/B citation+coverage eval for one grounded field value. Mirrors
+// qdocs_eval_field exactly for Metric A (byte-identical numbers) and adds the
+// Metric B twin computed from the SAME rows in the SAME pass.
+struct QFieldEvalDual {
+    bool found_verbatim = false;
+    int cite_n = 0, t1A = 0, t3A = 0, t1B = 0, t3B = 0;
+    double cov_peakA = -1, cov_peakB = -1;
+};
+static QFieldEvalDual qdocs_eval_field_dual(Tokenizer* tok, const FreeRun& R, const std::string& value,
+        const std::vector<int32_t>& attn_layers, int TOL,
+        const std::vector<std::vector<float>>& vnorm_cite,  // [kv_head][pos] at L3H13_SLOT's cache layer
+        const std::vector<std::vector<float>>& vnorm_cov,   // [kv_head][pos] at L11_SLOT's cache layer
+        int group) {
+    QFieldEvalDual e;
+    int slo, shi;
+    if (!qdocs_span_in_prompt(tok, R, value, slo, shi)) return e;
+
+    double sc[12][4]; span_scalars(R, slo, shi, sc, attn_layers);
+    e.cov_peakA = sc[1 + L11_SLOT][0];
+
+    double peakB = 0;
+    for (int t = 0; t < (int)R.rows.size(); ++t) {
+        int n_kv = R.n_kv_at_step[t];
+        double layer_best = 0;
+        for (int h = 0; h < R.n_head; ++h) {
+            int kh = h / group;
+            double s = span_mass_weighted(R.rows[t][L11_SLOT], h, n_kv, slo, shi, vnorm_cov[kh]);
+            if (s > layer_best) layer_best = s;
+        }
+        if (layer_best > peakB) peakB = layer_best;
+    }
+    e.cov_peakB = peakB;
+
+    std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+    size_t gb = R.gen_text.find(value);
+    if (gb == std::string::npos) return e;   // normalized away
+    e.found_verbatim = true;
+    size_t ge = gb + value.size();
+    const int kh_cite = FROZEN_HEAD / group;
+    for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+        if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+        if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+        int n_kv = R.n_kv_at_step[g - 1];
+        auto in = [&](int p) { return p >= slo - TOL && p <= shi + TOL; };
+        e.cite_n++;
+        auto tkA = topk_head(R.rows[g - 1][L3H13_SLOT], FROZEN_HEAD, n_kv, 3);
+        if (!tkA.empty() && in(tkA[0].first)) e.t1A++;
+        for (auto& pr : tkA) if (in(pr.first)) { e.t3A++; break; }
+        auto tkB = topk_head_weighted(R.rows[g - 1][L3H13_SLOT], FROZEN_HEAD, n_kv, 3, vnorm_cite[kh_cite]);
+        if (!tkB.empty() && in(tkB[0].first)) e.t1B++;
+        for (auto& pr : tkB) if (in(pr.first)) { e.t3B++; break; }
+    }
+    return e;
+}
+
+// ── ARM 1 — citation, paired A/B, on the SAME Leg C messy corpus (15 docs
+// EN+DE, 413 scored value tokens) that produced the shipped 98%/89% numbers.
+// Metric A must reproduce those numbers or the plumbing here is wrong.
+// used_peaks_AB collects every used-span's (peakA, peakB) pair for Arm 2's
+// final cross-check against Leg C's own population.
+static int run_qdocs_leg_c_dual(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                Tokenizer* tok, const ModelMetadata& meta,
+                                const std::vector<int32_t>& attn_layers,
+                                std::vector<std::pair<double, double>>* used_peaks_AB) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ NORM-WEIGHTED ARM 1 — citation, Leg C messy corpus (paired A/B) ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps10(attn_layers.begin(), attn_layers.end());
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+    simple_kv_cache* kv = fp->snapshot_kv_cache();
+    if (!kv) throw std::runtime_error("run_qdocs_leg_c_dual: expected a KV cache, actual nullptr");
+    const int n_head_kv = (int)meta.attention_head_count_kv;
+    const int head_dim  = (int)meta.attention_value_length;
+    const int group     = (int)meta.attention_head_count / n_head_kv;
+
+    struct Acc { int cite_n = 0, t1A = 0, t3A = 0, t1B = 0, t3B = 0;
+                 int used_spans = 0, used_clearA = 0;
+                 std::vector<double> peaksA, peaksB; int grounded = 0, labeled = 0; };
+    Acc en, de;
+    auto pick = [&](bool d) -> Acc& { return d ? de : en; };
+
+    for (const QMessy& d : corpus) {
+        std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps10,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        std::printf("\n[%s%s] %s\n", d.tag.c_str(), d.de ? " DE" : "", R.gen_text.c_str());
+
+        int n_kv_final = R.n_kv_at_step.empty() ? R.P : R.n_kv_at_step.back();
+        std::vector<std::vector<float>> vnorm_cite(n_head_kv), vnorm_cov(n_head_kv);
+        for (int kh = 0; kh < n_head_kv; ++kh) {
+            vnorm_cite[kh] = value_norms(kv, L3H13_SLOT, kh, head_dim, n_head_kv, n_kv_final);
+            sanity_check_norms(vnorm_cite[kh], "leg-c-dual citation layer");
+            vnorm_cov[kh] = value_norms(kv, L11_SLOT, kh, head_dim, n_head_kv, n_kv_final);
+            sanity_check_norms(vnorm_cov[kh], "leg-c-dual coverage layer");
+        }
+
+        Acc& A = pick(d.de);
+        for (const QLabel& f : d.fields) {
+            A.labeled++;
+            QFieldEvalDual e = qdocs_eval_field_dual(tok, R, f.value, attn_layers, TOL,
+                                                     vnorm_cite, vnorm_cov, group);
+            if (e.cov_peakA >= 0) {
+                A.used_spans++; A.peaksA.push_back(e.cov_peakA); A.peaksB.push_back(e.cov_peakB);
+                if (e.cov_peakA >= 0.705) A.used_clearA++;
+                if (used_peaks_AB) used_peaks_AB->push_back({e.cov_peakA, e.cov_peakB});
+            }
+            if (!e.found_verbatim) continue;
+            A.cite_n += e.cite_n; A.t1A += e.t1A; A.t3A += e.t3A; A.t1B += e.t1B; A.t3B += e.t3B;
+            A.grounded++;
+        }
+    }
+
+    auto med = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end());
+        return v[v.size() / 2]; };
+    auto report = [&](const char* label, const Acc& A) {
+        std::printf("\n──────── %s ────────\n", label);
+        std::printf("  citation A (raw alpha)     top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)\n",
+                    A.t1A, A.cite_n, A.cite_n ? 100.0 * A.t1A / A.cite_n : 0,
+                    A.t3A, A.cite_n, A.cite_n ? 100.0 * A.t3A / A.cite_n : 0);
+        std::printf("  citation B (alpha*||V||)   top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)\n",
+                    A.t1B, A.cite_n, A.cite_n ? 100.0 * A.t1B / A.cite_n : 0,
+                    A.t3B, A.cite_n, A.cite_n ? 100.0 * A.t3B / A.cite_n : 0);
+        std::printf("  coverage used-clear A @0.705: %d/%d (%.0f%%)  median peakA %.3f  median peakB %.3f\n",
+                    A.used_clearA, A.used_spans, A.used_spans ? 100.0 * A.used_clearA / A.used_spans : 0,
+                    med(A.peaksA), med(A.peaksB));
+    };
+    report("EN", en);
+    report("DE", de);
+    Acc all;
+    all.cite_n = en.cite_n + de.cite_n; all.t1A = en.t1A + de.t1A; all.t3A = en.t3A + de.t3A;
+    all.t1B = en.t1B + de.t1B; all.t3B = en.t3B + de.t3B;
+    all.used_spans = en.used_spans + de.used_spans; all.used_clearA = en.used_clearA + de.used_clearA;
+    for (double p : en.peaksA) all.peaksA.push_back(p);
+    for (double p : de.peaksA) all.peaksA.push_back(p);
+    for (double p : en.peaksB) all.peaksB.push_back(p);
+    for (double p : de.peaksB) all.peaksB.push_back(p);
+    report("COMBINED", all);
+
+    double t3A = all.cite_n ? 100.0 * all.t3A / all.cite_n : 0;
+    double t3B = all.cite_n ? 100.0 * all.t3B / all.cite_n : 0;
+    double t1A = all.cite_n ? 100.0 * all.t1A / all.cite_n : 0;
+    double t1B = all.cite_n ? 100.0 * all.t1B / all.cite_n : 0;
+    std::printf("\n── ARM 1 GATE: metric A top1 %.1f%% top3 %.1f%%  (repro check: want ~89%%/~98%%)\n"
+                "               metric B top1 %.1f%% top3 %.1f%%  (STOP condition: top3 <95%%) ──\n",
+                t1A, t3A, t1B, t3B);
+    return 0;
+}
+
+// ── ARM 2 — coverage separation, paired A/B, on the COV1 corpus (cov_calib +
+// cov_held, the only corpus here with an explicit USED-vs-DROPPED label) at
+// the frozen coverage layer (layer 11 / L11_SLOT — no layer search, per the
+// gate's scope). Reports medians, AUC, and each metric's OWN best threshold
+// (found independently — the 0.705 constant is Metric-A-only and is never
+// applied to Metric B's differently-scaled quantity).
+static int run_coverage_probe_dual(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   Tokenizer* tok, const ModelMetadata& meta,
+                                   const std::vector<int32_t>& attn_layers,
+                                   Thr* out_thrA, Thr* out_thrB) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ NORM-WEIGHTED ARM 2 — coverage separation, COV1 corpus (paired) ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::vector<int> tap_layers(attn_layers.begin(), attn_layers.end());
+    simple_kv_cache* kv = fp->snapshot_kv_cache();
+    if (!kv) throw std::runtime_error("run_coverage_probe_dual: expected a KV cache, actual nullptr");
+    const int n_head_kv = (int)meta.attention_head_count_kv;
+    const int head_dim  = (int)meta.attention_value_length;
+    const int group     = (int)meta.attention_head_count / n_head_kv;
+
+    struct SpanRecW { std::string prompt, marker; int cls = 0, label = 0, len = 0;
+                       double peakA = 0, peakB = 0; };
+    std::vector<SpanRecW> cal, hel;
+
+    auto run_set = [&](std::vector<CovPrompt> set, std::vector<SpanRecW>& out) {
+        for (auto& cp : set) {
+            FreeRun R = run_freegen(fp, sched, tok, meta, cp.body, cp.instr,
+                                    tap_layers, 320, false, cp.close);
+            int n_kv_final = R.n_kv_at_step.empty() ? R.P : R.n_kv_at_step.back();
+            std::vector<std::vector<float>> vnorm(n_head_kv);
+            for (int kh = 0; kh < n_head_kv; ++kh) {
+                vnorm[kh] = value_norms(kv, L11_SLOT, kh, head_dim, n_head_kv, n_kv_final);
+                sanity_check_norms(vnorm[kh], "cov1-dual coverage layer");
+            }
+            for (auto& tg : cp.tg) {
+                int lo, hi;
+                if (!find_token_span(tok, R.prompt_tokens, cp.body, tg.marker, lo, hi)) {
+                    std::printf("  WARN marker not found: %s\n", tg.marker.c_str());
+                    continue;
+                }
+                SpanRecW r; r.prompt = cp.tag; r.marker = tg.marker; r.cls = tg.cls; r.len = hi - lo + 1;
+                r.label = tg.cls != CT_TARGET ? -1 : (R.gen_text.find(tg.used) != std::string::npos ? 1 : 0);
+                double sc[12][4]; span_scalars(R, lo, hi, sc, attn_layers);
+                r.peakA = sc[1 + L11_SLOT][0];
+                double peakB = 0;
+                for (int t = 0; t < (int)R.rows.size(); ++t) {
+                    int n_kv = R.n_kv_at_step[t];
+                    double layer_best = 0;
+                    for (int h = 0; h < R.n_head; ++h) {
+                        int kh = h / group;
+                        double s = span_mass_weighted(R.rows[t][L11_SLOT], h, n_kv, lo, hi, vnorm[kh]);
+                        if (s > layer_best) layer_best = s;
+                    }
+                    if (layer_best > peakB) peakB = layer_best;
+                }
+                r.peakB = peakB;
+                out.push_back(r);
+            }
+        }
+    };
+    std::printf("\n---- generations + labels ----\n");
+    run_set(cov_calib(), cal);
+    std::printf("---- held ----\n");
+    run_set(cov_held(), hel);
+
+    auto pairsA = [&](const std::vector<SpanRecW>& v) {
+        std::vector<std::pair<double, bool>> d;
+        for (auto& r : v) if (r.cls == CT_TARGET) d.push_back({r.peakA, r.label == 1});
+        return d;
+    };
+    auto pairsB = [&](const std::vector<SpanRecW>& v) {
+        std::vector<std::pair<double, bool>> d;
+        for (auto& r : v) if (r.cls == CT_TARGET) d.push_back({r.peakB, r.label == 1});
+        return d;
+    };
+
+    Thr thrA = best_threshold(pairsA(cal));
+    Thr thrB = best_threshold(pairsB(cal));
+    double heldA = apply_thr(thrA, pairsA(hel));
+    double heldB = apply_thr(thrB, pairsB(hel));
+    double aucA_cal = auc_of(pairsA(cal)), aucA_hel = auc_of(pairsA(hel));
+    double aucB_cal = auc_of(pairsB(cal)), aucB_hel = auc_of(pairsB(hel));
+
+    std::printf("\n---- separation, TARGET USED vs DROPPED (calib=%zu, held=%zu spans, layer %d) ----\n",
+                pairsA(cal).size(), pairsA(hel).size(), attn_layers[L11_SLOT]);
+    std::printf("  metric A (raw alpha)     calib-best thr=%.3f dir%+d acc=%.0f%%  AUC(calib)=%.3f  "
+                "HELD acc=%.0f%% AUC(held)=%.3f\n",
+                thrA.t, thrA.dir, 100 * thrA.acc, aucA_cal, 100 * heldA, aucA_hel);
+    std::printf("  metric B (alpha*||V||)   calib-best thr=%.3f dir%+d acc=%.0f%%  AUC(calib)=%.3f  "
+                "HELD acc=%.0f%% AUC(held)=%.3f\n",
+                thrB.t, thrB.dir, 100 * thrB.acc, aucB_cal, 100 * heldB, aucB_hel);
+
+    std::vector<SpanRecW> all = cal; all.insert(all.end(), hel.begin(), hel.end());
+    auto med_cls = [&](int cls, int lab, bool useB) {
+        std::vector<double> v;
+        for (auto& r : all) if (r.cls == cls && (lab < -1 || r.label == lab)) v.push_back(useB ? r.peakB : r.peakA);
+        return median(v);
+    };
+    std::printf("\n---- per-class medians (COV1 pooled, calib+held) ----\n");
+    std::printf("  A: FILLER %.3f  DROPPED %.3f  USED %.3f  [VALUE anchor %.3f]\n",
+                med_cls(CT_FILLER, -2, false), med_cls(CT_TARGET, 0, false),
+                med_cls(CT_TARGET, 1, false), med_cls(CT_VALUE, -2, false));
+    std::printf("  B: FILLER %.3f  DROPPED %.3f  USED %.3f  [VALUE anchor %.3f]\n",
+                med_cls(CT_FILLER, -2, true), med_cls(CT_TARGET, 0, true),
+                med_cls(CT_TARGET, 1, true), med_cls(CT_VALUE, -2, true));
+
+    if (out_thrA) *out_thrA = thrA;
+    if (out_thrB) *out_thrB = thrB;
+    return 0;
+}
+
+// Combined driver: Arm 1 (citation, Leg C) then Arm 2 (coverage separation,
+// COV1), then a final cross-check applying Metric B's OWN best threshold
+// (picked on COV1, independently of Metric A's frozen 0.705) to Leg C's own
+// used-span population — the number that pairs directly against the shipped
+// 87%-at-0.705 result docs/note-lens-qwen38-probe.md reports.
+static int run_norm_weighted_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   Tokenizer* tok, const ModelMetadata& meta,
+                                   const std::vector<int32_t>& attn_layers) {
+    std::vector<std::pair<double, double>> used_peaks_AB;
+    int rc1 = run_qdocs_leg_c_dual(fp, sched, tok, meta, attn_layers, &used_peaks_AB);
+    if (rc1) return rc1;
+
+    Thr thrA, thrB;
+    int rc2 = run_coverage_probe_dual(fp, sched, tok, meta, attn_layers, &thrA, &thrB);
+    if (rc2) return rc2;
+
+    int clearA_frozen = 0, clearA_own = 0, clearB = 0;
+    for (auto& pr : used_peaks_AB) {
+        if (pr.first >= 0.705) clearA_frozen++;
+        bool a_clear_own = thrA.dir > 0 ? pr.first >= thrA.t : pr.first <= thrA.t;
+        if (a_clear_own) clearA_own++;
+        bool b_clear = thrB.dir > 0 ? pr.second >= thrB.t : pr.second <= thrB.t;
+        if (b_clear) clearB++;
+    }
+    int n = (int)used_peaks_AB.size();
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ ARM 2 CROSS-CHECK — Leg C used-span clear-rate at each metric's║\n");
+    std::printf("║ OWN best operating point (thresholds picked on COV1, THIS run) ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("  metric A @ 0.705 (frozen, COV1-derived on Qwen 3.6):       %d/%d (%.0f%%)  [bar >=90%%]\n",
+                clearA_frozen, n, n ? 100.0 * clearA_frozen / n : 0);
+    std::printf("  metric A @ %.3f dir%+d (COV1-derived on THIS run, fair):   %d/%d (%.0f%%)  [bar >=90%%]\n",
+                thrA.t, thrA.dir, clearA_own, n, n ? 100.0 * clearA_own / n : 0);
+    std::printf("  metric B @ %.3f dir%+d (COV1-derived on THIS run):         %d/%d (%.0f%%)  [bar >=90%%]\n",
+                thrB.t, thrB.dir, clearB, n, n ? 100.0 * clearB / n : 0);
+    std::printf("  (the A-frozen vs A-own-threshold pair isolates how much of any A-vs-B gap is\n"
+                "   metric shape vs. simply recalibrating the threshold on THIS model/corpus.)\n");
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// GEMMA4 candidate-space SEARCH — every (layer,head) candidate scored on the
+// Leg C messy corpus DIRECTLY, Metric A and Metric B in the same pass. Gated
+// GEMMA4_SEARCH_DUAL=1. docs/note-lens-gemma-norm-weighted.md.
+//
+// This does NOT select on Prompt A/B/C and confirm on the messy corpus
+// afterward -- note-lens-gemma4-probe.md §2 found that procedure has almost
+// no discriminating power on Gemma (ranks 1-4 tied at exactly 75.0%). Every
+// candidate here is scored directly against the same 15-doc EN+DE messy
+// corpus and grammar/task Leg C uses, so a reproduction of L4H7's documented
+// 41%/51% under Metric A is the plumbing sanity check (§6 of that note).
+//
+// Metric B needs ||V_j|| per candidate, and Gemma 4 splits attention across
+// TWO disjoint KV caches with DIFFERENT (n_kv_heads, head_dim) shapes: global
+// layers (V==K, no attn_v.weight, wide head_dim, few KV heads) and sliding
+// layers (separate V, narrow head_dim, more KV heads). Neither the per-layer
+// kind nor the two caches are reachable through the single-cache accessor
+// every other leg in this file uses (snapshot_kv_cache() returns nullptr on
+// gemma4 -- gemma4.h overrides the MULTI-cache snapshot_kv_caches() instead).
+// The per-layer kind is derived here from tensor-inventory presence of
+// blk.<il>.attn_v.weight -- the exact same test Gemma4Config::from_metadata
+// (gemma4.cpp) uses internally. This file does not include gemma4.h, so the
+// derivation is reproduced against meta.raw_kv / meta.tensor_inventory
+// rather than reached through the recipe's own config object; the two caches
+// snapshot_kv_caches() returns are then matched to (global, swa) by SHAPE
+// (n_layers, V ne[0]) rather than trusted by the documented return order --
+// "derive it, do not assume it" applied to a second, harder cache-layer trap
+// than the single-cache one the brief named.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ||V_j|| for every kv_head of one (cache, cache_layer) in ONE tensor read.
+// The single-head value_norms() above would re-read the same layer's full V
+// tensor once per kv_head; at 48 candidate slots (vs. the 1-2 frozen slots
+// every other leg reads) that redundancy is worth avoiding. Runs the exact
+// same checks (type, ne[0], row stride) value_norms() runs, so this is not
+// more trusting of the tensor than the reader it stands in for.
+static std::vector<std::vector<float>> value_norms_all_heads(
+        simple_kv_cache* kv, int cache_layer, int head_dim, int n_head_kv, int n_kv) {
+    ggml_tensor* vt = kv->get_v_cache_tensor(cache_layer);
+    if (!vt)
+        throw std::runtime_error("value_norms_all_heads: expected a V cache tensor for cache layer " +
+                                 std::to_string(cache_layer) + ", actual nullptr");
+    if (vt->type != GGML_TYPE_F32 && vt->type != GGML_TYPE_F16)
+        throw std::runtime_error("value_norms_all_heads: expected V cache type f32 or f16, actual " +
+            std::string(ggml_type_name(vt->type)));
+    const int n_embd_v = n_head_kv * head_dim;
+    if ((int)vt->ne[0] != n_embd_v)
+        throw std::runtime_error("value_norms_all_heads: expected V cache ne[0]=" +
+            std::to_string(n_embd_v) + " (n_head_kv*head_dim), actual " + std::to_string(vt->ne[0]));
+    const size_t elem = ggml_type_size(vt->type);
+    if (vt->nb[1] != (size_t)n_embd_v * elem)
+        throw std::runtime_error("value_norms_all_heads: expected V cache row stride " +
+            std::to_string((size_t)n_embd_v * elem) + " bytes (contiguous), actual " +
+            std::to_string(vt->nb[1]));
+    std::vector<uint8_t> raw((size_t)n_kv * n_embd_v * elem);
+    ggml_backend_tensor_get(vt, raw.data(), 0, raw.size());
+
+    std::vector<std::vector<float>> out(n_head_kv, std::vector<float>(n_kv, 0.0f));
+    for (int j = 0; j < n_kv; ++j) {
+        const uint8_t* rowb = raw.data() + (size_t)j * n_embd_v * elem;
+        for (int kh = 0; kh < n_head_kv; ++kh) {
+            double ss = 0;
+            if (vt->type == GGML_TYPE_F32) {
+                const float* row = reinterpret_cast<const float*>(rowb);
+                for (int d = 0; d < head_dim; ++d) { double x = row[(size_t)kh * head_dim + d]; ss += x * x; }
+            } else {
+                const ggml_fp16_t* row = reinterpret_cast<const ggml_fp16_t*>(rowb);
+                for (int d = 0; d < head_dim; ++d) {
+                    double x = ggml_fp16_to_fp32(row[(size_t)kh * head_dim + d]);
+                    ss += x * x;
+                }
+            }
+            out[kh][j] = (float)std::sqrt(ss);
+        }
+    }
+    return out;
+}
+
+// Allocation-free top-3-in-span scan. topk_head/topk_head_weighted above
+// build+partial_sort a vector per call; this leg calls a per-position scan
+// ~48 slots x 16 heads x ~400 scored tokens x 2 metrics times (~600K calls),
+// where a heap allocation per call would dominate wall time. Position 0 (the
+// BOS-sink) is excluded, matching topk_head's own convention, for the same
+// reason: an attention sink would otherwise win top-1 by construction.
+static void top3_positions(const float* r, int n_kv, int& p1, int& p2, int& p3) {
+    p1 = p2 = p3 = -1;
+    float v1 = -1e30f, v2 = -1e30f, v3 = -1e30f;
+    for (int j = 1; j < n_kv; ++j) {
+        float x = r[j];
+        if (x > v1)      { v3 = v2; p3 = p2; v2 = v1; p2 = p1; v1 = x; p1 = j; }
+        else if (x > v2) { v3 = v2; p3 = p2; v2 = x;  p2 = j; }
+        else if (x > v3) { v3 = x;  p3 = j; }
+    }
+}
+// Metric B's analogue: ranks by alpha_j * ||V_j|| instead of alpha_j.
+// Unnormalized -- renormalizing by the row's total is a positive rescale
+// that cannot change which positions are top-1/top-3 (see topk_head_weighted's
+// own comment), so the normalization that matters for honest score PRINTING
+// is skipped here on purpose; only membership is accumulated at this scale.
+static void top3_positions_weighted(const float* r, const float* vnorm, int n_kv,
+                                    int& p1, int& p2, int& p3) {
+    p1 = p2 = p3 = -1;
+    float v1 = -1e30f, v2 = -1e30f, v3 = -1e30f;
+    for (int j = 1; j < n_kv; ++j) {
+        float x = r[j] * vnorm[j];
+        if (x > v1)      { v3 = v2; p3 = p2; v2 = v1; p2 = p1; v1 = x; p1 = j; }
+        else if (x > v2) { v3 = v2; p3 = p2; v2 = x;  p2 = j; }
+        else if (x > v3) { v3 = x;  p3 = j; }
+    }
+}
+
+struct Gemma4KvLayout {
+    std::vector<bool> is_global;      // size block_count
+    std::vector<int>  cache_idx;      // per-layer index WITHIN its own cache
+    uint32_t head_dim_swa = 0, head_dim_global = 0;
+    uint32_t n_kv_heads_swa = 0, n_kv_heads_global = 0;
+    uint32_t n_swa_layers = 0, n_global_layers = 0;
+};
+
+// Reproduces Gemma4Config::from_metadata's per-layer-kind derivation
+// (gemma4.cpp) read-only, from meta.raw_kv / meta.tensor_inventory, so this
+// probe stays out of src/ and does not include gemma4.h.
+static Gemma4KvLayout resolve_gemma4_kv_layout(const ModelMetadata& meta) {
+    if (meta.architecture.rfind("gemma4", 0) != 0)
+        throw std::runtime_error("resolve_gemma4_kv_layout: expected arch 'gemma4*', actual '" +
+                                 meta.architecture + "'");
+    Gemma4KvLayout L;
+    const auto& inv = meta.tensor_inventory;
+    L.is_global.assign(meta.block_count, false);
+    L.cache_idx.assign(meta.block_count, -1);
+    int swa_idx = 0, glb_idx = 0;
+    for (uint32_t il = 0; il < meta.block_count; ++il) {
+        const std::string vk = "blk." + std::to_string(il) + ".attn_v.weight";
+        bool has_v = inv.find(vk) != inv.end();
+        L.is_global[il] = !has_v;
+        L.cache_idx[il] = has_v ? swa_idx++ : glb_idx++;
+    }
+    L.n_swa_layers    = (uint32_t)swa_idx;
+    L.n_global_layers = (uint32_t)glb_idx;
+    L.head_dim_global = meta.raw_kv.get_uint32("gemma4.attention.key_length");
+    L.head_dim_swa    = meta.raw_kv.get_uint32("gemma4.attention.key_length_swa");
+    auto k_out_dim = [&](uint32_t il) -> uint64_t {
+        const std::string kk = "blk." + std::to_string(il) + ".attn_k.weight";
+        auto it = inv.find(kk);
+        if (it == inv.end() || it->second.shape.size() < 2)
+            throw std::runtime_error("resolve_gemma4_kv_layout: tensor '" + kk +
+                                     "' missing or rank-deficient");
+        return it->second.shape[1];
+    };
+    bool seen_swa = false, seen_glb = false;
+    for (uint32_t il = 0; il < meta.block_count && !(seen_swa && seen_glb); ++il) {
+        if (!seen_swa && !L.is_global[il]) {
+            L.n_kv_heads_swa = (uint32_t)(k_out_dim(il) / L.head_dim_swa); seen_swa = true;
+        }
+        if (!seen_glb && L.is_global[il]) {
+            L.n_kv_heads_global = (uint32_t)(k_out_dim(il) / L.head_dim_global); seen_glb = true;
+        }
+    }
+    if (L.n_swa_layers && !L.n_kv_heads_swa)
+        throw std::runtime_error("resolve_gemma4_kv_layout: n_kv_heads_swa expected >0, actual 0");
+    if (L.n_global_layers && !L.n_kv_heads_global)
+        throw std::runtime_error("resolve_gemma4_kv_layout: n_kv_heads_global expected >0, actual 0");
+    return L;
+}
+
+// Matches fp->snapshot_kv_caches() to (global, swa) by SHAPE (n_layers, V
+// ne[0]) rather than by the documented return order -- see the section
+// banner above.
+struct Gemma4Caches { simple_kv_cache* global = nullptr; simple_kv_cache* swa = nullptr; };
+static Gemma4Caches resolve_gemma4_caches(ForwardPassBase* fp, const Gemma4KvLayout& L) {
+    auto caches = fp->snapshot_kv_caches();
+    Gemma4Caches out;
+    for (simple_kv_cache* kv : caches) {
+        if (!kv) continue;
+        uint32_t nl = kv->get_n_layers();
+        ggml_tensor* v0 = nl ? kv->get_v_cache_tensor(0) : nullptr;
+        uint32_t ne0 = v0 ? (uint32_t)v0->ne[0] : 0;
+        bool matches_global = L.n_global_layers && nl == L.n_global_layers &&
+                              ne0 == L.n_kv_heads_global * L.head_dim_global;
+        bool matches_swa    = L.n_swa_layers && nl == L.n_swa_layers &&
+                              ne0 == L.n_kv_heads_swa * L.head_dim_swa;
+        if (matches_global && matches_swa)
+            throw std::runtime_error("resolve_gemma4_caches: a cache matches BOTH global and swa "
+                "shapes (n_layers=" + std::to_string(nl) + " ne0=" + std::to_string(ne0) +
+                ") -- ambiguous, refusing to guess");
+        if (matches_global) {
+            if (out.global) throw std::runtime_error("resolve_gemma4_caches: two caches match global shape");
+            out.global = kv;
+        } else if (matches_swa) {
+            if (out.swa) throw std::runtime_error("resolve_gemma4_caches: two caches match swa shape");
+            out.swa = kv;
+        } else {
+            throw std::runtime_error("resolve_gemma4_caches: cache (n_layers=" + std::to_string(nl) +
+                " ne0=" + std::to_string(ne0) + ") matches neither global nor swa shape");
+        }
+    }
+    if (L.n_global_layers && !out.global)
+        throw std::runtime_error("resolve_gemma4_caches: expected a global-shaped cache, found none");
+    if (L.n_swa_layers && !out.swa)
+        throw std::runtime_error("resolve_gemma4_caches: expected a swa-shaped cache, found none");
+    return out;
+}
+
+// Average-rank (ties share the mean rank), rank 1 = highest score.
+static std::vector<double> rank_desc_avg(const std::vector<double>& v) {
+    int n = (int)v.size();
+    std::vector<int> idx(n);
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return v[a] > v[b]; });
+    std::vector<double> rank(n);
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && v[idx[j]] == v[idx[i]]) j++;
+        double avg = (i + j - 1) / 2.0 + 1.0;
+        for (int k2 = i; k2 < j; ++k2) rank[idx[k2]] = avg;
+        i = j;
+    }
+    return rank;
+}
+static double pearson(const std::vector<double>& a, const std::vector<double>& b) {
+    int n = (int)a.size();
+    double ma = 0, mb = 0;
+    for (int i = 0; i < n; ++i) { ma += a[i]; mb += b[i]; }
+    ma /= n; mb /= n;
+    double num = 0, da = 0, db = 0;
+    for (int i = 0; i < n; ++i) {
+        double xa = a[i] - ma, xb = b[i] - mb;
+        num += xa * xb; da += xa * xa; db += xb * xb;
+    }
+    return (da > 0 && db > 0) ? num / std::sqrt(da * db) : 0.0;
+}
+
+static int run_gemma4_search_dual(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                  Tokenizer* tok, const ModelMetadata& meta,
+                                  const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ GEMMA4 SEARCH — all (layer,head) candidates, Leg C corpus, A/B ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    // Byte-identical to run_qdocs_leg_c's TASK — the L4H7 41%/51% reproduction
+    // check below is only meaningful if every setting matches that leg.
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    const int C = S * H;
+    std::printf("candidates: %d slots x %d heads = %d\n", S, H, C);
+
+    Gemma4KvLayout L = resolve_gemma4_kv_layout(meta);
+    Gemma4Caches   K = resolve_gemma4_caches(fp, L);
+    std::printf("kv layout: swa layers=%u kv_heads=%u head_dim=%u | global layers=%u kv_heads=%u head_dim=%u\n",
+                L.n_swa_layers, L.n_kv_heads_swa, L.head_dim_swa,
+                L.n_global_layers, L.n_kv_heads_global, L.head_dim_global);
+
+    std::vector<simple_kv_cache*> slot_cache(S);
+    std::vector<int> slot_cache_layer(S), slot_head_dim(S), slot_n_kv_heads(S), slot_group(S);
+    for (int s = 0; s < S; ++s) {
+        int il = attn_layers[s];
+        bool g = L.is_global[il];
+        slot_cache[s]       = g ? K.global : K.swa;
+        slot_cache_layer[s] = L.cache_idx[il];
+        slot_head_dim[s]    = g ? (int)L.head_dim_global   : (int)L.head_dim_swa;
+        slot_n_kv_heads[s]  = g ? (int)L.n_kv_heads_global : (int)L.n_kv_heads_swa;
+        if (H % slot_n_kv_heads[s] != 0)
+            throw std::runtime_error("run_gemma4_search_dual: expected n_head (" + std::to_string(H) +
+                ") a multiple of n_kv_heads (" + std::to_string(slot_n_kv_heads[s]) + ") at il=" +
+                std::to_string(il));
+        slot_group[s] = H / slot_n_kv_heads[s];
+    }
+
+    std::vector<long> t1A_en(C, 0), t3A_en(C, 0), t1A_de(C, 0), t3A_de(C, 0);
+    std::vector<long> t1B_en(C, 0), t3B_en(C, 0), t1B_de(C, 0), t3B_de(C, 0);
+    int cite_n_en = 0, cite_n_de = 0;
+
+    for (const QMessy& d : corpus) {
+        std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        std::printf("\n[%s%s] %s\n", d.tag.c_str(), d.de ? " DE" : "", R.gen_text.c_str());
+
+        int n_kv_final = R.n_kv_at_step.empty() ? R.P : R.n_kv_at_step.back();
+        std::vector<std::vector<std::vector<float>>> vnorm_by_slot(S);
+        for (int s = 0; s < S; ++s) {
+            vnorm_by_slot[s] = value_norms_all_heads(slot_cache[s], slot_cache_layer[s],
+                                                     slot_head_dim[s], slot_n_kv_heads[s], n_kv_final);
+            for (auto& v : vnorm_by_slot[s]) sanity_check_norms(v, "gemma4-search value-norm layer");
+        }
+        // Diagnostic (first doc only): ||V_j|| spread for the eventual winner
+        // (L7H13, a sliding layer) and for the first global layer found --
+        // gemma4.cpp RMS-norms V with NO learned weight before it is cached
+        // ("Vcur = ggml_rms_norm(ctx0, Vcur, eps)"), which forces every V_j to
+        // a near-constant L2 norm BY CONSTRUCTION. If that is why Metric A/B
+        // tie, this spread should be tiny relative to the mean.
+        if (&d == &corpus.front()) {
+            auto stats = [&](int s, int kh) {
+                const auto& v = vnorm_by_slot[s][kh];
+                double mn = 1e30, mx = -1e30, sum = 0, sumsq = 0; int n = 0;
+                for (size_t j = 1; j + 1 < v.size(); ++j) {  // skip BOS + tail, as sanity_check_norms does
+                    double x = v[j]; mn = std::min(mn, x); mx = std::max(mx, x);
+                    sum += x; sumsq += x * x; n++;
+                }
+                double mean = n ? sum / n : 0;
+                double var = n ? sumsq / n - mean * mean : 0;
+                double sd = var > 0 ? std::sqrt(var) : 0;
+                std::printf("  ||V|| slot=%d kv_head=%d: n=%d min=%.4f mean=%.4f max=%.4f sd=%.4f cv=%.4f%%\n",
+                            s, kh, n, mn, mean, mx, sd, mean ? 100.0 * sd / mean : 0);
+            };
+            std::printf("\n── ||V_j|| SPREAD (doc 1 only, sanity for the A/B tie) ──\n");
+            for (int s = 0; s < S; ++s) if (attn_layers[s] == 7) { stats(s, 13 / slot_group[s]); break; }
+            for (int s = 0; s < S; ++s) if (L.is_global[attn_layers[s]]) { stats(s, 0); break; }
+        }
+
+        std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+        for (const QLabel& f : d.fields) {
+            int slo, shi;
+            if (!qdocs_span_in_prompt(tok, R, f.value, slo, shi)) continue;
+            size_t gb = R.gen_text.find(f.value);
+            if (gb == std::string::npos) continue;   // normalized away, unscoreable
+            size_t ge = gb + f.value.size();
+            auto in = [&](int p) { return p >= 1 && p >= slo - TOL && p <= shi + TOL; };
+
+            for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+                if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+                if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+                int n_kv = R.n_kv_at_step[g - 1];
+                if (d.de) cite_n_de++; else cite_n_en++;
+                for (int s = 0; s < S; ++s) {
+                    const float* rowBase = R.rows[g - 1][s].data();
+                    int group = slot_group[s];
+                    for (int h = 0; h < H; ++h) {
+                        int cand = s * H + h;
+                        const float* r = rowBase + (size_t)h * n_kv;
+                        int a1, a2, a3; top3_positions(r, n_kv, a1, a2, a3);
+                        bool a1in = in(a1), a3in = in(a1) || in(a2) || in(a3);
+                        int b1, b2, b3;
+                        top3_positions_weighted(r, vnorm_by_slot[s][h / group].data(), n_kv, b1, b2, b3);
+                        bool b1in = in(b1), b3in = in(b1) || in(b2) || in(b3);
+                        if (d.de) {
+                            if (a1in) t1A_de[cand]++; if (a3in) t3A_de[cand]++;
+                            if (b1in) t1B_de[cand]++; if (b3in) t3B_de[cand]++;
+                        } else {
+                            if (a1in) t1A_en[cand]++; if (a3in) t3A_en[cand]++;
+                            if (b1in) t1B_en[cand]++; if (b3in) t3B_en[cand]++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const int cite_n = cite_n_en + cite_n_de;
+    std::printf("\nscored value tokens: EN %d  DE %d  combined %d\n", cite_n_en, cite_n_de, cite_n);
+
+    // Rank all C candidates under each metric: primary=top1 combined count,
+    // tie-break=top3 combined count (same convention main()'s Prompt-A
+    // "global best" search below uses).
+    std::vector<double> compA(C), compB(C);
+    std::vector<long> t1A(C), t3A(C), t1B(C), t3B(C);
+    for (int c = 0; c < C; ++c) {
+        t1A[c] = t1A_en[c] + t1A_de[c]; t3A[c] = t3A_en[c] + t3A_de[c];
+        t1B[c] = t1B_en[c] + t1B_de[c]; t3B[c] = t3B_en[c] + t3B_de[c];
+        compA[c] = (double)t1A[c] * (cite_n + 1) + (double)t3A[c];
+        compB[c] = (double)t1B[c] * (cite_n + 1) + (double)t3B[c];
+    }
+    // Diagnostic: how many of the 768 candidates does Metric B actually move
+    // at the raw hit-count level (before any ranking/tie-break)? Spearman
+    // alone cannot distinguish "every candidate identical" from "a few tiny,
+    // rank-order-preserving nudges" at 4-decimal printing precision.
+    int diff_t1 = 0, diff_t3 = 0; long max_abs_t1_diff = 0, max_abs_t3_diff = 0;
+    for (int c = 0; c < C; ++c) {
+        if (t1A[c] != t1B[c]) { diff_t1++; max_abs_t1_diff = std::max(max_abs_t1_diff, std::abs(t1A[c] - t1B[c])); }
+        if (t3A[c] != t3B[c]) { diff_t3++; max_abs_t3_diff = std::max(max_abs_t3_diff, std::abs(t3A[c] - t3B[c])); }
+    }
+    std::printf("\n── METRIC A vs B, RAW HIT-COUNT DIFFERENCES (of %d candidates) ──\n", C);
+    std::printf("  top1 differs on %d candidates (max |delta|=%ld)\n", diff_t1, max_abs_t1_diff);
+    std::printf("  top3 differs on %d candidates (max |delta|=%ld)\n", diff_t3, max_abs_t3_diff);
+
+    std::vector<double> rankA = rank_desc_avg(compA);
+    std::vector<double> rankB = rank_desc_avg(compB);
+    double spearman = pearson(rankA, rankB);
+
+    int bestA = 0, bestB = 0;
+    for (int c = 1; c < C; ++c) {
+        if (compA[c] > compA[bestA]) bestA = c;
+        if (compB[c] > compB[bestB]) bestB = c;
+    }
+
+    auto layer_of = [&](int c) { return attn_layers[c / H]; };
+    auto head_of  = [&](int c) { return c % H; };
+    auto pct = [&](long n) { return cite_n ? 100.0 * n / cite_n : 0.0; };
+    auto printCand = [&](const std::string& label, int c) {
+        std::printf("  %-14s L%dH%-3d  A: top1 %ld/%d (%.1f%%) top3 %ld/%d (%.1f%%)  |  "
+                    "B: top1 %ld/%d (%.1f%%) top3 %ld/%d (%.1f%%)  |  rankA=%.1f rankB=%.1f\n",
+                    label.c_str(), layer_of(c), head_of(c),
+                    t1A[c], cite_n, pct(t1A[c]), t3A[c], cite_n, pct(t3A[c]),
+                    t1B[c], cite_n, pct(t1B[c]), t3B[c], cite_n, pct(t3B[c]), rankA[c], rankB[c]);
+    };
+    std::printf("\n── BEST CANDIDATES ──\n");
+    printCand("best under A", bestA);
+    printCand("best under B", bestB);
+
+    int clearA70 = 0, clearA80 = 0, clearA90 = 0, clearB70 = 0, clearB80 = 0, clearB90 = 0;
+    for (int c = 0; c < C; ++c) {
+        double t3a = pct(t3A[c]), t3b = pct(t3B[c]);
+        if (t3a >= 70) clearA70++; if (t3a >= 80) clearA80++; if (t3a >= 90) clearA90++;
+        if (t3b >= 70) clearB70++; if (t3b >= 80) clearB80++; if (t3b >= 90) clearB90++;
+    }
+    std::printf("\n── CLEAR-RATE COUNTS (top3, of %d candidates) ──\n", C);
+    std::printf("  metric A: >=70%% %d   >=80%% %d   >=90%% %d\n", clearA70, clearA80, clearA90);
+    std::printf("  metric B: >=70%% %d   >=80%% %d   >=90%% %d\n", clearB70, clearB80, clearB90);
+
+    std::printf("\n── SPEARMAN(rankA, rankB) over all %d candidates: %.4f ──\n", C, spearman);
+
+    std::vector<int> orderA(C), orderB(C);
+    for (int c = 0; c < C; ++c) { orderA[c] = c; orderB[c] = c; }
+    std::sort(orderA.begin(), orderA.end(), [&](int a, int b) { return compA[a] > compA[b]; });
+    std::sort(orderB.begin(), orderB.end(), [&](int a, int b) { return compB[a] > compB[b]; });
+    std::printf("\n── TOP 10 UNDER METRIC A ──\n");
+    for (int i = 0; i < 10 && i < C; ++i) printCand("#" + std::to_string(i + 1), orderA[i]);
+    std::printf("\n── TOP 10 UNDER METRIC B ──\n");
+    for (int i = 0; i < 10 && i < C; ++i) printCand("#" + std::to_string(i + 1), orderB[i]);
+
+    // BROKEN check: metric A at L4H7 must reproduce the documented 41%/51%
+    // baseline (note-lens-gemma4-probe.md §6), or this leg's plumbing -- not
+    // the metric -- is what is wrong.
+    for (int c = 0; c < C; ++c) {
+        if (layer_of(c) == 4 && head_of(c) == 7) {
+            std::printf("\n── L4H7 REPRODUCTION CHECK (metric A only, vs note-lens-gemma4-probe.md §6) ──\n");
+            std::printf("  documented: top1 161/397 (41%%)  top3 204/397 (51%%)\n");
+            std::printf("  this run:   top1 %ld/%d (%.1f%%)  top3 %ld/%d (%.1f%%)\n",
+                        t1A[c], cite_n, pct(t1A[c]), t3A[c], cite_n, pct(t3A[c]));
+            break;
+        }
+    }
+    return 0;
+}
+
 // ── Leg A — fixed grammar × tap sanity (the everything-stops leg) ────────────
 static int run_qdocs_leg_a(ForwardPassBase* fp, ggml_backend_sched_t sched,
                            Tokenizer* tok, const ModelMetadata& meta,
@@ -3949,8 +5443,11 @@ int main() {
     // 2048 for the short-prompt probes; leg D needs ≥4K + generation margin.
     // QDOCS_S1 also takes the margin: free decode has no accepting state to
     // close on, so a run can spend its whole 400-token budget before EOS.
+    // SS2 threads target up to 8K prompt tokens (the workload-envelope ceiling,
+    // CLAUDE.md) plus a 380-token grammar-decode margin.
     // KV *capacity* only — decode uses exact n_kv, so prior paths are byte-inert.
-    const uint32_t CTX = (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1")) ? 5120 : 2048;
+    const uint32_t CTX = std::getenv("SS2") ? 9216
+                        : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1")) ? 5120 : 2048;
     const int TOL = 2;
 
     apply_frozen_head_overrides();
@@ -4085,6 +5582,16 @@ int main() {
     // Qemmi-Docs P0 — leg C: messy-corpus robustness (frozen signals, 15 docs).
     if (std::getenv("QDOCS_C"))
         return run_qdocs_leg_c(fp.get(), sched, tok, meta, attn_layers);
+    // Norm-weighted attention calibration (docs/note-lens-norm-weighted-metric.md):
+    // Metric A (raw alpha) vs Metric B (alpha*||V||) on citation (Leg C corpus)
+    // and coverage separation (COV1 corpus), paired, same pass.
+    if (std::getenv("NORM_WEIGHTED"))
+        return run_norm_weighted_probe(fp.get(), sched, tok, meta, attn_layers);
+    // GEMMA4 SEARCH — all (layer,head) candidates scored on the Leg C messy
+    // corpus directly, Metric A vs Metric B, gemma4-only (the caches this
+    // reads have no Qwen equivalent). docs/note-lens-gemma-norm-weighted.md.
+    if (std::getenv("GEMMA4_SEARCH_DUAL"))
+        return run_gemma4_search_dual(fp.get(), sched, tok, meta, attn_layers);
     // Qemmi-Docs P0 — leg D: context length (1K/2K/4K buckets, real token counts).
     if (std::getenv("QDOCS_D"))
         return run_qdocs_leg_d(fp.get(), sched, tok, meta, attn_layers);
@@ -4092,6 +5599,12 @@ int main() {
     // math (docs/handoff-nogrammar-stages.md §S1.2). Gates the grammar removal.
     if (std::getenv("QDOCS_S1"))
         return run_qdocs_s1(fp.get(), sched, tok, meta, CTX);
+
+    // SS2 — coverage-free stale-source alarm on grammar-constrained email
+    // threads at 4K-8K tokens (supersedes SS1's inconclusive short-context
+    // composition). docs/note-ss2-thread-alarm.md.
+    if (std::getenv("SS2"))
+        return run_ss2(fp.get(), sched, tok, meta, attn_layers);
 
     // ── Prompt A (calibration) ───────────────────────────────────────────────
     std::string promptA =

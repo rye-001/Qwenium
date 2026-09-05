@@ -1469,6 +1469,25 @@ target_link_libraries(attn-provenance PRIVATE
 )
 target_compile_features(attn-provenance PRIVATE cxx_std_17)
 
+# Prefill image-lens depth-sweep probe — docs/note-image-lens-probe.md's one
+# open branch: does prefill attention (vs. the decode tap) reach past image
+# rows the decode tap never visits? Manually drives the chunked image-prefill
+# sequence (mirrors multimodal_prefill.cpp) so kq_soft.<il> can be tapped on
+# the image chunk and the suffix chunk separately. See probe_image_prefill_lens.cpp.
+add_executable(probe-image-prefill-lens
+    perf/probe_image_prefill_lens.cpp
+)
+target_link_libraries(probe-image-prefill-lens PRIVATE
+    qinf-image
+    qinf-vision
+    qinf-models
+    qinf-loader
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(probe-image-prefill-lens PRIVATE cxx_std_17)
+
 # PR 4.1 investigation — per-stage MoE timing.
 # Disposable: once the breakdown identifies the right fusion shape, this binary
 # can be deleted (or kept as a regression check).

@@ -67,6 +67,12 @@ docs/demo
 !docs/note-lens-gemma4-probe.md
 !docs/note-ggml-b10582-opportunities.md
 !docs/note-kv-quant-flash.md
+!docs/note-consolidation-defect-ledger.md
+!docs/note-image-prefill-tap-probe.md
+!docs/note-lens-norm-weighted-metric.md
+!docs/note-lens-gemma-norm-weighted.md
+!docs/note-ss2-thread-alarm.md
+!docs/handoff-qemmi-lens-revisit.md
 !docs/img-lens-probe-figs
 !docs/img-lens-probe-figs/*.png
 *.jpg
