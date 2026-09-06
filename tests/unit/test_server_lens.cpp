@@ -5,6 +5,7 @@
 // model. The driver (run_lens_extract) is covered by the endpoint smoke.
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -137,7 +138,7 @@ TEST(ServerLensCompute, ViewerArraysAndJson) {
     EXPECT_NE(json.find("\"qty\""), std::string::npos);
     EXPECT_NE(json.find("grounded"), std::string::npos);
     EXPECT_NE(json.find("\"skipped\""), std::string::npos);
-    EXPECT_NE(json.find("qemmi-lens/v2"), std::string::npos);  // Stage 2: subtractive bump
+    EXPECT_NE(json.find("qemmi-lens/v4"), std::string::npos);  // v4: candidate set on the wire (v3 was repeated keys)
 }
 
 // ── Fail-loud on structurally-impossible input ───────────────────────────────
@@ -549,7 +550,7 @@ TEST(LensAbsentByOmission, AbsentFieldSerializesNullValueAndAbsentBadge) {
 
     std::string json = lens_report_to_json(apply_absent_by_omission(rep, concepts));
 
-    EXPECT_NE(json.find("\"format_version\":\"qemmi-lens/v2\""), std::string::npos);
+    EXPECT_NE(json.find("\"format_version\":\"qemmi-lens/v4\""), std::string::npos);
     // present field: a string value + a real badge
     EXPECT_NE(json.find("\"value\":\"ACME GmbH\""), std::string::npos);
     EXPECT_NE(json.find("\"badge\":\"grounded\""), std::string::npos);
@@ -671,36 +672,91 @@ TEST(LensShapeContract, FencedOutputStillLocatesTheValueSpan) {
     EXPECT_EQ(count_confident_false_receipts(r), 0);
 }
 
-// ── Architecture guard ───────────────────────────────────────────────────────
-// LensConstants is a set of coordinates measured on ONE model (Qwen 3.6,
-// `qwen35moe`). Before this guard existed, --attention-lens was accepted on any
-// loaded model and /v1/extract answered with a confidently-shaped report
-// computed from constants that were never calibrated there. These tests pin the
-// predicate the startup refusal is built on, and the fail-loud SHAPE of its
-// message (parameter, then expected, then actual — in that order).
+// ── Calibration guard ────────────────────────────────────────────────────────
+// LensConstants is a set of coordinates measured on ONE model. Before this
+// guard existed, --attention-lens was accepted on any loaded model and
+// /v1/extract answered with a confidently-shaped report computed from constants
+// that were never calibrated there. These tests pin the predicate the startup
+// refusal is built on, and the fail-loud SHAPE of its message (parameter, then
+// expected, then actual — in that order).
 //
 // The refusal itself lives in QweniumServerIntegration::enable_attention_lens()
 // in src/server/http_server.cpp, which is a main()-local type in a binary
 // target; it is not linkable from a unit test. The predicate and the message
 // are shipped code in server_lens.h and are what that call site consists of.
+//
+// The key is {architecture, block_count}, and the second test below is the
+// reason: an architecture string is a family, not a model.
 
-TEST(LensArchitectureGuard, AcceptsOnlyTheCalibratedArchitecture) {
-    EXPECT_STREQ(kLensCalibratedArchitecture, "qwen35moe");
-    EXPECT_TRUE(lens_architecture_supported("qwen35moe"));
-
-    // Every other architecture the engine hosts is uncalibrated, including the
-    // near neighbour qwen35 (Qwen 3.5/3.8) — same family, different head layout.
-    for (const char* arch : {"qwen2", "qwen3", "qwen35", "gemma1", "gemma2",
-                             "gemma3", "gemma4", "gemma4uv", ""}) {
-        EXPECT_FALSE(lens_architecture_supported(arch)) << "arch: " << arch;
+TEST(LensCalibrationGuard, AcceptsTheCalibratedModelsWithTheirOwnCoordinates) {
+    // Qwen 3.6-35B-A3B — the model the lens was built on. Two GGUF builds of one
+    // base model (MTP build 41 = 40 + draft head; plain build 40), same 40-layer
+    // decode stack, same calibration.
+    for (uint32_t bc : {40u, 41u}) {
+        const LensCalibration* c = lens_calibration_for("qwen35moe", bc);
+        ASSERT_NE(c, nullptr) << "block_count: " << bc;
+        EXPECT_EQ(c->constants.citation_layer, 3);    // L3H13
+        EXPECT_EQ(c->constants.citation_head,  13);
     }
+
+    // Qwen 3.8-9B — its own head is L27H13, not L3H13 (98% vs 84% top-3 on the
+    // same messy corpus). This entry is the whole point of the table: before it,
+    // the shipped lens ran the weaker head and refused the stronger model.
+    const LensCalibration* q38 = lens_calibration_for("qwen35", 33);
+    ASSERT_NE(q38, nullptr);
+    EXPECT_EQ(q38->constants.citation_layer, 27);
+    EXPECT_EQ(q38->constants.citation_head,  13);
+
+    // Decided 2026-09-05: coverage stays 0.705 on every entry until a real
+    // coverage-layer search runs. The recalibrated alternative was fitted on 23
+    // spans — "recalibration is worth ~4 points" is the finding, not the value.
+    for (const LensCalibration& c : lens_calibrations())
+        EXPECT_DOUBLE_EQ(c.constants.coverage_used_peak, 0.705) << c.model;
+
+    // The report's `model` field travels with the coordinates. It was a
+    // hardcoded "Qwen3.6" literal until the table landed — which every Qwen 3.8
+    // receipt would have carried, mislabelling the one thing the report is for.
+    EXPECT_STREQ(lens_calibration_for("qwen35moe", 41)->constants.model_label,
+                 "Qwen3.6 (attention lens)");
+    EXPECT_STREQ(q38->constants.model_label, "Qwen3.8 (attention lens)");
+    for (const LensCalibration& c : lens_calibrations())
+        EXPECT_NE(std::string(c.constants.model_label), "") << c.model;
 }
 
-TEST(LensArchitectureGuard, RefusalNamesParameterExpectedActualInThatOrder) {
-    const std::string msg = lens_architecture_refusal("qwen35");
+TEST(LensCalibrationGuard, RefusesUncalibratedModelsOfACalibratedArchitecture) {
+    // THE hazard the key exists for. `qwen35` is a family, not a model
+    // (src/models/qwen35.h): these four are all `qwen35`, none is calibrated,
+    // and an architecture-keyed allowlist would have admitted every one of them
+    // under Qwen 3.8-9B's coordinates.
+    EXPECT_EQ(lens_calibration_for("qwen35", 24), nullptr);   // Qwen3.5-0.8B
+    EXPECT_EQ(lens_calibration_for("qwen35", 32), nullptr);   // Qwen3.5-9B
+    EXPECT_EQ(lens_calibration_for("qwen35", 64), nullptr);   // Qwen3.6-27B
+    EXPECT_EQ(lens_calibration_for("qwen35", 65), nullptr);   // Qwen3.8-27B
+
+    // Note 32 and 64 above: those are exactly the DECODE-STACK depths of the two
+    // calibrated Qwen 3.8 builds (33 − 1 MTP, 65 − 1). Keying on decode depth
+    // instead of raw block_count would have collided each of them with a
+    // calibrated entry. This test is what pins that choice.
+    EXPECT_EQ(lens_calibration_for("qwen35moe", 39), nullptr);
+    EXPECT_EQ(lens_calibration_for("qwen35moe", 42), nullptr);
+}
+
+TEST(LensCalibrationGuard, RefusesEveryOtherFamilyAtEveryDepth) {
+    // Gemma is refused by MEASUREMENT, not neglect: a properly-run search over
+    // all 768 candidate heads tops out at 63% against a 90% requirement
+    // (docs/note-lens-gemma4-probe.md, docs/note-lens-gemma-norm-weighted.md).
+    for (const char* arch : {"qwen2", "qwen3", "gemma1", "gemma2", "gemma3",
+                             "gemma4", "gemma4uv", ""})
+        for (uint32_t bc : {0u, 24u, 32u, 33u, 40u, 41u, 64u, 65u})
+            EXPECT_EQ(lens_calibration_for(arch, bc), nullptr)
+                << "arch: " << arch << " block_count: " << bc;
+}
+
+TEST(LensCalibrationGuard, RefusalNamesParameterExpectedActualInThatOrder) {
+    const std::string msg = lens_calibration_refusal("qwen35", 65);
 
     const size_t param    = msg.find("--attention-lens");
-    const size_t expected = msg.find("qwen35moe");
+    const size_t expected = msg.find("qwen35moe");     // first listed entry
     const size_t actual   = msg.find("'qwen35'");
 
     ASSERT_NE(param,    std::string::npos) << msg;
@@ -709,8 +765,763 @@ TEST(LensArchitectureGuard, RefusalNamesParameterExpectedActualInThatOrder) {
     EXPECT_LT(param,    expected) << msg;   // parameter before expected
     EXPECT_LT(expected, actual)   << msg;   // expected before actual
 
+    // The actual value must carry the block count too, not just the arch —
+    // otherwise the message reads as "wrong architecture" to an operator whose
+    // architecture is in fact listed, and the real reason (wrong model of a
+    // supported family) is invisible.
+    EXPECT_NE(msg.find("65"), std::string::npos) << msg;
+
     // It must say WHY, not just that it refused: an operator who is told only
-    // "wrong architecture" will reasonably assume the lens is merely untested
-    // here, rather than uncalibrated.
+    // "not supported" will reasonably assume the lens is merely untested here,
+    // rather than uncalibrated.
     EXPECT_NE(msg.find("calibrated"), std::string::npos) << msg;
+}
+
+// ── Message attribution ──────────────────────────────────────────────────────
+// The product claim the thread work landed on: every value reports WHICH message
+// it was read from ("from message 23 of 24"). It is attribution and nothing more
+// — no staleness verdict — because a later-message rule was measured to cry wolf
+// on 7 of 9 correctly-handled corrections and stay silent on the real failure
+// (docs/note-ss3-matched-pairs.md §3). These tests pin the attribution and the
+// -1/empty shape a plain `document` request must still produce.
+//
+// Fixture body: "buy 45 now\nskip me\n". Splitting at byte 11 makes message 0 =
+// "buy 45 now\n" and message 1 = "skip me\n"; the value "45" sits at byte 4.
+
+TEST(LensMessageAttribution, CitationNamesTheMessageItLandedIn) {
+    Fixture fx;
+    fx.cite(5, /*head*/0, /*pos*/1, 0.9f);       // cite the document's "45"
+    fx.run.message_offsets = {0, 11};
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    EXPECT_EQ(r.n_messages, 2);
+    ASSERT_EQ(r.fields.size(), 1u);
+    const LensField& f = r.fields[0];
+    ASSERT_FALSE(f.citations.empty());
+    EXPECT_EQ(f.citations[0].byte_lo, 4u);       // "45"
+    EXPECT_EQ(f.citations[0].message, 0);        // ...which is in message 0
+    ASSERT_EQ(f.citation_messages.size(), 1u);
+    EXPECT_EQ(f.citation_messages[0], 0);
+}
+
+TEST(LensMessageAttribution, ResolvesAByteInTheSecondMessage) {
+    Fixture fx;
+    // Attend to " me" (prompt position 5, byte 15) — past the boundary at 11.
+    fx.cite(5, /*head*/0, /*pos*/5, 0.9f);
+    fx.run.message_offsets = {0, 11};
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 1u);
+    const LensField& f = r.fields[0];
+    ASSERT_FALSE(f.citations.empty());
+    EXPECT_EQ(f.citations[0].byte_lo, 15u);
+    EXPECT_EQ(f.citations[0].message, 1);
+}
+
+TEST(LensMessageAttribution, TwoMessagesCoexistWithNoWinnerNamed) {
+    Fixture fx;
+    // The model looked at this key in BOTH messages — the conflict case. The
+    // format reports both, ordered by mass, and names no winner (the CF1
+    // non-claim): turn order does not identify which is current.
+    fx.cite(5, /*head*/0, /*pos*/5, 0.6f);       // " me"  → message 1
+    fx.cite(5, /*head*/0, /*pos*/1, 0.9f);       // "45"   → message 0
+    fx.run.message_offsets = {0, 11};
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 1u);
+    const LensField& f = r.fields[0];
+    ASSERT_EQ(f.citation_messages.size(), 2u);
+    EXPECT_EQ(f.citation_messages[0], 0);        // strongest citation first...
+    EXPECT_EQ(f.citation_messages[1], 1);        // ...not "the winner"
+}
+
+TEST(LensMessageAttribution, PlainDocumentRequestReportsNoMessages) {
+    Fixture fx;
+    fx.cite(5, /*head*/0, /*pos*/1, 0.9f);
+    // No message_offsets — a `document` request, the shape shipped since v1.
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    EXPECT_EQ(r.n_messages, 0);
+    ASSERT_EQ(r.fields.size(), 1u);
+    const LensField& f = r.fields[0];
+    ASSERT_FALSE(f.citations.empty());
+    EXPECT_EQ(f.citations[0].message, -1);       // unknown, not "message 0"
+    EXPECT_TRUE(f.citation_messages.empty());
+
+    // ...and it serializes as null, so an importer cannot read a 0 that means
+    // "we don't know" as "the first message".
+    const std::string j = lens_report_to_json(r);
+    EXPECT_NE(j.find("\"message\":null"), std::string::npos) << j;
+    EXPECT_NE(j.find("\"n_messages\":0"), std::string::npos) << j;
+}
+
+TEST(LensMessageAttribution, SerializesMessageAndCitationMessages) {
+    Fixture fx;
+    fx.cite(5, /*head*/0, /*pos*/1, 0.9f);
+    fx.run.message_offsets = {0, 11};
+
+    const std::string j = lens_report_to_json(compute_lens_report(fx.run, fx.k));
+
+    EXPECT_NE(j.find("\"n_messages\":2"), std::string::npos) << j;
+    EXPECT_NE(j.find("\"message\":0"), std::string::npos) << j;
+    EXPECT_NE(j.find("\"citation_messages\":[0]"), std::string::npos) << j;
+}
+
+// The report's own header must name the coordinates it actually ran, not a
+// literal. Both lines were hardcoded "layer 3, head 13" / "layer 11" until
+// per-model constants landed — a Qwen 3.8 report (L27H13) would have carried
+// someone else's coordinates as its receipt.
+TEST(LensMessageAttribution, ReportHeaderNamesTheCoordinatesItActuallyRan) {
+    Fixture fx;
+    fx.cite(5, /*head*/0, /*pos*/1, 0.9f);
+    fx.k.citation_layer = 27;
+    fx.k.citation_head  = 0;      // the fixture puts its signal on head 0
+    fx.k.coverage_layer = 11;
+
+    const std::string j = lens_report_to_json(compute_lens_report(fx.run, fx.k));
+
+    EXPECT_NE(j.find("layer 27, head 0 (L27H0)"), std::string::npos) << j;
+    EXPECT_NE(j.find("layer 11, max over heads"), std::string::npos) << j;
+}
+
+// ── Nested output: refused, loudly ───────────────────────────────────────────
+// The lens emits and parses a FLAT object of scalar values. Nothing stops a free
+// decode emitting nested JSON, and before 2026-09-05 the parse did not refuse it
+// — it silently produced wrong fields by two independent mechanisms, both
+// measured as characterization tests before the fix and preserved below as the
+// refusal cases they became:
+//
+//   lens_keys   (server_lens.cpp:60) is DEPTH-BLIND — it collects every "..."
+//               followed by ':' at any nesting depth, so keys inside an array
+//               element surfaced as top-level fields.
+//   lens_value_of (:94) is SCALAR-ONLY — a value not starting with '"' was read
+//               to the first ',' '}' or newline, so an array yielded a fragment
+//               (`[{"desc": "Widget"`) shipped with a real badge and citations;
+//               and it resolves a key by the FIRST occurrence of "key", so a
+//               nested "quantity":"5" answered a top-level "quantity":"45".
+//
+// The second was the serious one: a wrong value, normally badged, with citations
+// pointing at a span the model did not read — the lens misreporting where the
+// model looked, which lens-format.md calls the one thing it must never do.
+//
+// Refusal (422) is the answer rather than a summary or a dropped key, because
+// the lens claims a faithful record and cannot make that claim about a value it
+// did not read. This is NOT a ruling that arrays are unsupportable: the trust
+// math is per-value-span and generalizes to leaf scalars at any depth. What is
+// missing is a hint form for repeating groups, which is a Leg-B-style
+// measurement, not a parser change.
+
+namespace {
+// Drive the parse with an arbitrary emitted string: one token per byte, so the
+// gen-token span math is exact and the citation rows stay inert.
+void set_gen(Fixture& fx, const std::string& text) {
+    fx.run.gen_text = text;
+    fx.run.gen_tok_text.clear();
+    for (char c : text) fx.run.gen_tok_text.push_back(std::string(1, c));
+    const size_t G = fx.run.gen_tok_text.size();
+    fx.run.gen_cum.assign(G + 1, 0);
+    for (size_t i = 0; i < G; ++i)
+        fx.run.gen_cum[i + 1] = fx.run.gen_cum[i] + fx.run.gen_tok_text[i].size();
+    fx.run.steps.assign(G, LensStep{});
+    for (auto& st : fx.run.steps) {
+        st.n_kv = Fixture::N_KV;
+        st.citation_row.assign((size_t)Fixture::N_HEAD * Fixture::N_KV, 0.0f);
+        st.coverage_row.assign((size_t)Fixture::N_HEAD * Fixture::N_KV, 0.0f);
+    }
+}
+const LensField* field_named(const LensReport& r, const std::string& key) {
+    for (const LensField& f : r.fields) if (f.key == key) return &f;
+    return nullptr;
+}
+}  // namespace
+
+TEST(LensNestedOutput, ArrayValueIsRefusedNotTruncated) {
+    Fixture fx;
+    set_gen(fx, R"({"line_items": [{"desc": "Widget", "qty": "5"}]})");
+
+    // Was: returned a field whose value was the fragment `[{"desc": "Widget"`.
+    EXPECT_THROW(compute_lens_report(fx.run, fx.k), LensUnparseableError);
+}
+
+TEST(LensNestedOutput, ObjectValueIsRefused) {
+    Fixture fx;
+    set_gen(fx, R"({"customer": {"name": "Acme Ltd"}, "quantity": "45"})");
+
+    EXPECT_THROW(compute_lens_report(fx.run, fx.k), LensUnparseableError);
+}
+
+TEST(LensNestedOutput, RefusalNamesTheKeyAndCarriesTheRawOutput) {
+    Fixture fx;
+    const std::string emitted = R"({"line_items": [{"desc": "Widget"}]})";
+    set_gen(fx, emitted);
+
+    try {
+        compute_lens_report(fx.run, fx.k);
+        FAIL() << "expected LensUnparseableError";
+    } catch (const LensUnparseableError& e) {
+        const std::string msg = e.what();
+        // Fail-loud contract order: parameter, expected, actual.
+        const size_t param    = msg.find("line_items");
+        const size_t expected = msg.find("expected a scalar");
+        const size_t actual   = msg.find("actual=");
+        ASSERT_NE(param,    std::string::npos) << msg;
+        ASSERT_NE(expected, std::string::npos) << msg;
+        ASSERT_NE(actual,   std::string::npos) << msg;
+        EXPECT_LT(expected, actual) << msg;
+        // The 422 body carries exactly what the model emitted, so the failure is
+        // inspectable rather than merely reported.
+        EXPECT_EQ(e.raw, emitted);
+    }
+}
+
+TEST(LensNestedOutput, ANestedKeyCanNoLongerAnswerATopLevelLookup) {
+    Fixture fx;
+    // The document's real answer is 45, and the model emitted 45 at the top
+    // level. Before the guard this reported quantity="5" — the nested value —
+    // with a normal badge and citations pointing at the wrong span.
+    set_gen(fx, R"({"items": [{"quantity": "5"}], "quantity": "45"})");
+
+    EXPECT_THROW(compute_lens_report(fx.run, fx.k), LensUnparseableError);
+}
+
+TEST(LensNestedOutput, FlatOutputIsUnaffected) {
+    // The control: the shipped flat shape parses exactly as before. A brace or
+    // bracket INSIDE a string value is a value, not nesting, and must still pass.
+    Fixture fx;
+    set_gen(fx, R"({"customer": "Acme [Holdings] Ltd", "quantity": "45"})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 2u);
+    EXPECT_EQ(field_named(r, "customer")->value, "Acme [Holdings] Ltd");
+    EXPECT_EQ(field_named(r, "quantity")->value, "45");
+}
+
+TEST(LensNestedOutput, ScalarNonStringValuesStillParse) {
+    // Numbers, booleans and null are scalars, not nesting — the guard must not
+    // catch them. null stays "the model declined" (absent), not a refusal.
+    Fixture fx;
+    set_gen(fx, R"({"quantity": 45, "total": null})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 2u);
+    EXPECT_EQ(field_named(r, "quantity")->value, "45");
+    EXPECT_TRUE(field_named(r, "total")->value.empty());   // declined ⇒ absent
+}
+
+// ── Repeated keys: every occurrence is reported ──────────────────────────────
+// Found by the multi-line invoice probe (2026-09-05). Asked for a flat schema on
+// an invoice with three line items, the model emitted all three as REPEATED
+// top-level keys. The document was not the problem and the model was not wrong;
+// the requested shape simply could not hold what the document said.
+//
+// Before the fix, two readers disagreed and two thirds of the answer vanished:
+// lens_value_of resolved by the FIRST occurrence, so all three line_item fields
+// came back as the first item; apply_absent_by_omission then kept only one of
+// them. Nothing marked the loss — no error, no badge, and coverage stayed silent
+// (measured: the un-extracted lines were NOT flagged as un-consulted). A
+// confident, correctly-grounded, silently incomplete answer.
+//
+// Now each occurrence carries its own value, its own byte span and therefore its
+// own citations. What this does NOT do is pair them into records: occurrence
+// order is emission order, and line_item[1] is not claimed to belong with
+// quantity[1]. Grouping is a leaf-path design and is deliberately not this.
+
+TEST(LensRepeatedKeys, EveryOccurrenceGetsItsOwnValue) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": "Bracket", "quantity": "7", )"
+                R"("line_item": "Fan", "quantity": "19", )"
+                R"("line_item": "Pipe", "quantity": "43"})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    std::vector<std::string> items, qtys;
+    for (const LensField& f : r.fields) {
+        if (f.key == "line_item") items.push_back(f.value);
+        if (f.key == "quantity")  qtys.push_back(f.value);
+    }
+    EXPECT_EQ(items, (std::vector<std::string>{"Bracket", "Fan", "Pipe"}));
+    EXPECT_EQ(qtys,  (std::vector<std::string>{"7", "19", "43"}));
+}
+
+TEST(LensRepeatedKeys, OccurrenceIndexIsEmissionOrder) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": "Bracket", "line_item": "Fan", "line_item": "Pipe"})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 3u);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(r.fields[i].occurrence, i);
+    EXPECT_EQ(r.fields[2].value, "Pipe");
+}
+
+TEST(LensRepeatedKeys, OrderingPassKeepsAllOccurrencesUnderTheirConcept) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": "Bracket", "line_item": "Fan", "customer": "Acme Ltd"})");
+
+    LensReport r = apply_absent_by_omission(
+        compute_lens_report(fx.run, fx.k),
+        {{"customer", ""}, {"line_item", ""}, {"total", ""}});
+
+    // Concept order still governs: customer, then BOTH line_items, then absent total.
+    ASSERT_EQ(r.fields.size(), 4u);
+    EXPECT_EQ(r.fields[0].key, "customer");
+    EXPECT_EQ(r.fields[1].key, "line_item");
+    EXPECT_EQ(r.fields[1].value, "Bracket");
+    EXPECT_EQ(r.fields[2].key, "line_item");
+    EXPECT_EQ(r.fields[2].value, "Fan");
+    EXPECT_EQ(r.fields[3].key, "total");
+    EXPECT_FALSE(r.fields[3].present);          // absent-by-omission still works
+}
+
+TEST(LensRepeatedKeys, FirstEntryPerKeyIsUnchangedForOldImporters) {
+    // The back-compat property that makes this survivable: an importer taking the
+    // FIRST match for a key gets exactly what v2 gave it. Later occurrences are
+    // appended after, never inserted before. (An importer doing LAST-wins does
+    // change behaviour — which is precisely why the format bumps to v3.)
+    Fixture fx;
+    set_gen(fx, R"({"quantity": "7", "quantity": "43"})");
+
+    LensReport r = apply_absent_by_omission(compute_lens_report(fx.run, fx.k),
+                                            {{"quantity", ""}});
+
+    ASSERT_EQ(r.fields.size(), 2u);
+    EXPECT_EQ(r.fields[0].value, "7");          // what v2 reported
+    EXPECT_EQ(r.fields[1].value, "43");         // what v2 threw away
+}
+
+TEST(LensRepeatedKeys, SingleOccurrenceIsUnaffected) {
+    // The control: the ordinary flat document is byte-for-byte the same shape.
+    Fixture fx;
+    set_gen(fx, R"({"customer": "Acme Ltd", "quantity": "45"})");
+
+    LensReport r = apply_absent_by_omission(compute_lens_report(fx.run, fx.k),
+                                            {{"customer", ""}, {"quantity", ""}});
+
+    ASSERT_EQ(r.fields.size(), 2u);
+    EXPECT_EQ(r.fields[0].value, "Acme Ltd");
+    EXPECT_EQ(r.fields[1].value, "45");
+    EXPECT_EQ(r.fields[0].occurrence, 0);
+    EXPECT_EQ(r.fields[1].occurrence, 0);
+}
+
+TEST(LensRepeatedKeys, VersionIsBumpedAndOccurrenceIsSerialized) {
+    Fixture fx;
+    set_gen(fx, R"({"quantity": "7", "quantity": "43"})");
+
+    const std::string j = lens_report_to_json(compute_lens_report(fx.run, fx.k));
+
+    EXPECT_NE(j.find("qemmi-lens/v4"), std::string::npos) << j;
+    EXPECT_NE(j.find("\"occurrence\":1"), std::string::npos) << j;
+}
+
+// ── Arrays of scalars: one occurrence per element ────────────────────────────
+// The same answer, two encodings. Asked for a flat schema on a three-line
+// invoice, Qwen3.8-9B repeats the key ("quantity":"7", ... "quantity":"43")
+// while Qwen3.6-35B answers "quantity": [7, 19, 43]. Both are the model doing
+// the right thing with a shape that cannot hold three items; refusing one and
+// serving the other would be an accident of which model you loaded.
+//
+// A scalar element is LOCATABLE — it has its own byte span — so the
+// per-value-span trust math gives it its own real citations, exactly as a
+// repeated key gets. That is the whole test for whether a shape is servable, and
+// it is why an array containing OBJECTS stays refused: there is no scalar span
+// to cite, and lens_keys would leak the inner keys as top-level fields.
+
+TEST(LensScalarArrays, StringArrayBecomesOneOccurrencePerElement) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": ["Bracket", "Fan", "Pipe"]})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 3u);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(r.fields[i].occurrence, i);
+    EXPECT_EQ(r.fields[0].value, "Bracket");
+    EXPECT_EQ(r.fields[1].value, "Fan");
+    EXPECT_EQ(r.fields[2].value, "Pipe");
+}
+
+TEST(LensScalarArrays, NumberArrayBecomesOneOccurrencePerElement) {
+    Fixture fx;
+    set_gen(fx, R"({"quantity": [7, 19, 43]})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 3u);
+    EXPECT_EQ(r.fields[0].value, "7");
+    EXPECT_EQ(r.fields[1].value, "19");
+    EXPECT_EQ(r.fields[2].value, "43");
+}
+
+TEST(LensScalarArrays, EachElementGetsItsOwnGenSpan) {
+    // The load-bearing property: elements must not share a span, or all three
+    // would carry identical citations and the receipts would be a fiction.
+    Fixture fx;
+    set_gen(fx, R"({"quantity": [7, 19, 43]})");
+
+    LensReport r = compute_lens_report(fx.run, fx.k);
+
+    ASSERT_EQ(r.fields.size(), 3u);
+    EXPECT_LT(r.fields[0].gen_lo, r.fields[1].gen_lo);
+    EXPECT_LT(r.fields[1].gen_lo, r.fields[2].gen_lo);
+    EXPECT_NE(r.fields[0].gen_hi, r.fields[1].gen_hi);
+}
+
+TEST(LensScalarArrays, AnArrayHoldingAnObjectIsStillRefused) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": [{"desc": "Bracket"}, {"desc": "Fan"}]})");
+
+    // No scalar span to cite, and lens_keys would leak "desc" as a top-level
+    // field. Refused, exactly as before this change.
+    EXPECT_THROW(compute_lens_report(fx.run, fx.k), LensUnparseableError);
+}
+
+TEST(LensScalarArrays, EmptyArrayAndNullElementsDecline) {
+    Fixture fx;
+    set_gen(fx, R"({"quantity": [], "total": [null], "tax": "170.50"})");
+
+    LensReport r = apply_absent_by_omission(
+        compute_lens_report(fx.run, fx.k),
+        {{"quantity", ""}, {"total", ""}, {"tax", ""}});
+
+    ASSERT_EQ(r.fields.size(), 3u);
+    EXPECT_FALSE(r.fields[0].present);          // [] ⇒ absent, never a blank value
+    EXPECT_FALSE(r.fields[1].present);          // [null] ⇒ absent
+    EXPECT_EQ(r.fields[2].value, "170.50");     // the scalar beside them is intact
+}
+
+TEST(LensScalarArrays, RefusalMessageNamesBothAcceptedShapes) {
+    Fixture fx;
+    set_gen(fx, R"({"line_item": [{"desc": "Bracket"}]})");
+    try {
+        compute_lens_report(fx.run, fx.k);
+        FAIL() << "expected LensUnparseableError";
+    } catch (const LensUnparseableError& e) {
+        const std::string msg = e.what();
+        // An operator reading this must learn that arrays are not banned — only
+        // ones we cannot cite. Naming only "scalar" would send them to redesign
+        // a prompt that already works.
+        EXPECT_NE(msg.find("array of scalars"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("line_item"), std::string::npos) << msg;
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Candidate set — pass 2 (docs/plan-candidate-set.md). Both functions under
+// test are PURE (no engine, no model): lens_parse_pass2_candidates is the
+// tolerant line parser ported from the CAND=1 probe, and
+// lens_apply_pass2_candidates layers the byte-exactness check, dedup,
+// document-order sort, and producer-failure detection on top. The cold
+// taps-disarmed decode that PRODUCES the raw text (run_cand_pass2_decode) is
+// not model-free and is not exercised here — see the header comment on
+// run_lens_extract for what remains untestable without a model.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST(LensCandidatePass2Parse, QuotedInputParsesOneSpanPerKey) {
+    const std::vector<std::string> keys = {"monthly_rent", "supplier"};
+    auto out = lens_parse_pass2_candidates(
+        "monthly_rent: \"1,450.00 GBP\"\nsupplier: \"Acme Ltd\"\n", keys);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].first, "monthly_rent");
+    EXPECT_EQ(out[0].second, "1,450.00 GBP");
+    EXPECT_EQ(out[1].first, "supplier");
+    EXPECT_EQ(out[1].second, "Acme Ltd");
+}
+
+TEST(LensCandidatePass2Parse, UnquotedInputStillParses) {
+    // m_en1 in the probe corpus emitted every line unquoted; the strict
+    // key: "span"-only parser dropped the lot. This is the regression it fixes.
+    const std::vector<std::string> keys = {"monthly_rent"};
+    auto out = lens_parse_pass2_candidates("monthly_rent: 1,450.00 GBP\n", keys);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].first, "monthly_rent");
+    EXPECT_EQ(out[0].second, "1,450.00 GBP");
+}
+
+TEST(LensCandidatePass2Parse, MixedQuotedAndUnquotedLinesBothParse) {
+    const std::vector<std::string> keys = {"monthly_rent", "supplier"};
+    auto out = lens_parse_pass2_candidates(
+        "monthly_rent: \"1,450.00 GBP\"\nsupplier: Acme Ltd\n", keys);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].second, "1,450.00 GBP");
+    EXPECT_EQ(out[1].second, "Acme Ltd");
+}
+
+TEST(LensCandidatePass2Parse, NoneIsARealAnswerNotAMalformedLine) {
+    const std::vector<std::string> keys = {"warranty_period"};
+    auto out = lens_parse_pass2_candidates("warranty_period: (none)\n", keys);
+    EXPECT_TRUE(out.empty());   // a real answer (no candidate) — not dropped as malformed
+}
+
+TEST(LensCandidatePass2Parse, UnterminatedQuoteIsMalformedAndSkipped) {
+    const std::vector<std::string> keys = {"monthly_rent", "supplier"};
+    auto out = lens_parse_pass2_candidates(
+        "monthly_rent: \"1,450.00 GBP\nsupplier: \"Acme Ltd\"\n", keys);
+    // The first line's quote never closes (it runs into the next line) — malformed,
+    // skipped. Only the second, well-formed line survives.
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].first, "supplier");
+    EXPECT_EQ(out[0].second, "Acme Ltd");
+}
+
+TEST(LensCandidatePass2Parse, UnknownKeyIsIgnored) {
+    const std::vector<std::string> keys = {"monthly_rent"};
+    auto out = lens_parse_pass2_candidates(
+        "monthly_rent: \"1,450.00 GBP\"\nrandom_prose: not a key\n", keys);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].first, "monthly_rent");
+}
+
+TEST(LensCandidatePass2Apply, NonVerbatimSpanIsDroppedNotFlagged) {
+    // "1450.00 GBP" (no comma, no period) never appears in the document —
+    // a paraphrase, not a byte-exact slice. Must be dropped silently, not
+    // reported as a producer failure (other keys parsed fine).
+    const std::string document = "Clause 2: Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    lens_apply_pass2_candidates(document, "monthly_rent: \"1450.00 GBP\"\n", keys, r);
+    EXPECT_FALSE(r.candidates_producer_failed);
+    EXPECT_TRUE(r.key_candidates["monthly_rent"].empty());
+}
+
+TEST(LensCandidatePass2Apply, ByteExactSpanIsKeptWithCorrectOffsets) {
+    const std::string document = "Clause 2: Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    lens_apply_pass2_candidates(document, "monthly_rent: \"1,450.00 GBP\"\n", keys, r);
+    ASSERT_EQ(r.key_candidates["monthly_rent"].size(), 1u);
+    const LensCandidate& c = r.key_candidates["monthly_rent"][0];
+    EXPECT_EQ(c.value, "1,450.00 GBP");
+    EXPECT_EQ(document.substr(c.byte_lo, c.byte_hi - c.byte_lo), "1,450.00 GBP");
+}
+
+TEST(LensCandidatePass2Apply, CandidatesSortIntoDocumentOrder) {
+    const std::string document = "Amendment: 1,375.00 GBP. Clause 2: 1,450.00 GBP.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    // Emitted in the OPPOSITE order from how they appear in the document.
+    lens_apply_pass2_candidates(
+        document,
+        "monthly_rent: \"1,450.00 GBP\"\nmonthly_rent: \"1,375.00 GBP\"\n", keys, r);
+    ASSERT_EQ(r.key_candidates["monthly_rent"].size(), 2u);
+    EXPECT_EQ(r.key_candidates["monthly_rent"][0].value, "1,375.00 GBP");  // earlier byte_lo
+    EXPECT_EQ(r.key_candidates["monthly_rent"][1].value, "1,450.00 GBP");
+}
+
+TEST(LensCandidatePass2Apply, DuplicateSpanIsNotDoubleCounted) {
+    const std::string document = "Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    lens_apply_pass2_candidates(
+        document,
+        "monthly_rent: \"1,450.00 GBP\"\nmonthly_rent: \"1,450.00 GBP\"\n", keys, r);
+    EXPECT_EQ(r.key_candidates["monthly_rent"].size(), 1u);
+}
+
+TEST(LensCandidatePass2Apply, ProducerFailureIsDistinguishedFromEmptyDocument) {
+    // Non-empty generation, zero parseable lines — the fourth state
+    // (docs/plan-candidate-set.md): a PRODUCER failure, not "the document
+    // offers nothing". Must never render as an empty, unflagged key_candidates.
+    const std::string document = "Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    lens_apply_pass2_candidates(document, "I cannot help with that request.", keys, r);
+    EXPECT_TRUE(r.candidates_producer_failed);
+    EXPECT_FALSE(r.candidates_error.empty());
+    EXPECT_TRUE(r.key_candidates.empty());
+}
+
+TEST(LensCandidatePass2Apply, NoneAnswerCoexistsWithRealCandidatesWithoutProducerFailure) {
+    // "(none)" on one key alongside a real span on another: the (none) line
+    // must not poison the whole document into a producer failure, and the
+    // real candidate on the other key must still land.
+    const std::string document = "Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent", "warranty_period"};
+    LensReport r;
+    lens_apply_pass2_candidates(
+        document, "monthly_rent: \"1,450.00 GBP\"\nwarranty_period: (none)\n", keys, r);
+    EXPECT_FALSE(r.candidates_producer_failed);
+    EXPECT_TRUE(r.candidates_error.empty());
+    ASSERT_EQ(r.key_candidates["monthly_rent"].size(), 1u);
+    EXPECT_EQ(r.key_candidates["monthly_rent"][0].value, "1,450.00 GBP");
+    EXPECT_TRUE(r.key_candidates["warranty_period"].empty());
+}
+
+TEST(LensCandidatePass2Apply, EmptyGenerationIsNotAProducerFailure) {
+    // No output at all (e.g. immediate EOS) is a different fact than non-empty
+    // garbage — only the latter is a producer failure.
+    const std::string document = "Rent is 1,450.00 GBP per month.";
+    const std::vector<std::string> keys = {"monthly_rent"};
+    LensReport r;
+    lens_apply_pass2_candidates(document, "", keys, r);
+    EXPECT_FALSE(r.candidates_producer_failed);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Candidate set — the WIRE (docs/plan-candidate-set.md, qemmi-lens/v4).
+// lens_report_to_json is pure (no engine, no model): these tests build a
+// LensReport by hand (fields + key_candidates + the two producer-outcome
+// flags) and assert on the parsed JSON, exactly like the fixtures above.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST(LensCandidateWire, FormatVersionIsV4) {
+    LensReport r;
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["format_version"], "qemmi-lens/v4");
+}
+
+TEST(LensCandidateWire, EveryVocabularyKeyGetsAnEntryIncludingEmpty) {
+    LensReport r;
+    r.document_text = "Rent is 1,450.00 GBP. Pets: none allowed.";
+    r.fields = {present_field("monthly_rent", "1,450.00 GBP", true, true),
+                present_field("pets_policy", "none allowed", true, true)};
+    r.candidates_requested = true;
+    r.key_candidates["monthly_rent"] = {LensCandidate{"1,450.00 GBP", 9, 21}};
+    // "pets_policy" is deliberately absent from the map — a key pass 2 found
+    // nothing for. The wire must still carry it, as [].
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    ASSERT_TRUE(j.contains("key_candidates"));
+    ASSERT_TRUE(j["key_candidates"].contains("monthly_rent"));
+    ASSERT_TRUE(j["key_candidates"].contains("pets_policy"));
+    EXPECT_EQ(j["key_candidates"]["monthly_rent"].size(), 1u);
+    EXPECT_TRUE(j["key_candidates"]["pets_policy"].is_array());
+    EXPECT_EQ(j["key_candidates"]["pets_policy"].size(), 0u);
+}
+
+TEST(LensCandidateWire, ArrayOrderIsDocumentOrder) {
+    LensReport r;
+    r.document_text = "Amendment: 1,375.00 GBP. Clause 2: 1,450.00 GBP.";
+    r.fields = {present_field("monthly_rent", "1,450.00 GBP", true, true)};
+    r.candidates_requested = true;
+    // Already producer-sorted by byte_lo ascending — the wire must preserve
+    // this, not re-rank by mass or any other criterion (CF1: no verdicts).
+    r.key_candidates["monthly_rent"] = {LensCandidate{"1,375.00 GBP", 11, 24},
+                                       LensCandidate{"1,450.00 GBP", 36, 49}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    auto& cands = j["key_candidates"]["monthly_rent"];
+    ASSERT_EQ(cands.size(), 2u);
+    EXPECT_EQ(cands[0]["value"], "1,375.00 GBP");
+    EXPECT_EQ(cands[1]["value"], "1,450.00 GBP");
+    EXPECT_LT((int)cands[0]["byte_lo"], (int)cands[1]["byte_lo"]);
+}
+
+TEST(LensCandidateWire, ReturnedAsLinksAWiderCandidateToTheNarrowerFieldValue) {
+    LensReport r;
+    r.document_text = "ACME ordered 45 units on Monday.";
+    LensField f = present_field("quantity", "45", true, true);
+    f.occurrence = 0;
+    r.fields = {f};
+    r.candidates_requested = true;
+    r.key_candidates["quantity"] = {LensCandidate{"45 units", 13, 21}};  // wider
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["key_candidates"]["quantity"][0]["returned_as"], 0);
+}
+
+TEST(LensCandidateWire, ReturnedAsLinksANarrowerCandidateToTheWiderFieldValue) {
+    LensReport r;
+    r.document_text = "Ship 300 x 45 units total.";
+    LensField f = present_field("shipment", "300 x 45 units", true, true);
+    f.occurrence = 0;
+    r.fields = {f};
+    r.candidates_requested = true;
+    r.key_candidates["shipment"] = {LensCandidate{"300 x", 5, 10}};  // narrower
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["key_candidates"]["shipment"][0]["returned_as"], 0);
+}
+
+TEST(LensCandidateWire, TiebreakPrefersTightestContainmentThenEarliestByteLo) {
+    LensReport r;
+    r.document_text = "Clause A: 45. Later, clause B says 45 units again.";
+    LensField f = present_field("qty", "45", true, true);
+    f.occurrence = 0;
+    r.fields = {f};
+    r.candidates_requested = true;
+    // Both candidates contain "45"; the exact-length match (gap 0) must win
+    // over the wider one (gap 6), regardless of array position.
+    r.key_candidates["qty"] = {LensCandidate{"45 units", 36, 44},
+                              LensCandidate{"45", 10, 12}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    auto& cands = j["key_candidates"]["qty"];
+    ASSERT_EQ(cands.size(), 2u);
+    // cands[1] is the exact "45" (byte_lo 10) — the tight match.
+    EXPECT_EQ(cands[1]["value"], "45");
+    EXPECT_EQ(cands[1]["returned_as"], 0);
+    EXPECT_TRUE(cands[0]["returned_as"].is_null());
+}
+
+TEST(LensCandidateWire, TiebreakOnEqualGapPicksEarliestByteLo) {
+    LensReport r;
+    r.document_text = "x";  // byte offsets below are synthetic, not sliced from this
+    LensField f = present_field("code", "45", true, true);
+    f.occurrence = 0;
+    r.fields = {f};
+    r.candidates_requested = true;
+    // Both candidates have the same length gap (1) against "45"; the one with
+    // the earlier byte_lo must be chosen. Array order is already the
+    // producer's byte_lo-ascending contract — lens_report_to_json does not
+    // re-sort, so it is given in that order directly.
+    r.key_candidates["code"] = {LensCandidate{"X45", 10, 13}, LensCandidate{"45X", 30, 33}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    auto& cands = j["key_candidates"]["code"];
+    ASSERT_EQ(cands.size(), 2u);
+    EXPECT_EQ(cands[0]["value"], "X45");   // byte_lo 10 — earlier
+    EXPECT_EQ(cands[0]["returned_as"], 0);
+    EXPECT_TRUE(cands[1]["returned_as"].is_null());
+}
+
+TEST(LensCandidateWire, ProducerFailureOmitsKeyCandidatesAndSetsError) {
+    LensReport r;
+    r.fields = {present_field("monthly_rent", "1,450.00 GBP", true, true)};
+    r.candidates_requested = true;
+    r.candidates_producer_failed = true;
+    r.candidates_error = "candidate-set pass 2: 0 parseable lines";
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_FALSE(j.contains("key_candidates"));
+    EXPECT_EQ(j["candidates_error"], "candidate-set pass 2: 0 parseable lines");
+}
+
+TEST(LensCandidateWire, NotRequestedOmitsBothKeyCandidatesAndError) {
+    LensReport r;   // candidates_requested defaults false — pass 2 never ran
+    r.fields = {present_field("monthly_rent", "1,450.00 GBP", true, true)};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_FALSE(j.contains("key_candidates"));
+    EXPECT_FALSE(j.contains("candidates_error"));
+}
+
+TEST(LensCandidateWire, AnchorNullWhenNoStructureExists) {
+    LensReport r;
+    r.document_text = "45";   // the whole document IS the candidate — no label,
+                              // and the "enclosing line" carries no more context
+                              // than the span itself.
+    r.fields = {present_field("amount", "45", true, true)};
+    r.candidates_requested = true;
+    r.key_candidates["amount"] = {LensCandidate{"45", 0, 2}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_TRUE(j["key_candidates"]["amount"][0]["anchor"].is_null());
+}
+
+TEST(LensCandidateWire, AnchorResolvesToThePrecedingLabelLine) {
+    LensReport r;
+    r.document_text = "2. RENT:\nMonthly rent is 1,450.00 GBP due on the first.\n";
+    r.fields = {present_field("monthly_rent", "1,450.00 GBP", true, true)};
+    r.candidates_requested = true;
+    const size_t lo = r.document_text.find("1,450.00 GBP");
+    r.key_candidates["monthly_rent"] = {LensCandidate{"1,450.00 GBP", lo, lo + 13}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["key_candidates"]["monthly_rent"][0]["anchor"], "2. RENT:");
 }

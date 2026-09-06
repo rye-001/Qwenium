@@ -39,20 +39,31 @@
 // per-request `grammar` field on /v1/completions and /v1/chat/completions —
 // that is a separate, shipped, unaffected feature.
 //
-// The frozen constants are Qwen3.6-pinned. What guards that pin is an
-// ARCHITECTURE REFUSAL at server startup, not a numeric self-check: if the
-// loaded model is not `qwen35moe`, --attention-lens is refused fail-loud before
-// the server binds (lens_architecture_supported / lens_architecture_refusal
-// below, called from main() in http_server.cpp). There is NO known-answer
-// sanity check on the citation head — an earlier version of this comment
-// claimed one and was wrong. Drift of the head WITHIN Qwen 3.6 is therefore
-// unguarded at runtime; it is caught, if at all, by the offline probe
-// (tests/perf/attn_provenance.cpp). No lens claims for other model families.
+// The constants are PER MODEL, and what guards them is a CALIBRATION REFUSAL at
+// server startup, not a numeric self-check: the loaded model is looked up in
+// kLensCalibrations by {architecture, block_count}, and --attention-lens is
+// refused fail-loud before the server binds if it has no entry
+// (lens_calibration_for / lens_calibration_refusal below, called from main() in
+// http_server.cpp). There is NO known-answer sanity check on the citation head —
+// an earlier version of this comment claimed one and was wrong. Drift of the
+// head WITHIN a calibrated model is therefore unguarded at runtime; it is
+// caught, if at all, by the offline probe (tests/perf/attn_provenance.cpp).
+//
+// Two calibrated models today, both Qwen: Qwen 3.6-35B-A3B (L3H13) and
+// Qwen 3.8-9B (L27H13). No lens claims for other families, and that is a
+// MEASURED position, not neglect — Gemma was searched properly and 0 of 768
+// candidate heads clear even a 70% bar against the 90% requirement
+// (docs/note-lens-gemma4-probe.md, docs/note-lens-gemma-norm-weighted.md). The
+// lens is a Qwen-family capability by measurement; the refusal is the mechanism
+// that keeps that honest.
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 class ForwardPassBase;
@@ -64,7 +75,11 @@ namespace qinf {
 
 class GrammarVocab;
 
-// ── Frozen Qwen3.6 lens constants (plan §1.6; note-qemmi-docs-p0.md) ──────────
+// ── Lens constants — one model's measured coordinates ────────────────────────
+// The member defaults below ARE the Qwen 3.6 calibration (plan §1.6;
+// docs/note-qemmi-docs-p0.md), and they are the only place those numbers are
+// written down: the qwen35moe rows of kLensCalibrations{} take them by
+// default-construction rather than restating them.
 struct LensConstants {
     int    citation_head        = 13;     // L3H13 retrieval head (N3)
     int    citation_layer       = 3;      // physical attention layer for citations
@@ -72,30 +87,104 @@ struct LensConstants {
     double coverage_used_peak   = 0.705;  // span-peak ≥ this ⇒ "consulted" (COV1)
     double ungrounded_body_mass = 0.538;  // mean body_mass ≥ this ⇒ grounded (N3b)
     int    citation_topk        = 8;      // source positions reported per token/field
+    // What the report's `model` field says. It travels WITH the coordinates
+    // because it describes them: a report computed from this entry was produced
+    // by this model, and a hardcoded name would mislabel every other entry's
+    // receipts (it did — `run.model` was a literal "Qwen3.6" string until the
+    // table landed, which a Qwen 3.8 extraction would have carried).
+    const char* model_label     = "Qwen3.6 (attention lens)";
 };
 
-// ── The architecture the constants above are calibrated on ───────────────────
-// Every number in LensConstants was measured on ONE model: Qwen 3.6 (GGUF arch
-// `qwen35moe`). They are coordinates and thresholds, not a mechanism — layer 3
-// head 13 is a retrieval head *of that model*, and nothing about it transfers.
-// Run the lens on another architecture and /v1/extract returns a
-// confidently-shaped report computed from constants that were never calibrated
-// there: citations pointing at whatever L3H13 happens to be, grounded/ungrounded
-// badges off an unvalidated threshold. That is a false receipt, so the flag is
-// REFUSED rather than best-efforted. Uncalibrated everywhere else means exactly
-// that: no head has been identified on any other model (docs/note-lens-qwen38-probe.md).
-constexpr const char* kLensCalibratedArchitecture = "qwen35moe";
+// ── The calibration table — which models the lens may run on ─────────────────
+// These are coordinates and thresholds, not a mechanism: "layer 3 head 13" is a
+// retrieval head *of one model*, and nothing about it transfers. Run the lens
+// on an uncalibrated model and /v1/extract returns a confidently-shaped report
+// computed from someone else's coordinates — citations pointing at whatever the
+// named layer/head happens to be there, badges off an unvalidated threshold.
+// That is a false receipt, so an unlisted model is REFUSED rather than
+// best-efforted. The table IS the calibration record: an entry exists because a
+// probe measured it, and `provenance` says which one.
+//
+// ── Why the key is {architecture, block_count} and not architecture alone ────
+// Approved 2026-09-05. An architecture string is a FAMILY, not a model:
+// `qwen35` hosts Qwen3.5-0.8B (24), Qwen3.5-9B (32), Qwen3.8-9B (33),
+// Qwen3.6-27B (64) and Qwen3.8-27B (65) — five different models, five
+// different layer counts, one string (src/models/qwen35.h). An arch-keyed
+// allowlist would admit all five under coordinates measured on one of them,
+// which is the exact false receipt the refusal exists to prevent.
+//
+// And the key is the RAW GGUF block_count, deliberately, not the decode-stack
+// depth (block_count − nextn_predict_layers). Decode depth is the more natural
+// quantity, and it is the WRONG key here: it collides Qwen3.5-9B with
+// Qwen3.8-9B at 32, and Qwen3.6-27B with Qwen3.8-27B at 64 — in both pairs a
+// calibrated model and an uncalibrated one. Raw block_count separates every
+// model above, because the trailing MTP head shifts the Qwen 3.8 builds by one.
+// That separation is an accident of these files, not a law; it holds for every
+// model this repo targets, and a future collision must be resolved by adding a
+// field to the key, never by widening an entry to cover a model nobody measured.
+struct LensCalibration {
+    const char*   architecture;   // GGUF general.architecture
+    uint32_t      block_count;    // GGUF <arch>.block_count, raw (see the key note)
+    const char*   model;          // the exact model the numbers were measured on
+    const char*   provenance;     // the probe note that measured them
+    LensConstants constants;
+};
 
-inline bool lens_architecture_supported(const std::string& arch) {
-    return arch == kLensCalibratedArchitecture;
+inline const std::vector<LensCalibration>& lens_calibrations() {
+    static const std::vector<LensCalibration> kLensCalibrations = {
+        // Qwen 3.6-35B-A3B, the model the lens was built on. Two GGUF builds of
+        // one base model: the MTP build carries a trailing NextN draft block
+        // (41 = 40 + 1), the plain build does not (40). The decode stack is the
+        // same 40 layers in both and the lens never touches the draft head, so
+        // both are the SAME calibration — listed twice rather than keyed on a
+        // depth that would collide with uncalibrated models elsewhere.
+        {"qwen35moe", 41, "Qwen3.6-35B-A3B (MTP build)",
+         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
+        {"qwen35moe", 40, "Qwen3.6-35B-A3B (plain build, same 40-layer stack)",
+         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
+        // Qwen 3.8-9B. Its own head is L27H13, not L3H13 — 98% top-3 vs 84% on
+        // the same messy corpus, and 0% vs 7% ungrounded false alarm
+        // (note-lens-qwen38-probe.md §5.3, confirmed on an independent corpus,
+        // not overfit to the selection prompt). Thread-scale citation was then
+        // validated on this entry at 4774–6200 tokens with no degradation
+        // (note-ss2-thread-alarm.md Gate 0: 89% top-1 / 98% top-3).
+        //
+        // coverage_used_peak stays 0.705 deliberately. It is the weak arm on
+        // BOTH models (87% / 84% used-clear against a ≥90% bar) and was never
+        // searched — it was frozen from COV1 on one model. A recalibration on
+        // 12+11 spans scored ~4 points better (note-lens-norm-weighted-metric.md);
+        // "recalibration is worth ~4 points" is the finding, the value it
+        // produced is fitted on 23 spans and is not shippable. Decided
+        // 2026-09-05: carry 0.705 here until a real coverage-layer search runs.
+        {"qwen35", 33, "Qwen3.8-9B",
+         "docs/note-lens-qwen38-probe.md §5.3; docs/note-ss2-thread-alarm.md",
+         LensConstants{/*citation_head*/ 13, /*citation_layer*/ 27, /*coverage_layer*/ 11,
+                       /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
+                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8 (attention lens)"}},
+    };
+    return kLensCalibrations;
+}
+
+// The calibration for one loaded model, or nullptr if it has none.
+inline const LensCalibration* lens_calibration_for(const std::string& arch, uint32_t block_count) {
+    for (const LensCalibration& c : lens_calibrations())
+        if (arch == c.architecture && block_count == c.block_count) return &c;
+    return nullptr;
 }
 
 // The refusal text. Fail-loud contract order: parameter, expected, actual.
-inline std::string lens_architecture_refusal(const std::string& arch) {
-    return std::string("--attention-lens: expected a ") + kLensCalibratedArchitecture +
-           " model (the lens constants are calibrated on Qwen 3.6 only and are "
-           "uncalibrated on every other architecture), actual architecture '" +
-           arch + "'";
+inline std::string lens_calibration_refusal(const std::string& arch, uint32_t block_count) {
+    std::string expected;
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (!expected.empty()) expected += ", ";
+        expected += std::string(c.architecture) + "/" + std::to_string(c.block_count) +
+                    " (" + c.model + ")";
+    }
+    return "--attention-lens: expected a model with a calibrated lens entry, one of {" +
+           expected + "}, actual architecture '" + arch + "' with block_count " +
+           std::to_string(block_count) +
+           " — the lens constants are coordinates measured on one model and do not "
+           "transfer to another model of the same architecture";
 }
 
 // ── Pure-computation input: one tapped decode run ────────────────────────────
@@ -126,6 +215,10 @@ struct LensRun {
     size_t doc_byte_offset = 0;
     int  n_head = 0;
     std::vector<LensStep> steps;            // one per gen token; steps.size() == G
+    // Byte offset, within `document`, where each request message starts (message
+    // i spans [message_offsets[i], message_offsets[i+1])). Empty ⇒ the caller
+    // sent a plain `document` and citations carry message -1.
+    std::vector<size_t> message_offsets;
     std::string model;                      // passthrough for the report header
     // false ⇒ prompt exceeded the 4 K CALIBRATION floor (a disclosure on the
     // report, not an error). Unrelated to the 10 K workload envelope.
@@ -133,7 +226,11 @@ struct LensRun {
 };
 
 // ── Lens report (the interchange format; P3 versions/documents it) ───────────
-struct LensCitation { int pos; double mass; size_t byte_lo, byte_hi; };  // attended prompt position
+// An attended prompt position. `message` is the index of the request message
+// this byte range falls in, or -1 when the request sent a plain `document`
+// (no boundaries to resolve against). It is a LOCATION, not a verdict — see
+// the CF1 non-claim in lens-format.md: the top citation is not "the winner".
+struct LensCitation { int pos; double mass; size_t byte_lo, byte_hi; int message = -1; };
 struct LensPromptToken { int pos; std::string text; std::string region; };  // region: "body"|"instr"
 struct LensCoverageSpan { int lo, hi; double peak; std::string text; size_t byte_lo, byte_hi; };
 
@@ -148,6 +245,14 @@ struct LensField {
     bool   grounded = true;               // body_mass ≥ threshold (badge)
     double body_mass = 0.0;               // mean citation-head mass on body positions
     std::vector<LensCitation> citations;  // top-k document source positions (body only)
+    // Distinct request-message indices this field's citations landed in, in
+    // descending citation mass. Empty when the request sent a plain `document`.
+    // Usually one element ("read from message 23"); more than one means the
+    // model looked at this key in several messages, which is exactly the
+    // coexisting-conflict presentation the format already requires — the lens
+    // does NOT say which of them is current (turn order does not identify
+    // supersession, docs/note-ss3-matched-pairs.md §3).
+    std::vector<int> citation_messages;
     // ── Absent by omission (Stage 2; was the two-pass presence gate, A5.1) ───
     // false ⇒ ABSENT: the model simply did not emit this hinted concept (or
     // emitted it empty). Serializes value:null, badge:"absent". This is now a
@@ -156,6 +261,24 @@ struct LensField {
     // the grammar's 10/30 — docs/note-nogrammar-refutation.md), so there is
     // nothing to gate. The N+1 presence prefills are gone with it.
     bool present = true;
+    // Which occurrence of this key in the model's output this field is (0-based,
+    // emission order). A document whose real structure REPEATS — an invoice with
+    // three line items against a flat schema — makes the model emit the key
+    // several times. Every occurrence is now reported with its OWN value and its
+    // OWN citations; before 2026-09-05 the first was reported three times over
+    // and the rest were discarded silently (measured: LensDuplicateKeys).
+    // Occurrence order is EMISSION order, which is positional in the document —
+    // it is NOT a claim that occurrence 0 pairs with occurrence 0 of another key.
+    // Grouping repeated keys into records is a leaf-path design and is not this.
+    int occurrence = 0;
+};
+
+// One candidate span for one key (docs/plan-candidate-set.md, pass 2). `value`
+// is always a byte-exact slice of `document` — non-verbatim spans are dropped
+// by the producer before they reach here, never stored and flagged.
+struct LensCandidate {
+    std::string value;
+    size_t      byte_lo = 0, byte_hi = 0;
 };
 
 struct LensReport {
@@ -164,12 +287,33 @@ struct LensReport {
     // importer that hard-refused unknown fields stayed safe. This one REMOVES a
     // column from a shipped shape, so it cannot ride in place: an importer reading
     // presence_grounded would silently get nothing. Subtractive ⇒ version bump.
-    std::string format_version = "qemmi-lens/v2";
+    // v3 (2026-09-05): `fields` may carry MORE THAN ONE entry per key — one per
+    // occurrence the model emitted (see LensField::occurrence). v1's additions
+    // rode in place because they were purely additive and a strict importer
+    // stayed safe; this changes a STRUCTURAL invariant that importers can have
+    // relied on (fields.size() == key_vocabulary.size(), one field per concept),
+    // so it cannot ride. An importer that maps key -> value LAST-wins silently
+    // flips from the first repeated value to the last — a wrong value, no error.
+    // Same severity class as v2's removal of presence_grounded ⇒ version bump.
+    // The first entry for each key is unchanged in value and position, so a
+    // first-match importer is unaffected.
+    // v4 (2026-09-06, docs/plan-candidate-set.md, architect-approved): adds
+    // `key_candidates` + top-level `candidates_error`, additive — a v3 importer
+    // that ignores unknown top-level members is unaffected. Bumped anyway
+    // (not ridden in place) because the ABSENCE of `key_candidates` is now a
+    // load-bearing fact: a v4 response with no `key_candidates` member means
+    // "the finder failed on this document"; a v3 response means "this server
+    // has no finder." An importer stuck on v3 cannot tell those apart, so the
+    // version string is what lets it refuse loud instead of reading absence as
+    // silence — see ../qemmi-lens ACCEPTED_FORMAT_VERSIONS, which must add
+    // "qemmi-lens/v4" or every extract call fails its own fail-loud gate.
+    std::string format_version = "qemmi-lens/v4";
     std::string model;
     bool        validated_envelope = true;
     LensConstants k;
 
     int prompt_len = 0, doc_lo = 0, doc_hi = 0;
+    int n_messages = 0;                     // 0 ⇒ the request sent a plain document
     std::string document_text;              // the user's raw document
     std::string raw_json;                   // exactly what the model emitted
 
@@ -179,6 +323,33 @@ struct LensReport {
     std::vector<std::vector<LensCitation>> hover; // viewer: per-gen-token citations
     std::vector<double>               heat;      // viewer: per-prompt-token coverage peak
     std::vector<LensCoverageSpan>     skipped;   // "possibly not incorporated" (peak < used)
+
+    // ── Candidate set (docs/plan-candidate-set.md) — producer + wire ─────────
+    // Populated only when LensExtractOptions::want_candidates is true (default
+    // false ⇒ pass 2 never runs and these stay default-constructed/empty — the
+    // off-path is byte-inert). Keyed by concept key. lens_report_to_json emits
+    // this (with `anchor` + `returned_as` derived, not stored) as of v4 — see
+    // the header comment on `format_version` above.
+    std::map<std::string, std::vector<LensCandidate>> key_candidates;
+    // true ⇒ pass 2 generated non-empty output that parsed to ZERO candidate
+    // lines across the whole key vocabulary — a PRODUCER failure (the model
+    // did not honor the requested `key: "span"` / `key: (none)` shape), and
+    // must never be read as "the document offers nothing for every key". This
+    // is the fourth state docs/plan-candidate-set.md's own states table was
+    // missing (absorbed from the m_en1 probe finding). key_candidates stays
+    // empty when this is true.
+    bool        candidates_producer_failed = false;
+    std::string candidates_error;   // set iff candidates_producer_failed
+    // Set true iff LensExtractOptions::want_candidates was true for this
+    // extract — i.e. pass 2 was attempted at all, success or failure. This is
+    // the ONLY way lens_report_to_json can tell "candidates were not
+    // requested" (this stays false, key_candidates stays empty, no error) apart
+    // from "requested and ran to a legitimate empty result" — both leave
+    // key_candidates empty, but only the former must render `key_candidates`
+    // absent-with-no-error on the wire; the two are otherwise indistinguishable
+    // from key_candidates/candidates_producer_failed alone. Not itself
+    // serialized (it is a driver-side fact, not a document fact).
+    bool        candidates_requested = false;
 };
 
 // Compute the lens report from one tapped run. Pure; fails loud (throws
@@ -250,6 +421,25 @@ struct LensConcept { std::string key, gloss; };
 struct LensExtractOptions {
     int  max_new_tokens = 512;   // hard cap on the emitted JSON length
     bool validated_envelope_only = false;  // reserved; false = accept + disclose
+    // Per-request toggle for the candidate set (docs/plan-candidate-set.md).
+    // Default OFF: pass 1 is untouched either way, and false means run_lens_extract
+    // does not run pass 2 at all — no second prefill, no extra decode, no
+    // behaviour change of any kind. No server flag / CLI flag exists for this;
+    // it is request-scoped only, by design. The wire contract for what
+    // want_candidates=true PRODUCES (`key_candidates`, `anchor`, `returned_as`,
+    // format_version qemmi-lens/v4) is architect-approved and implemented
+    // (docs/plan-candidate-set.md); still out of scope is any route/flag that
+    // would let an HTTP caller flip this bit — that remains a separate decision.
+    bool want_candidates = false;
+    // Message boundaries, as byte offsets into `document`, when the caller sent
+    // `messages` instead of a flat `document` (the server joins them and fills
+    // this in). Empty ⇒ plain document, and every citation reports message -1.
+    // Boundaries buy ATTRIBUTION ("this value was read from message 23"), which
+    // is all the lens claims. They deliberately do NOT buy a staleness alarm:
+    // measured, a later-message rule cried wolf on 7 of 9 correctly-handled
+    // corrections and stayed silent on the real failure, because a later message
+    // routinely restates an old value (docs/note-ss3-matched-pairs.md §3).
+    std::vector<size_t> message_offsets;
 };
 
 // Assemble the ChatML thinking-off prompt from (document, concepts), run the
@@ -281,7 +471,11 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
                             const std::string& document,
                             const std::vector<LensConcept>& concepts,
                             const LensExtractOptions& opts,
-                            const LensConstants& k = {},
+                            // No default: the constants are per model (see
+                            // kLensCalibrations). A defaulted `k` would silently
+                            // run Qwen 3.6 coordinates on whatever is loaded —
+                            // the false receipt the refusal exists to prevent.
+                            const LensConstants& k,
                             GrammarVocab* control_arm_grammar = nullptr,
                             const std::vector<std::string>* control_arm_vocab = nullptr);
 
@@ -310,6 +504,45 @@ std::string lens_build_instruction(const std::vector<std::string>& key_vocabular
 // Kept as exercised, measured history rather than deleted, the same precedent as
 // the other refuted machinery. Do not wire this to an endpoint.
 const char* lens_grammar_gbnf();
+
+// ── Candidate set — pass 2 (docs/plan-candidate-set.md) ──────────────────────
+// Ported from tests/perf/attn_provenance.cpp's CAND=1 probe
+// (CAND_PASS2_TASK_PREFIX / cand_parse_pass2), which measured the cheap-kill
+// gate: median candidate-set size 1.0 on 75 uncontested keys, 100%
+// byte-exactness. Both are PURE (no model, no engine) and exposed for tests;
+// the cold decode that produces the raw text pass 2 parses lives in
+// server_lens.cpp and is not model-free, so it is not unit-tested here.
+
+// The pass-2 instruction: a fixed task description (asking for every span
+// answering each key, quoted verbatim, one per line, "(none)" if absent) plus
+// the complete key vocabulary — built the same way as lens_build_instruction.
+std::string lens_cand_pass2_instruction(const std::vector<std::string>& keys);
+
+// Tolerant line parser for pass 2's free-form output. Tolerates bullets,
+// numbering, and unquoted `key: span` (a strict `key: "span"`-only parser
+// silently dropped an entire document's correct output when the model emitted
+// every line unquoted, and rendered it as "this document offers no answers" —
+// the exact confusion the candidate-set format exists to prevent, reproduced
+// one level down). `(none)` is a real ANSWER (no candidate for that key), not
+// a malformed line. An unterminated quote IS malformed and is skipped. Returns
+// (key, span) pairs in EMISSION order, restricted to `keys` — the caller
+// dedups, byte-checks against the document, and sorts into document order.
+std::vector<std::pair<std::string, std::string>>
+lens_parse_pass2_candidates(const std::string& text, const std::vector<std::string>& keys);
+
+// PURE (no engine): parses pass 2's raw output with lens_parse_pass2_candidates,
+// verifies every candidate is a byte-exact slice of `document` (dropping any
+// that are not — the format requires exactness, not a disclosure about it),
+// dedups per key, sorts each key's candidates into document order (byte_lo
+// ascending), and writes the result into `report.key_candidates`.
+//
+// FAILS LOUD on a producer failure: non-empty `gen_text` that parses to zero
+// candidate lines sets report.candidates_producer_failed + candidates_error
+// instead of silently leaving key_candidates empty — see the header comment on
+// LensReport::candidates_producer_failed for why (docs/plan-candidate-set.md's
+// own states table is missing this as its fourth state).
+void lens_apply_pass2_candidates(const std::string& document, const std::string& gen_text,
+                                 const std::vector<std::string>& keys, LensReport& report);
 
 // A5.3 trust tier of a (present) value, by VALUE SHAPE — deterministic,
 // regex-grade: a short bare integer ⇒ "short_numeric" (the weak citation class,

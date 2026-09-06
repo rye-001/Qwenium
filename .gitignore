@@ -73,6 +73,9 @@ docs/demo
 !docs/note-lens-gemma-norm-weighted.md
 !docs/note-ss2-thread-alarm.md
 !docs/handoff-qemmi-lens-revisit.md
+!docs/lens-format.md
+!docs/plan-candidate-set.md
+!docs/note-ss3-matched-pairs.md
 !docs/img-lens-probe-figs
 !docs/img-lens-probe-figs/*.png
 *.jpg
@@ -83,3 +86,4 @@ qemmi.config.*
 .qemmi/
 
 .session-results/
+claude-memory

@@ -37,6 +37,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <sstream>
 
 #include "engine/model.h"
 #include "../../src/models/model_registry.h"
@@ -3599,6 +3600,23 @@ static const char* S2_FILLER_DE[8] = {
 // A thread specification: one seed document from qdocs_messy_corpus() (the
 // oldest/innermost message), one correction reply, and (optionally) one
 // distractor reply that restates the pre-correction value.
+// One restatement message: a natural reply that repeats one or more
+// NON-corrected field values verbatim (confirmation / recap / inline
+// partial re-quote / cross-reference — see kind in the authoring comment
+// at each thread def). `depth` places it relative to the correction so
+// occurrences of a value land at genuinely different distances from the
+// decode position, not just "seed" and "one other spot": "early" (right
+// after the seed, before the pre-correction filler run), "mid" (partway
+// through that filler run), "pre_corr" (immediately before the correction
+// reply), "post_corr" (immediately after it). Deliberately never touches
+// def.corr_concept — see the comment above s2_build_thread's restatement
+// wiring for why that field is excluded.
+struct S2Restate {
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> fields;   // concept -> literal value (in `body`)
+    std::string depth;   // "early" | "mid" | "pre_corr" | "post_corr"
+};
+
 struct S2ThreadDef {
     std::string tag; bool de; std::string seed_tag;
     std::string corr_concept, corr_body, corr_new;
@@ -3606,42 +3624,267 @@ struct S2ThreadDef {
     bool explicit_ph;
     bool has_distractor; std::string distr_body;
     int target_tokens;
+    std::vector<S2Restate> restatements;   // enriches recurrence for the trivial-rule control
 };
 
+// Restatement authoring note (2026-09-05, trivial-rule control fix): every
+// body below is a LITERAL copy of a value string as it appears in the seed
+// (qdocs_messy_corpus) — s2_build()'s own guard fails loud if it isn't, so
+// this is self-checking. None restate def.corr_concept: the ORACLE alarm's
+// "superseded_msgs" (run_ss2) is computed purely as "any OTHER message that
+// carries this concept", so a post-correction confirmation of the corr_new
+// value would itself get counted as superseded ground truth and silently
+// invert Gate 2 — see comment above `superseded_msgs` in run_ss2. Every
+// other tracked field is fair game and is exactly what was under-represented
+// (15/207 ambiguous tokens, all from the one corrected concept per thread).
+// Four depths per thread — early / mid / pre_corr / post_corr, relative to
+// the correction reply — spread occurrences so R_first/R_last/R_near
+// genuinely disagree instead of collapsing to "seed vs. one other spot".
+// Kinds are rotated across depths per thread so no single template repeats
+// mechanically: confirmation, recap, inline partial re-quote, cross-reference.
+// target_tokens are each cut 500 from the pre-existing values to leave
+// headroom for the added restatement bulk while staying well under the
+// 6000-token hard ceiling.
 static std::vector<S2ThreadDef> ss2_thread_defs() {
     return {
       {"t_en1", false, "m_en1", "quantity",
        "Correction on the Brightwork order: we actually need 60 units of the Matte Black Easel "
        "Stand — please update the paperwork accordingly.", "60", "early", true, true,
        "Warehouse note: confirming 45 units of the Matte Black Easel Stand are already palletised "
-       "and ready for the Brightwork pickup, right on schedule.", 4600},
+       "and ready for the Brightwork pickup, right on schedule.", 4100,
+       {
+         {"Warehouse note: confirming 82.00 GBP each is still the rate on file for Brightwork "
+          "Studios Ltd, and the order date of 2025-10-06 is logged correctly on our side.",
+          {{"unit_price","82.00"},{"customer","Brightwork Studios Ltd"},{"order_date","2025-10-06"}}, "early"},
+         {"To recap the order so far: Brightwork Studios Ltd, delivery requested for 2025-10-24, "
+          "unit price holding at 82.00 GBP each.",
+          {{"customer","Brightwork Studios Ltd"},{"delivery_date","2025-10-24"},{"unit_price","82.00"}}, "mid"},
+         {"Quick cross-check against the Brightwork Studios Ltd file: order date 2025-10-06 and "
+          "delivery window 2025-10-24 both still look correct before we touch anything else.",
+          {{"customer","Brightwork Studios Ltd"},{"order_date","2025-10-06"},{"delivery_date","2025-10-24"}}, "pre_corr"},
+         {"> 82.00 GBP each\n\nyes, that price is unchanged from our side.",
+          {{"unit_price","82.00"}}, "post_corr"},
+       }},
       {"t_en3", false, "m_en3", "unit_price",
        "heads up, the galvanising supplier put their rates up again this month, so it works out "
-       "to 0.42 eur each on our side now for the coach bolts.", "0.42", "mid", false, false, "", 5800},
+       "to 0.42 eur each on our side now for the coach bolts.", "0.42", "mid", false, false, "", 5300,
+       {
+         {"To recap where things stand: stonegate builders, 300 x galvanised coach bolt 10mm, "
+          "delivery still pencilled in for 2025-09-30 under order ref SG-7742.",
+          {{"customer","stonegate builders"},{"quantity","300"},{"delivery_date","2025-09-30"},{"order_number","SG-7742"}}, "early"},
+         {"> 300 x galvanised coach bolt 10mm\n\nyep, that quantity is still right on our end, no change there.",
+          {{"quantity","300"}}, "mid"},
+         {"As per order ref SG-7742, everything for stonegate builders is queued for the "
+          "2025-09-30 delivery window.",
+          {{"order_number","SG-7742"},{"customer","stonegate builders"},{"delivery_date","2025-09-30"}}, "pre_corr"},
+         {"Warehouse note: confirming SG-7742 is still the reference we have filed for stonegate builders.",
+          {{"order_number","SG-7742"},{"customer","stonegate builders"}}, "post_corr"},
+       }},
       {"t_en5", false, "m_en5", "delivery_date",
        "One correction on the Arctic Gear order: the requested delivery date is now 2026-01-29 — "
        "our dock schedule shifted, please plan around the new date.", "2026-01-29", "late", true, true,
        "Logistics note: the carrier still has 2026-01-15 pencilled in for the Arctic Gear pickup "
-       "and everything looks on track for that slot.", 5600},
+       "and everything looks on track for that slot.", 5100,
+       {
+         {"Warehouse note: confirming 88 units of the Insulated Flask 750ml at 11.25 CAD each "
+          "for the Arctic Gear Co account, all logged correctly.",
+          {{"quantity","88"},{"unit_price","11.25"},{"customer","Arctic Gear Co"}}, "early"},
+         {"Recap for the file: Arctic Gear Co, 88 units, 11.25 CAD per unit — nothing else changes here.",
+          {{"customer","Arctic Gear Co"},{"quantity","88"},{"unit_price","11.25"}}, "mid"},
+         {"> 88 of the Insulated Flask 750ml\n\nconfirmed, that count is still what we're working with.",
+          {{"quantity","88"}}, "pre_corr"},
+         {"As per the Arctic Gear Co file, 88 units at 11.25 CAD each remain correct aside from "
+          "the date change.",
+          {{"customer","Arctic Gear Co"},{"quantity","88"},{"unit_price","11.25"}}, "post_corr"},
+       }},
       {"t_en7", false, "m_en7", "quantity",
        "quick update from the lab — turns out we only need enough Anti-Reflective Lens Blanks to "
-       "cover 130 units this run, the rest of the batch got reassigned elsewhere.", "130", "mid", false, false, "", 5000},
+       "cover 130 units this run, the rest of the batch got reassigned elsewhere.", "130", "mid", false, false, "", 4500,
+       {
+         {"As per order no. LO-0098, the Lumen Optics GmbH account still shows 6.80 EUR/pc as "
+          "the agreed unit price.",
+          {{"order_number","LO-0098"},{"customer","Lumen Optics GmbH"},{"unit_price","6.80"}}, "early"},
+         {"Confirming delivery required 2025-10-19 is still correct on our production schedule "
+          "for Lumen Optics GmbH.",
+          {{"delivery_date","2025-10-19"},{"customer","Lumen Optics GmbH"}}, "mid"},
+         {"To recap: order no. LO-0098, Lumen Optics GmbH, unit price 6.80 EUR/pc, delivery "
+          "required 2025-10-19.",
+          {{"order_number","LO-0098"},{"customer","Lumen Optics GmbH"},{"unit_price","6.80"},{"delivery_date","2025-10-19"}}, "pre_corr"},
+         {"> 6.80 EUR/pc\n\nconfirmed, that unit price still stands for Lumen Optics GmbH.",
+          {{"unit_price","6.80"},{"customer","Lumen Optics GmbH"}}, "post_corr"},
+       }},
       {"t_de1", true, "m_de1", "unit_price",
        "Korrektur zur Bergblick-Bestellung: der Einzelpreis für den Wanderstock Alu Pro beträgt "
-       "jetzt 27,50 EUR — der Hersteller hat die Preise angepasst.", "27,50", "early", true, false, "", 4400},
+       "jetzt 27,50 EUR — der Hersteller hat die Preise angepasst.", "27,50", "early", true, false, "", 3900,
+       {
+         {"Kurze Bestätigung vom Lager: 80 Stück des Wanderstock Alu Pro sind für die Bergblick "
+          "Handels GmbH eingeplant, Bestelldatum 2025-10-13 ist bei uns korrekt hinterlegt.",
+          {{"quantity","80"},{"customer","Bergblick Handels GmbH"},{"order_date","2025-10-13"}}, "early"},
+         {"Zusammenfassung zum aktuellen Stand: Bergblick Handels GmbH, 80 Stück, Liefertermin "
+          "weiterhin 2025-10-27.",
+          {{"customer","Bergblick Handels GmbH"},{"quantity","80"},{"delivery_date","2025-10-27"}}, "mid"},
+         {"Mit Verweis auf die Bergblick Handels GmbH: Bestelldatum 2025-10-13 und Liefertermin "
+          "2025-10-27 bleiben unverändert.",
+          {{"customer","Bergblick Handels GmbH"},{"order_date","2025-10-13"},{"delivery_date","2025-10-27"}}, "pre_corr"},
+         {"> 2025-10-27\n\nja, der Liefertermin bleibt so für die Bergblick Handels GmbH.",
+          {{"delivery_date","2025-10-27"},{"customer","Bergblick Handels GmbH"}}, "post_corr"},
+       }},
       {"t_de3", true, "m_de3", "delivery_date",
        "kurz zur info, die spedition kann den termin diese woche nicht mehr schaffen, das rutscht "
        "jetzt eher richtung 2025-10-07.", "2025-10-07", "late", false, true,
        "Kurzer Zwischenstand von der Filiale: für 2025-09-30 ist die Anlieferung der Schrauben "
-       "weiterhin so im System eingetragen, sieht soweit gut aus.", 5400},
+       "weiterhin so im System eingetragen, sieht soweit gut aus.", 4900,
+       {
+         {"Zusammenfassung bisher: steinweg baumarkt, 300 x verzinkte schlossschraube 10mm, je "
+          "0,35 eur, bestellref SW-7742.",
+          {{"customer","steinweg baumarkt"},{"quantity","300"},{"unit_price","0,35"},{"order_number","SW-7742"}}, "early"},
+         {"> 300 x verzinkte schlossschraube 10mm\n\nja, die Menge stimmt weiterhin, keine Änderung nötig.",
+          {{"quantity","300"}}, "mid"},
+         {"Bestätigung vom Lager: bestellref SW-7742 für steinweg baumarkt ist weiterhin korrekt vermerkt.",
+          {{"order_number","SW-7742"},{"customer","steinweg baumarkt"}}, "pre_corr"},
+         {"Mit Verweis auf SW-7742: der Einzelpreis von 0,35 eur für steinweg baumarkt bleibt unverändert.",
+          {{"order_number","SW-7742"},{"unit_price","0,35"},{"customer","steinweg baumarkt"}}, "post_corr"},
+       }},
       {"t_de5", true, "m_de5", "quantity",
        "Korrektur: wir benötigen jetzt 96 Stück der Isolierflasche 750ml statt vorher, ein "
-       "zweites Team ist dazugekommen.", "96", "mid", true, false, "", 5200},
+       "zweites Team ist dazugekommen.", "96", "mid", true, false, "", 4700,
+       {
+         {"> stückpreis 11,25 EUR\n\ngenau, dieser Preis bleibt unverändert.",
+          {{"unit_price","11,25"}}, "early"},
+         {"Mit Verweis auf die Polar Ausrüstung GmbH: gewünschte lieferung bleibt 2026-01-15.",
+          {{"customer","Polar Ausrüstung GmbH"},{"delivery_date","2026-01-15"}}, "mid"},
+         {"Bestätigung vom Lager: für Polar Ausrüstung GmbH steht stückpreis 11,25 EUR und "
+          "lieferung 2026-01-15 weiterhin so im System.",
+          {{"customer","Polar Ausrüstung GmbH"},{"unit_price","11,25"},{"delivery_date","2026-01-15"}}, "pre_corr"},
+         {"Zusammenfassung: Polar Ausrüstung GmbH, stückpreis weiterhin 11,25 EUR.",
+          {{"customer","Polar Ausrüstung GmbH"},{"unit_price","11,25"}}, "post_corr"},
+       }},
       {"t_de7", true, "m_de7", "unit_price",
        "achso, der Großhändler hat das Griffband teurer gemacht, das kommt jetzt eher auf 2,10 "
        "EUR raus.", "2,10", "early", false, true,
        "Kurze Rückmeldung vom Lager: für das Griffband steht bei uns weiterhin 1,95 EUR pro Rolle "
-       "in der Preisliste, falls das noch relevant ist.", 4800},
+       "in der Preisliste, falls das noch relevant ist.", 4300,
+       {
+         {"Mit Verweis auf Gipfel Sport: 500 Griffband-Rollen, gesamt 975,00 EUR, benötigt bis "
+          "2025-11-28 — soweit alles wie besprochen.",
+          {{"customer","Gipfel Sport"},{"quantity","500"},{"total","975,00"},{"delivery_date","2025-11-28"}}, "early"},
+         {"Zusammenfassung: Gipfel Sport, 500 Rollen, Liefertermin 2025-11-28.",
+          {{"customer","Gipfel Sport"},{"quantity","500"},{"delivery_date","2025-11-28"}}, "mid"},
+         {"Bestätigung vom Lager: gesamt 975,00 EUR und Liefertermin 2025-11-28 stehen für "
+          "Gipfel Sport weiterhin so im System.",
+          {{"total","975,00"},{"delivery_date","2025-11-28"},{"customer","Gipfel Sport"}}, "pre_corr"},
+         {"> 500 Griffband-Rollen\n\nja, diese Menge bleibt für Gipfel Sport gültig.",
+          {{"quantity","500"},{"customer","Gipfel Sport"}}, "post_corr"},
+       }},
+    };
+}
+
+// SS3 — powering Gate 2, and testing SS2's one hypothesis (2026-09-05).
+//
+// SS2 validated the alarm on ONE true positive (t_de3). A product cannot rest
+// on n=1 — the two-signal rule exists for exactly this, and it is what caught
+// Gemma's L4H7 at 51% after three held-out prompts passed. SS2 §2 also named
+// where more STALE cases live: its single failure was **late + indirect +
+// distractor**, while t_en5 — equally late, equally distracted, but phrased
+// EXPLICITLY ("One correction on the ... order:") — survived. That is a
+// hypothesis from one case: *indirect phrasing is the discriminator, not
+// position.*
+//
+// Design: MATCHED PAIRS. Six unused seeds from the same messy corpus, each
+// built TWICE into a thread that is identical in seed, corrected concept,
+// corrected value, distractor text, position (late) and target length (5400
+// tokens) — and differs ONLY in how the correction is phrased. Everything the
+// alarm could key on other than phrasing is held constant within a pair, so
+// a split between the arms is attributable, and a NON-split falsifies the
+// hypothesis rather than leaving it open.
+//
+// Two outcomes, both useful:
+//  - indirect arm produces several STALE, explicit arm ~none ⇒ recall gets a
+//    real denominator AND the discriminator is identified (a generator for
+//    stale cases, and a shape the product can warn about).
+//  - both arms ~all FRESH ⇒ t_de3 was seed-specific, the profile does not
+//    reproduce, and Gate 2 recall stays honestly unpowered. Worth knowing
+//    before any product work rests on it.
+//
+// Constraint honored in every added message body: it states the corrected
+// concept's value and NO other tracked field value, so the citation targets
+// of the untouched fields stay single-sourced in msg0 (an added mention would
+// silently make a correct citation look wrong).
+//
+// Gated SS3=1. Shares run_ss2() verbatim — same alarm, same scorer, same
+// tolerant parse. SS2=1 still returns SS2's own eight threads unchanged.
+static std::vector<S2ThreadDef> ss3_thread_defs() {
+    // Per pair: {seed, concept, old -> new, distractor restating old}.
+    // "exp" = explicit correction marker; "ind" = the same correction stated
+    // indirectly, as a passing remark. Nothing else differs within a pair.
+    const int TGT = 5400;   // t_de3's length — the one observed positive
+    return {
+      // ── m_en2 · unit_price 0.14 -> 0.19 ────────────────────────────────
+      {"en2_exp", false, "m_en2", "unit_price",
+       "Correction on the glove order: the unit price for the Nitrile Exam Gloves (M) is now "
+       "0.19 USD per unit — our supplier revised the rate.", "0.19", "late", true, true,
+       "Warehouse note: the Nitrile Exam Gloves (M) are still down as 0.14 USD per unit in our "
+       "system, in case that helps with the paperwork.", TGT},
+      {"en2_ind", false, "m_en2", "unit_price",
+       "heads up, our supplier put the nitrile line up again this quarter, so the gloves work out "
+       "to 0.19 USD a unit on our side now.", "0.19", "late", false, true,
+       "Warehouse note: the Nitrile Exam Gloves (M) are still down as 0.14 USD per unit in our "
+       "system, in case that helps with the paperwork.", TGT},
+      // ── m_en4 · quantity 640 -> 700 ────────────────────────────────────
+      {"en4_exp", false, "m_en4", "quantity",
+       "Correction on this week's order: we now need 700 cartons of the Cold-Pressed Coconut Oil "
+       "(1L) — a second outlet has been added to the run.", "700", "late", true, true,
+       "Warehouse note: 640 cartons of the coconut oil are pencilled in on our side for the "
+       "Meridian pickup, looking on track.", TGT},
+      {"en4_ind", false, "m_en4", "quantity",
+       "one more thing — a second outlet joined the run this week, so we end up nearer 700 cartons "
+       "of the coconut oil.", "700", "late", false, true,
+       "Warehouse note: 640 cartons of the coconut oil are pencilled in on our side for the "
+       "Meridian pickup, looking on track.", TGT},
+      // ── m_en6 · quantity 24 -> 40 ──────────────────────────────────────
+      {"en6_exp", false, "m_en6", "quantity",
+       "Correction on the cleat order: we now need 40 of the Stainless Cleat 6in — the second "
+       "pontoon got approved after all.", "40", "late", true, true,
+       "Yard note: we have 24 of the Stainless Cleat 6in put aside for Harbour Point, ready "
+       "whenever the truck comes.", TGT},
+      {"en6_ind", false, "m_en6", "quantity",
+       "quick one from the yard — the second pontoon got signed off after all, so we're looking at "
+       "40 of the cleats for this run.", "40", "late", false, true,
+       "Yard note: we have 24 of the Stainless Cleat 6in put aside for Harbour Point, ready "
+       "whenever the truck comes.", TGT},
+      // ── m_de2 · unit_price 0,12 -> 0,15 ────────────────────────────────
+      {"de2_exp", true, "m_de2", "unit_price",
+       "Korrektur zur Handschuh-Bestellung: der Einzelpreis für die Einweghandschuhe Nitril (M) "
+       "beträgt jetzt 0,15 EUR — der Hersteller hat die Preise angepasst.", "0,15", "late", true, true,
+       "Kurze Rückmeldung aus dem Lager: für die Nitril-Handschuhe stehen bei uns weiterhin "
+       "0,12 EUR pro Stück in der Preisliste.", TGT},
+      {"de2_ind", true, "m_de2", "unit_price",
+       "kurz zur info, der hersteller hat bei der nitril-linie nochmal aufgeschlagen, damit kommen "
+       "wir jetzt eher auf 0,15 EUR pro stück.", "0,15", "late", false, true,
+       "Kurze Rückmeldung aus dem Lager: für die Nitril-Handschuhe stehen bei uns weiterhin "
+       "0,12 EUR pro Stück in der Preisliste.", TGT},
+      // ── m_de4 · quantity 640 -> 700 ────────────────────────────────────
+      {"de4_exp", true, "m_de4", "quantity",
+       "Korrektur zur Wochenbestellung: wir benötigen jetzt 700 Kartons Kaltgepresstes Kokosöl "
+       "(1L) — eine weitere Filiale ist dazugekommen.", "700", "late", true, true,
+       "Zwischenstand aus dem Lager: für das Kokosöl sind bei uns 640 Kartons vorgemerkt, das "
+       "sieht soweit gut aus.", TGT},
+      {"de4_ind", true, "m_de4", "quantity",
+       "ach, noch etwas — eine weitere Filiale ist diese Woche dazugekommen, damit landen wir eher "
+       "bei 700 Kartons Kokosöl.", "700", "late", false, true,
+       "Zwischenstand aus dem Lager: für das Kokosöl sind bei uns 640 Kartons vorgemerkt, das "
+       "sieht soweit gut aus.", TGT},
+      // ── m_de6 · unit_price 27,50 -> 29,80 ──────────────────────────────
+      {"de6_exp", true, "m_de6", "unit_price",
+       "Korrektur: der Stückpreis für die Edelstahlklampe 15cm beträgt jetzt 29,80 EUR — die "
+       "Preisliste wurde zum Quartal angepasst.", "29,80", "late", true, true,
+       "Kurze Rückmeldung: für die Edelstahlklampe steht bei uns weiterhin 27,50 EUR pro Stück in "
+       "der Liste, falls das noch relevant ist.", TGT},
+      {"de6_ind", true, "m_de6", "unit_price",
+       "kurze info, das material ist teurer geworden, die klampe kommt jetzt eher auf 29,80 EUR "
+       "pro Stück raus.", "29,80", "late", false, true,
+       "Kurze Rückmeldung: für die Edelstahlklampe steht bei uns weiterhin 27,50 EUR pro Stück in "
+       "der Liste, falls das noch relevant ist.", TGT},
     };
 }
 
@@ -3690,12 +3933,44 @@ static std::vector<S2Msg> s2_build_thread(Tokenizer* tok, const std::string& tas
         prev_name = name; fi++;
         return m;
     };
+    // Same envelope as mk_named, but for a restatement message that repeats
+    // several NON-corrected field values at once (a recap or cross-reference
+    // naturally names more than one figure). See S2Restate for why
+    // def.corr_concept is never passed through here.
+    auto mk_fields = [&](const std::string& body,
+                         const std::vector<std::pair<std::string, std::string>>& fields) -> S2Msg {
+        std::string name = s2_qname(de, fi), date = s2_qdate(fi);
+        S2Msg m;
+        m.pre = "From: " + name + "\nDate: " + date + "\n\n" + (de ? "Hallo,\n\n" : "Hi,\n\n");
+        m.body = body;
+        m.post = de ? "\n\nViele Grüße\n" + name + "\n" : "\n\nBest,\n" + name + "\n";
+        m.quote_lead = de ? ("\nAm " + date + " schrieb " + prev_name + ":\n")
+                          : ("\nOn " + date + ", " + prev_name + " wrote:\n");
+        m.fields = fields;
+        prev_name = name; fi++;
+        return m;
+    };
+    // Insert every authored restatement tagged with `depth`, in def.restatements
+    // order. Depths are relative to the correction reply, not absolute message
+    // count, so a value's occurrences land at genuinely different distances
+    // from the decode position across the 4 call sites below.
+    auto add_restatements = [&](const char* depth) {
+        for (auto& rs : def.restatements)
+            if (rs.depth == depth) msgs.push_back(mk_fields(rs.body, rs.fields));
+    };
+
+    add_restatements("early");
 
     int pre_seed = def.position == "late" ? 6 : def.position == "mid" ? 3 : 1;
-    for (int i = 0; i < pre_seed; ++i) msgs.push_back(mk_filler());
+    int pre_seed_half = pre_seed / 2;
+    for (int i = 0; i < pre_seed_half; ++i) msgs.push_back(mk_filler());
+    add_restatements("mid");
+    for (int i = pre_seed_half; i < pre_seed; ++i) msgs.push_back(mk_filler());
 
+    add_restatements("pre_corr");
     msgs.push_back(mk_named(def.corr_body, def.corr_concept, def.corr_new));
     int corr_pos = (int)msgs.size() - 1;
+    add_restatements("post_corr");
 
     if (def.has_distractor) {
         msgs.push_back(mk_filler());
@@ -3733,19 +4008,82 @@ static int s2_classify(const std::vector<std::pair<size_t, size_t>>& env, size_t
     return -1;
 }
 
+// TRIVIAL-RULE CONTROL — defends the citation result against the same
+// failure class that killed the earlier image-tap probe (a head that looked
+// like it tracked an object but was actually just favouring one side of the
+// image). Threads quote history, so a scored value string can appear in
+// several messages; if a head merely points at "the most recent copy" or
+// "the first copy" of the string, it adds nothing over a plain string search
+// and the citation result is an artifact, not evidence of retrieval. This
+// finds every literal occurrence of a value in the prompt and classifies
+// each by message index, so callers can compare the head's pick against
+// R_last / R_first / R_near. Known limitation: literal substring match can
+// false-positive on short values (e.g. "5" inside "15") — acceptable here
+// because the scored fields (names, prices, order numbers, dates) are
+// distinctive strings, not single digits.
+static std::vector<std::pair<int, int>> s2_occurrences(
+        const std::string& prompt, const std::vector<std::pair<size_t, size_t>>& env,
+        const std::vector<size_t>& pcum, int P, const std::string& value) {
+    std::vector<std::pair<int, int>> occ;   // {msg_idx, token_pos}, ascending position
+    if (value.empty()) return occ;
+    size_t p = 0;
+    while (true) {
+        size_t f = prompt.find(value, p);
+        if (f == std::string::npos) break;
+        int mi = s2_classify(env, f);
+        int lo, hi;
+        if (mi >= 0 && s2_bytes_to_toks(pcum, P, f, f + value.size(), lo, hi))
+            occ.push_back({mi, lo});
+        p = f + 1;
+    }
+    return occ;
+}
+
+// One row of the alarm-field control (item 4): what the head cited vs. what
+// each trivial rule would have predicted, for the 8 correction instances.
+// n is tiny here — print rows, not a rate.
+struct S2TrivAlarmRow {
+    std::string thread, concept;
+    int head_msg = -1, r_last = -1, r_first = -1, r_near = -1;
+};
+
 // One scored field instance (the corrected field, one per thread).
 struct S2AlarmRec {
     std::string thread, position; bool de, explicit_ph, has_distractor;
     int label = -1;           // 1 FRESH (emitted current), 0 STALE (emitted superseded), -1 excluded
-    bool alarm = false;
-    int cited_msg = -1, current_msg = -1;
+    bool alarm = false;       // ORACLE arm — uses corpus ground truth (see below)
+    bool alarm_srv = false;   // SERVEABLE arm — uses only what /v1/extract would have
+    bool alarm_srv2 = false;  // SERVEABLE+ — same, plus the confirmation check (see below)
+    int cited_msg = -1, current_msg = -1, latest_cited_msg = -1;
 };
+
+// ═══ Two alarms, deliberately ═════════════════════════════════════════════
+// SS2 scored ONE predicate: "the cited message is superseded for this field",
+// where `superseded` comes from field_spans — corpus ground truth listing which
+// messages state a value for the concept. **A server cannot compute that.** At
+// serve time /v1/extract has the document, the caller's message boundaries, the
+// emitted value and the top-k citations; it does NOT know which other messages
+// speak to the same key. Scoring only the oracle would validate a predicate the
+// product can never run — the same class of defect as SS2's own L3H13_SLOT
+// no-op override, caught before an hour of GPU rather than after.
+//
+// So both are scored on the same run:
+//   ORACLE     (r.alarm)     — cited message ∈ superseded_msgs (ground truth).
+//   SERVEABLE  (r.alarm_srv) — the field's citations span a LATER message than
+//                              the one the emitted value was drawn from. Uses
+//                              only shipped signals plus caller-declared message
+//                              boundaries, so it is exactly what a v3 endpoint
+//                              could raise. Its known weakness is that a
+//                              citation landing in a later FILLER message counts
+//                              — measuring that cost is the point.
+// A gap between the two arms is the real cost of shipping the alarm.
 
 static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
                    Tokenizer* tok, const ModelMetadata& meta,
-                   const std::vector<int32_t>& attn_layers) {
+                   const std::vector<int32_t>& attn_layers,
+                   const std::vector<S2ThreadDef>& defs, const char* leg) {
     std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    std::printf("║ SS2 — coverage-free thread stale-source alarm (grammar, long) ║\n");
+    std::printf("║ %-3s — coverage-free thread stale-source alarm (long threads) ║\n", leg);
     std::printf("╚══════════════════════════════════════════════════════════════╝\n");
     std::printf("citation tap: L%dH%d (slot %d)  [defaults 0/13 = Qwen3.6 L3H13; override via "
                 "ATTN_FROZEN_SLOT/ATTN_FROZEN_HEAD]\n", (*g_attn_layers)[FROZEN_SLOT], FROZEN_HEAD, FROZEN_SLOT);
@@ -3791,10 +4129,25 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
     struct CiteAcc { int n = 0, t1 = 0, t3 = 0; };
     CiteAcc cite_all;
+    // RE-SCORE (2026-09-05). cite_all is STRICT: a hit requires the citation to
+    // land in the field's designated message (msg 0 for uncorrected fields).
+    // Once the corpus restates values truthfully in several later messages, that
+    // label asserts a unique correct source where several equally true ones
+    // exist — the head pointing at a confirmation instead of the original scores
+    // as a miss. cite_any is PERMISSIVE: a hit if the citation lands in ANY
+    // literal occurrence of the value. The strict/permissive GAP separates "the
+    // head is inaccurate" from "our ground truth is wrong".
+    CiteAcc cite_any;
     std::vector<S2AlarmRec> alarms;
     int excluded = 0, labeled_total = 0;
 
-    for (auto& def : ss2_thread_defs()) {
+    // TRIVIAL-RULE CONTROL accumulator, across every scored value token in
+    // every thread (see s2_occurrences above for what this defends against).
+    struct TrivAgg { long ambiguous = 0, last_agree = 0, first_agree = 0, near_agree = 0; };
+    TrivAgg triv;
+    std::vector<S2TrivAlarmRow> triv_rows;   // the 8 alarm-field rows (item 4)
+
+    for (auto& def : defs) {
         const QMessy& seed = find_seed(def.seed_tag);
         int corr_idx = -1; std::string corr_old;
         std::vector<S2Msg> msgs = s2_build_thread(tok, TASK, def, seed, corr_idx, corr_old);
@@ -3827,8 +4180,12 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
             else field_spans[sp.tag].push_back({sp.msg_idx, {base + sp.lo, base + sp.hi}});
         }
 
+        // `cited_any` collects EVERY top-3 citation's message index over every
+        // scored token of the value — the serveable arm's raw material.
+        std::set<int> cited_any;
         auto score_field = [&](const std::string& concept, const std::string& emitted_value,
                                const std::vector<std::pair<size_t, size_t>>& target_spans) -> int {
+            cited_any.clear();
             // returns the classified msg_idx of the top-1 citation on the LAST
             // scored gen-token (majority not needed for single/short values;
             // multi-token values use the final token, which is where the
@@ -3837,6 +4194,18 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
             if (gb == std::string::npos) return -2;   // normalized away
             size_t ge = gb + emitted_value.size();
             int last_cited = -1;
+            // Full occurrence set O of this value across the prompt, computed
+            // once per field-call (same value for every scored gen-token of
+            // it) — see s2_occurrences for what this is for.
+            auto occ = s2_occurrences(prompt, env, pcum, R.P, emitted_value);
+            // Every literal occurrence, as byte spans — the permissive target.
+            std::vector<std::pair<size_t, size_t>> any_spans;
+            for (size_t q = 0; ; ) {
+                size_t f = prompt.find(emitted_value, q);
+                if (f == std::string::npos) break;
+                any_spans.push_back({f, f + emitted_value.size()});
+                q = f + 1;
+            }
             for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
                 if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
                 if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
@@ -3853,7 +4222,43 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 }
                 if (t1) cite_all.t1++;
                 if (t3) cite_all.t3++;
+                bool a1 = false, a3 = false;
+                for (auto& [tlo, thi] : any_spans) {
+                    int slo, shi;
+                    if (!s2_bytes_to_toks(pcum, R.P, tlo, thi, slo, shi)) continue;
+                    auto ain = [&](int q) { return q >= slo - TOL && q <= shi + TOL; };
+                    if (!tk.empty() && ain(tk[0].first)) a1 = true;
+                    for (auto& pr : tk) if (ain(pr.first)) { a3 = true; break; }
+                }
+                cite_any.n++;
+                if (a1) cite_any.t1++;
+                if (a3) cite_any.t3++;
+                // TRIVIAL-RULE CONTROL: only meaningful when the value is
+                // genuinely ambiguous in the prompt (|O| >= 2). R_near is
+                // computed generically (nearest occurrence by token distance
+                // to n_kv) even though, by construction, decode always
+                // happens strictly after the whole prompt here, which makes
+                // R_near coincide with R_last — reported anyway for
+                // completeness and stated explicitly in the summary so it is
+                // not mistaken for an independent confirmation.
+                if (occ.size() >= 2 && !tk.empty()) {
+                    triv.ambiguous++;
+                    int head_msg = s2_classify(env, pcum[tk[0].first]);
+                    int r_last = occ.back().first, r_first = occ.front().first;
+                    int r_near = r_first; int best_d = -1;
+                    for (auto& o : occ) {
+                        int d = std::abs(n_kv - o.second);
+                        if (best_d < 0 || d < best_d) { best_d = d; r_near = o.first; }
+                    }
+                    if (head_msg == r_last) triv.last_agree++;
+                    if (head_msg == r_first) triv.first_agree++;
+                    if (head_msg == r_near) triv.near_agree++;
+                }
                 if (!tk.empty()) last_cited = s2_classify(env, pcum[tk[0].first]);
+                for (auto& pr : tk) {
+                    int mi = s2_classify(env, pcum[pr.first]);
+                    if (mi >= 0) cited_any.insert(mi);
+                }
             }
             return last_cited;
         };
@@ -3898,10 +4303,54 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 // message" (a filler-message citation is noise, not a
                 // stale-source finding, and must not count as either).
                 r.alarm = std::find(superseded_msgs.begin(), superseded_msgs.end(), cited) != superseded_msgs.end();
+                // SERVEABLE arm: the field's citations reach a message LATER than
+                // the one the emitted value came from ⇒ the value the model wrote
+                // is not from the last place it looked for this key. No ground
+                // truth consulted — only citations and message boundaries.
+                r.latest_cited_msg = cited_any.empty() ? -1 : *cited_any.rbegin();
+                r.alarm_srv = cited >= 0 && r.latest_cited_msg > cited;
+                // SERVEABLE+ : SERVEABLE's documented weakness is that ANY later
+                // cited message fires it — including one that merely RESTATES the
+                // same value. A confirmation ("confirming 300 units") is a later
+                // message saying the identical thing; it is not a supersession,
+                // and treating it as one manufactured false alarms the moment the
+                // corpus gained restatements (FP 2 -> 4). Fix: fire only when the
+                // later cited message does NOT contain the emitted value. Still
+                // server-computable — the endpoint has the document, the caller's
+                // message boundaries and the emitted value, so it can string-search
+                // that message without any ground truth about which keys it speaks to.
+                std::set<int> msgs_restating;
+                for (auto& [mi, tp] : s2_occurrences(prompt, env, pcum, R.P, emitted))
+                    msgs_restating.insert(mi);
+                r.alarm_srv2 = r.alarm_srv && !msgs_restating.count(r.latest_cited_msg);
                 alarms.push_back(r);
+                // TRIVIAL-RULE CONTROL, item 4: this correction instance is
+                // one of the tiny handful (n=8) of real alarm fields, so
+                // record what each trivial rule would have predicted here
+                // for the row dump — n is too small for a rate.
+                {
+                    auto occ = s2_occurrences(prompt, env, pcum, R.P, emitted);
+                    if (occ.size() >= 2) {
+                        S2TrivAlarmRow tr; tr.thread = def.tag; tr.concept = f.concept;
+                        tr.head_msg = cited; tr.r_last = occ.back().first;
+                        tr.r_first = occ.front().first; tr.r_near = tr.r_last;
+                        triv_rows.push_back(tr);
+                    }
+                }
                 std::printf("  [ALARM FIELD] %-13s emitted=%-12s label=%-5s cited_msg=%-3d "
-                            "current_msg=%-3d -> %s\n", f.concept.c_str(), emitted.c_str(),
-                            label ? "FRESH" : "STALE", cited, corr_idx, r.alarm ? "ALARM" : "silent");
+                            "latest_cited=%-3d current_msg=%-3d -> oracle:%-6s serveable:%s\n",
+                            f.concept.c_str(), emitted.c_str(), label ? "FRESH" : "STALE", cited,
+                            r.latest_cited_msg, corr_idx, r.alarm ? "ALARM" : "silent",
+                            r.alarm_srv ? "ALARM" : "silent");
+                // DIAGNOSTIC: SERVEABLE takes the MAX over every message any
+                // citation touched, so one stray hit into a late filler fires it.
+                // Print the whole cited set, marking which messages actually
+                // restate the emitted value (*) vs. which do not (-), so the
+                // firing mechanism is visible instead of guessed at.
+                std::printf("      cited_any = {");
+                for (int cm : cited_any)
+                    std::printf("%d%s ", cm, msgs_restating.count(cm) ? "*" : "-");
+                std::printf("}  (* = message contains the emitted value)\n");
             } else {
                 std::string ev;
                 for (auto& gf : gfs) if (gf.name == f.concept) { ev = gf.value; break; }
@@ -3921,8 +4370,77 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 cite_all.n, t1p, cite_all.t1, cite_all.n, t3p, cite_all.t3, cite_all.n);
     std::printf("  excluded (normalized / not emitted verbatim): %d / %d labeled fields\n",
                 excluded, labeled_total);
+    // PERMISSIVE re-score printed alongside: same citations, target = ANY literal
+    // occurrence of the value rather than only its designated message.
+    double a1p = cite_any.n ? 100.0 * cite_any.t1 / cite_any.n : 0;
+    double a3p = cite_any.n ? 100.0 * cite_any.t3 / cite_any.n : 0;
+    std::printf("  RE-SCORE permissive (hit = ANY truthful occurrence of the value):\n"
+                "    top1=%.0f%% (%d/%d)  top3=%.0f%% (%d/%d)\n"
+                "    strict->permissive delta: top1 %+.0f pts, top3 %+.0f pts\n"
+                "    A LARGE delta means the strict number is a LABELLING artifact (the head\n"
+                "    points at a truthful confirmation, not the designated message). A SMALL\n"
+                "    delta means the head genuinely misses the value's locations.\n",
+                a1p, cite_any.t1, cite_any.n, a3p, cite_any.t3, cite_any.n,
+                a1p - t1p, a3p - t3p);
     bool gate0 = cite_all.n > 0 && t3p >= 85.0;
     std::printf("  => %s\n", gate0 ? "GATE 0 PASS" : "GATE 0 FAIL — citation not measurable at thread scale");
+    // Item 5 (open question settled): every call to score_field passes
+    // target_spans restricted to specific message(s) — the corrected
+    // message alone for FRESH, the superseded-but-not-corrected messages for
+    // STALE, message 0 alone for the non-corrected "other fields" branch.
+    // corr_idx's own span is explicitly excluded from the STALE target set.
+    // So a hit requires landing in one of those named messages, NOT merely
+    // matching the value string anywhere in the prompt: Gate 0's target
+    // spans are MESSAGE-SCOPED, not value-scoped. Its 98% therefore DID
+    // require the head to land in the right subset of messages for each
+    // scored token, not just anywhere the string repeats.
+    std::printf("  scope: target spans are MESSAGE-SCOPED (specific message(s) per field), "
+                "not value-scoped (any copy anywhere) — see comment above cite_all.n at score_field.\n");
+
+    // ══════════════ TRIVIAL-RULE CONTROL ══════════════════════════════════════
+    // Defends the citation result above against the same failure class that
+    // killed the earlier image-tap probe: a head that looks like it tracks
+    // something meaningful but is actually just a positional artifact (there,
+    // favouring one side of the image; here, always pointing at "the most
+    // recent copy" or "the first copy" of a repeated value). If a trivial
+    // positional rule reproduces the head's picks, the head adds nothing
+    // over plain string matching.
+    std::printf("\n================ TRIVIAL-RULE CONTROL ================\n");
+    // Item 1 — denominator FIRST. Ambiguity requires |O| >= 2 (the value
+    // actually repeats in the prompt); MIN_AMBIGUOUS_N is a stated bar below
+    // which a rate is not worth reporting (chosen, like the file's other
+    // bars, to keep a percentage from resting on a handful of tokens).
+    const int MIN_AMBIGUOUS_N = 20;
+    std::printf("  scored tokens with an actual ambiguity to resolve (|O|>=2): %ld / %d total scored\n",
+                triv.ambiguous, cite_all.n);
+    if (triv.ambiguous < MIN_AMBIGUOUS_N) {
+        std::printf("  denominator < %d — THE CONTROL CANNOT RUN. Do not read a rate below; there is "
+                    "not enough genuine ambiguity in this corpus to test the head against a trivial "
+                    "positional rule.\n", MIN_AMBIGUOUS_N);
+    } else {
+        double rate_last  = 100.0 * triv.last_agree  / triv.ambiguous;
+        double rate_first = 100.0 * triv.first_agree / triv.ambiguous;
+        double rate_near  = 100.0 * triv.near_agree  / triv.ambiguous;
+        std::printf("  R_last  agreement: %.0f%% (%ld/%ld)\n", rate_last,  triv.last_agree,  triv.ambiguous);
+        std::printf("  R_first agreement: %.0f%% (%ld/%ld)\n", rate_first, triv.first_agree, triv.ambiguous);
+        std::printf("  R_near  agreement: %.0f%% (%ld/%ld)  [coincides with R_last by construction here: "
+                    "decode always follows the whole prompt, so the nearest occurrence to the decode "
+                    "position is always the last one — reported for completeness, not as an "
+                    "independent confirmation]\n", rate_near, triv.near_agree, triv.ambiguous);
+        double best = std::max({rate_last, rate_first, rate_near});
+        double disagree = 100.0 - best;
+        const char* verdict = (best >= 95.0) ? "FAIL (head is redundant — a trivial rule agrees >=95%)"
+                            : (disagree >= 15.0) ? "PASS (head is load-bearing — best trivial rule "
+                                                    "disagrees on >=15% of ambiguous tokens)"
+                            : "WEAK (neither bar met)";
+        std::printf("  best trivial rule agrees %.0f%% (disagrees %.0f%%)  => %s\n", best, disagree, verdict);
+    }
+    // Item 4 — the 8 alarm fields specifically. n is tiny; print rows.
+    std::printf("  alarm-field rows (n=%zu, head vs. what each trivial rule predicts):\n", triv_rows.size());
+    std::printf("  %-8s %-12s %-8s %-8s %-9s %-8s\n", "thread", "concept", "head", "R_last", "R_first", "R_near");
+    for (auto& tr : triv_rows)
+        std::printf("  %-8s %-12s %-8d %-8d %-9d %-8d\n", tr.thread.c_str(), tr.concept.c_str(),
+                    tr.head_msg, tr.r_last, tr.r_first, tr.r_near);
 
     // ── Gate 1: natural STALE rate ────────────────────────────────────────────
     int fresh = 0, stale = 0;
@@ -3947,20 +4465,46 @@ static int run_ss2(ForwardPassBase* fp, ggml_backend_sched_t sched,
         std::printf("  FRESH false-alarm rate (fired despite correct answer): %d/%d (%.0f%%)\n",
                     fp_fired, fp_n, fp_n ? 100.0 * fp_fired / fp_n : 0);
     } else {
-        int tp = 0, fn = 0, fp_n = 0, tn = 0;
-        for (auto& r : alarms) {
-            if (r.label == 0) { if (r.alarm) tp++; else fn++; }
-            else { if (r.alarm) fp_n++; else tn++; }
-        }
-        double precision = (tp + fp_n) ? 100.0 * tp / (tp + fp_n) : 0;
-        double recall = (tp + fn) ? 100.0 * tp / (tp + fn) : 0;
-        double falarm = (fp_n + tn) ? 100.0 * fp_n / (fp_n + tn) : 0;
-        std::printf("  TP=%d FN=%d FP=%d TN=%d\n", tp, fn, fp_n, tn);
-        std::printf("  precision=%.0f%%  recall=%.0f%%  FRESH false-alarm rate=%.0f%%\n",
-                    precision, recall, falarm);
+        auto score_arm = [&](const char* name, bool S2AlarmRec::*fired) {
+            int tp = 0, fn = 0, fp_n = 0, tn = 0;
+            for (auto& r : alarms) {
+                if (r.label == 0) { if (r.*fired) tp++; else fn++; }
+                else { if (r.*fired) fp_n++; else tn++; }
+            }
+            double precision = (tp + fp_n) ? 100.0 * tp / (tp + fp_n) : 0;
+            double recall = (tp + fn) ? 100.0 * tp / (tp + fn) : 0;
+            double falarm = (fp_n + tn) ? 100.0 * fp_n / (fp_n + tn) : 0;
+            std::printf("  %-10s TP=%d FN=%d FP=%d TN=%d  precision=%.0f%%  recall=%.0f%%  "
+                        "FRESH false-alarm=%.0f%%\n", name, tp, fn, fp_n, tn,
+                        precision, recall, falarm);
+        };
+        score_arm("ORACLE", &S2AlarmRec::alarm);
+        score_arm("SERVEABLE", &S2AlarmRec::alarm_srv);
+        score_arm("SERVEABLE+", &S2AlarmRec::alarm_srv2);
+        std::printf("  ORACLE uses corpus ground truth and CANNOT be computed by /v1/extract.\n"
+                    "  SERVEABLE uses only citations + caller-declared message boundaries — it is\n"
+                    "  the predicate a v3 endpoint could actually raise. Read the gap as the cost\n"
+                    "  of shipping the alarm, not as noise.\n");
     }
 
-    std::printf("\n================ VERDICT (SS2) ================\n");
+    // ── Phrasing split — SS2's one hypothesis, stated as a testable claim ────
+    // SS2 §2: its single STALE was late+indirect+distractor while an equally
+    // late, equally distracted but EXPLICIT correction survived ⇒ "indirect
+    // phrasing is the discriminator, not position." Under SS3's matched pairs
+    // (seed, concept, value, distractor, position and length identical within
+    // a pair; only phrasing differs) this table is the hypothesis test. Under
+    // SS2 it is descriptive only — those threads are not matched.
+    int e_n = 0, e_stale = 0, i_n = 0, i_stale = 0;
+    for (auto& r : alarms) {
+        if (r.explicit_ph) { e_n++; if (r.label == 0) e_stale++; }
+        else               { i_n++; if (r.label == 0) i_stale++; }
+    }
+    std::printf("\n================ PHRASING SPLIT — is indirect the discriminator? ==\n");
+    std::printf("  explicit correction: STALE %d/%d\n", e_stale, e_n);
+    std::printf("  indirect correction: STALE %d/%d\n", i_stale, i_n);
+    std::printf("  (matched pairs under SS3; descriptive only under SS2)\n");
+
+    std::printf("\n================ VERDICT (%s) ================\n", leg);
     if (!gate0) std::printf("  => STILL BLOCKED: Gate 0 failed (top3 %.0f%% < 85%% bar) — citation "
                             "not measurable at thread scale.\n", t3p);
     else if (!gate1) std::printf("  => NO JOB: Gate 0 passed but natural STALE is 0/%d at 4K-8K "
@@ -5436,6 +5980,255 @@ static int run_qdocs_s1(ForwardPassBase* fp, ggml_backend_sched_t sched,
     return (gate_top3 && gate_lfl) ? 0 : 1;
 }
 
+// ── CAND — candidate-set cheap-kill gate (docs/plan-candidate-set.md) ────────
+// Tests Gate 2 of the plan BEFORE any format/endpoint/schema work: does a cold
+// two-pass candidate finder emit exactly one span per UNCONTESTED key, or does
+// it over-report type-matches? Gates 1 (human precision) and 3 (seeded-conflict
+// recall) are out of scope here — see the plan and the task brief.
+//
+// Pass 1 is the shipped free-decode extraction path, byte-identical to the NG
+// arm of QDOCS_S1: run_lens_extract() with no grammar, on the same per-doc key
+// vocabulary (qdocs_messy_corpus() labels + the two verified-absent probes).
+// Pass 2 is a SEPARATE cold inference over the same document — fresh slot, full
+// prefill, a different instruction, taps DISARMED (run_freegen with an empty
+// tap_layers list — no kq_soft capture, which is also what makes flash
+// attention available in the real design). It asks the model to list every
+// span answering each hinted key, quoted verbatim from the document.
+static const char* CAND_PASS2_TASK_PREFIX =
+    "\n\nFor each of the following keys, list every span in the document above "
+    "that could answer it — for example a clause and a later amendment that both "
+    "give an amount are TWO spans for the same key, not one. Quote each span "
+    "EXACTLY as it appears in the document above: do not paraphrase, reformat, "
+    "translate, or combine spans. Write one span per line, in the exact form "
+    "key: \"span\". A key may have zero, one, or several spans; if it has none, "
+    "write key: (none). List every span for one key before moving to the next "
+    "key. Output only the list, nothing else. Keys: ";
+
+// Permissive line parser for pass 2's free-form output — not a grammar, so this
+// tolerates bullets/numbering and only requires `known_key: "span"` somewhere
+// on the line. Returns (key, span) pairs in EMISSION order; the caller dedups
+// and sorts into document order.
+static std::vector<std::pair<std::string, std::string>>
+cand_parse_pass2(const std::string& text, const std::vector<std::string>& keys) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::set<std::string> keyset(keys.begin(), keys.end());
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line)) {
+        size_t b = 0;
+        while (b < line.size() &&
+               (std::isspace((unsigned char)line[b]) || line[b] == '-' || line[b] == '*' ||
+                std::isdigit((unsigned char)line[b]) || line[b] == '.' || line[b] == ')'))
+            b++;
+        std::string rest = line.substr(b);
+        size_t colon = rest.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = rest.substr(0, colon);
+        while (!key.empty() && std::isspace((unsigned char)key.back())) key.pop_back();
+        if (!keyset.count(key)) continue;
+        std::string val = rest.substr(colon + 1);
+        std::string span;
+        size_t q1 = val.find('"');
+        if (q1 != std::string::npos) {
+            size_t q2 = val.find('"', q1 + 1);
+            if (q2 == std::string::npos) continue;   // unterminated quote — malformed
+            span = val.substr(q1 + 1, q2 - q1 - 1);
+        } else {
+            // TOLERANT PARSE. The strict version required key: "span" and dropped
+            // any unquoted line. The model honours the requested format on most
+            // documents but not all — m_en1 emitted EVERY line unquoted, all of
+            // them correct, and the strict parser silently discarded the lot. The
+            // probe then reported "(no candidates)", which is indistinguishable
+            // from "this document offers no answers" — a producer defect wearing
+            // the costume of a fact about the document. Same lesson the fixed KV
+            // grammar taught (docs/note-nogrammar-refutation.md): free decode does
+            // not reliably emit one shape, so the parse must be tolerant.
+            span = val;
+            size_t a = 0;
+            while (a < span.size() && std::isspace((unsigned char)span[a])) a++;
+            span.erase(0, a);
+            while (!span.empty() && std::isspace((unsigned char)span.back())) span.pop_back();
+            // "(none)" is a real ANSWER (this key has no candidate), not a parse
+            // failure — must not be counted as either a span or a malformed line.
+            if (span == "(none)" || span == "none" || span == "-") continue;
+        }
+        if (!span.empty()) out.emplace_back(key, span);
+    }
+    return out;
+}
+
+static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                          Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ CAND — candidate-set cheap-kill gate (plan-candidate-set.md)   ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const std::vector<std::string> ABSENT = {"payment_terms", "warranty_period"};
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    auto corpus = qdocs_messy_corpus();
+    int n_unparseable = 0;   // producer failures — see the FAIL LOUD block below
+    std::printf("corpus=%zu docs  ctx=%u\n", corpus.size(), n_ctx);
+
+    struct CandSet {
+        std::string p1_value;
+        bool p1_grounded = false;
+        bool p1_present  = false;
+        std::vector<std::string> cands;  // deduped, document order (found-in-doc first)
+    };
+    struct DocOut { std::string tag, document; bool de; std::map<std::string, CandSet> per_key;
+                    std::set<std::string> uncontested; };
+    std::vector<DocOut> docs_out;
+
+    for (const QMessy& d : corpus) {
+        std::vector<qinf::LensConcept> concepts;
+        for (const QLabel& f : d.fields) concepts.push_back({f.concept, ""});
+        for (const std::string& a : ABSENT) concepts.push_back({a, ""});
+        std::vector<std::string> keys;
+        for (auto& c : concepts) keys.push_back(c.key);
+
+        // ── Pass 1 — unchanged extraction (shipped free path, no grammar) ────
+        qinf::LensExtractOptions opts; opts.max_new_tokens = 400;
+        qinf::LensReport r;
+        try {
+            r = qinf::run_lens_extract(fp, sched, tok, meta, vocab_size, n_ctx, d.document,
+                                       concepts, opts, qinf::LensConstants{});
+        } catch (const qinf::LensUnparseableError& e) {
+            std::printf("\n[%s%s] PASS1 422 UNPARSEABLE — doc skipped\n  %.140s\n",
+                        d.tag.c_str(), d.de ? " DE" : "", e.raw.c_str());
+            continue;
+        }
+
+        DocOut out; out.tag = d.tag; out.de = d.de; out.document = d.document;
+        for (auto& k : keys) out.per_key[k];  // every hinted key gets an entry, even []
+        for (const auto& f : r.fields) {
+            auto it = out.per_key.find(f.key);
+            if (it == out.per_key.end()) continue;
+            if (!it->second.p1_present && f.present) {  // first occurrence wins
+                it->second.p1_value    = f.value;
+                it->second.p1_grounded = f.grounded;
+                it->second.p1_present  = true;
+            }
+        }
+
+        // ── Pass 2 — cold, separate inference, taps DISARMED ─────────────────
+        std::string task = CAND_PASS2_TASK_PREFIX;
+        for (size_t i = 0; i < keys.size(); ++i) task += (i ? ", " : "") + keys[i];
+        std::string prompt = qdocs_chat_prompt(d.document, task);
+        FreeRun P2 = run_freegen(fp, sched, tok, meta, prompt, "", /*tap_layers=*/{},
+                                 700, /*capture_conf=*/false, /*close_char=*/'\x01');
+        if (std::getenv("CAND_DEBUG"))
+            std::printf("\n[%s%s] PASS2 raw (%zu gen tok):\n%s\n", d.tag.c_str(),
+                        d.de ? " DE" : "", P2.gen_tokens.size(), P2.gen_text.c_str());
+
+        // FAIL LOUD on a producer failure. An empty parse over a NON-empty
+        // generation means the finder produced output we could not read — which
+        // is a different fact from "the document offers nothing", and must never
+        // render as an empty candidate set. This is the gap the plan's own states
+        // table does not yet cover (docs/plan-candidate-set.md §"The states it
+        // must express"): it separates absence from recall failure, but not
+        // either of those from PRODUCER failure.
+        auto parsed = cand_parse_pass2(P2.gen_text, keys);
+        if (parsed.empty() && !P2.gen_text.empty()) {
+            n_unparseable++;
+            std::printf("  !! [%s] PASS2 UNPARSEABLE — %zu gen tokens produced 0 readable "
+                        "candidate lines. This is a PRODUCER failure, not an empty document.\n",
+                        d.tag.c_str(), P2.gen_tokens.size());
+        }
+        for (auto& kv : parsed) {
+            auto& cs = out.per_key[kv.first].cands;
+            if (std::find(cs.begin(), cs.end(), kv.second) == cs.end())
+                cs.push_back(kv.second);
+        }
+        // Sort each key's candidates into document order (byte_lo ascending) —
+        // not-found spans (a paraphrase) sort after found ones, emission order
+        // among themselves. This is the print/report order, not a stored offset.
+        for (auto& kv : out.per_key) {
+            std::vector<std::pair<size_t, std::string>> tagged;
+            for (auto& sp : kv.second.cands) tagged.push_back({d.document.find(sp), sp});
+            std::stable_sort(tagged.begin(), tagged.end(), [](const auto& a, const auto& b) {
+                bool af = a.first != std::string::npos, bf = b.first != std::string::npos;
+                if (af != bf) return af;
+                return af && bf && a.first < b.first;
+            });
+            kv.second.cands.clear();
+            for (auto& t : tagged) kv.second.cands.push_back(t.second);
+        }
+
+        // Uncontested keys: the corpus labels EXACTLY ONE true value for this
+        // doc's concept. Concepts with 0 or ≥2 labels are excluded from Gate 2.
+        std::map<std::string, int> truth_count;
+        for (auto& f : d.fields) truth_count[f.concept]++;
+        for (auto& kv : truth_count) if (kv.second == 1) out.uncontested.insert(kv.first);
+
+        docs_out.push_back(std::move(out));
+    }
+
+    // ── 1. THE KILL GATE — median candidate-set size on uncontested keys ─────
+    std::vector<int> sizes; std::map<int, int> hist;
+    for (auto& d : docs_out)
+        for (auto& kv : d.per_key)
+            if (d.uncontested.count(kv.first)) {
+                int n = (int)kv.second.cands.size();
+                sizes.push_back(n);
+                hist[n >= 3 ? 3 : n]++;
+            }
+    std::sort(sizes.begin(), sizes.end());
+    double median = 0;
+    if (!sizes.empty()) {
+        size_t mid = sizes.size() / 2;
+        median = (sizes.size() % 2) ? sizes[mid] : (sizes[mid - 1] + sizes[mid]) / 2.0;
+    }
+    std::printf("\n================ 1. GATE 2 — median candidate-set size, UNCONTESTED keys ================\n");
+    std::printf("keys scored: %zu\n", sizes.size());
+    std::printf("producer failures (pass-2 output unreadable): %d  "
+                "[these are NOT empty documents — see the !! lines above]\n", n_unparseable);
+    std::printf("median: %.1f   (BAR: exactly 1 — above 1 means type-matches, not answers; KILLS the feature)\n", median);
+    std::printf("distribution: 0=%d  1=%d  2=%d  3+=%d\n", hist[0], hist[1], hist[2], hist[3]);
+    std::printf("VERDICT: %s\n", (!sizes.empty() && median == 1.0) ? "PASS" : "KILL");
+
+    // ── 2. Byte-exactness ─────────────────────────────────────────────────────
+    int be_ok = 0, be_tot = 0;
+    for (auto& d : docs_out)
+        for (auto& kv : d.per_key)
+            for (auto& c : kv.second.cands) {
+                be_tot++;
+                if (d.document.find(c) != std::string::npos) be_ok++;
+            }
+    std::printf("\n================ 2. byte-exactness ================\n");
+    std::printf("%d/%d candidates are a byte-exact slice of their document (%.0f%%)\n",
+                be_ok, be_tot, be_tot ? 100.0 * be_ok / be_tot : 0.0);
+
+    // ── 3. returned_as coverage (recall proxy) ────────────────────────────────
+    int rc_ok = 0, rc_tot = 0;
+    for (auto& d : docs_out)
+        for (auto& kv : d.per_key) {
+            const CandSet& cs = kv.second;
+            if (!cs.p1_grounded || cs.p1_value.empty()) continue;
+            rc_tot++;
+            if (std::find(cs.cands.begin(), cs.cands.end(), cs.p1_value) != cs.cands.end())
+                rc_ok++;
+        }
+    std::printf("\n================ 3. returned_as coverage ================\n");
+    std::printf("%d/%d pass-1 grounded values also appear among pass-2 candidates (%.0f%%)\n",
+                rc_ok, rc_tot, rc_tot ? 100.0 * rc_ok / rc_tot : 0.0);
+
+    // ── 4. Every candidate set, for eyeball scoring (Gate 1 needs a human) ────
+    std::printf("\n================ 4. candidate sets (document order) ================\n");
+    for (auto& d : docs_out) {
+        std::printf("\n[%s%s]\n", d.tag.c_str(), d.de ? " DE" : "");
+        for (auto& kv : d.per_key) {
+            bool unc = d.uncontested.count(kv.first) != 0;
+            std::printf("  %-16s p1=\"%s\"%s\n", kv.first.c_str(), kv.second.p1_value.c_str(),
+                        unc ? "  [UNCONTESTED]" : "");
+            if (kv.second.cands.empty()) { std::printf("      (no candidates)\n"); continue; }
+            for (auto& c : kv.second.cands) std::printf("      - \"%s\"\n", c.c_str());
+        }
+    }
+
+    return (!sizes.empty() && median == 1.0) ? 0 : 1;
+}
+
 int main() {
     const char* env = std::getenv("QWEN36_MODEL_PATH");
     std::string path = env ? env : "models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf";
@@ -5446,8 +6239,9 @@ int main() {
     // SS2 threads target up to 8K prompt tokens (the workload-envelope ceiling,
     // CLAUDE.md) plus a 380-token grammar-decode margin.
     // KV *capacity* only — decode uses exact n_kv, so prior paths are byte-inert.
-    const uint32_t CTX = std::getenv("SS2") ? 9216
-                        : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1")) ? 5120 : 2048;
+    const uint32_t CTX = (std::getenv("SS2") || std::getenv("SS3")) ? 9216
+                        : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1") || std::getenv("CAND"))
+                            ? 5120 : 2048;
     const int TOL = 2;
 
     apply_frozen_head_overrides();
@@ -5600,11 +6394,24 @@ int main() {
     if (std::getenv("QDOCS_S1"))
         return run_qdocs_s1(fp.get(), sched, tok, meta, CTX);
 
+    // CAND — candidate-set cheap-kill gate (docs/plan-candidate-set.md), tested
+    // BEFORE any v4/key_candidates format or endpoint work. Cold two-pass: pass
+    // 1 is the unchanged free extraction, pass 2 is a separate cold inference,
+    // taps disarmed, asking for every span that answers each hinted key.
+    if (std::getenv("CAND"))
+        return run_cand_probe(fp.get(), sched, tok, meta, CTX);
+
     // SS2 — coverage-free stale-source alarm on grammar-constrained email
     // threads at 4K-8K tokens (supersedes SS1's inconclusive short-context
     // composition). docs/note-ss2-thread-alarm.md.
     if (std::getenv("SS2"))
-        return run_ss2(fp.get(), sched, tok, meta, attn_layers);
+        return run_ss2(fp.get(), sched, tok, meta, attn_layers, ss2_thread_defs(), "SS2");
+
+    // SS3 — Gate 2 power-up: six matched pairs (explicit vs indirect correction,
+    // everything else held constant) that test SS2's one hypothesis and give
+    // recall a denominator. docs/note-ss2-thread-alarm.md §2 Gate 1.
+    if (std::getenv("SS3"))
+        return run_ss2(fp.get(), sched, tok, meta, attn_layers, ss3_thread_defs(), "SS3");
 
     // ── Prompt A (calibration) ───────────────────────────────────────────────
     std::string promptA =

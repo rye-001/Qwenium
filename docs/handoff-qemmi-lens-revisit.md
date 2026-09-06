@@ -4,6 +4,55 @@
 2026-09-04 changed what the lens is *for*, and because the app was built in July
 against a July server that has grown substantially since.
 
+---
+
+> ## STATUS 2026-09-05 — steps 1–3 are DONE, and step 3's premise was WRONG
+>
+> Read this box before the body; three sections below are now history.
+>
+> - **§8.1 (power up Gate 2) — DONE.** `SS3=1`, six matched pairs isolating
+>   phrasing. [`note-ss3-matched-pairs.md`](note-ss3-matched-pairs.md). The
+>   hypothesis held: STALE **3/6 indirect, 0/6 explicit**. Gate 2 oracle arm is
+>   now TP=3 FN=0 FP=0 TN=9; with SS2, recall 4/4 and false alarm **0/16**.
+> - **§8.2 (per-model `LensConstants`) — DECIDED AND LANDED.** Approved keyed by
+>   `{architecture, block_count}`, *not* by architecture — `qwen35` alone spans
+>   0.8B to 27B, so an arch-keyed allowlist would have admitted five models under
+>   one model's coordinates. Qwen 3.8-9B is admitted at L27H13.
+>   `coverage_used_peak` stays **0.705** on every entry pending a real
+>   coverage-layer search. See `architecture.md` §6.
+> - **§4.1 / §8.3 (thread request shape) — PREMISE REFUTED, then shipped
+>   narrower.** §4.1 assumed the missing input was message boundaries. Measured:
+>   boundaries are necessary and **not sufficient**. The alarm SS2 validated uses
+>   ground truth a server does not have; the predicate a server *can* compute
+>   cried wolf on **7 of 9** correctly-handled corrections and stayed silent on
+>   the real failure — because a later message routinely restates an old value,
+>   so **turn order does not identify supersession**
+>   ([`note-ss3-matched-pairs.md`](note-ss3-matched-pairs.md) §3).
+>   `/v1/extract` now takes `messages` and reports **which message each citation
+>   landed in** — attribution ("read from message 23 of 24"), no staleness
+>   verdict. Additive, so the format stays `qemmi-lens/v2`, **not** the v3 §4.1
+>   assumed.
+> - **§5's "fourth badge — stale" is REJECTED.** A badge asserts a property of
+>   the value; `stale` would be a correctness claim, which
+>   [`lens-format.md`](lens-format.md) §Non-claims forbids and which no signal we
+>   have supports (it would have been wrong 7 times in 9). Attribution ships as
+>   additive fields instead.
+> - **§5's "stale footer" is HALF WRONG.** *"Single document, ≤4K tokens
+>   validated"* — the 4K half is CORRECT and deliberately unchanged: SS2/SS3
+>   re-measured *citation* at thread length, but not the coverage bar or the
+>   grounded threshold, and `validated_envelope` gates on all three.
+>
+> - **§4.4 (the 8.3 K OOM) — REFUTED.** It does not reproduce; the one recorded
+>   OOM is a 35B server at 4 slots × 8192 answering *"Say OK"*. The shipped lens
+>   answers 200 at 8102 and 8873 tokens on Qwen3.8-9B. Nothing to fix.
+>
+> **Still open, unchanged:** §4.2 warm prefix, §4.3 single-slot exclusivity,
+> §6's UI brief (the omission report is still behind a tab),
+> and the choice of what — if anything — to fund toward a serveable supersession
+> signal (`note-ss3-matched-pairs.md` §4 lists three candidates, none measured).
+
+---
+
 **START HERE:** §1 (what changed), then §3 (the one decision that gates
 everything), then §7 (what is permanently closed — four dead ends, do not
 re-propose them).
@@ -119,11 +168,19 @@ while the unit was one document, cold was the only option.
 a ≤10-slot envelope. Re-test whether exclusivity is still required or was V1
 conservatism; it is a hard throughput ceiling on the lens's own workload.
 
-**4.4 Live envelope defect (independent of the lens).** SS2 v1 hit
-`kIOGPUCommandBufferCallbackErrorOutOfMemory` at **8292 tokens** — a 9 B Q8_0
-with a 576 MB KV cache could not complete an 8.3 K prefill on this host with the
-tap armed. CLAUDE.md claims ≤10 K. Avoided in v2 by capping threads at 5800, not
-resolved. `--kv-f16` is the first lever. Worth its own check.
+**4.4 ~~Live envelope defect~~ — REFUTED 2026-09-05, do not spend time here.**
+The claim was that SS2 v1 hit `kIOGPUCommandBufferCallbackErrorOutOfMemory` at
+8292 tokens on a 9 B Q8_0. It got its own check and did not survive it. The only
+such OOM recorded in the repo is a **35B-A3B server at 4 slots × 8192 ctx**
+failing on *"Say OK"* (`.session-results/prio2/server_d8b.log`) — a different
+model, a different configuration, and unrelated to prompt length; v1's own log
+ends mid weight-load and never reached a prefill. Measured on the named
+configuration (Qwen3.8-9B Q8_0, `-c 9216`): an 8299-token CLI prefill succeeds,
+and the **shipped lens** answers **200** at 8102 tokens (5/5 grounded) and at
+8873 tokens, with zero OOM. The 9 B lens reaches its context ceiling; the ≤10 K
+envelope holds here. Real memory pressure exists on the **35 B at multi-slot ×
+8 K**, which is a capacity fact the engine already refuses fail-loud with the
+right remedies. See `note-ss2-thread-alarm.md` §4.
 
 ## 5. App-side audit — `../qemmi-lens` (TypeScript, pnpm, 1345 LOC)
 

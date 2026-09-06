@@ -11,7 +11,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <set>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
 
 #include <nlohmann/json.hpp>   // the shape contract's real parse (tolerant, then loud)
 
@@ -91,28 +95,96 @@ std::vector<std::string> lens_keys(const std::string& json) {
 // fabricated field. That is the same class of self-inflicted wound the grammar
 // caused, one layer down. A *quoted* "null" is left alone: that is a document
 // that really says "null".
-bool lens_value_of(const std::string& json, const std::string& key,
-                   std::string& value, size_t& vb0, size_t& vb1, bool& is_null) {
-    is_null = false;
-    size_t kp = json.find("\"" + key + "\"");
-    if (kp == std::string::npos) return false;
+// One value the model emitted under a key, with its byte span in `json`.
+struct LensValueSpan { std::string value; size_t vb0 = 0, vb1 = 0; bool is_null = false; };
+
+// Read ONE scalar starting at `i`, returning its span. A quoted string spans the
+// quotes' interior; anything else runs to the first delimiter. `stop_at_bracket`
+// is set when reading inside an array, where ']' also ends a value.
+LensValueSpan lens_read_scalar(const std::string& json, size_t i, bool stop_at_bracket) {
+    LensValueSpan v;
+    if (i < json.size() && json[i] == '"') {
+        v.vb0 = i + 1;
+        v.vb1 = json.find('"', v.vb0);
+        if (v.vb1 == std::string::npos) v.vb1 = json.size();
+    } else {
+        v.vb0 = i;
+        size_t j = i;
+        while (j < json.size() && json[j] != ',' && json[j] != '}' && json[j] != '\n' &&
+               !(stop_at_bracket && json[j] == ']')) j++;
+        v.vb1 = j;
+        while (v.vb1 > v.vb0 && (json[v.vb1 - 1] == ' ' || json[v.vb1 - 1] == '\r')) v.vb1--;
+        v.is_null = (json.compare(v.vb0, v.vb1 - v.vb0, "null") == 0);
+    }
+    v.value = json.substr(v.vb0, v.vb1 - v.vb0);
+    return v;
+}
+
+// Every value the model emitted for the `occurrence`-th appearance of `key`
+// (0-based, text order), each with its own byte span.
+//
+// THREE shapes, and the distinction is the whole point:
+//   scalar            -> one value. The ordinary case.
+//   array of SCALARS  -> one value PER ELEMENT. Each element is a locatable
+//                        scalar with its own span, so the per-value-span trust
+//                        math gives each one its own real citations — exactly
+//                        what repeated keys get. Refusing these would refuse a
+//                        shape we can account for faithfully. Measured need:
+//                        asked for a flat schema on a three-line invoice,
+//                        Qwen3.8-9B repeats the key while Qwen3.6-35B answers
+//                        with `"quantity": [7, 19, 43]`. Same document, same
+//                        question, two encodings of one answer.
+//   anything deeper   -> REFUSED via `is_nonscalar` (an object value, or an
+//                        array holding objects/arrays). Those have no locatable
+//                        scalar identity: `lens_keys` is depth-blind so inner
+//                        keys leak as top-level fields, and a fragment scanned
+//                        to the first comma would ship as a real field with a
+//                        badge and citations pointing where the model did not
+//                        read (measured: LensNestedOutput).
+//
+// An empty array, and a null element, yield no value: the model declining, which
+// apply_absent_by_omission renders as absent. Never a fabricated blank.
+bool lens_values_of(const std::string& json, const std::string& key, size_t occurrence,
+                    std::vector<LensValueSpan>& out, bool& is_nonscalar) {
+    is_nonscalar = false;
+    const std::string needle = "\"" + key + "\"";
+    size_t kp = std::string::npos, from = 0;
+    for (size_t n = 0; n <= occurrence; ++n) {
+        kp = json.find(needle, from);
+        if (kp == std::string::npos) return false;
+        from = kp + needle.size();
+    }
     size_t colon = json.find(':', kp);
     if (colon == std::string::npos) return false;
     size_t i = colon + 1;
     while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) i++;
-    if (i < json.size() && json[i] == '"') {
-        vb0 = i + 1;
-        vb1 = json.find('"', vb0);
-        if (vb1 == std::string::npos) vb1 = json.size();
-    } else {
-        vb0 = i;
-        size_t j = i;
-        while (j < json.size() && json[j] != ',' && json[j] != '}' && json[j] != '\n') j++;
-        vb1 = j;
-        while (vb1 > vb0 && (json[vb1 - 1] == ' ' || json[vb1 - 1] == '\r')) vb1--;
-        is_null = (json.compare(vb0, vb1 - vb0, "null") == 0);
+    if (i >= json.size()) return false;
+
+    if (json[i] == '{') { is_nonscalar = true; return true; }
+
+    if (json[i] == '[') {
+        size_t j = i + 1;
+        while (j < json.size()) {
+            while (j < json.size() && (json[j] == ' ' || json[j] == '\t' ||
+                                       json[j] == '\n' || json[j] == '\r')) j++;
+            if (j >= json.size()) break;
+            if (json[j] == ']') break;                       // end of array
+            if (json[j] == '{' || json[j] == '[') {           // an element we cannot locate
+                is_nonscalar = true;
+                return true;
+            }
+            LensValueSpan v = lens_read_scalar(json, j, /*stop_at_bracket=*/true);
+            if (!v.is_null && !v.value.empty()) out.push_back(v);
+            j = (json[j] == '"') ? v.vb1 + 1 : v.vb1;         // past the closing quote, if any
+            while (j < json.size() && json[j] != ',' && json[j] != ']') j++;
+            if (j < json.size() && json[j] == ']') break;
+            j++;                                              // past the comma
+        }
+        return true;
     }
-    value = json.substr(vb0, vb1 - vb0);
+
+    LensValueSpan v = lens_read_scalar(json, i, /*stop_at_bracket=*/false);
+    if (!v.is_null) out.push_back(v);
     return true;
 }
 
@@ -257,6 +329,17 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
         bhi = phi > run.doc_byte_offset ? phi - run.doc_byte_offset : 0;
     };
 
+    // Which request message a DOCUMENT-relative byte falls in. -1 when the
+    // caller sent a plain `document` (no boundaries), or when the byte lands
+    // before the first message. Pure lookup — no claim attached; see the
+    // LensCitation comment.
+    r.n_messages = (int)run.message_offsets.size();
+    auto msg_of = [&](size_t doc_byte) -> int {
+        if (run.message_offsets.empty()) return -1;
+        auto it = std::upper_bound(run.message_offsets.begin(), run.message_offsets.end(), doc_byte);
+        return it == run.message_offsets.begin() ? -1 : (int)(it - run.message_offsets.begin()) - 1;
+    };
+
     for (int p = 0; p < P; ++p)
         r.prompt.push_back({p, run.prompt_text[p],
                             (p >= doc_lo && p < doc_hi) ? "body" : "instr"});
@@ -283,7 +366,10 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
                           [](auto& a, auto& b) { return a.second > b.second; });
         for (int i = 0; i < topk; ++i) {
             int p = v[i].first;
-            r.hover[t].push_back({p, v[i].second, run.prompt_cum[p], run.prompt_cum[p + 1]});
+            size_t dblo, dbhi; doc_bytes(p, dblo, dbhi);
+            const bool in_doc = p >= doc_lo && p < doc_hi;
+            r.hover[t].push_back({p, v[i].second, run.prompt_cum[p], run.prompt_cum[p + 1],
+                                  in_doc ? msg_of(dblo) : -1});
         }
     }
 
@@ -344,16 +430,55 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
     // (gen_cum) is relative to `gen_text`. Shift by obj_lo or a fenced/prefaced
     // response silently mis-locates every value span — which would be the lens
     // lying about where the model looked, the one thing it must never do.
+    // lens_keys returns keys in emission order, duplicates included. Two counters,
+    // because they count different things: `key_textual` walks the appearances of
+    // the key in the output (so each reads ITS OWN, not all the first), while
+    // `key_occurrence` numbers the VALUES that come back — and one appearance can
+    // carry several, when the model answers with an array of scalars.
+    std::map<std::string, int> key_textual, key_occurrence;
     for (const std::string& key : lens_keys(obj)) {
+        std::vector<LensValueSpan> vals;
+        bool is_nonscalar = false;
+        const size_t textual = (size_t)(key_textual[key]++);
+        auto empty_field = [&]() {
+            LensField f;
+            f.key = key;
+            f.occurrence = key_occurrence[key]++;
+            r.fields.push_back(f);
+        };
+        if (!lens_values_of(obj, key, textual, vals, is_nonscalar)) { empty_field(); continue; }
+        // A value we cannot locate is REFUSED, not summarized, not partially
+        // reported. The lens claims one thing — a faithful record of where the
+        // model looked — and it cannot make that claim about a value it did not
+        // read. Every softer option is worse: a fragment scanned to the first
+        // comma is a wrong value wearing a real badge, and dropping the key
+        // silently is the data loss the shape contract exists to prevent. 422
+        // says "route this document to a human" (lens-format.md).
+        //
+        // Note what this does NOT refuse any more: an array of SCALARS, which is
+        // handled above as one value per element. Each element is locatable, so
+        // each gets its own real citations. Refusing those refused a shape we can
+        // account for faithfully — and it is the shape Qwen 3.6-35B chooses for
+        // exactly the document Qwen 3.8-9B answers with repeated keys.
+        if (is_nonscalar)
+            throw LensUnparseableError(
+                "/v1/extract: expected a scalar or an array of scalars for key \"" + key +
+                "\" actual=a nested object or an array containing one — extraction "
+                "refused, never partially reported: a nested value cannot be located "
+                "in the document, so its citations would point somewhere the model "
+                "did not read",
+                run.gen_text);
+        // No values = the model declining (JSON null, or an empty array). Absent
+        // by omission; claiming the literal "null" would fabricate a field the
+        // model explicitly refused.
+        if (vals.empty()) { empty_field(); continue; }
+
+        for (const LensValueSpan& vs : vals) {
         LensField f;
         f.key = key;
-        std::string value; size_t vb0 = 0, vb1 = 0; bool is_null = false;
-        if (!lens_value_of(obj, key, value, vb0, vb1, is_null)) { r.fields.push_back(f); continue; }
-        // JSON null = the model declining. Leave the value EMPTY so
-        // apply_absent_by_omission marks it absent; claiming the literal "null"
-        // as a value would fabricate a field the model explicitly refused.
-        if (is_null) { r.fields.push_back(f); continue; }
-        vb0 += obj_lo; vb1 += obj_lo;
+        f.occurrence = key_occurrence[key]++;
+        const std::string& value = vs.value;
+        const size_t vb0 = vs.vb0 + obj_lo, vb1 = vs.vb1 + obj_lo;
         f.value = value;
         f.tier  = lens_value_tier(value);
         for (int g = 0; g < G; ++g)
@@ -398,9 +523,20 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
         for (int i = 0; i < topk; ++i) {
             int p = av[i].first;
             size_t cblo, cbhi; doc_bytes(p, cblo, cbhi);
-            f.citations.push_back({p, av[i].second / std::max(1, nval), cblo, cbhi});
+            f.citations.push_back({p, av[i].second / std::max(1, nval), cblo, cbhi, msg_of(cblo)});
         }
+        // Distinct messages, first-seen order — and `av` is already sorted by
+        // descending mass, so that IS descending citation mass. One element is
+        // the ordinary case ("read from message 23"); several mean the model
+        // looked at this key in several messages, reported side by side with no
+        // winner named (the CF1 non-claim).
+        for (const LensCitation& ct : f.citations)
+            if (ct.message >= 0 && std::find(f.citation_messages.begin(),
+                                             f.citation_messages.end(),
+                                             ct.message) == f.citation_messages.end())
+                f.citation_messages.push_back(ct.message);
         r.fields.push_back(f);
+        }
     }
 
     return r;
@@ -425,6 +561,135 @@ std::string jesc(const std::string& s) {
     return o;
 }
 std::string fnum(double v) { char b[32]; std::snprintf(b, sizeof(b), "%.4f", v); return b; }
+
+// ── Candidate-set wire helpers (docs/plan-candidate-set.md) ──────────────────
+// `anchor` and `returned_as` are DERIVED at serialization time, not stored on
+// LensCandidate — they depend on `document` and on the sibling `fields`
+// entries, and recomputing them here keeps the producer (lens_apply_pass2_candidates)
+// untouched, per this change's mandate to build on top of it, not inside it.
+
+std::string trim_ws(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && std::isspace((unsigned char)s[a])) a++;
+    while (b > a && std::isspace((unsigned char)s[b - 1])) b--;
+    return s.substr(a, b - a);
+}
+
+// Collapse runs of whitespace to one space and trim. Used ONLY to decide
+// whether two spans are "the same answer" for `returned_as` linking — never
+// changes what is stored or shown, which stays the raw byte-exact text.
+std::string ws_normalize(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    bool sp = false;
+    for (unsigned char c : s) {
+        if (std::isspace(c)) { sp = true; continue; }
+        if (sp && !o.empty()) o += ' ';
+        sp = false;
+        o += (char)c;
+    }
+    return o;
+}
+
+bool is_underline_rule(const std::string& t) {
+    if (t.size() < 3) return false;
+    char c0 = t[0];
+    if (c0 != '-' && c0 != '=') return false;
+    for (char c : t) if (c != c0) return false;
+    return true;
+}
+
+// A "label-like" line (docs/plan-candidate-set.md's anchor rule): short, and
+// either ends in ':' or reads as a numbered heading ("2. RENT", "IV. Terms").
+bool is_label_like_line(const std::string& t) {
+    if (t.empty() || t.size() > 60) return false;
+    if (t.back() == ':') return true;
+    size_t i = 0;
+    while (i < t.size() && std::isdigit((unsigned char)t[i])) i++;
+    if (i == 0)
+        while (i < t.size() && std::string("IVXLCM").find(t[i]) != std::string::npos) i++;
+    return i > 0 && i < t.size() && (t[i] == '.' || t[i] == ')') &&
+           i + 1 < t.size() && std::isspace((unsigned char)t[i + 1]);
+}
+
+// anchor derivation: nearest preceding label-like line (an underlined heading
+// counts via the line before a bare '---'/'===' rule), else the enclosing
+// line trimmed+truncated, else no anchor at all. `value_norm` is the
+// candidate's own whitespace-normalized text: an enclosing line that carries
+// nothing beyond the span itself is not a place, it is the span — so that
+// case falls through to "no anchor" too (Nullable is deliberate — a byte
+// offset is not a place, and inventing one would be dishonest).
+bool derive_anchor(const std::string& doc, size_t byte_lo, const std::string& value_norm,
+                    std::string& out) {
+    if (byte_lo > doc.size()) byte_lo = doc.size();
+    std::vector<std::pair<size_t, size_t>> lines;
+    size_t start = 0;
+    for (size_t i = 0; i <= doc.size(); ++i)
+        if (i == doc.size() || doc[i] == '\n') { lines.emplace_back(start, i); start = i + 1; }
+
+    size_t idx = 0;
+    for (; idx < lines.size(); ++idx)
+        if (byte_lo >= lines[idx].first && byte_lo <= lines[idx].second) break;
+    if (idx == lines.size()) idx = lines.empty() ? 0 : lines.size() - 1;
+    if (lines.empty()) return false;
+
+    for (long j = (long)idx - 1; j >= 0; --j) {
+        std::string t = trim_ws(doc.substr(lines[j].first, lines[j].second - lines[j].first));
+        if (is_underline_rule(t)) {
+            if (j - 1 >= 0) {
+                std::string h = trim_ws(doc.substr(lines[j - 1].first,
+                                                   lines[j - 1].second - lines[j - 1].first));
+                if (!h.empty() && h.size() <= 60) { out = h; return true; }
+            }
+            continue;   // the underline itself is a separator, not a label
+        }
+        if (is_label_like_line(t)) { out = t; return true; }
+    }
+
+    std::string enclosing = trim_ws(doc.substr(lines[idx].first, lines[idx].second - lines[idx].first));
+    if (enclosing.empty() || ws_normalize(enclosing) == value_norm) return false;
+    out = enclosing.size() > 60 ? enclosing.substr(0, 60) : enclosing;
+    return true;
+}
+
+// returned_as linking: bidirectional containment on whitespace-normalized
+// text (pass 2 legitimately returns wider or narrower spans than the field's
+// value — docs/plan-candidate-set.md "Linking"). Tiebreak: tightest
+// containment first (smallest length gap between the candidate and the
+// value it is being linked to), then earliest byte_lo. Greedy, one
+// occurrence at a time in occurrence order, each candidate claimed at most
+// once — a candidate's `returned_as` is a single occurrence-or-null, so it
+// cannot simultaneously answer two occurrences.
+std::vector<int> compute_returned_as(const std::vector<LensCandidate>& cands,
+                                     const std::vector<LensField>& fields,
+                                     const std::string& key) {
+    std::vector<int> returned_as(cands.size(), -1);
+    struct Occ { int occurrence; std::string norm; };
+    std::vector<Occ> occs;
+    for (const LensField& f : fields)
+        if (f.key == key && f.present && !f.value.empty())
+            occs.push_back({f.occurrence, ws_normalize(f.value)});
+    std::stable_sort(occs.begin(), occs.end(),
+                     [](const Occ& a, const Occ& b) { return a.occurrence < b.occurrence; });
+
+    std::vector<char> claimed(cands.size(), 0);
+    for (const Occ& occ : occs) {
+        long best = -1, best_gap = -1;
+        for (size_t ci = 0; ci < cands.size(); ++ci) {
+            if (claimed[ci]) continue;
+            std::string cnorm = ws_normalize(cands[ci].value);
+            bool contains = cnorm.find(occ.norm) != std::string::npos ||
+                           occ.norm.find(cnorm) != std::string::npos;
+            if (!contains) continue;
+            long gap = std::labs((long)cnorm.size() - (long)occ.norm.size());
+            if (best < 0 || gap < best_gap ||
+                (gap == best_gap && cands[ci].byte_lo < cands[(size_t)best].byte_lo)) {
+                best = (long)ci; best_gap = gap;
+            }
+        }
+        if (best >= 0) { claimed[(size_t)best] = 1; returned_as[(size_t)best] = occ.occurrence; }
+    }
+    return returned_as;
+}
 }  // namespace
 
 std::string lens_report_to_json(const LensReport& r) {
@@ -433,13 +698,21 @@ std::string lens_report_to_json(const LensReport& r) {
     o += "\"format_version\":\"" + jesc(r.format_version) + "\",\n";
     o += "\"model\":\"" + jesc(r.model) + "\",\n";
     o += "\"validated_envelope\":" + std::string(r.validated_envelope ? "true" : "false") + ",\n";
-    o += "\"citation_source\":\"layer 3, head 13 (L3H13) \\u2014 N3\",\n";
-    o += "\"coverage_source\":\"layer 11, max over heads \\u2014 COV1\",\n";
+    // Derived from the calibration entry, never literal: these lines said
+    // "layer 3, head 13" on every report until per-model constants landed, which
+    // a Qwen 3.8 extraction (L27H13) would have carried as a false receipt —
+    // the same defect class as the hardcoded `model` field.
+    o += "\"citation_source\":\"layer " + std::to_string(r.k.citation_layer) + ", head " +
+         std::to_string(r.k.citation_head) + " (L" + std::to_string(r.k.citation_layer) + "H" +
+         std::to_string(r.k.citation_head) + ") \\u2014 N3\",\n";
+    o += "\"coverage_source\":\"layer " + std::to_string(r.k.coverage_layer) +
+         ", max over heads \\u2014 COV1\",\n";
     o += "\"used_threshold\":" + fnum(r.k.coverage_used_peak) + ",\n";
     o += "\"ungrounded_threshold\":" + fnum(r.k.ungrounded_body_mass) + ",\n";
     o += "\"prompt_len\":" + std::to_string(r.prompt_len) +
          ",\"doc_lo\":" + std::to_string(r.doc_lo) +
-         ",\"doc_hi\":" + std::to_string(r.doc_hi) + ",\n";
+         ",\"doc_hi\":" + std::to_string(r.doc_hi) +
+         ",\"n_messages\":" + std::to_string(r.n_messages) + ",\n";
     o += "\"document\":\"" + jesc(r.document_text) + "\",\n";
     o += "\"raw\":\"" + jesc(r.raw_json) + "\",\n";
 
@@ -460,6 +733,7 @@ std::string lens_report_to_json(const LensReport& r) {
         // null on absent (no value to class).
         o += "\"tier\":" + (f.tier.empty() ? std::string("null")
                                            : "\"" + jesc(f.tier) + "\"") + ",";
+        o += "\"occurrence\":" + std::to_string(f.occurrence) + ",";
         o += "\"body_mass\":" + fnum(f.body_mass) + ",";
         o += "\"found_in_document\":" + std::string(f.found_in_document ? "true" : "false") + ",";
         if (f.found_in_document)
@@ -473,11 +747,77 @@ std::string lens_report_to_json(const LensReport& r) {
             o += (c ? "," : "");
             o += "{\"pos\":" + std::to_string(ct.pos) + ",\"mass\":" + fnum(ct.mass) +
                  ",\"byte_lo\":" + std::to_string(ct.byte_lo) +
-                 ",\"byte_hi\":" + std::to_string(ct.byte_hi) + "}";
+                 ",\"byte_hi\":" + std::to_string(ct.byte_hi) +
+                 ",\"message\":" + (ct.message >= 0 ? std::to_string(ct.message)
+                                                   : std::string("null")) + "}";
         }
+        o += "],";
+        o += "\"citation_messages\":[";
+        for (size_t m = 0; m < f.citation_messages.size(); ++m)
+            o += (m ? "," : "") + std::to_string(f.citation_messages[m]);
         o += "]}";
     }
     o += "],\n";
+
+    // ── Candidate set (docs/plan-candidate-set.md, qemmi-lens/v4) ────────────
+    // Three top-level states, distinguishable by a reader that never has to
+    // guess: `key_candidates` present = pass 2 ran; absent + `candidates_error`
+    // = the finder failed; absent + no error = candidates were not requested
+    // for this extract. A producer failure must NEVER render as an empty,
+    // unflagged set — that is the exact confusion this feature exists to fix,
+    // one level down (see LensReport::candidates_producer_failed).
+    if (r.candidates_producer_failed) {
+        o += "\"candidates_error\":\"" + jesc(r.candidates_error) + "\",\n";
+    } else if (r.candidates_requested) {
+        // Vocabulary = every key `fields` covers, in first-seen (request) order
+        // — apply_absent_by_omission guarantees one field entry per requested
+        // key, so this is the complete key set, not just the ones with hits.
+        std::vector<std::string> vocab;
+        {
+            std::set<std::string> seen;
+            for (const LensField& f : r.fields)
+                if (seen.insert(f.key).second) vocab.push_back(f.key);
+        }
+        static const std::vector<LensCandidate> kNoCands;
+        o += "\"key_candidates\":{";
+        for (size_t vi = 0; vi < vocab.size(); ++vi) {
+            const std::string& key = vocab[vi];
+            auto it = r.key_candidates.find(key);
+            const std::vector<LensCandidate>& cands =
+                (it != r.key_candidates.end()) ? it->second : kNoCands;
+            // Every key gets an entry, including one whose array is `[]` — `[]`
+            // and absent-from-the-map are different facts (plan §"Shape") and
+            // this loop is the reason they cannot be conflated on the wire.
+            const std::vector<int> returned_as = compute_returned_as(cands, r.fields, key);
+            o += (vi ? "," : "");
+            o += "\"" + jesc(key) + "\":[";
+            // Array order is document order (byte_lo ascending, already the
+            // producer's sort) and that order is LOAD-BEARING — not mass, not
+            // any ranking. Position is a fact about the document; any other
+            // ordering would be a verdict, and CF1 forbids verdicts.
+            for (size_t ci = 0; ci < cands.size(); ++ci) {
+                const LensCandidate& c = cands[ci];
+                std::string anchor;
+                const bool has_anchor = derive_anchor(r.document_text, c.byte_lo,
+                                                      ws_normalize(c.value), anchor);
+                o += (ci ? "," : "");
+                o += "{\"value\":\"" + jesc(c.value) + "\",";
+                o += "\"byte_lo\":" + std::to_string(c.byte_lo) +
+                     ",\"byte_hi\":" + std::to_string(c.byte_hi) + ",";
+                o += "\"anchor\":" + (has_anchor ? ("\"" + jesc(anchor) + "\"")
+                                                 : std::string("null")) + ",";
+                o += "\"returned_as\":" + (returned_as[ci] >= 0
+                                               ? std::to_string(returned_as[ci])
+                                               : std::string("null"));
+                o += "}";
+            }
+            o += "]";
+        }
+        o += "},\n";
+    }
+    // else: want_candidates was false for this extract — key_candidates and
+    // candidates_error both stay absent, meaning "not requested" (distinct
+    // from a producer failure, which sets candidates_error with no set).
 
     // viewer data (demo-compatible)
     o += "\"prompt\":[";
@@ -541,6 +881,97 @@ std::string lens_build_instruction(const std::vector<std::string>& key_vocabular
            "object, nothing else.";
 }
 
+// ── Candidate set — pass 2 (docs/plan-candidate-set.md) — ported verbatim ────
+// from tests/perf/attn_provenance.cpp's CAND=1 probe (CAND_PASS2_TASK_PREFIX /
+// cand_parse_pass2). See server_lens.h for why the tolerance exists.
+std::string lens_cand_pass2_instruction(const std::vector<std::string>& keys) {
+    static const char* kTaskPrefix =
+        "\n\nFor each of the following keys, list every span in the document above "
+        "that could answer it — for example a clause and a later amendment that both "
+        "give an amount are TWO spans for the same key, not one. Quote each span "
+        "EXACTLY as it appears in the document above: do not paraphrase, reformat, "
+        "translate, or combine spans. Write one span per line, in the exact form "
+        "key: \"span\". A key may have zero, one, or several spans; if it has none, "
+        "write key: (none). List every span for one key before moving to the next "
+        "key. Output only the list, nothing else. Keys: ";
+    std::string task = kTaskPrefix;
+    for (size_t i = 0; i < keys.size(); ++i) task += (i ? ", " : "") + keys[i];
+    return task;
+}
+
+std::vector<std::pair<std::string, std::string>>
+lens_parse_pass2_candidates(const std::string& text, const std::vector<std::string>& keys) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::set<std::string> keyset(keys.begin(), keys.end());
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line)) {
+        size_t b = 0;
+        while (b < line.size() &&
+               (std::isspace((unsigned char)line[b]) || line[b] == '-' || line[b] == '*' ||
+                std::isdigit((unsigned char)line[b]) || line[b] == '.' || line[b] == ')'))
+            b++;
+        std::string rest = line.substr(b);
+        size_t colon = rest.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = rest.substr(0, colon);
+        while (!key.empty() && std::isspace((unsigned char)key.back())) key.pop_back();
+        if (!keyset.count(key)) continue;
+        std::string val = rest.substr(colon + 1);
+        std::string span;
+        size_t q1 = val.find('"');
+        if (q1 != std::string::npos) {
+            size_t q2 = val.find('"', q1 + 1);
+            if (q2 == std::string::npos) continue;   // unterminated quote — malformed
+            span = val.substr(q1 + 1, q2 - q1 - 1);
+        } else {
+            // TOLERANT PARSE — see server_lens.h for why (m_en1 emitted every
+            // line unquoted; a strict parser dropped the lot).
+            span = val;
+            size_t a = 0;
+            while (a < span.size() && std::isspace((unsigned char)span[a])) a++;
+            span.erase(0, a);
+            while (!span.empty() && std::isspace((unsigned char)span.back())) span.pop_back();
+            // "(none)" is a real ANSWER (this key has no candidate), not a parse
+            // failure — must not be counted as either a span or a malformed line.
+            if (span == "(none)" || span == "none" || span == "-") continue;
+        }
+        if (!span.empty()) out.emplace_back(key, span);
+    }
+    return out;
+}
+
+void lens_apply_pass2_candidates(const std::string& document, const std::string& gen_text,
+                                 const std::vector<std::string>& keys, LensReport& report) {
+    auto parsed = lens_parse_pass2_candidates(gen_text, keys);
+    if (parsed.empty() && !gen_text.empty()) {
+        // FAIL LOUD: a producer failure, not evidence the document offers
+        // nothing for every key — the fourth state (see server_lens.h).
+        report.candidates_producer_failed = true;
+        report.candidates_error =
+            "candidate-set pass 2: expected >=1 parseable `key: \"span\"` line from "
+            "non-empty output, actual 0 parseable lines from " +
+            std::to_string(gen_text.size()) +
+            " raw bytes — producer failure, not evidence the document offers nothing";
+        return;
+    }
+    for (auto& kv : parsed) {
+        const size_t lo = document.find(kv.second);
+        if (lo == std::string::npos) continue;  // not byte-exact — drop, per the format's discipline
+        const size_t hi = lo + kv.second.size();
+        std::vector<LensCandidate>& cands = report.key_candidates[kv.first];
+        bool dup = false;
+        for (const LensCandidate& c : cands) if (c.value == kv.second) { dup = true; break; }
+        if (dup) continue;
+        cands.push_back(LensCandidate{kv.second, lo, hi});
+    }
+    for (auto& kv : report.key_candidates)
+        std::stable_sort(kv.second.begin(), kv.second.end(),
+                         [](const LensCandidate& a, const LensCandidate& b) {
+                             return a.byte_lo < b.byte_lo;
+                         });
+}
+
 namespace {
 // cum_bytes: token -> cumulative decoded byte offset, via incremental decode
 // (byte-level BPE; matches attn_provenance.cpp cum_bytes exactly).
@@ -601,7 +1032,7 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             " — document too large for the configured context");
 
     LensRun run;
-    run.model              = "Qwen3.6 (attention lens)";
+    run.model              = k.model_label;   // names the calibration entry, not a literal
     run.n_head             = (int)meta.attention_head_count;
     run.document           = document;   // value-source lookups resolve against the doc
     // 4096 is the CALIBRATION floor, not the workload envelope (that is 10 K as
@@ -703,10 +1134,25 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 ggml_backend_sched_graph_compute(sched, gf), "lens_tapped_decode");
 
             std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
+            // taps[i] corresponds to attention_taps()[i] — the order this
+            // function armed above, NOT layer order. The two coincided while the
+            // only calibration was Qwen 3.6's {3, 11} (ascending); Qwen 3.8 arms
+            // {27, 11} (descending), so a reordering readback would silently swap
+            // the citation and coverage signals and produce a shaped, wrong
+            // report. Asserted rather than trusted, in the fail-loud order.
+            if (taps.size() != 2 || taps[0].layer != k.citation_layer ||
+                taps[1].layer != k.coverage_layer)
+                throw std::runtime_error(
+                    "lens_tapped_decode: attention taps expected {citation_layer " +
+                    std::to_string(k.citation_layer) + ", coverage_layer " +
+                    std::to_string(k.coverage_layer) + "}, actual " +
+                    (taps.size() != 2 ? std::to_string(taps.size()) + " taps"
+                                      : "{" + std::to_string(taps[0].layer) + ", " +
+                                        std::to_string(taps[1].layer) + "}"));
             LensStep st;
             st.n_kv         = taps[0].n_kv;
-            st.citation_row = std::move(taps[0].rows);   // citation_layer (L3)
-            st.coverage_row = std::move(taps[1].rows);   // coverage_layer (layer 11)
+            st.citation_row = std::move(taps[0].rows);   // k.citation_layer
+            st.coverage_row = std::move(taps[1].rows);   // k.coverage_layer
             run.steps.push_back(std::move(st));
 
             std::vector<float> lg = fp->get_output_logits(gf);
@@ -747,6 +1193,100 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     return run;
 }
 
+// Pass 2 of the candidate set (docs/plan-candidate-set.md) — a SEPARATE cold
+// inference over the same document with a different instruction, needing no
+// citations, so attention taps stay DISARMED for the whole pass (which is also
+// what makes flash attention available here, per the plan). This is NOT warm
+// reuse of pass 1's KV — the plan explicitly rejects checkpoint/rewind, since
+// chunked-vs-one-shot prefill is not bit-identical on Metal and would perturb
+// pass 1. Fresh slot: clear_slot + set_cache_pos(0,0) + a full prefill, exactly
+// like run_lens_tapped_decode's own reset above, and the same symmetric
+// clear_slot(0) on the way out (see the comment on that one for why leaving
+// the slot dirty corrupts the next unrelated request).
+//
+// Free decode only — no grammar, no attention-tap bookkeeping (mark/get_attention_taps
+// are never called, because nothing is armed to read). Only called when the
+// caller opted into LensExtractOptions::want_candidates; the off path never
+// reaches this function at all.
+std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                  ::Tokenizer* tok, const std::string& document,
+                                  const std::vector<std::string>& keys,
+                                  uint32_t vocab_size, uint32_t n_ctx_max,
+                                  int max_new_tokens) {
+    QwenChatTemplate ct;
+    std::vector<ChatMessage> hist = {{"user", document + lens_cand_pass2_instruction(keys)}};
+    const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true,
+                                              /*enable_thinking=*/false);
+    std::vector<int32_t> prompt_tokens = tok->encode(prompt_text);
+    if ((uint32_t)prompt_tokens.size() >= n_ctx_max)
+        throw std::runtime_error(
+            "run_cand_pass2_decode: prompt tokens expected < n_ctx_max=" +
+            std::to_string(n_ctx_max) + " actual=" + std::to_string(prompt_tokens.size()) +
+            " — document too large for the configured context");
+
+    fp->set_attention_taps({});   // disarmed for the whole pass — no citations needed
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    std::vector<float> logits = fp->run_prefill(prompt_tokens, 0, 0, sched);
+    const int32_t eos = tok->get_eos_token_id();
+
+    auto argmax_all = [&](const std::vector<float>& lg) -> int32_t {
+        const size_t n = std::min(lg.size(), (size_t)vocab_size);
+        int32_t best = -1; float bl = -1e30f;
+        for (size_t i = 0; i < n; ++i)
+            if (lg[i] > bl) { bl = lg[i]; best = (int32_t)i; }
+        return best;
+    };
+
+    std::vector<int32_t> gen_tokens;
+    int32_t next = argmax_all(logits);
+    if (next >= 0) {
+        for (int t = 0; t < max_new_tokens; ++t) {
+            const int32_t cur = next;
+            gen_tokens.push_back(cur);
+
+            std::vector<int32_t>  tks       = {cur};
+            std::vector<uint32_t> slots     = {0};
+            std::vector<int32_t>  positions = {fp->get_rope_pos(0)};
+            ggml_cgraph* gf = fp->build_decoding_graph(tks, slots, positions);
+            ggml_backend_sched_reset(sched);
+            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->set_decode_inputs(gf, tks, slots, positions);
+            qinf::engine::require_compute_success(
+                ggml_backend_sched_graph_compute(sched, gf), "cand_pass2_decode");
+
+            std::vector<float> lg = fp->get_output_logits(gf);
+            fp->advance_cache(1, 0);
+
+            next = argmax_all(lg);
+            if (next == eos || next < 0) break;
+        }
+    }
+    fp->clear_slot(0);   // leave the engine as found, symmetric with pass 1's own cleanup
+
+    return tok->decode(gen_tokens);
+}
+
+// Candidate-set pass 2, orchestrated: runs the cold decode above, parses it
+// with the tolerant parser, and folds the result into `report` in place.
+// FAILS LOUD on a producer failure (non-empty output, zero parseable lines) by
+// setting report.candidates_producer_failed rather than leaving key_candidates
+// silently empty — see server_lens.h and docs/plan-candidate-set.md's fourth
+// state. Every candidate is verified byte-exact against `document` before it
+// is stored; a non-verbatim span is dropped, not flagged (the format requires
+// exactness, not a disclosure about its absence).
+void run_cand_pass2(ForwardPassBase* fp, ggml_backend_sched_t sched, ::Tokenizer* tok,
+                    const std::string& document, const std::vector<std::string>& keys,
+                    uint32_t vocab_size, uint32_t n_ctx_max, LensReport& report) {
+    // 700, not opts.max_new_tokens: pass 2 must enumerate every span for every
+    // key (potentially several per key), a longer output than pass 1's single
+    // value per key — matches the budget the CAND=1 probe measured the gate
+    // against (docs/plan-candidate-set.md "Viability measured").
+    const std::string gen_text =
+        run_cand_pass2_decode(fp, sched, tok, document, keys, vocab_size, n_ctx_max, 700);
+    lens_apply_pass2_candidates(document, gen_text, keys, report);
+}
+
 }  // namespace
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -785,28 +1325,55 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
     // The gloss is deliberately NOT in the instruction — see the header. The
     // prompt is byte-identical to the regime Stage 1 measured.
     static const std::vector<std::string> kNoVocab;
+    // Request metadata, not decode state — set here rather than inside the
+    // decode helper, whose job is the forward pass.
     LensRun run = run_lens_tapped_decode(
         fp, sched, tok, meta, control_arm_grammar,
         control_arm_vocab ? *control_arm_vocab : kNoVocab,
         vocab_size, n_ctx_max, document, lens_build_instruction(keys),
         opts.max_new_tokens, k);
+    run.message_offsets = opts.message_offsets;
+    if (!run.message_offsets.empty() && run.message_offsets.back() >= document.size())
+        throw std::runtime_error(
+            "run_lens_extract: message_offsets expected offsets within the document "
+            "(< " + std::to_string(document.size()) + " bytes), actual last offset " +
+            std::to_string(run.message_offsets.back()));
 
     // Throws LensUnparseableError (⇒ 422) if the output holds no parseable object.
-    return apply_absent_by_omission(compute_lens_report(run, k), concepts);
+    LensReport report = apply_absent_by_omission(compute_lens_report(run, k), concepts);
+
+    // Pass 2 — candidate set (docs/plan-candidate-set.md), OFF by default and
+    // byte-inert when off: this branch is the only place want_candidates is
+    // read, and when it is false nothing below it ever runs — no second
+    // prefill, no extra decode, no engine call of any kind beyond what pass 1
+    // already did above.
+    if (opts.want_candidates) {
+        // Recorded regardless of what pass 2 produces (success, failure, or a
+        // legitimate empty result) — it is the only signal lens_report_to_json
+        // has for "not requested" vs. "ran" (see LensReport::candidates_requested).
+        report.candidates_requested = true;
+        run_cand_pass2(fp, sched, tok, document, keys, vocab_size, n_ctx_max, report);
+    }
+
+    return report;
 }
 
 LensReport apply_absent_by_omission(LensReport report,
                                     const std::vector<LensConcept>& concepts) {
-    auto emitted = [&](const std::string& key) -> const LensField* {
-        for (const LensField& f : report.fields) if (f.key == key) return &f;
-        return nullptr;
-    };
-
     std::vector<LensField> out;
     out.reserve(concepts.size());
     for (const LensConcept& c : concepts) {
-        const LensField* got = emitted(c.key);
-        if (got && !got->value.empty()) { out.push_back(*got); continue; }
+        // EVERY occurrence of the concept, in emission order — not just the
+        // first. Concept order still governs the array, so the first entry for
+        // each key keeps its old value and position and a first-match importer
+        // is unaffected; what changes is that later occurrences now follow it
+        // instead of being dropped. This is why the format bumps to v3
+        // (server_lens.h LensReport): fields.size() == concepts.size() was an
+        // invariant and no longer holds.
+        bool any = false;
+        for (const LensField& f : report.fields)
+            if (f.key == c.key && !f.value.empty()) { out.push_back(f); any = true; }
+        if (any) continue;
         // Absent: the model did not state it. With no grammar it declines
         // natively (30/30 on Leg C), so omission IS the signal — no probe needed.
         LensField f;
