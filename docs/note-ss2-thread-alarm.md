@@ -16,14 +16,81 @@ point (404/413 = 98%). The retrieval head transfers to multi-turn threads
 cleanly. SS1's poor 71% was the extractor confound plus a weaker head and quant,
 not a property of threads. **That question is now answered.**
 
-Gate 2 (alarm precision/recall) is **promising but under-powered**: TP=1, FN=0,
-FP=0, TN=7 ⇒ precision 100%, recall 100%, FRESH false-alarm 0%. The **0/7
-false-alarm rate is the meaningful half** — the alarm stayed silent on every
-correctly-handled correction. **Recall rests on n=1 and must not be quoted as a
-rate.**
+**CORRECTION (2026-09-05), after the trivial-rule control leg — read this
+before quoting any Gate 2 number.** The originally reported Gate 2 figures
+(TP=1 FN=0 FP=0 TN=7 ⇒ precision 100%, false-alarm 0%) are an **ORACLE**
+measurement: they use corpus ground truth that `/v1/extract` does not have and
+**cannot compute**. Recomputed with only what a real endpoint would see —
+citations plus caller-declared message boundaries — the **SERVEABLE** predicate
+scores **TP=1 FN=0 FP=2 TN=5 ⇒ precision 33%, FRESH false-alarm 29%**. Two false
+alarms in seven correctly-handled corrections. That gap is the cost of shipping
+the alarm, not noise, and 33%/29% is the number a product decision must use.
+
+Two further limits found by the same leg:
+- **The disambiguation claim is UNTESTED.** Only **15 of 207** scored tokens had
+  the value appearing in ≥2 places at all, below the pre-set floor of 20, so the
+  trivial-rule control **could not run**. This corpus does not contain enough
+  genuine ambiguity to test whether the head resolves near-duplicates or merely
+  follows a positional rule. An earlier claim in this note that the threads are
+  "adversarial by construction" is therefore **not supported by measurement** —
+  quoted history repeats the *messages*, but rarely the *scored values*.
+- **On the one inspectable case the head matches two of three trivial rules.**
+  `t_de3`: head cited message 0; `R_last` predicts 0 and `R_near` predicts 0;
+  only `R_first` (24) differs. n=1, so this refutes nothing — but it is the
+  opposite of reassuring, and it corrects an earlier reading of this case as
+  evidence *against* a recency rule.
+
+Gate 0 is unaffected: its target spans are confirmed **message-scoped**, so the
+98% required landing in the correct message's copy. But because only 15/207
+tokens were ambiguous, **Gate 0 measures citation accuracy, not occurrence
+disambiguation.** Both statements are true and neither substitutes for the other.
 
 **Date** 2026-09-04 · **Status** measurement note; zero `src/` edits,
 `LensConstants` unchanged, server architecture refusal unchanged.
+
+## 0. SECOND CORRECTION (2026-09-05) — the recurring-value corpus and re-score
+
+The original corpus contained almost no ambiguity (15 of 207 scored tokens had
+the value in >=2 places), so nothing here had tested occurrence disambiguation.
+The corpus was rebuilt with truthful restatements (confirmations, recaps,
+cross-references) — **183 of 213 tokens are now genuinely ambiguous** — and
+re-run. Three results, in order of how well-powered they are:
+
+**1. The head is NOT a positional artifact. Well-powered, and it stands.**
+Over 183 ambiguous tokens: `R_last` 26%, `R_first` 25%, `R_near` 26%. The best
+trivial rule disagrees with the head on **74%** of tokens (bar: >=15%). No
+"always newest / always oldest / always nearest" rule reproduces what the head
+does. This was the threat the control existed to test, and the head survives it.
+
+**2. The head reliably finds a true occurrence. Also well-powered.**
+Re-scored with a hit = ANY literal occurrence of the value rather than the
+field's designated message: **top1 93% (199/213), top3 99% (211/213)**, versus
+strict top1 34% / top3 74%. **Delta +59 / +25 points.**
+
+**3. Therefore Gate 0's "FAIL" is a LABELLING artifact, not a head failure.**
+Strict scoring counts a hit only when the citation lands in message 0. Once the
+corpus states the same value truthfully in several later messages, that label
+asserts a unique correct source where several exist — the head pointing at a
+confirmation in message 8 is scored as a miss. The strict number answers "does
+the head prefer the ORIGINAL statement" (no, 34%), not "does the head find the
+value" (yes, 93%). **The gate needs redefining, not re-thresholding**; the
+printed FAIL is against a question that no longer has a well-defined answer.
+
+### What is STILL NOT established
+- **Which copy the model actually used.** The head names a message; we cannot
+  verify it is the message the generation drew on. That needs ablation (drop a
+  copy, re-run, see if the answer moves) — the PROOF1 method. Nothing in this
+  corpus supplies that ground truth.
+- **The alarm as a shippable predicate.** SERVEABLE (citations + caller-declared
+  message boundaries, i.e. what `/v1/extract` could actually compute) scores
+  **precision 20%, recall 50%, FRESH false-alarm 67%** — four false alarms in
+  six correctly-handled corrections. ORACLE's 100%/100%/0% uses corpus ground
+  truth the endpoint does not have. **Quote the SERVEABLE row, never ORACLE.**
+- One mitigation worth testing rather than assuming: the alarm's predicate needs
+  only the message *class* (superseded vs current), not message *identity*. If
+  every copy of a stale value sits in a superseded message, landing on any of
+  them is sufficient. That may matter more than strict citation accuracy, and it
+  has not been measured.
 
 ## 1. Provenance
 
@@ -117,10 +184,32 @@ the grammar — which is why removing it fixed both.
   false-alarm rate (0/7) is the better-supported half.
 - **No coverage / COV1 arm** — excluded by design; the alarm is coverage-free.
 - **No conflict attribution** (CF1 dead), no product build, no server wiring.
-- **v1's GPU OOM at 8292 tokens is unresolved, only avoided** — thread targets
-  were capped at 5800. A 9 B Q8_0 with a 576 MB KV cache could not complete an
-  8.3 K prefill on this host with the tap armed. That is a live data point
-  against the ≤10 K envelope and deserves its own check.
+- ~~**v1's GPU OOM at 8292 tokens is unresolved, only avoided**~~ — **RETRACTED
+  2026-09-05. This claim was wrong.** It got its own check and did not survive
+  it. The only `kIOGPUCommandBufferCallbackErrorOutOfMemory` recorded anywhere in
+  this repo is `.session-results/prio2/server_d8b.log`, which is a *different
+  configuration entirely*: Qwen **3.6-35B-A3B** (12.5 GB of weights, 1280 MB KV,
+  "max batch size: 4 and max ctx: 8192"), failing while answering *"Say OK"*.
+  It has nothing to do with 8292 tokens or with a 9 B model. v1's own log
+  (`ss2_thread_alarm.log`) ends mid weight-load and never reached a prefill.
+  Measured on the exact configuration the claim named — Qwen3.8-9B Q8_0,
+  `--ctx-size 9216`, same host:
+
+  | path | prompt tokens | result |
+  |---|---|---|
+  | CLI, no tap | 8299 | OK (53 s prefill, 156 t/s) |
+  | shipped lens `/v1/extract`, taps armed | 8102 | **200**, 5/5 fields grounded |
+  | shipped lens `/v1/extract`, taps armed | 8873 | **200**, 3/3 fields |
+
+  Zero OOM in the server log. The 9 B lens runs to ~8.9 K, i.e. the context
+  ceiling it was given, so **the ≤10 K envelope holds for this configuration**
+  and the thread cap of 5800 was never needed. What *is* real is memory pressure
+  on the **35 B at 4 slots × 8192** — a capacity fact, not a bug, and the engine
+  already refuses it loudly, names the remedies, and stops the loop cleanly
+  (`qinf::engine::require_compute_success`). One caveat kept honest: unified
+  memory is shared, so an earlier run competing with a resident 35 B server could
+  genuinely have OOM'd; what is refuted is the *attribution* to 8.3 K tokens on a
+  9 B.
 - **Zero `src/` edits.**
 
 ## 5. Honest limits

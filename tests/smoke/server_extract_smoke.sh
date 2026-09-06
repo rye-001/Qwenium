@@ -14,7 +14,7 @@
 # Drives the free tapped extraction + the server-side lens computation (citations
 # L3H13 / coverage layer-11 / badge body_mass) on EN + DE order emails, asserting:
 #
-#   1. Well-formed: HTTP 200, format_version qemmi-lens/v2, one field per hinted
+#   1. Well-formed: HTTP 200, format_version qemmi-lens/v3, one field per hinted
 #      {key,gloss} concept (Leg B: complete hint ⇒ no naming zoo), present values
 #      verbatim-lifted (found_in_document), a badge per field, coverage present.
 #   2. Signal reproduction (N3, end to end): for present distinctive fields the
@@ -142,7 +142,16 @@ def extract(doc, keys, expect=200, max_tokens=220):
 def overlaps(a_lo, a_hi, b_lo, b_hi, tol=3):
     return a_lo < b_hi + tol and a_hi > b_lo - tol
 
-def by_key(d): return {f["key"]: f for f in d["fields"]}
+# FIRST occurrence wins, deliberately. v3 allows several fields per key (one per
+# occurrence the model emitted); the first keeps its v2 value and position, so
+# reading first-wins is what keeps this gate measuring what it measured before.
+# A dict comprehension over d["fields"] would be LAST-wins and would silently
+# change which value every assertion below is about.
+def by_key(d):
+    out = {}
+    for f in d["fields"]:
+        out.setdefault(f["key"], f)
+    return out
 
 # Accumulator for the absent-specificity safety property.
 spec_absent_total = spec_absent_ok = 0     # genuinely-absent concepts marked absent
@@ -154,10 +163,15 @@ def check_superset(name, doc, present_order, absent_keys, min_inspan):
     concepts = kv(*present_order, *absent_keys)
     d = extract(doc, concepts)
     open(f"{outdir}/lens_{name}.json", "w").write(json.dumps(d, indent=1))
-    assert d.get("format_version") == "qemmi-lens/v2", f"{name}: bad format_version"
+    assert d.get("format_version") == "qemmi-lens/v3", f"{name}: bad format_version"
+    # v3: a key may appear several times (one field per emitted occurrence), so
+    # collapse consecutive repeats before comparing. The property this gate is
+    # really asserting is unchanged — concept ORDER and COMPLETENESS, i.e. the
+    # naming zoo stays shut — and it must not be weakened into "some superset".
     got = [f["key"] for f in d["fields"]]
+    got_distinct = [k for i, k in enumerate(got) if i == 0 or k != got[i - 1]]
     want = present_order + list(absent_keys)
-    assert got == want, f"{name}: fields {got} != hint {want} (order/completeness)"
+    assert got_distinct == want, f"{name}: fields {got_distinct} != hint {want} (order/completeness)"
     fields = by_key(d)
 
     # (4) absent-specificity: every genuinely-absent concept must be `absent`.
@@ -255,6 +269,123 @@ assert json.loads(msg).get("code") == "bad_request", f"400 has no code: {msg[:16
 print("  fail-loud: empty key_vocabulary -> 400 bad_request OK (split from 422)")
 print("PHASE A PASS")
 PY
+
+stop_server
+
+# ── Phase A2: `messages` — attribution, and the fail-loud either/or ────────────
+# The thread unit. `messages` replaces `document`; every citation then reports
+# WHICH message it landed in, so a value reads "from message N of M". That is the
+# whole claim: attribution, no staleness verdict — a later-message rule was
+# measured to cry wolf on 7 of 9 correctly-handled corrections and stay silent on
+# the real failure (docs/note-ss3-matched-pairs.md §3).
+echo "=== Phase A2: messages[] attribution + either/or contract ==="
+start_server "--attention-lens" "$WORK/lens_msgs.log"
+
+python3 - "$PORT" <<'PY2'
+import json, sys, urllib.request
+
+port = sys.argv[1]
+def post(body):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/extract",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+# Three messages; the order facts live in message 0 and message 2 states nothing
+# extractable. Attribution must point at a real message, never at "unknown".
+MSGS = [
+    "From: orders@brightwork.example\nSubject: Restock\n\n"
+    "Please book 45 units of the Matte Black Easel Stand at 82.00 GBP each "
+    "for Brightwork Studios Ltd.",
+    "Thanks — noted. The loading dock is being repainted next week, so please "
+    "use the side entrance. Nothing about the order changes.",
+    "Acknowledged, nothing further from our side.",
+]
+KEYS = ["customer", "product", "quantity", "unit_price"]
+
+code, rep = post({"messages": MSGS, "key_vocabulary": KEYS, "max_tokens": 220})
+assert code == 200, (code, rep)
+assert rep["n_messages"] == 3, rep["n_messages"]
+print(f"  n_messages={rep['n_messages']} OK")
+
+present = [f for f in rep["fields"] if f["value"] is not None and f["citations"]]
+assert present, "no present cited field came back"
+for f in present:
+    for ct in f["citations"]:
+        assert ct["message"] is not None, f
+        assert 0 <= ct["message"] < 3, (f["key"], ct["message"])
+    assert f["citation_messages"], f
+    assert f["citation_messages"][0] == f["citations"][0]["message"], f
+print(f"  every citation on {len(present)} present field(s) names a real message OK")
+
+# The order facts are all in message 0, so that is where the strongest citations
+# must land. This is the end-to-end reproduction of the attribution claim.
+top = [f["citation_messages"][0] for f in present]
+assert top.count(0) >= (len(top) + 1) // 2, top
+print(f"  strongest citation lands in message 0 for {top.count(0)}/{len(top)} fields OK")
+
+# A plain `document` request must still report "unknown", never message 0.
+code, rep = post({"document": "\n\n".join(MSGS), "key_vocabulary": KEYS, "max_tokens": 220})
+assert code == 200, (code, rep)
+assert rep["n_messages"] == 0, rep["n_messages"]
+for f in rep["fields"]:
+    for ct in f.get("citations", []):
+        assert ct["message"] is None, f
+    assert f["citation_messages"] == [], f
+print("  plain document -> n_messages 0, message null (not 0) OK")
+
+# Fail-loud either/or: never both, never neither, never a silent precedence.
+for body, why in [({"document": "x", "messages": ["y"], "key_vocabulary": ["a"]}, "both"),
+                  ({"key_vocabulary": ["a"]}, "neither"),
+                  ({"messages": [], "key_vocabulary": ["a"]}, "empty array"),
+                  ({"messages": [""], "key_vocabulary": ["a"]}, "empty text")]:
+    code, rep = post(body)
+    assert code == 400, (why, code, rep)
+    assert rep.get("code") == "bad_request", (why, rep)
+print("  fail-loud: both/neither/empty-array/empty-text -> 400 bad_request OK")
+
+# v3: a repeating document against a flat schema. The model emits the key several
+# times; every occurrence must come back with its OWN value and its OWN citation,
+# not the first one repeated (which is what v2 did, silently, with no coverage
+# flag). Gated live because the unit tests drive synthetic tap rows.
+INVOICE = (
+    "INVOICE\n\nSupplier: Rowan Hardware Supply Co.\nCustomer: Bluepeak Construction LLC\n"
+    "Invoice Number: INV-58234\n\nLine Items:\n"
+    "Galvanized Steel Bracket - Quantity: 7 - Unit Price: 12.50\n"
+    "Industrial Ceiling Fan - Quantity: 19 - Unit Price: 88.00\n"
+    "Copper Pipe Fitting - Quantity: 43 - Unit Price: 5.25\n\n"
+    "Subtotal: 2131.25\nTax: 170.50\nTotal: 2301.75\n")
+code, rep = post({"document": INVOICE,
+                  "key_vocabulary": ["supplier","customer","invoice_number","line_item",
+                                     "quantity","unit_price","subtotal","tax","total"],
+                  "max_tokens": 300})
+assert code == 200, (code, rep)
+assert rep["format_version"] == "qemmi-lens/v3", rep["format_version"]
+
+def occurrences(key):
+    return [f for f in rep["fields"] if f["key"] == key and f["value"] is not None]
+
+qty = occurrences("quantity")
+if len(qty) < 2:
+    # Not a failure of v3: whether the model enumerates at all depends on the
+    # document and the hint. Report it rather than asserting a model behaviour.
+    print(f"  !! model emitted only {len(qty)} quantity occurrence(s) — repeated-key "
+          f"path not exercised this run (not a v3 defect)")
+else:
+    vals = [f["value"] for f in qty]
+    assert len(set(vals)) == len(vals), f"occurrences share a value (v2 collapse): {vals}"
+    for i, f in enumerate(qty):
+        assert f["occurrence"] == i, (i, f["occurrence"])
+    cites = [f["citations"][0]["byte_lo"] for f in qty if f["citations"]]
+    assert len(set(cites)) == len(cites), f"occurrences share a citation: {cites}"
+    print(f"  v3 repeated keys: {len(qty)} quantity occurrences {vals}, "
+          f"distinct values and distinct citations OK")
+print("PHASE A2 PASS")
+PY2
 
 stop_server
 

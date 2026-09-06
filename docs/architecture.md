@@ -585,7 +585,22 @@ mid-extraction on.
 **Attention Lens (opt-in `--attention-lens`, `POST /v1/extract`).** A dedicated
 endpoint — separate from the OpenAI surface by design (its inputs are a
 document + a complete key vocabulary of `{key, gloss}` concepts, not chat
-messages; its output is the lens format, not a completion). It runs **one free
+messages; its output is the lens format, not a completion).
+
+**The unit is a document OR an ordered thread** (additive, 2026-09-05). A request
+carries **exactly one** of `document` or `messages` — both or neither is a
+fail-loud 400, because boundaries cannot be recovered from concatenated text and
+a precedence rule would be a silent fallback. With `messages`, the server joins
+them with one blank line (the text a caller would otherwise have concatenated, so
+the validated prompt regime is unchanged) and every citation reports the message
+index it landed in; fields carry `citation_messages` and the report `n_messages`.
+This buys **attribution** — *"read from message 23 of 24"* — and deliberately
+**not** a staleness alarm. The alarm was built and measured first: the predicate
+a server can actually compute fired on 7 of 9 correctly-handled corrections and
+stayed silent on the real failure, because a later message routinely restates an
+old value, so **turn order does not identify supersession**
+([`note-ss3-matched-pairs.md`](note-ss3-matched-pairs.md)). The receipts are
+additive, so the format stays `qemmi-lens/v2`. It runs **one free
 tapped decode, in one prefill** (`run_lens_extract` → `run_lens_tapped_decode`):
 argmax over the full vocabulary with the P1 attention tap armed on the two frozen
 lens layers, then `compute_lens_report` derives citations (L3H13, N3), the
@@ -616,14 +631,105 @@ object by string-aware brace depth — and *loud* on failure —
 bad_request` and carrying the model's `raw`. Never a partial extraction: a refusal
 and "the document has none of these concepts" are different facts.
 
+**Repeated keys are all reported** (v3, 2026-09-05). A flat schema over a
+repeating document — an invoice with three line items — makes the model emit the
+key several times. v2 read the first occurrence and kept one field, dropping the
+rest with no error, no badge, and **no coverage flag**: measured, the
+un-extracted lines were *not* reported as un-consulted, because the model does
+read them. Each occurrence now carries its own value, byte span and citations
+(`LensField::occurrence`), which the per-value-span trust math supports
+unchanged. Structural change ⇒ format bump to `qemmi-lens/v3`; the first entry
+per key keeps its v2 value and position. It does **not** group repeated keys into
+records — that is the leaf-path design, gated on measuring a repeating-group hint.
+
+**Values are scalars or arrays of scalars; deeper nesting is refused**
+(2026-09-05). An array of scalars expands to one occurrence per element, since an
+element is locatable and gets its own citations — the same treatment as a
+repeated key. The two are one answer in two encodings: on a three-line invoice
+Qwen 3.8-9B repeats the key and Qwen 3.6-35B emits `[7, 19, 43]`, so refusing
+either would make the contract depend on the loaded model. `lens_value_of` reads
+scalars only and `lens_keys` is depth-blind, so before this guard a nested value
+did not fail — it produced a truncated fragment shipped as a real field, and a
+nested key could answer a top-level lookup with the wrong value and citations
+pointing at a span the model never read (both measured, `LensNestedOutput`).
+Refused rather than summarized, because a faithful record cannot be claimed for a
+value that was not read. Supporting arrays properly is a *leaf-path* design —
+the per-value-span trust math already generalizes to any depth — gated on a
+Leg-B-style measurement of a repeating-group hint, since `line_items[0..N]`
+cannot be enumerated in a complete hint up front.
+
+**The candidate set** (v4, 2026-09-06, architect-approved,
+[`plan-candidate-set.md`](plan-candidate-set.md)). Alongside the value `fields`
+already returns, a request that opts into the (currently internal-only,
+`LensExtractOptions::want_candidates`) candidate-set producer also gets **every
+span in the document that answers a key** — not just the one the model
+returned — via a **second, cold, taps-disarmed decode** over the same document
+with a different instruction (`run_cand_pass2`); pass 1 is byte-untouched.
+`lens_report_to_json` emits this as a new top-level `key_candidates`: an object
+keyed by the **complete request vocabulary** (every key present, `[]` included
+— `[]` and absent-from-the-map are different facts), each candidate a
+byte-exact `{value, byte_lo, byte_hi, anchor, returned_as}`, array order
+**document order (`byte_lo` ascending) and load-bearing** — not mass, not a
+ranking (CF1 forbids a verdict). `anchor` and `returned_as` are derived at
+serialize time from `document` and the sibling `fields` entries, not stored on
+`LensCandidate` — `returned_as` links a candidate to the `fields` occurrence it
+answers by **bidirectional containment** on whitespace-normalized text
+(tiebreak: tightest containment, then earliest `byte_lo`), because pass 2
+legitimately returns spans wider or narrower than the field's own value.
+**Three distinguishable top-level states**, the reason the format bumps rather
+than riding in place: `key_candidates` present ⇒ the finder ran; absent +
+`candidates_error` ⇒ the finder **failed** on this document (never rendered as
+an empty set — the exact confusion this feature exists to prevent, one level
+down from `fields`' own `422`); absent + no error ⇒ candidates were not
+requested. `fields` — taps, calibration, coverage — is completely unchanged.
+Format bump: `qemmi-lens/v3` → **`qemmi-lens/v4`**, additive
+([`lens-format.md`](lens-format.md)). No server/CLI flag exposes
+`want_candidates` yet; that remains a separate, unapproved decision. **Action
+item on `../qemmi-lens`: its `ACCEPTED_FORMAT_VERSIONS` must add
+`"qemmi-lens/v4"` or every extract call fails its own fail-loud version gate.**
+
 **Single-slot and exclusive**: `extract_lens_json` holds the model lock for the
 whole tapped decode and uses slot 0 (the only correct qwen36 decode KV gather,
 §12); do not drive concurrent OpenAI traffic on slot 0 while extracting.
-Qwen3.6-pinned constants; `--attention-lens` is **refused at startup on any
-architecture but `qwen35moe`** (the constants are uncalibrated elsewhere, so a
-report computed with them would be shaped but false); fail-loud on empty
-concepts or an oversized document.
+Fail-loud on empty concepts or an oversized document.
 Off ⇒ the route 404s and no lens code runs.
+
+**Per-model calibration, keyed `{architecture, block_count}`** (decided
+2026-09-05). `LensConstants` is not one frozen struct: `kLensCalibrations` in
+`server_lens.h` is a table of calibration entries, and `--attention-lens` is
+**refused at startup on any model with no entry** (`lens_calibration_for` /
+`lens_calibration_refusal`, resolved once in `enable_attention_lens()` and
+carried on the integration; `run_lens_extract` takes the constants with **no
+default argument**, so no call site can silently fall back to someone else's
+coordinates). Two models are calibrated today, both Qwen: **Qwen 3.6-35B-A3B**
+(`qwen35moe`/40 and /41, citation **L3H13**) and **Qwen 3.8-9B** (`qwen35`/33,
+citation **L27H13** — 98% vs 84% top-3 and 0% vs 7% ungrounded false alarm on
+the same messy corpus, `note-lens-qwen38-probe.md` §5.3).
+
+*Why the key is the model and not the architecture.* An architecture string is a
+family: `qwen35` alone hosts Qwen3.5-0.8B (24), Qwen3.5-9B (32), Qwen3.8-9B (33),
+Qwen3.6-27B (64) and Qwen3.8-27B (65). An arch-keyed allowlist would admit all
+five under coordinates measured on one of them — the exact false receipt the
+refusal exists to prevent. The key is the **raw GGUF `block_count`**, not the
+decode-stack depth: depth collides Qwen3.5-9B with Qwen3.8-9B at 32 and
+Qwen3.6-27B with Qwen3.8-27B at 64, each pairing a calibrated model with an
+uncalibrated one. A future collision is resolved by **adding a field to the key,
+never by widening an entry to a model nobody measured**. `coverage_used_peak`
+stays 0.705 on every entry until a real coverage-layer search runs (it is the
+weak arm on both models at 87%/84% against a ≥90% bar; the recalibrated
+alternative is fitted on 23 spans — "recalibration is worth ~4 points" is the
+finding, not the value).
+
+*The lens is a Qwen-family capability by measurement, not by neglect.* CLAUDE.md
+makes Gemma the falsifier for anything touching the forward pass, and Gemma was
+run properly: **0 of 768 candidate heads** clear even a 70% bar against the 90%
+requirement, topping out at 63% (L7H13), and the norm-weighted metric is *inert
+by construction* there — `gemma4.cpp:447` RMS-norms V with no learned weight, so
+Spearman(rankA, rankB) = 1.0000 over all 768 candidates. The refusal is the
+mechanism that keeps that honest; it is not an untested-family placeholder.
+[`note-lens-gemma4-probe.md`](note-lens-gemma4-probe.md),
+[`note-lens-gemma-norm-weighted.md`](note-lens-gemma-norm-weighted.md),
+[`note-lens-norm-weighted-metric.md`](note-lens-norm-weighted-metric.md).
 [`plan-qemmi-lens.md`](plan-qemmi-lens.md), [`lens-format.md`](lens-format.md),
 [`note-nogrammar-refutation.md`](note-nogrammar-refutation.md),
 [`note-lens-absent-attempt.md`](note-lens-absent-attempt.md); gates
@@ -1147,8 +1253,10 @@ Current, verified against the tree at time of writing:
   byte-inert when disarmed (default empty layer set marks no node — same
   liveness-only argument as `set_output_hidden`; gated by
   `test_forward_pass_base` `TapOffByteIdentical`) and recipe-agnostic (the tensor
-  name is the seam, so any recipe naming `kq_soft` hosts it — no lens *claims*
-  for Gemma yet, its constants are unprobed).
+  name is the seam, so any recipe naming `kq_soft` hosts it). No lens *claims*
+  for Gemma — and as of 2026-09-04 that is a **settled measurement, not an
+  unprobed gap**: 0 of 768 candidate heads clear a 70% bar (§6). The seam hosts
+  the probe on any recipe; only Qwen models have a calibration entry.
 
 - **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
   automated test** — but the two links most likely to fail quietly are now

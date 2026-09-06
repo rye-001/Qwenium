@@ -336,22 +336,36 @@ public:
     // `grammar` field on /v1/completions and /v1/chat/completions, which is a
     // separate shipped feature and still works exactly as before.
     //
-    // Refused fail-loud on any architecture but the one LensConstants was
-    // calibrated on (server_lens.h). Same shape and same reason class as
-    // enable_flash_attn: accepting the flag on an uncalibrated model would not
-    // degrade the lens, it would make it lie — a shaped report whose citations
-    // and badges come from coordinates measured on a different model. Returns
-    // false with a printed reason so main() can just `return 1`.
+    // Refused fail-loud on any model that has no calibration entry
+    // (server_lens.h kLensCalibrations, keyed {architecture, block_count}).
+    // Same shape and same reason class as enable_flash_attn: accepting the flag
+    // on an uncalibrated model would not degrade the lens, it would make it lie
+    // — a shaped report whose citations and badges come from coordinates
+    // measured on a different model. Note the key is the MODEL, not the
+    // architecture: `qwen35` alone spans 0.8B through 27B. Returns false with a
+    // printed reason so main() can just `return 1`.
+    //
+    // The resolved entry is stored, not re-looked-up per request: which
+    // coordinates a report was computed from is fixed for the process lifetime.
     bool enable_attention_lens() {
-        const std::string& arch = model_.get_metadata().architecture;
-        if (!qinf::lens_architecture_supported(arch)) {
-            std::cerr << qinf::lens_architecture_refusal(arch) << std::endl;
+        const ModelMetadata& meta = model_.get_metadata();
+        const qinf::LensCalibration* cal =
+            qinf::lens_calibration_for(meta.architecture, meta.block_count);
+        if (!cal) {
+            std::cerr << qinf::lens_calibration_refusal(meta.architecture, meta.block_count)
+                      << std::endl;
             return false;
         }
+        lens_constants_ = cal->constants;
         attention_lens_enabled_ = true;
         std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
                      "(single-slot; document → audited key-value JSON; free decode, "
                      "tolerant parse, 422 on unparseable output)" << std::endl;
+        std::cout << "  lens calibration: " << cal->model << " [" << cal->architecture << "/"
+                  << cal->block_count << "] citation L" << lens_constants_.citation_layer
+                  << "H" << lens_constants_.citation_head << ", coverage layer "
+                  << lens_constants_.coverage_layer << " @ " << lens_constants_.coverage_used_peak
+                  << " — " << cal->provenance << std::endl;
         return true;
     }
     bool attention_lens_enabled() const { return attention_lens_enabled_; }
@@ -488,16 +502,28 @@ public:
     // must keep them apart (docs/lens-format.md §"The shape contract").
     std::string extract_lens_json(const std::string& document,
                                   const std::vector<qinf::LensConcept>& concepts,
-                                  int max_new_tokens) {
+                                  int max_new_tokens,
+                                  const std::vector<size_t>& message_offsets,
+                                  bool want_candidates) {
         std::lock_guard<std::mutex> lock(model_mutex_);
         qinf::LensExtractOptions opts;
-        opts.max_new_tokens = max_new_tokens;
+        opts.max_new_tokens  = max_new_tokens;
+        opts.message_offsets = message_offsets;
+        // Opt-in per request. TRUE COSTS A SECOND COLD INFERENCE over the same
+        // document (docs/plan-candidate-set.md), so it is never implied by
+        // anything else and never defaulted on: the caller pays only when it
+        // asks. False is byte-inert — pass 1 is unchanged and no second pass
+        // runs. `format_version` is qemmi-lens/v4 either way: the version
+        // states what this server SPEAKS, not what one response happens to
+        // carry, so a caller that never sets this still needs v4 accepted.
+        opts.want_candidates = want_candidates;
         // One prefill, one pass, no grammar. Absent concepts come back
         // value:null/badge:"absent" by omission — the model declines natively
         // (30/30 on Leg C) once nothing forces it to fill every key.
         qinf::LensReport rep = qinf::run_lens_extract(
             forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts);
+            (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts,
+            lens_constants_);
         return qinf::lens_report_to_json(rep);
     }
 
@@ -1089,6 +1115,9 @@ private:
     // extraction grammar and the yes/no presence grammar — with the presence gate.
     // The lens holds no grammar state at all now.
     bool attention_lens_enabled_ = false;
+    // Resolved once by enable_attention_lens() from the loaded model's
+    // calibration entry; only read while attention_lens_enabled_ is true.
+    qinf::LensConstants lens_constants_{};
     ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-type / --kv-f16 select otherwise
 
     // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
@@ -1710,11 +1739,64 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             return;
         }
         std::string document;
+        std::vector<size_t> message_offsets;
         std::vector<qinf::LensConcept> concepts;
         int max_tokens = 512;
+        bool want_candidates = false;   // opt-in; see extract_lens_json
         try {
             json body = json::parse(req.body);
-            document = body.at("document").get<std::string>();
+            // The unit is EITHER a flat `document` OR an ordered `messages`
+            // array — exactly one, never both, never neither. Boundaries cannot
+            // be recovered from concatenated text, and picking a precedence
+            // between the two would be a silent fallback at a module boundary.
+            //
+            // What `messages` buys is ATTRIBUTION: every citation reports which
+            // message it landed in, so a value reads "from message 23 of 24".
+            // It deliberately does NOT arm a staleness alarm — measured, a
+            // later-message rule cried wolf on 7 of 9 correctly-handled
+            // corrections and stayed silent on the one real failure, because a
+            // later message routinely restates an old value
+            // (docs/note-ss3-matched-pairs.md §3).
+            const bool has_doc  = body.contains("document");
+            const bool has_msgs = body.contains("messages");
+            if (has_doc == has_msgs)
+                throw std::runtime_error(
+                    std::string("expected exactly one of \"document\" or \"messages\", actual ") +
+                    (has_doc ? "both" : "neither"));
+            if (has_doc) {
+                document = body.at("document").get<std::string>();
+            } else {
+                const json& msgs = body.at("messages");
+                if (!msgs.is_array() || msgs.empty())
+                    throw std::runtime_error(
+                        std::string("\"messages\" expected a non-empty array, actual ") +
+                        (msgs.is_array() ? "empty array" : msgs.type_name()));
+                // Joined with one blank line — the same shape a caller who
+                // concatenated the thread themselves would have sent, so the
+                // prompt regime the free path was validated on is unchanged.
+                // Offsets are recorded against the JOINED text, which is what
+                // the report echoes as `document`, so byte spans line up.
+                for (size_t i = 0; i < msgs.size(); ++i) {
+                    const json& m = msgs[i];
+                    std::string text;
+                    if (m.is_string()) {
+                        text = m.get<std::string>();
+                    } else if (m.is_object() && m.contains("text")) {
+                        text = m.at("text").get<std::string>();
+                    } else {
+                        throw std::runtime_error(
+                            "messages[" + std::to_string(i) +
+                            "] expected a string or {\"text\": string} object, actual " +
+                            std::string(m.type_name()));
+                    }
+                    if (text.empty())
+                        throw std::runtime_error("messages[" + std::to_string(i) +
+                                                 "].text expected non-empty, actual empty");
+                    if (i) document += "\n\n";
+                    message_offsets.push_back(document.size());
+                    document += text;
+                }
+            }
             // key_vocabulary is an array of {key, gloss} objects. `gloss` is
             // accepted but CURRENTLY UNUSED — its consumer, the presence gate,
             // was deleted in Stage 2 (see LensConcept in server_lens.h). A bare
@@ -1734,17 +1816,31 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 }
             }
             if (body.contains("max_tokens")) max_tokens = body.at("max_tokens").get<int>();
+            // "candidates": true asks for the candidate set (qemmi-lens/v4).
+            // Opt-in and default false because it costs a SECOND cold inference
+            // over the same document. Fail loud on a non-boolean rather than
+            // coercing — a silent fallback here would bill the caller for a pass
+            // they did not ask for.
+            if (body.contains("candidates")) {
+                if (!body.at("candidates").is_boolean())
+                    throw std::runtime_error(
+                        "\"candidates\": expected boolean, actual " +
+                        std::string(body.at("candidates").type_name()));
+                want_candidates = body.at("candidates").get<bool>();
+            }
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(json({{"error", std::string("bad request — expected "
-                "{\"document\": string, \"key_vocabulary\": [{\"key\",\"gloss\"}|string,...], "
-                "\"max_tokens\"?: int}: ") + e.what()},
+                "{(\"document\": string | \"messages\": [string|{\"text\": string},...]), "
+                "\"key_vocabulary\": [{\"key\",\"gloss\"}|string,...], "
+                "\"max_tokens\"?: int, \"candidates\"?: bool}: ") + e.what()},
                 {"code", "bad_request"}}).dump(), "application/json");
             return;
         }
         try {
             std::string lens_json =
-                integration.extract_lens_json(document, concepts, max_tokens);
+                integration.extract_lens_json(document, concepts, max_tokens,
+                                              message_offsets, want_candidates);
             res.set_content(lens_json, "application/json");
         } catch (const qinf::LensUnparseableError& e) {
             // The shape contract (docs/lens-format.md): the REQUEST was fine —
