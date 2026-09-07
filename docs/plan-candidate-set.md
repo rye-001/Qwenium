@@ -215,9 +215,16 @@ Same bar that killed the fixed grammar, the presence gate and the thread alarm.
 On `qdocs_messy_corpus`:
 
 1. **Precision** — fraction of emitted candidates a human accepts as answering
-   the key. Bar **≥ 0.90**. *Open — needs human scoring.*
+   the key. Bar **≥ 0.90**. **PASSED 2026-09-07** (human scoring, the gate's own
+   definition): 77/81 ≈ 95%. All four rejects are on `customer`, the corpus's
+   most semantically open key, and split into two classes — see *Precision
+   rejects* below.
 2. **Median set size on uncontested keys** — must be **1**. *PASSED
    2026-09-06: median 1.0, `0=0 1=71 2=2 3+=2`, byte-exactness 81/81.*
+   **Re-measured 2026-09-07 against the SHIPPED producer** (see *The gate was
+   measuring a lookalike*) after the recall/anchor fixes: bit-identical —
+   median 1.0, `0=0 1=71 2=2 3+=2`, 81/81 byte-exact, `returned_as` 62/73,
+   0 producer failures.
 3. **Recall on known conflicts** — on a seeded conflict corpus (the lease shape:
    a clause and a later amendment), the losing span appears as a candidate.
    Bar **≥ 0.90**. *Open — the corpus does not exist yet.*
@@ -418,3 +425,66 @@ Fixtures covering every row of the state table, including finder-failed
 (`candidates_error`) and not-requested (both members absent), each rendering
 distinguishably. The server side lands
 separately, so build against committed fixtures rather than a live v4 endpoint.
+
+---
+
+## The gate was measuring a lookalike (found and fixed 2026-09-07)
+
+`run_cand_probe` had its **own** copy of the producer — `cand_parse_pass2`, a
+raw-string dedup, and a `document.find()` sort — and never called the shipped
+`lens_apply_pass2_candidates`. Two consequences, both now closed:
+
+- **The gate could not see a producer change.** A fix or a regression in the
+  server's candidate assembly was invisible to CAND. This is exactly the hazard
+  `tests/CMakeLists.txt` warns about for QDOCS_S1 — *"the gate would be worthless
+  against a lookalike"* — reproduced in the candidate gate.
+- **Byte-exactness was a tautology.** The old line counted `document.find(c)`
+  over spans the harness had itself collected as raw model strings, so `81/81`
+  measured that findable spans are findable. Against the shipped function, where
+  `value` is sliced out of the document, it is a real check.
+
+The harness now calls the shipped function. The re-run reproduces every number
+bit-identically, which is the correct result: **the corpus contains no
+hard-wrapped prose**, so the recall defect the fix addresses does not occur in
+it. That is also why a systematic defect survived a full gate pass — the gate ran
+a copy *and* the corpus was blind to the failure class. A hard-wrapped document
+belongs in the corpus; it is cheap and pairs naturally with the gate-3 corpus
+work.
+
+## Precision rejects (gate 1, 2026-09-07)
+
+Four of 81. All on `customer`, in two classes that need different responses:
+
+```
+[m_en4] "Meridian Foods Pte"  ·  "Meridian Foods Pte Ltd"      <- truncation
+[m_de3] ... "an die filiale"                                   <- not a customer
+[m_de4] ... "Karin Brand" · "Leitung Beschaffung"              <- contact / job title
+```
+
+**Class 1 — nested duplicate.** `"Meridian Foods Pte"` is a strict prefix of
+`"Meridian Foods Pte Ltd"`: one span quoted twice at different extents, not two
+answers. Mechanically fixable.
+
+**Careful — the obvious containment rule is wrong.** This plan already prefers
+the *tighter* span when linking `returned_as`, but here the *wider* candidate is
+the correct one, because the narrower is a truncation. The same structural
+relation has opposite correct answers: `"1,450.00"` inside `"Rent is 1,450.00 GBP
+per month"` is a real narrow answer plus context, while `"Meridian Foods Pte"`
+inside `"Meridian Foods Pte Ltd"` is a mistake. Neither "always keep wider" nor
+"always keep narrower" is safe.
+
+The discriminator is the **shared boundary**: a truncation shares a `byte_lo`
+(or `byte_hi`) with the span containing it; a narrow-answer-inside-context does
+not. Proposed rule, deliberately narrow: *when two candidates for one key share a
+byte_lo or a byte_hi and one contains the other, they are one span quoted twice —
+keep the longer.* Containment with two different boundaries stays two candidates,
+because both really are spans the document offers. **Not yet implemented; needs a
+decision.**
+
+**Class 2 — role/type confusion.** `"Leitung Beschaffung"` (Head of Procurement)
+and `"an die filiale"` (to the branch) are not customers; `"Karin Brand"` is a
+contact person, not the buying entity. These are *type-matches for "who"*, not
+answers to the key — the risk this plan names as *"the whole risk"*. Not
+mechanically fixable: it is producer quality, and the lever is the pass-2
+instruction or the key gloss, both of which change the measured regime and would
+need re-gating.

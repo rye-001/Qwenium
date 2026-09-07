@@ -246,6 +246,9 @@ Done in that repo's working tree as of 2026-09-06 (uncommitted there).
 | `document` | string | The user's raw document, verbatim. **All byte offsets below are relative to this string.** |
 | `raw` | string | Exactly what the model emitted, verbatim. Today this is grammar-shaped; note that "grammar-guaranteed well-formed" is **not** a claim the format makes — it was measured false (a constrained value can run off the token budget mid-string). Treat `raw` as evidence, not as a parse guarantee; the shape contract above is the guarantee. |
 | `fields` | array | The structured extraction — the importer surface. See below. |
+| `prefix` | `"warm"` \| **absent** | Present iff this extract reused a primed document prefix instead of re-reading the document. See *The warm document* below. |
+| `vocabulary_mode` | `"questions"` \| **absent** | Present iff the request used a question vocabulary. Absent = ordinary identifier keys. See *Question vocabulary* below. |
+| `uncalibrated` | array \| **absent** | Present iff `vocabulary_mode` is `"questions"`. Names the signals running on constants that were NOT measured for this vocabulary mode. Currently always `["badge","coverage"]`. |
 | `key_candidates` | object \| **absent** | v4. Present iff the candidate-set producer ran. See *`key_candidates` — the candidate set* below for the full three-state contract. |
 | `candidates_error` | string \| **absent** | v4. Present iff the candidate-set producer **failed**; `key_candidates` is then also absent. |
 | `prompt`, `gen`, `hover`, `heat`, `skipped` | arrays | The viewer surface (token-level provenance). See below. |
@@ -531,3 +534,103 @@ context ⇒ **400** (fail-loud, names the parameter). Output that cannot be pars
 ⇒ **422** `unparseable_extraction` (see the shape contract — this one is *not*
 your fault). The endpoint is single-slot and exclusive; the server 404s it when
 `--attention-lens` is off.
+
+## Question vocabulary (docs/plan-question-keys.md)
+
+A `key_vocabulary` entry may be `{"id": "delivery_date", "question": "What is the
+delivery date?"}` instead of `{"key", "gloss"}` or a bare string. `id` and `key`
+are the same thing under two names; **the question is never a map key.** `fields`
+and `key_candidates` stay keyed by the short id, so nothing downstream has to
+handle a sentence as an identifier.
+
+The answer is still **a verbatim span of the document**. This is not a
+convenience of the current prompt — it is what was measured, and the instruction
+keeps demanding it. Measured 2026-09-07 on Qwen 3.8-9B (`QKEY=1`, 15 docs EN+DE,
+75 fields, matched pairs against an identifier control):
+
+| | control (identifiers) | questions |
+|---|---|---|
+| extractiveness | — | **97%** (73/75) |
+| citation top-1 | 92% | **93%** |
+| citation top-3 | 99% | **99.5%** |
+
+Questions were marginally *better* than identifiers on citation. The calibrated
+citation head transfers.
+
+**What did NOT transfer, and why `uncalibrated` exists.** The probe measured the
+citation head and nothing else. `badge` (`ungrounded_body_mass`) and coverage
+(`coverage_used_peak`) still run on constants measured for identifier
+extraction. A question-mode payload therefore carries
+`"uncalibrated":["badge","coverage"]`, and an importer **must not** present those
+two as validated receipts in question mode. This is the same defect class
+per-model calibration was introduced to kill — coordinates measured on one thing,
+reported as if measured on another — caught here at the task boundary instead of
+the model boundary.
+
+**Mixed vocabularies are refused, fail-loud.** Either every entry carries a
+`question` or none does. The probe compared an all-identifier arm against an
+all-question arm and says nothing about a prompt that does both, so a mixed
+request is an unmeasured regime and returns `400`, not a best-effort run.
+
+**No version bump.** Both members are additive and absent in key mode, and `id`
+is optional (`key` still works), so a v4 payload for an identifier request is
+byte-identical to before. A caller knows whether it asked a question, so — unlike
+`key_candidates` — absence needs no version to disambiguate it.
+
+**What a question still does not buy.** Every non-claim above survives verbatim.
+The lens does not answer a question; it locates the span the document offers as
+an answer and reports where the model looked. A question that the document does
+not answer comes back `badge:"absent"`, earned by omission, exactly as a key
+does. Nothing here licenses prose, inference, or a synthesized answer — see
+docs/plan-question-keys.md §2 for why that is a different endpoint, not a flag.
+
+## The warm document (docs/plan-lens-warm-document.md)
+
+A request may carry an optional `"document_id"`: an opaque caller-chosen handle
+saying *this is the same document I named last time*.
+
+```json
+{ "document": "...", "document_id": "lease-4471", "key_vocabulary": [...] }
+```
+
+Omit it and nothing changes — the payload is byte-identical to before this
+feature existed. Send it and, when the server still holds that document's
+prefix, the document is not re-read: only the instruction is. The response then
+carries `"prefix": "warm"`.
+
+**Why it is worth asking for.** The prompt is `document + instruction`, so
+editing the key vocabulary changes a ~40-80 token suffix of a multi-thousand
+token prompt. Measured 2026-09-07 on Qwen 3.8-9B, pass-1 prefill:
+
+| document | cold | warm | saving |
+|---|---|---|---|
+| 1 K | 5254.7 ms | 390.0 ms | 92.6% (13.5x) |
+| 2 K | 9980.9 ms | 408.7 ms | 95.9% (24.4x) |
+| 4 K | 20676.2 ms | 456.3 ms | 97.8% (45.3x) |
+| 8 K | 41132.5 ms | 452.4 ms | 98.9% (90.9x) |
+
+Prefill only; decode is unchanged and costs the same either way. Read the
+ratios, not the absolute milliseconds — the implied throughput on that host is
+unexplained and should not be quoted as this engine's prefill speed.
+
+**Reusing an id with different text is a `400`, always.** The server hashes the
+document and refuses to serve a primed prefix for bytes that do not match,
+because doing so would report citations against a document the model never read.
+That is the worst failure this format has, so it is an interlock, not a warning.
+
+**Warmth changes nothing the lens claims.** It is a statement about how the
+prefix was computed, not about what the model knows. Measured: warm and cold
+produce identical field values (15/15), identical citation accuracy (92%/99%
+across all arms), and identical candidate sets (75/75). `prefix` is disclosed
+anyway so a warm citation mass is never unknowingly compared against a cold one.
+
+**Explicit, not transparent — on purpose.** The lens sells receipts, and a
+transparent cache would let the same request return different receipts depending
+on invisible server state. The caller knows when a document is "the same" across
+an edit; the server does not. There is no server flag: it is request-scoped, and
+a caller that never sends `document_id` never warms.
+
+**Both passes warm.** With `"candidates": true`, pass 2 shares pass 1's document
+prefix as well, so an iterating caller pays the document once rather than twice
+per edit. Pass 2 verifies the shared prefix token-for-token before reusing it and
+falls back to a cold prefill on any mismatch.

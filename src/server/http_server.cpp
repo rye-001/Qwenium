@@ -504,11 +504,18 @@ public:
                                   const std::vector<qinf::LensConcept>& concepts,
                                   int max_new_tokens,
                                   const std::vector<size_t>& message_offsets,
-                                  bool want_candidates) {
+                                  bool want_candidates,
+                                  const std::string& document_id) {
         std::lock_guard<std::mutex> lock(model_mutex_);
         qinf::LensExtractOptions opts;
         opts.max_new_tokens  = max_new_tokens;
         opts.message_offsets = message_offsets;
+        // Warm document (docs/plan-lens-warm-document.md). Opt-in: an empty id
+        // is today's behaviour exactly. The state lives on the server because
+        // the reusable thing IS slot 0's contents, and --attention-lens owns
+        // slot 0 exclusively; the mutex above is what makes that safe.
+        opts.document_id = document_id;
+        opts.warm        = &warm_document_;
         // Opt-in per request. TRUE COSTS A SECOND COLD INFERENCE over the same
         // document (docs/plan-candidate-set.md), so it is never implied by
         // anything else and never defaulted on: the caller pays only when it
@@ -1118,6 +1125,9 @@ private:
     // Resolved once by enable_attention_lens() from the loaded model's
     // calibration entry; only read while attention_lens_enabled_ is true.
     qinf::LensConstants lens_constants_{};
+    // Warm document state for the lens (docs/plan-lens-warm-document.md). Guarded
+    // by model_mutex_, like every other use of slot 0.
+    qinf::LensWarmDocument warm_document_{};
     ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-type / --kv-f16 select otherwise
 
     // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
@@ -1743,6 +1753,7 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         std::vector<qinf::LensConcept> concepts;
         int max_tokens = 512;
         bool want_candidates = false;   // opt-in; see extract_lens_json
+        std::string document_id;        // opt-in warm handle; empty ⇒ cold
         try {
             json body = json::parse(req.body);
             // The unit is EITHER a flat `document` OR an ordered `messages`
@@ -1807,12 +1818,30 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                     concepts.push_back({kv.get<std::string>(), ""});
                 } else if (kv.is_object()) {
                     qinf::LensConcept c;
-                    c.key   = kv.at("key").get<std::string>();
+                    // `id` is the question form's join key and is exactly `key`
+                    // under another name — accept either, require one. The
+                    // sentence is NEVER the map key (plan-question-keys.md §5).
+                    if (kv.contains("key"))      c.key = kv.at("key").get<std::string>();
+                    else if (kv.contains("id"))  c.key = kv.at("id").get<std::string>();
+                    else throw std::runtime_error(
+                        "key_vocabulary object expected a \"key\" or \"id\" member, "
+                        "actual neither");
                     c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
+                    // Optional question form. Empty string is rejected rather
+                    // than treated as absent: a caller that sent the member
+                    // meant to ask something.
+                    if (kv.contains("question")) {
+                        c.question = kv.at("question").get<std::string>();
+                        if (c.question.empty())
+                            throw std::runtime_error(
+                                "key_vocabulary \"question\" expected non-empty for key '" +
+                                c.key + "', actual empty string");
+                    }
                     concepts.push_back(std::move(c));
                 } else {
                     throw std::runtime_error("key_vocabulary element expected a "
-                                             "string or {\"key\",\"gloss\"} object");
+                                             "string, {\"key\",\"gloss\"} or "
+                                             "{\"id\",\"question\"} object");
                 }
             }
             if (body.contains("max_tokens")) max_tokens = body.at("max_tokens").get<int>();
@@ -1828,19 +1857,29 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                         std::string(body.at("candidates").type_name()));
                 want_candidates = body.at("candidates").get<bool>();
             }
+            // Opt-in warm handle. A caller that omits it gets today's behaviour.
+            if (body.contains("document_id")) {
+                document_id = body.at("document_id").get<std::string>();
+                if (document_id.empty())
+                    throw std::runtime_error(
+                        "\"document_id\": expected non-empty string when present, "
+                        "actual empty — omit the member to run cold");
+            }
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(json({{"error", std::string("bad request — expected "
                 "{(\"document\": string | \"messages\": [string|{\"text\": string},...]), "
                 "\"key_vocabulary\": [{\"key\",\"gloss\"}|string,...], "
-                "\"max_tokens\"?: int, \"candidates\"?: bool}: ") + e.what()},
+                "\"max_tokens\"?: int, \"candidates\"?: bool, "
+                "\"document_id\"?: string}: ") + e.what()},
                 {"code", "bad_request"}}).dump(), "application/json");
             return;
         }
         try {
             std::string lens_json =
                 integration.extract_lens_json(document, concepts, max_tokens,
-                                              message_offsets, want_candidates);
+                                              message_offsets, want_candidates,
+                                              document_id);
             res.set_content(lens_json, "application/json");
         } catch (const qinf::LensUnparseableError& e) {
             // The shape contract (docs/lens-format.md): the REQUEST was fine —

@@ -27,6 +27,7 @@
 //   ATTN_TAP_SELFTEST=1   ./bin/attn-provenance   # tap sanity only, then exit
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -6057,6 +6058,210 @@ cand_parse_pass2(const std::string& text, const std::vector<std::string>& keys) 
     return out;
 }
 
+// ── QKEY — question-key probe (docs/plan-question-keys.md §4) ───────────────
+// Matched pairs, the design that caught what coverage could not in SS3: same
+// documents, same expected values, same taps, same calibrated head, same
+// max_new_tokens, same greedy decode. The ONLY variable is whether a
+// vocabulary entry is an identifier (Arm K, control) or a question (Arm Q).
+// Byte-inert when QKEY is unset (this function is only ever reached from the
+// QKEY dispatch below). Arm S (the 768-head sweep) is explicitly OUT OF SCOPE
+// here — if Arm Q fails its bar, the report says Arm S is indicated and stops.
+static int run_qkey_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                          Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ QKEY — question-key probe (docs/plan-question-keys.md §4)      ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    // This model's own calibrated citation coordinates — NOT the global
+    // FROZEN_SLOT/HEAD defaults (those are Qwen 3.6 L3H13 unless overridden by
+    // ATTN_FROZEN_SLOT/HEAD, which this run does not set). Looking the model up
+    // in the same table production uses means the probe is correct regardless
+    // of env state, and fails loud instead of silently scoring the wrong head.
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count);
+    if (!calib) {
+        std::fprintf(stderr, "QKEY: expected a calibrated lens entry for arch '%s' "
+                             "block_count %u, actual none present — %s\n",
+                     meta.architecture.c_str(), meta.block_count,
+                     qinf::lens_calibration_refusal(meta.architecture, meta.block_count).c_str());
+        return 1;
+    }
+    const int qkey_layer = calib->constants.citation_layer;
+    const int qkey_head  = calib->constants.citation_head;
+    int qkey_slot = -1;
+    for (size_t i = 0; i < g_attn_layers->size(); ++i)
+        if ((*g_attn_layers)[i] == qkey_layer) { qkey_slot = (int)i; break; }
+    if (qkey_slot < 0) {
+        std::fprintf(stderr, "QKEY: expected citation_layer %d among the %zu discovered "
+                             "attention layers, actual not found\n",
+                     qkey_layer, g_attn_layers->size());
+        return 1;
+    }
+    // Leg C's scoring (qdocs_eval_field) reads the FROZEN_SLOT/HEAD globals,
+    // not parameters — point them at THIS model's calibration once, up front,
+    // so both arms score against the identical, correct head.
+    L3H13_SLOT  = qkey_slot;
+    FROZEN_SLOT = qkey_slot;
+    FROZEN_HEAD = qkey_head;
+    std::printf("calibration: %s — citation L%dH%d (tap slot %d)\n",
+                calib->model, qkey_layer, qkey_head, qkey_slot);
+
+    // Mechanical concept -> question rewrite table — one entry per distinct
+    // concept in qdocs_messy_corpus() (verified: exactly these 7 across all 15
+    // docs). Uniform phrasing, deliberately unclever, per plan §4: a cleverer
+    // question for one concept than another would confound the measurement.
+    static const std::map<std::string, std::string> QUESTION_FOR = {
+        {"customer",      "Who is the customer?"},
+        {"quantity",      "What is the quantity?"},
+        {"unit_price",    "What is the unit price?"},
+        {"total",         "What is the total?"},
+        {"order_date",    "What is the order date?"},
+        {"delivery_date", "What is the delivery date?"},
+        {"order_number",  "What is the order number?"},
+    };
+
+    const int TOL = 2;
+    const int MAX_NEW = 400;   // same budget as the CAND pass-1 extraction
+    auto corpus = qdocs_messy_corpus();
+    std::vector<int> taps(g_attn_layers->begin(), g_attn_layers->end());
+
+    struct Acc { int cite_n = 0, t1 = 0, t3 = 0, labeled = 0, extractive = 0; };
+    Acc armK, armQ;
+    std::map<int, int> head_hist;   // Arm Q argmax-head distribution, over fields
+    int head_fields = 0;
+
+    // TASK wording is IDENTICAL between arms; only the key list differs — that
+    // is the one variable plan §4 requires.
+    auto build_task = [](const std::vector<std::string>& keys) {
+        std::string t = "\n\nExtract the following from the email above into a flat JSON "
+            "object of \"key\": \"value\" pairs, using EXACTLY these keys, verbatim. "
+            "Copy each value verbatim from the email. Output ONLY the JSON object, "
+            "nothing else. Keys: ";
+        for (size_t i = 0; i < keys.size(); ++i) t += (i ? ", " : "") + keys[i];
+        return t;
+    };
+    auto ws_normalize = [](const std::string& s) {
+        std::string out; bool sp = false;
+        for (char c : s) {
+            if (std::isspace((unsigned char)c)) { sp = true; continue; }
+            if (sp && !out.empty()) out += ' ';
+            sp = false; out += c;
+        }
+        return out;
+    };
+
+    for (const QMessy& d : corpus) {
+        for (int arm = 0; arm < 2; ++arm) {   // 0 = K (control, identifiers), 1 = Q (questions)
+            std::vector<std::string> keys;
+            for (const QLabel& f : d.fields)
+                keys.push_back(arm == 0 ? f.concept : QUESTION_FOR.at(f.concept));
+            std::string prompt = qdocs_chat_prompt(d.document, build_task(keys));
+            FreeRun R = run_freegen(fp, sched, tok, meta, prompt, "", taps, MAX_NEW);
+
+            int doc_lo, doc_hi;
+            if (!qdocs_span_in_prompt(tok, R, d.document, doc_lo, doc_hi)) { doc_lo = 0; doc_hi = R.P - 1; }
+
+            Acc& A = arm == 0 ? armK : armQ;
+            for (const QLabel& f : d.fields) {
+                A.labeled++;
+                QFieldEval e = qdocs_eval_field(tok, R, f.value, doc_lo, doc_hi, *g_attn_layers, TOL);
+                if (e.found_verbatim) {
+                    A.extractive++;
+                    A.cite_n += e.cite_n; A.t1 += e.cite_t1; A.t3 += e.cite_t3;
+                } else if (arm == 1) {
+                    // whitespace-normalized-exact fallback — extractiveness bar only.
+                    std::string nv = ws_normalize(f.value), ng = ws_normalize(R.gen_text);
+                    if (!nv.empty() && ng.find(nv) != std::string::npos) A.extractive++;
+                }
+                // Head agreement (Arm Q only): among ALL heads at the calibrated
+                // citation LAYER, which one has the single sharpest (highest
+                // top-1 weight) attention at the first gen step overlapping the
+                // true value? This is a within-layer check, not the 768-head
+                // sweep (Arm S) — it answers "did the SAME head stay sharpest",
+                // not "is some other layer's head now sharper".
+                if (arm == 1 && e.found_verbatim) {
+                    std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+                    size_t gb = R.gen_text.find(f.value);
+                    if (gb != std::string::npos) {
+                        size_t ge = gb + f.value.size();
+                        for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+                            if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+                            if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+                            int n_kv = R.n_kv_at_step[g - 1];
+                            const auto& row = R.rows[g - 1][qkey_slot];
+                            int n_head = n_kv ? (int)(row.size() / n_kv) : 0;
+                            int best_h = -1; float best_w = -1.f;
+                            for (int h = 0; h < n_head; ++h) {
+                                auto tk = topk_head(row, h, n_kv, 1);
+                                if (!tk.empty() && tk[0].second > best_w) { best_w = tk[0].second; best_h = h; }
+                            }
+                            if (best_h >= 0) { head_hist[best_h]++; head_fields++; }
+                            break;   // first overlapping gen step only
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auto pct = [](int a, int b) { return b ? 100.0 * a / b : 0.0; };
+
+    // ── 1. Extractiveness (Arm Q) — the cheapest kill; print it first ────────
+    double extr = pct(armQ.extractive, armQ.labeled);
+    bool bar_extr = extr >= 90.0;
+    std::printf("\n================ 1. EXTRACTIVENESS — Arm Q (CHEAPEST KILL) ================\n");
+    std::printf("byte-exact or whitespace-normalized-exact slices of the document: %d/%d (%.0f%%)  [bar >= 90%%]\n",
+                armQ.extractive, armQ.labeled, extr);
+    std::printf("VERDICT: %s\n", bar_extr ? "PASS"
+                : "FAIL — questions pull the model off extraction; nothing below can be trusted to matter");
+
+    // ── 2/3. Citation top-1 / top-3, Arm K vs Arm Q ──────────────────────────
+    double k1 = pct(armK.t1, armK.cite_n), k3 = pct(armK.t3, armK.cite_n);
+    double q1 = pct(armQ.t1, armQ.cite_n), q3 = pct(armQ.t3, armQ.cite_n);
+    std::printf("\n================ 2. CITATION — Arm K (control, identifier keys) ================\n");
+    std::printf("top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [scoreable/verbatim fields: %d/%d]\n",
+                armK.t1, armK.cite_n, k1, armK.t3, armK.cite_n, k3, armK.extractive, armK.labeled);
+    std::printf("\n================ 3. CITATION — Arm Q (question keys) ================\n");
+    std::printf("top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [scoreable/verbatim fields: %d/%d]\n",
+                armQ.t1, armQ.cite_n, q1, armQ.t3, armQ.cite_n, q3, armQ.extractive, armQ.labeled);
+
+    // ── Reproduction check — Arm K must land near the published 89%/98% ──────
+    bool repro = std::fabs(k1 - 89.0) <= 2.0 && std::fabs(k3 - 98.0) <= 2.0;
+    std::printf("\n================ REPRODUCTION CHECK — Arm K vs published Qwen3.8-9B (89%%/98%%) ================\n");
+    std::printf("Arm K top1 %.0f%% (published 89%%, delta %+.1f)  top3 %.0f%% (published 98%%, delta %+.1f)\n",
+                k1, k1 - 89.0, k3, k3 - 98.0);
+    std::printf("VERDICT: %s\n", repro ? "PASS — probe is correctly configured"
+                : "FAIL — probe is MISCONFIGURED; treat every other number here with suspicion");
+
+    // ── 4. Head agreement, Arm Q ──────────────────────────────────────────────
+    int on_head = head_hist.count(qkey_head) ? head_hist[qkey_head] : 0;
+    std::printf("\n================ 4. HEAD AGREEMENT — Arm Q (calibrated head L%dH%d) ================\n",
+                qkey_layer, qkey_head);
+    std::printf("argmax head stayed H%d: %d/%d fields (%.0f%%)\n",
+                qkey_head, on_head, head_fields, pct(on_head, head_fields));
+    std::printf("distribution over heads (head:count of fields where it was sharpest):\n  ");
+    for (auto& kv : head_hist) std::printf("H%d:%d  ", kv.first, kv.second);
+    std::printf("\n");
+
+    // ── 5. Delta — Arm K top3 minus Arm Q top3 ───────────────────────────────
+    double delta = k3 - q3;
+    bool bar_delta = delta <= 5.0;
+    std::printf("\n================ 5. DELTA — Arm K top3 minus Arm Q top3 ================\n");
+    std::printf("%.1f points  [bar <= 5.0]\n", delta);
+    std::printf("VERDICT: %s\n", bar_delta ? "PASS" : "FAIL — the prompt shape moves the head; constants are task-shaped");
+
+    bool bar2 = q3 >= 90.0;
+    std::printf("\n================ SUMMARY ================\n");
+    std::printf("bar1 Arm K reproduces published numbers (within 2pt): %s\n", repro ? "PASS" : "FAIL");
+    std::printf("bar2 Arm Q citation top3 >= 90%%:                      %s (%.0f%%)\n", bar2 ? "PASS" : "FAIL", q3);
+    std::printf("bar3 Arm K - Arm Q top3 <= 5pt:                       %s (%.1f)\n", bar_delta ? "PASS" : "FAIL", delta);
+    std::printf("bar4 Arm Q extractiveness >= 90%%:                     %s (%.0f%%)\n", bar_extr ? "PASS" : "FAIL", extr);
+    if (!bar2)
+        std::printf("Arm Q failed its bar — Arm S (the 768-head sweep) is indicated as the next step; NOT implemented here.\n");
+
+    return (repro && bar2 && bar_delta && bar_extr) ? 0 : 1;
+}
+
 static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
                           Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx) {
     std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
@@ -6128,31 +6333,32 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         // table does not yet cover (docs/plan-candidate-set.md §"The states it
         // must express"): it separates absence from recall failure, but not
         // either of those from PRODUCER failure.
-        auto parsed = cand_parse_pass2(P2.gen_text, keys);
-        if (parsed.empty() && !P2.gen_text.empty()) {
+        // THE SHIPPED PRODUCER, not a lookalike. This gate previously ran the
+        // harness's own parse-and-accumulate (cand_parse_pass2 + a raw-string
+        // dedup + a document.find() sort), which is NOT what the server does:
+        // the server resolves each quoted span to a byte range, tolerating the
+        // hard-wrap newline and a trailing sentence period, emits the DOCUMENT's
+        // bytes, and dedups by RANGE. Measuring the copy is exactly the failure
+        // tests/CMakeLists.txt warns about for QDOCS_S1 ("the gate would be
+        // worthless against a lookalike") — a gate that cannot see a producer
+        // change cannot gate it. Calling the shipped function makes CAND
+        // measure what ships, and makes the byte-exactness line below a real
+        // check rather than a tautology.
+        qinf::LensReport prep;
+        qinf::lens_apply_pass2_candidates(d.document, P2.gen_text, keys, prep);
+        if (prep.candidates_producer_failed) {
             n_unparseable++;
             std::printf("  !! [%s] PASS2 UNPARSEABLE — %zu gen tokens produced 0 readable "
                         "candidate lines. This is a PRODUCER failure, not an empty document.\n",
                         d.tag.c_str(), P2.gen_tokens.size());
         }
-        for (auto& kv : parsed) {
+        // Already deduped by byte range and sorted byte_lo-ascending by the
+        // shipped function; no re-sort here, and no string dedup — two spans
+        // with identical text at different offsets are two candidates on the
+        // wire, so they must be two here.
+        for (auto& kv : prep.key_candidates) {
             auto& cs = out.per_key[kv.first].cands;
-            if (std::find(cs.begin(), cs.end(), kv.second) == cs.end())
-                cs.push_back(kv.second);
-        }
-        // Sort each key's candidates into document order (byte_lo ascending) —
-        // not-found spans (a paraphrase) sort after found ones, emission order
-        // among themselves. This is the print/report order, not a stored offset.
-        for (auto& kv : out.per_key) {
-            std::vector<std::pair<size_t, std::string>> tagged;
-            for (auto& sp : kv.second.cands) tagged.push_back({d.document.find(sp), sp});
-            std::stable_sort(tagged.begin(), tagged.end(), [](const auto& a, const auto& b) {
-                bool af = a.first != std::string::npos, bf = b.first != std::string::npos;
-                if (af != bf) return af;
-                return af && bf && a.first < b.first;
-            });
-            kv.second.cands.clear();
-            for (auto& t : tagged) kv.second.cands.push_back(t.second);
+            for (const qinf::LensCandidate& c : kv.second) cs.push_back(c.value);
         }
 
         // Uncontested keys: the corpus labels EXACTLY ONE true value for this
@@ -6229,6 +6435,596 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
     return (!sizes.empty() && median == 1.0) ? 0 : 1;
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// WARM1/WARM2 — docs/plan-lens-warm-document.md probes. Harness-only, no
+// server/engine changes: both reuse qdocs_messy_corpus() and the existing
+// pass-1 (QKEY-style citation scoring, qdocs_eval_field) / pass-2 (CAND's
+// lens_apply_pass2_candidates) machinery. Byte-inert when WARM1/WARM2 unset.
+// ═════════════════════════════════════════════════════════════════════════
+
+enum class SplitMode { ONESHOT, SPLIT_COLD, SPLIT_WARM };
+
+static double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+}
+
+// Same free-greedy tapped generation as run_freegen (identical decode loop),
+// generalized with a document/instruction split mode. `document` + `task` are
+// rendered through the production chat template exactly as qdocs_chat_prompt
+// already does for QKEY/CAND/Leg C. The split point is the document's own
+// byte span within that ONE rendered+tokenized text (the same boundary
+// run_lens_tapped_decode computes as doc_hi), not a second, independently
+// tokenized concatenation — this keeps the split token-boundary-safe.
+static FreeRun run_freegen_split(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                 Tokenizer* tok, const ModelMetadata& meta,
+                                 const std::string& document, const std::string& task,
+                                 const std::vector<int>& tap_layers, int max_new,
+                                 SplitMode mode, bool capture_conf = false,
+                                 char close_char = '}',
+                                 double* prefill_ms = nullptr, double* decode_ms = nullptr) {
+    FreeRun R;
+    std::string prompt_text = qdocs_chat_prompt(document, task);
+    R.body_text = prompt_text;
+    R.n_head = (int)meta.attention_head_count;
+    R.prompt_tokens = encode_prompt(tok, prompt_text);
+    if (tok->decode(R.prompt_tokens) != prompt_text)
+        throw std::runtime_error("run_freegen_split: prompt roundtrip mismatch");
+    R.P = (int)R.prompt_tokens.size();
+
+    size_t doc_pos = prompt_text.find(document);
+    if (doc_pos == std::string::npos)
+        throw std::runtime_error("run_freegen_split: document expected verbatim in "
+                                 "rendered prompt, actual not found");
+    size_t doc_end = doc_pos + document.size();
+    std::vector<size_t> cum = cum_bytes(tok, R.prompt_tokens);
+    int split_idx = R.P;
+    for (int k = 0; k < R.P; ++k) if (cum[k] >= doc_end) { split_idx = k; break; }
+    R.instr_tok = split_idx;   // reused field: document/suffix boundary
+
+    auto tpre0 = std::chrono::steady_clock::now();
+    std::vector<float> logits;
+    if (mode == SplitMode::ONESHOT) {
+        fp->clear_slot(0); fp->set_cache_pos(0, 0);
+        logits = fp->run_prefill(R.prompt_tokens, 0, 0, sched);
+    } else {
+        std::vector<int32_t> chunk1(R.prompt_tokens.begin(), R.prompt_tokens.begin() + split_idx);
+        std::vector<int32_t> chunk2(R.prompt_tokens.begin() + split_idx, R.prompt_tokens.end());
+        if (mode == SplitMode::SPLIT_COLD) {
+            fp->clear_slot(0); fp->set_cache_pos(0, 0);
+            fp->run_prefill(chunk1, 0, 0, sched);
+        }
+        // SPLIT_WARM: the caller has already primed slot 0 with this exact
+        // chunk 1 (qdocs_prime_chunk1_chat, same document+task ⇒ identical
+        // tokenization) — resume from its cache position instead of redoing it.
+        int pos2 = (int)fp->get_cache_pos(0);
+        logits = fp->run_prefill(chunk2, pos2, 0, sched);
+    }
+    if (prefill_ms) *prefill_ms = ms_since(tpre0);
+
+    int32_t next = 0;
+    for (int j = 1; j < (int)logits.size(); ++j) if (logits[j] > logits[next]) next = j;
+
+    auto tdec0 = std::chrono::steady_clock::now();
+    const int32_t eos = tok->get_eos_token_id();
+    for (int t = 0; t < max_new; ++t) {
+        if (next == eos) break;
+        int32_t cur = next;
+        R.gen_tokens.push_back(cur);
+        std::string ct = tok->decode(cur);
+        bool closed = ct.find(close_char) != std::string::npos;
+
+        std::vector<int32_t>  tks = {cur};
+        std::vector<uint32_t> slots = {0};
+        std::vector<int32_t>  positions = {(int)fp->get_cache_pos(0)};
+        ggml_cgraph* gf = fp->build_decoding_graph(tks, slots, positions);
+
+        std::vector<ggml_tensor*> taps;
+        for (int il : tap_layers) {
+            std::string nm = "kq_soft." + std::to_string(il);
+            ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
+            if (!ts) throw std::runtime_error("freegen_split tap missing: " + nm);
+            ggml_set_output(ts); ggml_build_forward_expand(gf, ts); taps.push_back(ts);
+        }
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_decode_inputs(gf, tks, slots, positions);
+        ggml_backend_sched_graph_compute(sched, gf);
+
+        std::vector<std::vector<float>> layer_rows; int n_kv = 0;
+        for (ggml_tensor* ts : taps) {
+            n_kv = (int)ts->ne[0]; int nh = (int)ts->ne[2];
+            std::vector<float> buf((size_t)n_kv * nh);
+            ggml_backend_tensor_get(ts, buf.data(), 0, ggml_nbytes(ts));
+            layer_rows.push_back(std::move(buf));
+        }
+        R.rows.push_back(std::move(layer_rows));
+        R.n_kv_at_step.push_back(n_kv);
+
+        std::vector<float> lg = fp->get_output_logits(gf);
+        if (capture_conf) R.conf.push_back(conf_from_logits(lg));
+        next = 0; for (int j = 1; j < (int)lg.size(); ++j) if (lg[j] > lg[next]) next = j;
+        fp->advance_cache(1, 0);
+        if (closed) break;
+    }
+    if (decode_ms) *decode_ms = ms_since(tdec0);
+    R.gen_text = tok->decode(R.gen_tokens);
+    return R;
+}
+
+// Prefill ONLY the document-boundary prefix (chunk 1 = chat header + document)
+// on a freshly cleared slot 0, for reuse by a subsequent run_freegen_split
+// SPLIT_WARM call over the SAME (document, task). `task` only determines
+// where the split point falls when re-tokenized — the resulting chunk-1
+// TOKENS are identical for any task (chat header + document precede it, and a
+// causal model's earlier K/V never depend on later tokens), so priming under
+// one task's rendering and resuming decode under a DIFFERENT task (WARM2's
+// pass-2 task vs pass-1's) is safe as long as `document` is unchanged.
+// `arm_taps` mirrors run_lens_tapped_decode's real pass-1 behaviour, which
+// arms attention taps BEFORE its prefill (forcing the non-flash path) — WARM2
+// needs this to faithfully reuse a prefix computed the way real pass 1
+// computes it; WARM1 does not (all three of its arms stay on one consistent,
+// disarmed policy, isolating the chunking question from the arming question).
+static void qdocs_prime_chunk1_chat(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                    Tokenizer* tok, const std::string& document,
+                                    const std::string& task, bool arm_taps,
+                                    int citation_layer, int coverage_layer,
+                                    double* prefill_ms = nullptr) {
+    std::string prompt_text = qdocs_chat_prompt(document, task);
+    std::vector<int32_t> toks = encode_prompt(tok, prompt_text);
+    if (tok->decode(toks) != prompt_text)
+        throw std::runtime_error("qdocs_prime_chunk1_chat: prompt roundtrip mismatch");
+    size_t doc_pos = prompt_text.find(document);
+    if (doc_pos == std::string::npos)
+        throw std::runtime_error("qdocs_prime_chunk1_chat: document expected verbatim "
+                                 "in rendered prompt, actual not found");
+    size_t doc_end = doc_pos + document.size();
+    std::vector<size_t> cum = cum_bytes(tok, toks);
+    int split_idx = (int)toks.size();
+    for (int k = 0; k < (int)toks.size(); ++k) if (cum[k] >= doc_end) { split_idx = k; break; }
+    std::vector<int32_t> chunk1(toks.begin(), toks.begin() + split_idx);
+
+    if (arm_taps) fp->set_attention_taps({citation_layer, coverage_layer});
+    auto t0 = std::chrono::steady_clock::now();
+    fp->clear_slot(0); fp->set_cache_pos(0, 0);
+    fp->run_prefill(chunk1, 0, 0, sched);
+    if (prefill_ms) *prefill_ms = ms_since(t0);
+    if (arm_taps) fp->set_attention_taps({});  // disarm before the caller's own suffix prefill
+}
+
+// ── WARMPERF — does the warm prefix actually SAVE anything? ─────────────────
+// The correctness probes (WARM1/WARM2) passed; the speed question was left
+// unanswered because WARM2's timers disagreed with each other (a "suffix-only"
+// prefill timed SLOWER than the full-document prefill it replaces) and because
+// the messy corpus is short business email, which is the wrong instrument: a
+// warm prefix removes document-proportional work, so the saving only appears on
+// documents long enough for prefill to matter.
+//
+// This arm fixes both. Identical timer scope for every arm (strictly around
+// run_prefill, nothing else), a warmup iteration before any measurement so
+// graph build and kernel compile are not attributed to the first sample,
+// medians rather than means, and synthetic documents at controlled lengths.
+//
+// Measures PASS 1 ONLY — the pass that runs on every request (candidates are
+// opt-in) and the one a key-editing loop actually repeats.
+static int run_warmperf_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                              Tokenizer* tok, uint32_t n_ctx) {
+    std::printf("\n+==============================================================+\n");
+    std::printf("| WARMPERF - warm-prefix prefill saving, pass 1, by doc length  |\n");
+    std::printf("+==============================================================+\n");
+
+    auto corpus = qdocs_messy_corpus();
+    const std::vector<std::string> keys = {"customer", "quantity", "unit_price",
+                                           "total", "order_date", "delivery_date"};
+    const std::string task = qinf::lens_build_instruction(keys);
+
+    auto make_doc = [&](int target_tok) {
+        std::string doc;
+        for (size_t i = 0; i < 400; ++i) {
+            doc += corpus[i % corpus.size()].document;
+            doc += "\n\n---\n\n";
+            if ((int)tok->encode(doc).size() >= target_tok) break;
+        }
+        return doc;
+    };
+
+    const int REPS = 5;
+    std::printf("\n%-8s %-8s | %-24s | %-24s | %s\n", "target", "Ptok",
+                "COLD full prefill", "WARM suffix prefill", "saving");
+    std::printf("%s\n", std::string(96, '-').c_str());
+
+    for (int target : {1000, 2000, 4000, 8000}) {
+        const std::string document = make_doc(target);
+        const std::string prompt   = qdocs_chat_prompt(document, task);
+        std::vector<int32_t> toks  = tok->encode(prompt);
+        if ((uint32_t)toks.size() + 8 >= n_ctx) {
+            std::printf("%-8d  (skipped - %zu tokens exceeds ctx %u)\n",
+                        target, toks.size(), n_ctx);
+            continue;
+        }
+        const size_t doc_end_byte = prompt.find(document) + document.size();
+        const std::vector<size_t> cum = cum_bytes(tok, toks);
+        size_t split = toks.size();
+        for (size_t i = 0; i < toks.size(); ++i)
+            if (cum[i + 1] >= doc_end_byte) { split = i + 1; break; }
+        if (split >= toks.size()) { std::printf("%-8d  (split not found)\n", target); continue; }
+        const std::vector<int32_t> pre(toks.begin(), toks.begin() + (long)split);
+        const std::vector<int32_t> suf(toks.begin() + (long)split, toks.end());
+
+        auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : v[v.size() / 2];
+        };
+        auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
+
+        // COLD - today's path: clear, rewind, prefill everything.
+        std::vector<double> cold;
+        for (int r = 0; r <= REPS; ++r) {
+            fp->clear_slot(0);
+            fp->set_cache_pos(0, 0);
+            auto t0 = std::chrono::steady_clock::now();
+            fp->run_prefill(toks, 0, 0, sched);
+            const double ms = ms_since(t0);
+            if (r) cold.push_back(ms);          // r == 0 is the untimed warmup
+        }
+
+        // WARM - prime the document ONCE, untimed (a real restore is a copy,
+        // not a recompute), then pay only the instruction on every edit.
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        fp->run_prefill(pre, 0, 0, sched);
+        std::vector<double> warm;
+        for (int r = 0; r <= REPS; ++r) {
+            // Rewind to the document boundary: the suffix is rewritten at the
+            // same positions every time, exactly as a re-extraction would.
+            fp->set_cache_pos((uint32_t)split, 0);
+            auto t0 = std::chrono::steady_clock::now();
+            fp->run_prefill(suf, (uint32_t)split, 0, sched);
+            const double ms = ms_since(t0);
+            if (r) warm.push_back(ms);
+        }
+
+        const double c = median(cold), w = median(warm);
+        std::printf("%-8d %-8zu | %10.1f ms (%5zu tok) | %10.1f ms (%5zu tok) | %5.1f%%  (%.1fx)\n",
+                    target, split, c, toks.size(), w, suf.size(),
+                    c > 0 ? 100.0 * (c - w) / c : 0.0, w > 0 ? c / w : 0.0);
+    }
+
+    std::printf("\nPrefill only. Decode is unchanged by warming and costs the same in both\n"
+                "arms, so the end-to-end saving on one edit is this saving over\n"
+                "(prefill + decode) at the caller's own generation length.\n");
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    return 0;
+}
+
+// ── WARM1 — pass-1 split-prefill probe (plan-lens-warm-document.md §4) ──────
+// Three arms over qdocs_messy_corpus, reusing QKEY's exact task/instruction
+// and qdocs_eval_field citation-scoring machinery — QKEY's Arm K IS the
+// "92%/99% under the QKEY control arm" baseline §4's gate 2 is measured
+// against, so Arm O below reproduces that same measurement rather than
+// re-approximating it.
+//   Arm O — one-shot prefill (today's path, unchanged).
+//   Arm S — split prefill (P as chunk 1, suffix as chunk 2), cold: chunk 1 is
+//           recomputed fresh, in-line, via clear_slot+run_prefill.
+//   Arm W — split prefill, chunk 1 "restored": primed in its OWN call
+//           (qdocs_prime_chunk1_chat) immediately before chunk 2 is
+//           prefilled, rather than inline within one uninterrupted call like
+//           Arm S. Per plan §2.1 the two are claimed to be the identical
+//           computation on identical tokens; this measures whether that
+//           claim holds byte-for-byte on this engine — not a real
+//           snapshot/PrefixLibrary restore (recompute stands in for it, per
+//           the task brief: "simulate however is simplest in-process").
+static int run_warm1_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ WARM1 — pass-1 split-prefill probe (plan-lens-warm-document §4)║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count);
+    if (!calib) {
+        std::fprintf(stderr, "WARM1: expected a calibrated lens entry for arch '%s' "
+                             "block_count %u, actual none — %s\n",
+                    meta.architecture.c_str(), meta.block_count,
+                    qinf::lens_calibration_refusal(meta.architecture, meta.block_count).c_str());
+        return 1;
+    }
+    const int layer = calib->constants.citation_layer;
+    const int head  = calib->constants.citation_head;
+    int slot = -1;
+    for (size_t i = 0; i < g_attn_layers->size(); ++i)
+        if ((*g_attn_layers)[i] == layer) { slot = (int)i; break; }
+    if (slot < 0) {
+        std::fprintf(stderr, "WARM1: expected citation_layer %d among %zu discovered "
+                             "attention layers, actual not found\n", layer, g_attn_layers->size());
+        return 1;
+    }
+    L3H13_SLOT = slot; FROZEN_SLOT = slot; FROZEN_HEAD = head;
+    std::printf("calibration: %s — citation L%dH%d (tap slot %d)   ctx=%u\n",
+                calib->model, layer, head, slot, n_ctx);
+
+    const int TOL = 2;
+    const int MAX_NEW = 400;   // same budget as QKEY/CAND pass 1
+    auto corpus = qdocs_messy_corpus();
+    std::vector<int> taps(g_attn_layers->begin(), g_attn_layers->end());
+
+    auto build_task = [](const std::vector<std::string>& keys) {
+        std::string t = "\n\nExtract the following from the email above into a flat JSON "
+            "object of \"key\": \"value\" pairs, using EXACTLY these keys, verbatim. "
+            "Copy each value verbatim from the email. Output ONLY the JSON object, "
+            "nothing else. Keys: ";
+        for (size_t i = 0; i < keys.size(); ++i) t += (i ? ", " : "") + keys[i];
+        return t;
+    };
+
+    struct Acc { int cite_n = 0, t1 = 0, t3 = 0, labeled = 0, extractive = 0; };
+    Acc armO, armS, armW;
+    int docs_n = 0, sw_match = 0, so_match = 0;
+    std::vector<std::string> sw_diff, so_diff;
+
+    for (const QMessy& d : corpus) {
+        std::vector<std::string> keys;
+        for (auto& f : d.fields) keys.push_back(f.concept);
+        std::string task = build_task(keys);
+
+        FreeRun RO = run_freegen_split(fp, sched, tok, meta, d.document, task, taps,
+                                       MAX_NEW, SplitMode::ONESHOT);
+        FreeRun RS = run_freegen_split(fp, sched, tok, meta, d.document, task, taps,
+                                       MAX_NEW, SplitMode::SPLIT_COLD);
+        qdocs_prime_chunk1_chat(fp, sched, tok, d.document, task, /*arm_taps=*/false, layer, head);
+        FreeRun RW = run_freegen_split(fp, sched, tok, meta, d.document, task, taps,
+                                       MAX_NEW, SplitMode::SPLIT_WARM);
+
+        docs_n++;
+        bool sw = (RS.gen_text == RW.gen_text);
+        bool so = (RS.gen_text == RO.gen_text);
+        if (sw) sw_match++; else sw_diff.push_back(d.tag + (d.de ? " DE" : ""));
+        if (so) so_match++; else so_diff.push_back(d.tag + (d.de ? " DE" : ""));
+
+        auto score = [&](FreeRun& R, Acc& A) {
+            int doc_lo, doc_hi;
+            if (!qdocs_span_in_prompt(tok, R, d.document, doc_lo, doc_hi)) { doc_lo = 0; doc_hi = R.P - 1; }
+            for (auto& f : d.fields) {
+                A.labeled++;
+                QFieldEval e = qdocs_eval_field(tok, R, f.value, doc_lo, doc_hi, *g_attn_layers, TOL);
+                if (e.found_verbatim) { A.extractive++; A.cite_n += e.cite_n; A.t1 += e.cite_t1; A.t3 += e.cite_t3; }
+            }
+        };
+        score(RO, armO); score(RS, armS); score(RW, armW);
+    }
+
+    auto pct = [](int a, int b) { return b ? 100.0 * a / b : 0.0; };
+
+    std::printf("\n================ 1. WARM == COLD — Arm W vs Arm S (bar: exact) ================\n");
+    std::printf("exact-match completions: %d/%d (%.0f%%)\n", sw_match, docs_n, pct(sw_match, docs_n));
+    if (!sw_diff.empty()) { std::printf("  DIFFERS on:"); for (auto& t : sw_diff) std::printf(" %s", t.c_str()); std::printf("\n"); }
+    std::printf("VERDICT: %s\n", sw_match == docs_n
+                ? "PASS — warm == cold by construction, as designed"
+                : "FAIL — warm != cold: the split-prefill design does NOT hold by "
+                  "construction on this engine; this is loud and should be treated as such");
+
+    std::printf("\n================ 2. TOKEN STABILITY — Arm S vs Arm O (bar: exact) ================\n");
+    std::printf("exact-match completions: %d/%d (%.0f%%)\n", so_match, docs_n, pct(so_match, docs_n));
+    if (!so_diff.empty()) { std::printf("  DIFFERS on:"); for (auto& t : so_diff) std::printf(" %s", t.c_str()); std::printf("\n"); }
+    std::printf("VERDICT: %s\n", so_match == docs_n
+                ? "PASS — split path token-identical to one-shot"
+                : "NOTE — split path diverges from one-shot at the token level; see the "
+                  "mass-drift-ceiling check below (chunked-vs-one-shot prefill is a known "
+                  "non-bit-identical fork on Metal, per the mm-vs-mv precedent)");
+
+    std::printf("\n================ 3. CITATION top-1/top-3 — all three arms ================\n");
+    auto report = [&](const char* label, Acc& A) {
+        double t1 = pct(A.t1, A.cite_n), t3 = pct(A.t3, A.cite_n);
+        std::printf("  %-6s top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [scoreable/verbatim: %d/%d]\n",
+                    label, A.t1, A.cite_n, t1, A.t3, A.cite_n, t3, A.extractive, A.labeled);
+        return std::make_pair(t1, t3);
+    };
+    std::pair<double,double> po = report("Arm O", armO);
+    std::pair<double,double> ps = report("Arm S", armS);
+    std::pair<double,double> pw = report("Arm W", armW);
+    double o1 = po.first, o3 = po.second, s1 = ps.first, s3 = ps.second, w1 = pw.first, w3 = pw.second;
+
+    bool repro = std::fabs(o1 - 92.0) <= 2.0 && std::fabs(o3 - 99.0) <= 2.0;
+    std::printf("\nArm O vs published QKEY control-arm baseline (92%%/99%%): top1 delta %+.1f  "
+                "top3 delta %+.1f  [%s]\n", o1 - 92.0, o3 - 99.0,
+                repro ? "reproduces" : "DOES NOT reproduce — treat other numbers with suspicion");
+    bool no_regress_S = s1 >= o1 - 2.0 && s3 >= o3 - 2.0;
+    bool no_regress_W = w1 >= o1 - 2.0 && w3 >= o3 - 2.0;
+    std::printf("Arm S vs Arm O: top1 %+.1f  top3 %+.1f  [%s]\n", s1 - o1, s3 - o3,
+                no_regress_S ? "no regression" : "REGRESSION");
+    std::printf("Arm W vs Arm O: top1 %+.1f  top3 %+.1f  [%s]\n", w1 - o1, w3 - o3,
+                no_regress_W ? "no regression" : "REGRESSION");
+
+    std::printf("\n================ SUMMARY ================\n");
+    std::printf("gate1 warm==cold (Arm W vs Arm S exact):            %s\n", sw_match == docs_n ? "PASS" : "FAIL");
+    std::printf("gate2 token stability (Arm S vs Arm O exact):       %s\n", so_match == docs_n ? "PASS" : "FAIL");
+    std::printf("gate3 mass-drift ceiling (S/W top1/top3 >= O-2pt):  %s\n",
+                (no_regress_S && no_regress_W) ? "PASS" : "FAIL");
+
+    return (sw_match == docs_n && no_regress_S && no_regress_W) ? 0 : 1;
+}
+
+// ── WARM2 — pass-2 restore probe (plan-lens-warm-document.md §3.1) ──────────
+// Extends CAND's own pass 2 (unchanged corpus/task/parser: CAND_PASS2_TASK_PREFIX,
+// lens_apply_pass2_candidates). Two arms:
+//   Arm C — pass 2 as CAND runs it today: cold, full P+suffix prefill, taps
+//           disarmed throughout.
+//   Arm W — pass 2 resuming from a simulated pass-1 document prefix: chunk 1
+//           (chat header + document) is primed on a fresh slot with attention
+//           taps ARMED (matching run_lens_tapped_decode's real pass-1 numeric
+//           path — arming forces the non-flash path the plan's open question
+//           is about), then disarmed, and only the pass-2 suffix is prefilled
+//           and decoded on top — exactly as a real warm hit would run.
+static int run_warm2_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ WARM2 — pass-2 restore probe (plan-lens-warm-document §3.1)    ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count);
+    if (!calib) {
+        std::fprintf(stderr, "WARM2: expected a calibrated lens entry for arch '%s' "
+                             "block_count %u, actual none — %s\n",
+                    meta.architecture.c_str(), meta.block_count,
+                    qinf::lens_calibration_refusal(meta.architecture, meta.block_count).c_str());
+        return 1;
+    }
+    const int citation_layer = calib->constants.citation_layer;
+    const int coverage_layer = calib->constants.coverage_layer;
+    std::printf("calibration: %s — arming {L%d citation, L%d coverage} for the simulated "
+                "pass-1 prime   ctx=%u\n", calib->model, citation_layer, coverage_layer, n_ctx);
+
+    const std::vector<std::string> ABSENT = {"payment_terms", "warranty_period"};
+    auto corpus = qdocs_messy_corpus();
+
+    struct DocCand {
+        std::string tag, document; bool de;
+        qinf::LensReport c, w;
+        std::set<std::string> uncontested;
+        double c_prefill_ms = 0, c_decode_ms = 0;
+        double w_prime_ms = 0, w_prefill_ms = 0, w_decode_ms = 0;
+    };
+    std::vector<DocCand> out;
+    int n_unparseable_c = 0, n_unparseable_w = 0;
+
+    for (const QMessy& d : corpus) {
+        std::vector<std::string> keys;
+        for (auto& f : d.fields) keys.push_back(f.concept);
+        for (auto& a : ABSENT) keys.push_back(a);
+        std::string task = CAND_PASS2_TASK_PREFIX;
+        for (size_t i = 0; i < keys.size(); ++i) task += (i ? ", " : "") + keys[i];
+
+        DocCand dc; dc.tag = d.tag; dc.document = d.document; dc.de = d.de;
+
+        // ── Arm C — cold, exactly as CAND runs pass 2 today ──────────────────
+        fp->set_attention_taps({});  // hygiene: guarantee disarmed, matching "today"
+        FreeRun PC = run_freegen_split(fp, sched, tok, meta, d.document, task, /*tap_layers=*/{},
+                                       700, SplitMode::ONESHOT, false, '\x01',
+                                       &dc.c_prefill_ms, &dc.c_decode_ms);
+        qinf::lens_apply_pass2_candidates(d.document, PC.gen_text, keys, dc.c);
+        if (dc.c.candidates_producer_failed) n_unparseable_c++;
+
+        // ── Arm W — resume from a simulated warm pass-1 document prefix ──────
+        qdocs_prime_chunk1_chat(fp, sched, tok, d.document, task, /*arm_taps=*/true,
+                                citation_layer, coverage_layer, &dc.w_prime_ms);
+        FreeRun PW = run_freegen_split(fp, sched, tok, meta, d.document, task, /*tap_layers=*/{},
+                                       700, SplitMode::SPLIT_WARM, false, '\x01',
+                                       &dc.w_prefill_ms, &dc.w_decode_ms);
+        qinf::lens_apply_pass2_candidates(d.document, PW.gen_text, keys, dc.w);
+        if (dc.w.candidates_producer_failed) n_unparseable_w++;
+
+        std::map<std::string, int> truth_count;
+        for (auto& f : d.fields) truth_count[f.concept]++;
+        for (auto& kv : truth_count) if (kv.second == 1) dc.uncontested.insert(kv.first);
+
+        out.push_back(std::move(dc));
+    }
+
+    // ── 1. Candidate-set identity, Arm W vs Arm C (diagnostic, not a bar) ────
+    int keys_total = 0, keys_match = 0;
+    std::vector<std::string> differ_docs;
+    for (auto& dc : out) {
+        bool doc_differs = false;
+        std::set<std::string> allkeys;
+        for (auto& kv : dc.c.key_candidates) allkeys.insert(kv.first);
+        for (auto& kv : dc.w.key_candidates) allkeys.insert(kv.first);
+        for (auto& k : allkeys) {
+            keys_total++;
+            auto itc = dc.c.key_candidates.find(k);
+            auto itw = dc.w.key_candidates.find(k);
+            std::vector<std::string> vc, vw;
+            if (itc != dc.c.key_candidates.end()) for (auto& cc : itc->second) vc.push_back(cc.value);
+            if (itw != dc.w.key_candidates.end()) for (auto& cc : itw->second) vw.push_back(cc.value);
+            if (vc == vw) keys_match++; else doc_differs = true;
+        }
+        if (doc_differs) differ_docs.push_back(dc.tag + (dc.de ? " DE" : ""));
+    }
+    std::printf("\n================ 1. CANDIDATE-SET IDENTITY — Arm W vs Arm C (diagnostic) ================\n");
+    std::printf("per-key exact match (same spans, same order): %d/%d (%.0f%%)\n",
+                keys_match, keys_total, keys_total ? 100.0 * keys_match / keys_total : 0.0);
+    if (!differ_docs.empty()) {
+        std::printf("documents with >=1 differing key:"); for (auto& t : differ_docs) std::printf(" %s", t.c_str());
+        std::printf("\n");
+    }
+
+    // ── 2. Gate 2 — median candidate-set size on uncontested keys, per arm ────
+    auto gate2 = [&](bool warm) {
+        std::vector<int> sizes; std::map<int, int> hist;
+        for (auto& dc : out) {
+            const qinf::LensReport& r = warm ? dc.w : dc.c;
+            for (auto& k : dc.uncontested) {
+                auto it = r.key_candidates.find(k);
+                int n = (it != r.key_candidates.end()) ? (int)it->second.size() : 0;
+                sizes.push_back(n); hist[n >= 3 ? 3 : n]++;
+            }
+        }
+        std::sort(sizes.begin(), sizes.end());
+        double median = 0;
+        if (!sizes.empty()) {
+            size_t mid = sizes.size() / 2;
+            median = (sizes.size() % 2) ? sizes[mid] : (sizes[mid - 1] + sizes[mid]) / 2.0;
+        }
+        std::printf("  %-6s keys=%zu  median=%.1f  dist: 0=%d 1=%d 2=%d 3+=%d  [bar (Arm W only): exactly 1]\n",
+                    warm ? "Arm W" : "Arm C", sizes.size(), median, hist[0], hist[1], hist[2], hist[3]);
+        return median;
+    };
+    std::printf("\n================ 2. GATE 2 — median candidate-set size, uncontested keys ================\n");
+    double med_c = gate2(false);
+    double med_w = gate2(true);
+    bool bar1 = med_w == 1.0;
+    std::printf("VERDICT bar1 (Arm W median == 1): %s\n", bar1 ? "PASS" : "FAIL — pass 2 stays cold; warm pass 1 only");
+
+    // ── 3. Byte-exactness under Arm W ──────────────────────────────────────────
+    int be_ok = 0, be_tot = 0;
+    for (auto& dc : out)
+        for (auto& kv : dc.w.key_candidates)
+            for (auto& cc : kv.second) {
+                be_tot++;
+                if (dc.document.find(cc.value) != std::string::npos) be_ok++;
+            }
+    std::printf("\n================ 3. BYTE-EXACTNESS — Arm W ================\n");
+    std::printf("%d/%d candidates are a byte-exact slice of their document (%.0f%%)  [bar: 100%%]\n",
+                be_ok, be_tot, be_tot ? 100.0 * be_ok / be_tot : 0.0);
+    bool bar2 = be_tot > 0 && be_ok == be_tot;
+    std::printf("VERDICT bar2: %s\n", bar2 ? "PASS"
+                : "FAIL — a restored prefix produced spans that fail to resolve; pass 2 stays cold");
+
+    // ── 4. Wall-clock per document ──────────────────────────────────────────
+    double c_pre = 0, c_dec = 0, w_pre = 0, w_dec = 0, w_prime = 0;
+    for (auto& dc : out) {
+        c_pre += dc.c_prefill_ms; c_dec += dc.c_decode_ms;
+        w_pre += dc.w_prefill_ms; w_dec += dc.w_decode_ms; w_prime += dc.w_prime_ms;
+    }
+    int n = (int)out.size();
+    std::printf("\n================ 4. WALL-CLOCK per document (n=%d) ================\n", n);
+    std::printf("Arm C  prefill %.1fms  decode %.1fms  total %.1fms\n",
+                c_pre / n, c_dec / n, (c_pre + c_dec) / n);
+    std::printf("Arm W  prefill %.1fms  decode %.1fms  total %.1fms  [suffix-only prefill; excludes\n",
+                w_pre / n, w_dec / n, (w_pre + w_dec) / n);
+    std::printf("       the %.1fms/doc document-priming step used to SIMULATE a restored prefix\n", w_prime / n);
+    std::printf("       in-process — a real snapshot restore would replace that recompute with a\n");
+    std::printf("       fast memcpy, not eliminate the cost the way excluding it here does]\n");
+    bool bar3 = (w_pre + w_dec) < (c_pre + c_dec);
+    std::printf("VERDICT bar3 (Arm W faster than Arm C, prime excluded): %s  (W %.1fms vs C %.1fms)\n",
+                bar3 ? "PASS" : "FAIL — no reason to change a path for nothing",
+                (w_pre + w_dec) / n, (c_pre + c_dec) / n);
+
+    std::printf("\n================ SUMMARY ================\n");
+    std::printf("bar1 Arm W gate-2 median == 1:        %s (%.1f)\n", bar1 ? "PASS" : "FAIL", med_w);
+    std::printf("bar2 Arm W byte-exactness == 100%%:     %s (%.0f%%)\n",
+                bar2 ? "PASS" : "FAIL", be_tot ? 100.0 * be_ok / be_tot : 0.0);
+    std::printf("bar3 Arm W faster than Arm C:          %s\n", bar3 ? "PASS" : "FAIL");
+    std::printf("(Arm C median for reference: %.1f)   producer failures: Arm C=%d  Arm W=%d\n",
+                med_c, n_unparseable_c, n_unparseable_w);
+
+    return (bar1 && bar2 && bar3) ? 0 : 1;
+}
+
 int main() {
     const char* env = std::getenv("QWEN36_MODEL_PATH");
     std::string path = env ? env : "models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf";
@@ -6240,7 +7036,9 @@ int main() {
     // CLAUDE.md) plus a 380-token grammar-decode margin.
     // KV *capacity* only — decode uses exact n_kv, so prior paths are byte-inert.
     const uint32_t CTX = (std::getenv("SS2") || std::getenv("SS3")) ? 9216
-                        : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1") || std::getenv("CAND"))
+                        : std::getenv("WARMPERF") ? 9216
+                        : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1") || std::getenv("CAND") ||
+                           std::getenv("QKEY") || std::getenv("WARM1") || std::getenv("WARM2"))
                             ? 5120 : 2048;
     const int TOL = 2;
 
@@ -6398,8 +7196,26 @@ int main() {
     // BEFORE any v4/key_candidates format or endpoint work. Cold two-pass: pass
     // 1 is the unchanged free extraction, pass 2 is a separate cold inference,
     // taps disarmed, asking for every span that answers each hinted key.
+    // WARMPERF — the speed question WARM2 left unanswered (its timers disagreed).
+    if (std::getenv("WARMPERF"))
+        return run_warmperf_probe(fp.get(), sched, tok, CTX);
+
     if (std::getenv("CAND"))
         return run_cand_probe(fp.get(), sched, tok, meta, CTX);
+
+    // QKEY — question-key probe (docs/plan-question-keys.md §4): matched-pairs
+    // Arm K (identifier keys, control) vs Arm Q (question keys), same corpus,
+    // same taps, same calibrated head, same constants, same greedy decode.
+    if (std::getenv("QKEY"))
+        return run_qkey_probe(fp.get(), sched, tok, meta, CTX);
+
+    // WARM1/WARM2 — docs/plan-lens-warm-document.md probes (harness-only,
+    // measurement only, no server/engine changes). WARM1 is the priority
+    // (pass-1 split-prefill gates); WARM2 extends CAND's pass 2.
+    if (std::getenv("WARM1"))
+        return run_warm1_probe(fp.get(), sched, tok, meta, CTX);
+    if (std::getenv("WARM2"))
+        return run_warm2_probe(fp.get(), sched, tok, meta, CTX);
 
     // SS2 — coverage-free stale-source alarm on grammar-constrained email
     // threads at 4K-8K tokens (supersedes SS1's inconclusive short-context
