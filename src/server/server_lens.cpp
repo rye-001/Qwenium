@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -598,11 +599,41 @@ bool is_underline_rule(const std::string& t) {
     return true;
 }
 
+// A run of >=2 leading ALL-CAPS words ("ORIGINAL CONFIRMATION (4 September,
+// superseded)", "REVISED CONFIRMATION (this message)"). Correspondence and
+// memos head their sections this way instead of numbering them, and such a
+// heading is often the ONLY thing that tells a reader which of two rival spans
+// is the superseded one — the probe on the Heliotrope PO-4471 mail found every
+// anchor falling through to the enclosing-line branch purely because these
+// were invisible here. Two words, not one, so an ordinary sentence opening on
+// an acronym ("EUR 11,776.00 is due") is not mistaken for a heading.
+bool has_allcaps_heading_prefix(const std::string& t) {
+    int words = 0;
+    size_t i = 0;
+    while (i < t.size() && words < 2) {
+        while (i < t.size() && std::isspace((unsigned char)t[i])) i++;
+        const size_t b = i;
+        while (i < t.size() && !std::isspace((unsigned char)t[i])) i++;
+        if (i == b) break;
+        bool has_alpha = false;
+        for (size_t j = b; j < i; ++j) {
+            const unsigned char c = (unsigned char)t[j];
+            if (std::islower(c)) return false;     // a cased word that is not upper
+            if (std::isalpha(c)) has_alpha = true;
+        }
+        if (!has_alpha || i - b < 2) return false;
+        words++;
+    }
+    return words == 2;
+}
+
 // A "label-like" line (docs/plan-candidate-set.md's anchor rule): short, and
-// either ends in ':' or reads as a numbered heading ("2. RENT", "IV. Terms").
+// either ends in ':', reads as a numbered heading ("2. RENT", "IV. Terms"), or
+// opens with an ALL-CAPS heading run (see above).
 bool is_label_like_line(const std::string& t) {
     if (t.empty() || t.size() > 60) return false;
     if (t.back() == ':') return true;
+    if (has_allcaps_heading_prefix(t)) return true;
     size_t i = 0;
     while (i < t.size() && std::isdigit((unsigned char)t[i])) i++;
     if (i == 0)
@@ -645,9 +676,49 @@ bool derive_anchor(const std::string& doc, size_t byte_lo, const std::string& va
         if (is_label_like_line(t)) { out = t; return true; }
     }
 
-    std::string enclosing = trim_ws(doc.substr(lines[idx].first, lines[idx].second - lines[idx].first));
+    // Fallback: the enclosing SENTENCE, not the enclosing line. A hard
+    // substr(0,60) on the line cut mid-token — the PO-4471 probe produced
+    // "Delivery ex works Gdansk on 30 October 2026. Payment terms 3", where the
+    // trailing "3" is the head of "30 days net" and reads as a fact that is not
+    // one. It is also not UTF-8-safe: 60 BYTES can land inside a multi-byte
+    // character, which the German half of the corpus reaches routinely. An
+    // anchor is a place a human navigates to; a truncated one is worse than
+    // none, so every path below either lands on a boundary or returns false.
+    const std::string line = doc.substr(lines[idx].first, lines[idx].second - lines[idx].first);
+    const size_t off = byte_lo >= lines[idx].first ? byte_lo - lines[idx].first : 0;
+
+    // Sentence boundary = '.', '?' or '!' followed by whitespace or end of
+    // line. "18.40" and "Sp. z o.o." are NOT boundaries by the first clause and
+    // by the length floor respectively — a boundary that leaves nothing before
+    // it is not one.
+    auto is_boundary = [&](size_t i) {
+        if (i >= line.size()) return false;
+        const char c = line[i];
+        if (c != '.' && c != '?' && c != '!') return false;
+        return i + 1 == line.size() || std::isspace((unsigned char)line[i + 1]);
+    };
+    size_t s_lo = 0;
+    for (size_t i = 0; i + 1 < line.size() && i < off; ++i)
+        if (is_boundary(i)) s_lo = i + 1;
+    while (s_lo < line.size() && std::isspace((unsigned char)line[s_lo])) s_lo++;
+    size_t s_hi = line.size();
+    for (size_t i = (off > s_lo ? off : s_lo); i < line.size(); ++i)
+        if (is_boundary(i)) { s_hi = i + 1; break; }
+    if (s_hi <= s_lo) { s_lo = 0; s_hi = line.size(); }
+
+    std::string enclosing = trim_ws(line.substr(s_lo, s_hi - s_lo));
     if (enclosing.empty() || ws_normalize(enclosing) == value_norm) return false;
-    out = enclosing.size() > 60 ? enclosing.substr(0, 60) : enclosing;
+    if (enclosing.size() > 60) {
+        // Cut at the last space at or before the budget. Space is ASCII, so the
+        // cut is both token- and UTF-8-safe. No space in the budget means one
+        // 60-byte token, which is not a place — say nothing instead.
+        const size_t cut = enclosing.rfind(' ', 60);
+        if (cut == std::string::npos || cut == 0) return false;
+        enclosing = trim_ws(enclosing.substr(0, cut));
+        if (enclosing.empty() || ws_normalize(enclosing) == value_norm) return false;
+        enclosing += "\xe2\x80\xa6";   // U+2026, marks the anchor as a fragment
+    }
+    out = enclosing;
     return true;
 }
 
@@ -698,6 +769,19 @@ std::string lens_report_to_json(const LensReport& r) {
     o += "\"format_version\":\"" + jesc(r.format_version) + "\",\n";
     o += "\"model\":\"" + jesc(r.model) + "\",\n";
     o += "\"validated_envelope\":" + std::string(r.validated_envelope ? "true" : "false") + ",\n";
+    // ── Question vocabulary (docs/plan-question-keys.md) ─────────────────────
+    // Both members are ABSENT in ordinary key mode, so a v4 importer that never
+    // asks a question sees a byte-identical payload. `uncalibrated` names the
+    // signals whose constants were measured for identifier extraction and NOT
+    // re-measured under questions — the probe validated the citation head only.
+    // Naming them is the honest alternative to printing a receipt we cannot back.
+    if (r.question_vocabulary) {
+        o += "\"vocabulary_mode\":\"questions\",\n";
+        o += "\"uncalibrated\":[\"badge\",\"coverage\"],\n";
+    }
+    // Absent when cold, so a v4 payload from a caller that never sends
+    // document_id is byte-identical to before this feature.
+    if (r.prefix_warm) o += "\"prefix\":\"warm\",\n";
     // Derived from the calibration entry, never literal: these lines said
     // "layer 3, head 13" on every report until per-model constants landed, which
     // a Qwen 3.8 extraction (L27H13) would have carried as a false receipt —
@@ -881,6 +965,26 @@ std::string lens_build_instruction(const std::vector<std::string>& key_vocabular
            "object, nothing else.";
 }
 
+std::string lens_build_question_instruction(const std::vector<std::string>& ids,
+                                            const std::vector<std::string>& questions) {
+    // Mirrors lens_build_instruction's shape deliberately: same "flat JSON
+    // object", same "Copy each value verbatim", same "Output ONLY the JSON
+    // object". The ONE difference is that each key is introduced by its
+    // question. Keeping the verbatim demand is load-bearing — 97%
+    // extractiveness was measured under an instruction that asks for a span,
+    // and says nothing about one that does not.
+    std::string list;
+    for (size_t i = 0; i < ids.size(); ++i)
+        list += "\n  \"" + ids[i] + "\": " + questions[i];
+    return "\n\nAnswer each of the following questions from the document above, "
+           "into a flat JSON object of \"key\": \"value\" pairs, using exactly "
+           "these snake_case keys:" + list +
+           "\nAnswer each question with a span copied verbatim from the document. "
+           "Do not paraphrase, summarise, infer, or combine spans. If the document "
+           "does not answer a question, omit that key. Output ONLY the JSON "
+           "object, nothing else.";
+}
+
 // ── Candidate set — pass 2 (docs/plan-candidate-set.md) — ported verbatim ────
 // from tests/perf/attn_provenance.cpp's CAND=1 probe (CAND_PASS2_TASK_PREFIX /
 // cand_parse_pass2). See server_lens.h for why the tolerance exists.
@@ -941,6 +1045,65 @@ lens_parse_pass2_candidates(const std::string& text, const std::vector<std::stri
     return out;
 }
 
+// The whitespace-normalized document, plus a map from each normalized byte back
+// to the original byte it came from. Mirrors ws_normalize's insertion rule
+// exactly, so `ix.norm` and `ws_normalize(doc)` are the same string.
+struct NormIndex {
+    std::string         norm;
+    std::vector<size_t> orig;   // orig[i] = byte in `doc` that norm[i] came from
+};
+
+NormIndex build_norm_index(const std::string& s) {
+    NormIndex ix;
+    ix.norm.reserve(s.size());
+    ix.orig.reserve(s.size());
+    bool sp = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = (unsigned char)s[i];
+        if (std::isspace(c)) { sp = true; continue; }
+        if (sp && !ix.norm.empty()) { ix.norm += ' '; ix.orig.push_back(i); }
+        sp = false;
+        ix.norm += (char)c;
+        ix.orig.push_back(i);
+    }
+    return ix;
+}
+
+// Resolve one span the model quoted to a byte range in `document`.
+//
+// The format requires a candidate's `value` to be a byte-exact slice of the
+// document, and the ONLY way it was previously enforced was `document.find()`
+// plus a silent `continue`. That drop was the single largest recall defect in
+// the feature: measured on a hard-wrapped 70-column business mail (the
+// Heliotrope PO-4471 probe), pass 2 correctly enumerated BOTH rivals for
+// order_total, delivery_date and payment_terms, and the apply step deleted one
+// or both of each pair — because a hard-wrapped document puts a '\n' where the
+// model wrote a space, and because the model routinely quotes a span with the
+// sentence period the document does not carry at that point ("13 November
+// 2026." against "...2026,"). The survivors were disproportionately the
+// SUPERSEDED spans, since corrections are written in longer wrapped sentences.
+// That turned a producer near-miss into a false claim about the document, which
+// is the exact failure this format exists to prevent.
+//
+// So: match tolerantly, but emit the DOCUMENT's bytes for whatever matched, so
+// `value` stays byte-exact by construction. A real paraphrase ("1450.00 GBP"
+// for "1,450.00 GBP") still fails every tier and is still dropped.
+bool resolve_candidate_span(const std::string& doc, const NormIndex& ix,
+                            const std::string& needle, size_t& lo, size_t& hi) {
+    if (needle.empty()) return false;
+    const size_t p = doc.find(needle);
+    if (p != std::string::npos) { lo = p; hi = p + needle.size(); return true; }
+    // Whitespace-tolerant: absorbs the hard-wrap newline. Never lowercases and
+    // never touches punctuation — those would be real differences.
+    const std::string n = ws_normalize(needle);
+    if (n.empty()) return false;
+    const size_t q = ix.norm.find(n);
+    if (q == std::string::npos) return false;
+    lo = ix.orig[q];
+    hi = ix.orig[q + n.size() - 1] + 1;
+    return true;
+}
+
 void lens_apply_pass2_candidates(const std::string& document, const std::string& gen_text,
                                  const std::vector<std::string>& keys, LensReport& report) {
     auto parsed = lens_parse_pass2_candidates(gen_text, keys);
@@ -955,15 +1118,46 @@ void lens_apply_pass2_candidates(const std::string& document, const std::string&
             " raw bytes — producer failure, not evidence the document offers nothing";
         return;
     }
+    const NormIndex ix = build_norm_index(document);
+    std::vector<std::string> dropped;
     for (auto& kv : parsed) {
-        const size_t lo = document.find(kv.second);
-        if (lo == std::string::npos) continue;  // not byte-exact — drop, per the format's discipline
-        const size_t hi = lo + kv.second.size();
+        size_t lo = 0, hi = 0;
+        bool ok = resolve_candidate_span(document, ix, kv.second, lo, hi);
+        if (!ok) {
+            // The model quoted the span with a sentence terminator the document
+            // does not carry there. Trim only TRAILING punctuation, and only
+            // after the untrimmed span has already failed.
+            std::string t = kv.second;
+            while (!t.empty() && (t.back() == '.' || t.back() == ',' || t.back() == ';' ||
+                                  t.back() == ':' || std::isspace((unsigned char)t.back())))
+                t.pop_back();
+            if (t.size() >= 2 && t.size() != kv.second.size())
+                ok = resolve_candidate_span(document, ix, t, lo, hi);
+        }
+        if (!ok) {
+            // NOT silent. A span the producer offered and we could not place is
+            // a fact about this run, not evidence about the document; swallowing
+            // it is what made the recall defect invisible for a whole gate pass.
+            dropped.push_back(kv.first + ": \"" + kv.second + "\"");
+            continue;
+        }
+        // The document's own bytes, never the model's — this is what keeps
+        // `value` a byte-exact slice after a tolerant match.
+        std::string value = document.substr(lo, hi - lo);
         std::vector<LensCandidate>& cands = report.key_candidates[kv.first];
         bool dup = false;
-        for (const LensCandidate& c : cands) if (c.value == kv.second) { dup = true; break; }
+        // Deduplicate by RANGE, not by text: two differently-quoted spans that
+        // resolve to the same bytes are one candidate.
+        for (const LensCandidate& c : cands) if (c.byte_lo == lo && c.byte_hi == hi) { dup = true; break; }
         if (dup) continue;
-        cands.push_back(LensCandidate{kv.second, lo, hi});
+        cands.push_back(LensCandidate{std::move(value), lo, hi});
+    }
+    if (!dropped.empty()) {
+        std::cerr << "lens candidate pass 2: " << dropped.size() << " of " << parsed.size()
+                  << " parsed spans expected to be locatable in the document, actual "
+                  << "unlocatable (dropped, not reported to the caller):";
+        for (const std::string& d : dropped) std::cerr << "\n    " << d;
+        std::cerr << std::endl;
     }
     for (auto& kv : report.key_candidates)
         std::stable_sort(kv.second.begin(), kv.second.end(),
@@ -1012,7 +1206,9 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                uint32_t vocab_size, uint32_t n_ctx_max,
                                const std::string& document,
                                const std::string& instruction_suffix,
-                               int max_new_tokens, const LensConstants& k) {
+                               int max_new_tokens, const LensConstants& k,
+                               bool reuse_prefix, uint32_t* out_prefix_tokens,
+                               std::vector<int32_t>* out_prefix_ids) {
     if (document.empty())
         throw std::runtime_error(
             "run_lens_tapped_decode: document expected non-empty actual=empty");
@@ -1074,9 +1270,47 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     const bool free_decode = (grammar == nullptr);
     fp->set_attention_taps({k.citation_layer, k.coverage_layer});
     if (!free_decode) grammar->reset();
-    fp->clear_slot(0);
-    fp->set_cache_pos(0, 0);
-    std::vector<float> logits = fp->run_prefill(prompt_tokens, 0, 0, sched);
+
+    // ── Split prefill (docs/plan-lens-warm-document.md §2.1) ─────────────────
+    // ALWAYS two chunks — the document, then the instruction — whether or not
+    // anything is being reused. Splitting only on a cache hit would make the
+    // FIRST extraction of a document numerically different from every later
+    // one, which is a permanent two-path system and a nasty surprise (same
+    // document, same keys, different answer the second time).
+    //
+    // Measured 2026-09-07: the split path is token-identical to one-shot,
+    // 15/15 on the messy corpus, so this costs nothing (plan §8.1). The plan
+    // had assumed the opposite — that chunked-vs-one-shot is not bit-identical
+    // on Metal — and that assumption is why warm reuse was set aside for pass 2
+    // in plan-candidate-set.md. It was wrong.
+    const uint32_t split = (uint32_t)run.doc_hi;
+    if (split == 0 || split >= (uint32_t)P)
+        throw std::runtime_error(
+            "run_lens_tapped_decode: document token span expected within the prompt "
+            "(0 < doc_hi < " + std::to_string(P) + "), actual doc_hi=" +
+            std::to_string(split) + " — the chat template moved the document");
+    if (out_prefix_tokens) *out_prefix_tokens = split;
+    if (out_prefix_ids)
+        out_prefix_ids->assign(prompt_tokens.begin(), prompt_tokens.begin() + (long)split);
+
+    std::vector<float> logits;
+    if (reuse_prefix) {
+        // Slot 0 still holds this document's KV at [0, split). A decode only
+        // ever wrote at positions >= split, so rewinding is all that is needed.
+        fp->set_cache_pos(split, 0);
+        const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)split,
+                                          prompt_tokens.end());
+        logits = fp->run_prefill(suffix, split, 0, sched);
+    } else {
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        const std::vector<int32_t> pre(prompt_tokens.begin(),
+                                       prompt_tokens.begin() + (long)split);
+        const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)split,
+                                          prompt_tokens.end());
+        fp->run_prefill(pre, 0, 0, sched);
+        logits = fp->run_prefill(suffix, split, 0, sched);
+    }
     const int32_t eos = tok->get_eos_token_id();
 
     auto argmax_over = [](const std::vector<float>& lg, const std::vector<int32_t>& ids) -> int32_t {
@@ -1212,7 +1446,8 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
                                   ::Tokenizer* tok, const std::string& document,
                                   const std::vector<std::string>& keys,
                                   uint32_t vocab_size, uint32_t n_ctx_max,
-                                  int max_new_tokens) {
+                                  int max_new_tokens,
+                                  const std::vector<int32_t>* prefix_ids) {
     QwenChatTemplate ct;
     std::vector<ChatMessage> hist = {{"user", document + lens_cand_pass2_instruction(keys)}};
     const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true,
@@ -1225,9 +1460,38 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
             " — document too large for the configured context");
 
     fp->set_attention_taps({});   // disarmed for the whole pass — no citations needed
-    fp->clear_slot(0);
-    fp->set_cache_pos(0, 0);
-    std::vector<float> logits = fp->run_prefill(prompt_tokens, 0, 0, sched);
+
+    // Pass 2's prompt is the SAME document followed by a different instruction,
+    // so it shares pass 1's prefix token-for-token at the same positions. When
+    // pass 1 left that prefix in slot 0, rewind to it instead of re-reading the
+    // document. Disarming the taps changes how attention is COMPUTED, not what
+    // the cache holds, so the flash path consumes the restored prefix fine —
+    // and validated: 75/75 candidate-set identity, gate 2 and byte-exactness
+    // unchanged (docs/plan-lens-warm-document.md §8.1).
+    // INTERLOCK — the shared prefix must actually BE shared, token for token.
+    // Both prompts start with the same bytes (chat header + document), but BPE
+    // is greedy and the token straddling the document/instruction boundary can
+    // merge differently under two different instructions. Reusing a prefix that
+    // diverges even in its last token would attribute pass 2's candidates to
+    // text the model never read at those positions. So compare rather than
+    // assume, and fall back to a cold prefill on any mismatch.
+    std::vector<float> logits;
+    const uint32_t prefix_tokens = prefix_ids ? (uint32_t)prefix_ids->size() : 0u;
+    bool can_reuse = prefix_ids != nullptr && prefix_tokens > 0 &&
+                     prefix_tokens < (uint32_t)prompt_tokens.size();
+    if (can_reuse)
+        can_reuse = std::equal(prefix_ids->begin(), prefix_ids->end(),
+                               prompt_tokens.begin());
+    if (can_reuse) {
+        fp->set_cache_pos(prefix_tokens, 0);
+        const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)prefix_tokens,
+                                          prompt_tokens.end());
+        logits = fp->run_prefill(suffix, prefix_tokens, 0, sched);
+    } else {
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        logits = fp->run_prefill(prompt_tokens, 0, 0, sched);
+    }
     const int32_t eos = tok->get_eos_token_id();
 
     auto argmax_all = [&](const std::vector<float>& lg) -> int32_t {
@@ -1277,13 +1541,15 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
 // exactness, not a disclosure about its absence).
 void run_cand_pass2(ForwardPassBase* fp, ggml_backend_sched_t sched, ::Tokenizer* tok,
                     const std::string& document, const std::vector<std::string>& keys,
-                    uint32_t vocab_size, uint32_t n_ctx_max, LensReport& report) {
+                    uint32_t vocab_size, uint32_t n_ctx_max, LensReport& report,
+                    const std::vector<int32_t>* prefix_ids) {
     // 700, not opts.max_new_tokens: pass 2 must enumerate every span for every
     // key (potentially several per key), a longer output than pass 1's single
     // value per key — matches the budget the CAND=1 probe measured the gate
     // against (docs/plan-candidate-set.md "Viability measured").
     const std::string gen_text =
-        run_cand_pass2_decode(fp, sched, tok, document, keys, vocab_size, n_ctx_max, 700);
+        run_cand_pass2_decode(fp, sched, tok, document, keys, vocab_size, n_ctx_max, 700,
+                              prefix_ids);
     lens_apply_pass2_candidates(document, gen_text, keys, report);
 }
 
@@ -1313,25 +1579,53 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                             : "grammar null, vocab set") +
             " — the probe's control arm needs the grammar's token table");
 
-    std::vector<std::string> keys;
+    std::vector<std::string> keys, questions;
     keys.reserve(concepts.size());
+    int n_questions = 0;
     for (const LensConcept& c : concepts) {
         if (c.key.empty())
             throw std::runtime_error(
                 "run_lens_extract: concept key expected non-empty actual=empty");
         keys.push_back(c.key);
+        questions.push_back(c.question);
+        if (!c.question.empty()) n_questions++;
     }
+    // A MIXED vocabulary is an unmeasured regime: the probe compared an
+    // all-identifier arm against an all-question arm and says nothing about a
+    // prompt that does both. Refuse rather than silently run it.
+    if (n_questions != 0 && n_questions != (int)concepts.size())
+        throw std::runtime_error(
+            "run_lens_extract: key_vocabulary expected either all questions or no "
+            "questions, actual " + std::to_string(n_questions) + " of " +
+            std::to_string(concepts.size()) +
+            " entries carry one — a mixed vocabulary is an unmeasured prompt regime "
+            "(docs/plan-question-keys.md §9)");
+    const bool question_mode = n_questions > 0;
 
     // The gloss is deliberately NOT in the instruction — see the header. The
     // prompt is byte-identical to the regime Stage 1 measured.
     static const std::vector<std::string> kNoVocab;
     // Request metadata, not decode state — set here rather than inside the
     // decode helper, whose job is the forward pass.
+    // ── Warm document (docs/plan-lens-warm-document.md) ─────────────────────
+    // Reuse only when the caller named an id, the server still holds THAT id,
+    // and the document bytes hash the same. The hash check is the safety
+    // interlock: serving a primed prefix for different text would report
+    // receipts about a document the model never read.
+    const size_t doc_hash = std::hash<std::string>{}(document);
+    const bool reuse = opts.warm != nullptr && !opts.document_id.empty() &&
+                       opts.warm->valid &&
+                       opts.warm->document_id == opts.document_id &&
+                       opts.warm->document_hash == doc_hash;
+    uint32_t prefix_tokens = 0;
+    std::vector<int32_t> prefix_ids;
     LensRun run = run_lens_tapped_decode(
         fp, sched, tok, meta, control_arm_grammar,
         control_arm_vocab ? *control_arm_vocab : kNoVocab,
-        vocab_size, n_ctx_max, document, lens_build_instruction(keys),
-        opts.max_new_tokens, k);
+        vocab_size, n_ctx_max, document,
+        question_mode ? lens_build_question_instruction(keys, questions)
+                      : lens_build_instruction(keys),
+        opts.max_new_tokens, k, reuse, &prefix_tokens, &prefix_ids);
     run.message_offsets = opts.message_offsets;
     if (!run.message_offsets.empty() && run.message_offsets.back() >= document.size())
         throw std::runtime_error(
@@ -1341,6 +1635,8 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
 
     // Throws LensUnparseableError (⇒ 422) if the output holds no parseable object.
     LensReport report = apply_absent_by_omission(compute_lens_report(run, k), concepts);
+    report.question_vocabulary = question_mode;
+    report.prefix_warm = reuse;
 
     // Pass 2 — candidate set (docs/plan-candidate-set.md), OFF by default and
     // byte-inert when off: this branch is the only place want_candidates is
@@ -1352,7 +1648,27 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
         // legitimate empty result) — it is the only signal lens_report_to_json
         // has for "not requested" vs. "ran" (see LensReport::candidates_requested).
         report.candidates_requested = true;
-        run_cand_pass2(fp, sched, tok, document, keys, vocab_size, n_ctx_max, report);
+        // Pass 2 shares pass 1's document prefix — same document, same
+        // positions, only the instruction differs. Slot 0 still holds it, so
+        // pass 2 rewinds exactly as pass 1 does. Cleared by measurement
+        // (plan §8.1: 75/75 candidate-set identity, gate 2 and byte-exactness
+        // unchanged), which is why this is option 1 and not option 2.
+        run_cand_pass2(fp, sched, tok, document, keys, vocab_size, n_ctx_max,
+                       report, &prefix_ids);
+    }
+
+    // The slot now holds this document's prefix at [0, prefix_tokens). Publish
+    // that so the NEXT request for the same id can rewind to it. Recorded after
+    // both passes precisely because pass 2 leaves the prefix intact too.
+    if (opts.warm != nullptr && !opts.document_id.empty()) {
+        opts.warm->document_id   = opts.document_id;
+        opts.warm->document_hash = doc_hash;
+        opts.warm->prefix_tokens = prefix_tokens;
+        opts.warm->valid         = true;
+    } else if (opts.warm != nullptr) {
+        // No id this time: the slot was clobbered by a cold run, so whatever we
+        // were holding is gone. Say so rather than leaving a stale claim.
+        opts.warm->invalidate();
     }
 
     return report;

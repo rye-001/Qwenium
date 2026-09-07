@@ -340,6 +340,24 @@ struct LensReport {
     // empty when this is true.
     bool        candidates_producer_failed = false;
     std::string candidates_error;   // set iff candidates_producer_failed
+
+    // True iff this extract ran a QUESTION vocabulary (docs/plan-question-keys.md).
+    // Drives two additive wire members, both absent in ordinary key mode:
+    //   "vocabulary_mode":"questions"
+    //   "uncalibrated":["badge","coverage"]
+    // The probe measured the CITATION head under questions and nothing else, so
+    // `badge` (ungrounded_body_mass) and coverage (coverage_used_peak) are
+    // running on coordinates measured for identifier extraction. Disclosing that
+    // is the whole point: the alternative is a receipt we cannot back, which is
+    // the defect class per-model calibration was introduced to kill.
+    bool question_vocabulary = false;
+
+    // True iff this extract REUSED a primed document prefix rather than
+    // re-prefilling it. Surfaces as `"prefix":"warm"`; absent when cold. A warm
+    // citation mass must never be compared against a cold one without the
+    // reader knowing which is which — same disclosure discipline as
+    // `uncalibrated`.
+    bool prefix_warm = false;
     // Set true iff LensExtractOptions::want_candidates was true for this
     // extract — i.e. pass 2 was attempted at all, success or failure. This is
     // the ONLY way lens_report_to_json can tell "candidates were not
@@ -415,11 +433,65 @@ bool lens_find_json_object(const std::string& raw, size_t& lo, size_t& hi);
 // instruction — that would silently change the exact prompt regime Stage 1
 // validated, on no measurement. If a glossed instruction is ever wanted, measure
 // it first.
-struct LensConcept { std::string key, gloss; };
+// One vocabulary entry. `key` is ALWAYS the join key — `fields` and
+// `key_candidates` are keyed by it, never by prose — so a question entry still
+// carries a short stable id in `key` (plan-question-keys.md §5: "the sentence is
+// never a map key").
+//
+// `question` is the OPTIONAL question form (docs/plan-question-keys.md). Empty
+// ⇒ today's identifier vocabulary, byte-identical prompt, nothing changes.
+// Non-empty ⇒ the instruction asks the question instead of naming the key, and
+// the model still answers with a VERBATIM SPAN — measured 2026-09-07 at 97%
+// extractiveness and 99.5% citation top-3 on Qwen 3.8-9B, marginally BETTER
+// than the identifier control (plan §9).
+//
+// `gloss` remains accepted and UNUSED. Do not repurpose it to carry the
+// question: it is deliberately kept out of the instruction so the prompt stays
+// byte-identical to the regime Stage 1 measured, and routing prose through it
+// would invalidate the calibration silently, with no version bump and no gate.
+struct LensConcept { std::string key, gloss, question; };
+
+// ── Warm document (docs/plan-lens-warm-document.md) ──────────────────────────
+// The lens prompt is `document + instruction_suffix`, so an edit to the key
+// vocabulary changes only a ~40-80 token SUFFIX of a multi-thousand-token
+// prompt. Re-prefilling the document on every edit is the dominant cost of the
+// UI's key-editing loop: measured 2026-09-07, skipping it saves 92.6% of pass-1
+// prefill at 1K tokens and 98.9% at 8K (plan §8.2).
+//
+// The mechanism is deliberately NOT a snapshot. `--attention-lens` is
+// single-slot EXCLUSIVE, so slot 0 belongs to the lens alone; a decode writes
+// only at positions >= the split, so the document's KV at [0, prefix_tokens)
+// survives untouched between requests. Warming is therefore "do not clear the
+// slot, rewind the cache position" — no serialization, no PrefixLibrary, no
+// disk. This is why the feature is small.
+//
+// Held by the server across requests, and reset fail-loud whenever anything it
+// depends on could have changed.
+struct LensWarmDocument {
+    std::string document_id;        // caller's handle; empty ⇒ nothing held
+    size_t      document_hash = 0;  // of the document BYTES — see http_server
+    uint32_t    prefix_tokens = 0;  // tokens of `document` in the rendered prompt
+    bool        valid = false;      // false ⇒ slot 0 holds nothing reusable
+
+    void invalidate() { *this = LensWarmDocument{}; }
+};
 
 // ── Driver ───────────────────────────────────────────────────────────────────
 struct LensExtractOptions {
     int  max_new_tokens = 512;   // hard cap on the emitted JSON length
+    // Opt-in warm handle (docs/plan-lens-warm-document.md §2.2). Empty ⇒ today's
+    // behaviour exactly: cold prefill, nothing stored. Non-empty ⇒ the caller
+    // asserts this is the same document it named last time, and the server
+    // reuses the primed prefix if it still holds one for that id.
+    //
+    // Explicit rather than transparent ON PURPOSE: the lens sells receipts, and
+    // a transparent cache would let the same request return different citation
+    // masses depending on invisible server state. The caller knows when a
+    // document is "the same" across an edit; the server does not.
+    std::string document_id;
+    // Server-owned warm state, borrowed for this call. nullptr ⇒ no warming
+    // regardless of document_id.
+    LensWarmDocument* warm = nullptr;
     bool validated_envelope_only = false;  // reserved; false = accept + disclose
     // Per-request toggle for the candidate set (docs/plan-candidate-set.md).
     // Default OFF: pass 1 is untouched either way, and false means run_lens_extract
@@ -497,6 +569,14 @@ LensReport apply_absent_by_omission(LensReport report,
 // — a complete hint or the naming zoo returns). Exposed for the startup sanity
 // check and tests.
 std::string lens_build_instruction(const std::vector<std::string>& key_vocabulary);
+
+// The question-vocabulary instruction (docs/plan-question-keys.md §5). Asks each
+// question but still keys the answer by its short id and still demands a
+// VERBATIM span — the extractiveness the probe measured is a property of an
+// instruction that keeps asking for one, not a property of questions.
+// `ids` and `questions` must be the same length; the caller guarantees it.
+std::string lens_build_question_instruction(const std::vector<std::string>& ids,
+                                            const std::vector<std::string>& questions);
 
 // The REFUTED fixed KV grammar (GBNF text) — docs/note-nogrammar-refutation.md.
 // NOT on the product path: it exists solely so the QDOCS_S1 probe can run it as a

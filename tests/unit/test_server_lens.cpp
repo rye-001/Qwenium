@@ -1369,6 +1369,106 @@ TEST(LensCandidatePass2Apply, EmptyGenerationIsNotAProducerFailure) {
 // flags) and assert on the parsed JSON, exactly like the fixtures above.
 // ═════════════════════════════════════════════════════════════════════════
 
+// ── Question vocabulary (docs/plan-question-keys.md) ─────────────────────────
+TEST(LensQuestionVocab, KeyModeInstructionIsUnchanged) {
+    // The regime Stage 1 measured must stay byte-identical when no question is
+    // asked — this is the guard on "additive".
+    const std::vector<std::string> keys = {"customer", "delivery_date"};
+    EXPECT_EQ(lens_build_instruction(keys),
+              "\n\nExtract the following fields from the document above into a flat "
+              "JSON object of \"key\": \"value\" pairs, using exactly these "
+              "snake_case keys: customer, delivery_date"
+              ". Copy each value verbatim from the document. Output ONLY the JSON "
+              "object, nothing else.");
+}
+
+TEST(LensQuestionVocab, QuestionInstructionKeysByIdAndDemandsVerbatim) {
+    const std::vector<std::string> ids = {"customer", "delivery_date"};
+    const std::vector<std::string> qs  = {"Who is the customer?",
+                                          "What is the delivery date?"};
+    const std::string instr = lens_build_question_instruction(ids, qs);
+    // The id is the join key, and the question rides beside it.
+    EXPECT_NE(instr.find("\"customer\": Who is the customer?"), std::string::npos);
+    EXPECT_NE(instr.find("\"delivery_date\": What is the delivery date?"), std::string::npos);
+    // The verbatim demand is load-bearing: 97% extractiveness was measured under
+    // an instruction that asks for a span.
+    EXPECT_NE(instr.find("verbatim"), std::string::npos);
+    EXPECT_NE(instr.find("Do not paraphrase"), std::string::npos);
+    // Absence stays earned by omission, same as key mode.
+    EXPECT_NE(instr.find("omit that key"), std::string::npos);
+}
+
+TEST(LensQuestionWire, KeyModeEmitsNeitherNewMember) {
+    LensReport r;
+    r.fields = {present_field("customer", "ACME GmbH", true, true)};
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_FALSE(j.contains("vocabulary_mode"));
+    EXPECT_FALSE(j.contains("uncalibrated"));
+    EXPECT_EQ(j["format_version"], "qemmi-lens/v4");   // additive, no bump
+}
+
+TEST(LensQuestionWire, QuestionModeDisclosesWhatWasNotCalibrated) {
+    // The probe measured the CITATION head under questions and nothing else.
+    // badge and coverage run on identifier-extraction coordinates, and the
+    // payload must say so rather than print a receipt it cannot back.
+    LensReport r;
+    r.question_vocabulary = true;
+    r.fields = {present_field("customer", "ACME GmbH", true, true)};
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["vocabulary_mode"], "questions");
+    ASSERT_TRUE(j["uncalibrated"].is_array());
+    std::vector<std::string> u = j["uncalibrated"].get<std::vector<std::string>>();
+    EXPECT_EQ(u, (std::vector<std::string>{"badge", "coverage"}));
+}
+
+// ── Warm document (docs/plan-lens-warm-document.md) ──────────────────────────
+TEST(LensWarmWire, ColdOmitsThePrefixMember) {
+    LensReport r;
+    r.fields = {present_field("customer", "ACME GmbH", true, true)};
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_FALSE(j.contains("prefix"))
+        << "a caller that never sends document_id must get a byte-identical payload";
+}
+
+TEST(LensWarmWire, WarmDisclosesItself) {
+    // A warm citation mass must never be compared against a cold one without
+    // the reader knowing which is which.
+    LensReport r;
+    r.prefix_warm = true;
+    r.fields = {present_field("customer", "ACME GmbH", true, true)};
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["prefix"], "warm");
+}
+
+TEST(LensWarmDocumentState, InvalidateClearsEveryField) {
+    LensWarmDocument w;
+    w.document_id = "lease-4471"; w.document_hash = 99; w.prefix_tokens = 1234; w.valid = true;
+    w.invalidate();
+    EXPECT_TRUE(w.document_id.empty());
+    EXPECT_EQ(w.document_hash, 0u);
+    EXPECT_EQ(w.prefix_tokens, 0u);
+    EXPECT_FALSE(w.valid);
+}
+
+TEST(LensWarmDocumentState, ReuseRequiresIdAndHashAndValidity) {
+    // Mirrors the predicate in run_lens_extract. The hash is the interlock that
+    // stops a primed prefix being served for different text — which would report
+    // receipts about a document the model never read.
+    const size_t h = std::hash<std::string>{}(std::string("the document"));
+    LensWarmDocument w;
+    w.document_id = "doc-a"; w.document_hash = h; w.prefix_tokens = 10; w.valid = true;
+
+    auto reuse = [&](const std::string& id, size_t hash) {
+        return w.valid && !id.empty() && w.document_id == id && w.document_hash == hash;
+    };
+    EXPECT_TRUE (reuse("doc-a", h));            // same id, same bytes
+    EXPECT_FALSE(reuse("doc-a", h + 1));        // SAME id, DIFFERENT document
+    EXPECT_FALSE(reuse("doc-b", h));            // different id
+    EXPECT_FALSE(reuse("", h));                 // no id ⇒ never warm
+    w.valid = false;
+    EXPECT_FALSE(reuse("doc-a", h));            // nothing held
+}
+
 TEST(LensCandidateWire, FormatVersionIsV4) {
     LensReport r;
     nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
@@ -1512,6 +1612,165 @@ TEST(LensCandidateWire, AnchorNullWhenNoStructureExists) {
 
     nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
     EXPECT_TRUE(j["key_candidates"]["amount"][0]["anchor"].is_null());
+}
+
+// ── Regression: the hard-wrapped supersession mail (Heliotrope PO-4471) ──────
+// Pass 2 enumerates BOTH rivals correctly; every one of these cases is a span
+// the apply step used to delete silently, leaving only the SUPERSEDED rival and
+// making a correct answer render as "1 found · 0 returned".
+namespace {
+const char* kWrappedMail =
+    "ORIGINAL CONFIRMATION (4 September, superseded)\n"
+    "Order reference PO-4471. Quantity 640 units of the BF-22 bulkhead fitting\n"
+    "at 18.40 EUR each, giving an order total of 11,776.00 EUR net of VAT.\n"
+    "Delivery ex works Gdansk on 30 October 2026. Payment terms 30 days net\n"
+    "from invoice date.\n"
+    "\n"
+    "REVISED CONFIRMATION (this message)\n"
+    "Following your increase to 720 units, the unit price falls to 17.65 EUR\n"
+    "under the volume band. The revised order total is 12,708.00 EUR net of\n"
+    "VAT. Please note that the earlier figure of 11,776.00 EUR is no longer\n"
+    "valid.\n"
+    "\n"
+    "Delivery has moved to 13 November 2026, as the additional 80 units\n"
+    "require a second galvanising run.\n";
+}  // namespace
+
+TEST(LensCandidatePass2Apply, HardWrappedSpanIsResolvedNotDropped) {
+    // "12,708.00 EUR net of VAT" is split by the 70-column wrap: the document
+    // has "...net of\nVAT". document.find() misses it; the candidate is real.
+    const std::string document = kWrappedMail;
+    const std::vector<std::string> keys = {"order_total"};
+    LensReport r;
+    lens_apply_pass2_candidates(document,
+        "order_total: \"11,776.00 EUR net of VAT\"\n"
+        "order_total: \"12,708.00 EUR net of VAT\"\n", keys, r);
+    ASSERT_EQ(r.key_candidates["order_total"].size(), 2u);
+    for (const LensCandidate& c : r.key_candidates["order_total"])
+        EXPECT_EQ(document.substr(c.byte_lo, c.byte_hi - c.byte_lo), c.value)
+            << "value must stay a byte-exact slice of the document";
+    // The wrapped one carries the document's own newline, not the model's space.
+    EXPECT_EQ(r.key_candidates["order_total"][1].value, "12,708.00 EUR net of\nVAT");
+}
+
+TEST(LensCandidatePass2Apply, TrailingSentencePeriodDoesNotLoseTheSpan) {
+    // The model quotes "13 November 2026." — the document has "13 November
+    // 2026," (comma). One character, and the whole revised delivery date was
+    // dropped, leaving only the superseded 30 October.
+    const std::string document = kWrappedMail;
+    const std::vector<std::string> keys = {"delivery_date"};
+    LensReport r;
+    lens_apply_pass2_candidates(document,
+        "delivery_date: \"30 October 2026.\"\n"
+        "delivery_date: \"13 November 2026.\"\n", keys, r);
+    ASSERT_EQ(r.key_candidates["delivery_date"].size(), 2u);
+    EXPECT_EQ(r.key_candidates["delivery_date"][0].value, "30 October 2026.");
+    EXPECT_EQ(r.key_candidates["delivery_date"][1].value, "13 November 2026");
+    for (const LensCandidate& c : r.key_candidates["delivery_date"])
+        EXPECT_EQ(document.substr(c.byte_lo, c.byte_hi - c.byte_lo), c.value);
+}
+
+TEST(LensCandidatePass2Apply, TolerantMatchStillRejectsARealParaphrase) {
+    // The tolerance must not become a fuzzy matcher: a changed CHARACTER is a
+    // real difference and still fails every tier.
+    const std::string document = kWrappedMail;
+    const std::vector<std::string> keys = {"order_total"};
+    LensReport r;
+    lens_apply_pass2_candidates(document, "order_total: \"12708.00 EUR\"\n", keys, r);
+    EXPECT_FALSE(r.candidates_producer_failed);
+    EXPECT_TRUE(r.key_candidates["order_total"].empty());
+}
+
+TEST(LensCandidatePass2Apply, TwoQuotationsOfOneSpanDeduplicateByRange) {
+    const std::string document = kWrappedMail;
+    const std::vector<std::string> keys = {"order_total"};
+    LensReport r;
+    lens_apply_pass2_candidates(document,
+        "order_total: \"12,708.00 EUR net of VAT\"\n"
+        "order_total: \"12,708.00 EUR net of\nVAT\"\n", keys, r);
+    EXPECT_EQ(r.key_candidates["order_total"].size(), 1u);
+}
+
+TEST(LensCandidateWire, AnchorNeverCutsMidToken) {
+    // The reported defect: "Delivery ex works Gdansk on 30 October 2026.
+    // Payment terms 3" — the "3" is the head of "30 days net" and reads as a
+    // fact. The enclosing SENTENCE is both shorter and true.
+    LensReport r;
+    r.document_text = kWrappedMail;
+    r.fields = {present_field("delivery_date", "30 October 2026", true, true)};
+    r.candidates_requested = true;
+    const size_t lo = r.document_text.find("30 October 2026");
+    ASSERT_NE(lo, std::string::npos);
+    r.key_candidates["delivery_date"] = {LensCandidate{"30 October 2026", lo, lo + 15}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    const std::string a = j["key_candidates"]["delivery_date"][0]["anchor"];
+    EXPECT_EQ(a.substr(a.size() - 1), std::string(")"))
+        << "expected the ALL-CAPS section heading, actual '" << a << "'";
+    EXPECT_EQ(a, "ORIGINAL CONFIRMATION (4 September, superseded)");
+}
+
+TEST(LensCandidateWire, AllCapsSectionHeadingIsALabel) {
+    // The heading that tells a reviewer WHICH rival this is. Correspondence
+    // heads sections this way instead of numbering them.
+    LensReport r;
+    r.document_text = kWrappedMail;
+    r.fields = {present_field("order_total", "12,708.00 EUR", true, true)};
+    r.candidates_requested = true;
+    const size_t lo = r.document_text.find("12,708.00 EUR");
+    ASSERT_NE(lo, std::string::npos);
+    r.key_candidates["order_total"] = {LensCandidate{"12,708.00 EUR", lo, lo + 13}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_EQ(j["key_candidates"]["order_total"][0]["anchor"],
+              "REVISED CONFIRMATION (this message)");
+}
+
+TEST(LensCandidateWire, AnchorTruncationLandsOnAWordBoundaryAndIsMarked) {
+    LensReport r;
+    r.document_text =
+        "Freight is DAP Rotterdam and is included and the customs clearance for "
+        "this consignment remains entirely with the buyer at 45 units\n";
+    r.fields = {present_field("quantity", "45", true, true)};
+    r.candidates_requested = true;
+    const size_t lo = r.document_text.find("45");
+    r.key_candidates["quantity"] = {LensCandidate{"45", lo, lo + 2}};
+
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    const std::string a = j["key_candidates"]["quantity"][0]["anchor"];
+    ASSERT_FALSE(a.empty());
+    // Marked as a fragment, and the text before the marker ends on a whole word.
+    ASSERT_GE(a.size(), 3u);
+    EXPECT_EQ(a.substr(a.size() - 3), std::string("\xe2\x80\xa6"));
+    const std::string body = a.substr(0, a.size() - 3);
+    EXPECT_EQ(r.document_text.compare(0, body.size(), body), 0)
+        << "the anchor must be a prefix of the real line, actual '" << body << "'";
+    EXPECT_NE(body.back(), ' ');
+}
+
+TEST(LensCandidateWire, AnchorIsValidUtf8WhenTheLineIsMultibyte) {
+    // A 60-BYTE cut lands inside a multi-byte character on the German half of
+    // the corpus and emits invalid UTF-8 into the JSON.
+    LensReport r;
+    r.document_text =
+        "Die Zahlungsbedingungen für die überarbeitete Bestellung müssen "
+        "spätestens am Montag bestätigt werden, Betrag 45 EUR\n";
+    r.fields = {present_field("amount", "45 EUR", true, true)};
+    r.candidates_requested = true;
+    const size_t lo = r.document_text.find("45 EUR");
+    r.key_candidates["amount"] = {LensCandidate{"45 EUR", lo, lo + 6}};
+
+    const std::string out = lens_report_to_json(r);
+    nlohmann::json j = nlohmann::json::parse(out);   // throws on invalid UTF-8
+    const std::string a = j["key_candidates"]["amount"][0]["anchor"];
+    // Every continuation byte must be preceded by a valid lead byte.
+    for (size_t i = 0; i < a.size();) {
+        const unsigned char c = (unsigned char)a[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        ASSERT_NE(len, 0u) << "invalid UTF-8 lead byte in anchor '" << a << "'";
+        ASSERT_LE(i + len, a.size()) << "truncated UTF-8 sequence in anchor '" << a << "'";
+        i += len;
+    }
 }
 
 TEST(LensCandidateWire, AnchorResolvesToThePrecedingLabelLine) {
