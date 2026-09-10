@@ -39,6 +39,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <fstream>
 
 #include "engine/model.h"
 #include "../../src/models/model_registry.h"
@@ -3402,6 +3403,162 @@ static int run_qdocs_leg_c(ForwardPassBase* fp, ggml_backend_sched_t sched,
     return 0;
 }
 
+// Read a whole file into a string, fail-loud (no silent empty-string fallback —
+// a missing fixture must stop the run, not silently score against "").
+static std::string read_file_or_die(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "read_file_or_die: expected fixture %s to open, "
+                             "actual fopen failure (run OCRDUMP + the cupsfilter/"
+                             "pdftotext round-trip first)\n", path.c_str());
+        std::exit(1);
+    }
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::string s;
+    if (sz > 0) { s.resize((size_t)sz); std::fread(&s[0], 1, (size_t)sz, f); }
+    std::fclose(f);
+    return s;
+}
+
+// Arm T (docs/plan-ocr-lens.md) — clone of run_qdocs_leg_c with EXACTLY ONE
+// change: the document text handed to qdocs_chat_prompt/qdocs_span_in_prompt
+// comes from the pdftotext -layout round-trip of the corpus document
+// (/tmp/ocr_probe/<tag>.rt.txt) instead of QMessy.document itself. Prompt
+// construction, the frozen-head citation read, the top1/top3 in-span scorer,
+// false-alarm and used-clear are byte-identical to leg C — this is a paired
+// comparison, so a reimplemented metric would make the delta meaningless.
+// The labeled field VALUES are NOT round-tripped (ground truth doesn't
+// change); only the surrounding document body is.
+//
+// Additive only (does not touch the leg-C scoring above): bar 4's
+// false-absent tally. The harness has no independent "model wrote key=null"
+// signal — qdocs_eval_field's only verbatim/not-verbatim bit is
+// found_verbatim. So "false absent" here is read as: the value string DOES
+// occur in the round-tripped source (cov_peak >= 0, i.e. qdocs_span_in_prompt
+// found it) but the model's generated JSON did not reproduce it verbatim
+// (found_verbatim == false) — the closest available proxy for "the model
+// reported this field absent/unrecoverable when it was actually on the page,"
+// without adding any new scoring math.
+static int run_ocr_t_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta,
+                           const std::vector<int32_t>& attn_layers) {
+    // Fixture suffix is env-selectable so Arm T and Arm O (docs/plan-ocr-lens.md
+    // step 2) share this exact scoring code — OCRO=1 selects the Vision-OCR
+    // fixture, OCR_SUFFIX overrides directly, default is Arm T's pdftotext one.
+    std::string ocr_suffix = std::getenv("OCR_SUFFIX") ? std::getenv("OCR_SUFFIX")
+                            : std::getenv("OCRO") ? ".ocr.txt" : ".rt.txt";
+
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ OCR-LENS ARM %s — 15 docs EN+DE, fixture suffix %-13s ║\n",
+                std::getenv("OCRO") ? "O" : "T", ocr_suffix.c_str());
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps10(attn_layers.begin(), attn_layers.end());
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+
+    struct Acc { int cite_n=0, t1=0, t3=0; int used_spans=0, used_clear=0;
+                 std::vector<double> used_peaks; int grounded=0, false_alarm=0;
+                 int labeled=0, normalized=0; int false_absent=0; };
+    Acc en, de;
+    auto pick = [&](bool d) -> Acc& { return d ? de : en; };
+    std::vector<std::string> false_absent_names;
+
+    for (const QMessy& d : corpus) {
+        std::string rt_doc = read_file_or_die("/tmp/ocr_probe/" + d.tag + ocr_suffix);
+        std::string prompt = qdocs_chat_prompt(rt_doc, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps10,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        std::printf("\n[%s%s] %s\n", d.tag.c_str(), d.de ? " DE" : "", R.gen_text.c_str());
+
+        int doc_lo, doc_hi;
+        if (!qdocs_span_in_prompt(tok, R, rt_doc, doc_lo, doc_hi)) {
+            doc_lo = 0; doc_hi = R.P - 1;
+        }
+        Acc& A = pick(d.de);
+        for (const QLabel& f : d.fields) {
+            A.labeled++;
+            QFieldEval e = qdocs_eval_field(tok, R, f.value, doc_lo, doc_hi, attn_layers, TOL);
+            if (e.cov_peak >= 0) {
+                A.used_spans++; A.used_peaks.push_back(e.cov_peak);
+                if (e.cov_peak >= 0.705) A.used_clear++;
+            }
+            if (!e.found_verbatim) { A.normalized++;
+                if (e.cov_peak >= 0) {
+                    A.false_absent++;
+                    false_absent_names.push_back(d.tag + "." + f.concept);
+                }
+                std::printf("    %-13s \"%s\"  NORMALIZED (not verbatim in output)  cov=%.3f%s\n",
+                            f.concept.c_str(), f.value.c_str(), e.cov_peak,
+                            e.cov_peak >= 0 ? "  << BAR4 FALSE-ABSENT" : "");
+                continue;
+            }
+            A.cite_n += e.cite_n; A.t1 += e.cite_t1; A.t3 += e.cite_t3;
+            A.grounded++;
+            bool alarm = e.body_mass < 0.538;
+            if (alarm) A.false_alarm++;
+            std::printf("    %-13s \"%s\"  cite t1 %d/%d t3 %d/%d  cov=%.3f  body_mass=%.3f%s\n",
+                        f.concept.c_str(), f.value.c_str(), e.cite_t1, e.cite_n, e.cite_t3, e.cite_n,
+                        e.cov_peak, e.body_mass, alarm ? "  << FALSE ALARM" : "");
+        }
+    }
+
+    auto med = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end());
+        return v[v.size() / 2]; };
+    auto report = [&](const char* label, const Acc& A) {
+        std::printf("\n──────── %s ────────\n", label);
+        std::printf("  citation (frozen L%dH%d) on value tokens: top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [bar top3 ≥90%%]\n",
+                    (*g_attn_layers)[FROZEN_SLOT], FROZEN_HEAD,
+                    A.t1, A.cite_n, A.cite_n ? 100.0 * A.t1 / A.cite_n : 0,
+                    A.t3, A.cite_n, A.cite_n ? 100.0 * A.t3 / A.cite_n : 0);
+        std::printf("  coverage: used spans clearing 0.705 = %d/%d (%.0f%%)  median used-peak %.3f  [COV1 USED median 0.937]\n",
+                    A.used_clear, A.used_spans, A.used_spans ? 100.0 * A.used_clear / A.used_spans : 0,
+                    med(A.used_peaks));
+        std::printf("  ungrounded false-alarm on grounded fields: %d/%d (%.0f%%)  [bar <10%%]\n",
+                    A.false_alarm, A.grounded, A.grounded ? 100.0 * A.false_alarm / A.grounded : 0);
+        std::printf("  verbatim-ness: normalized %d/%d (%.0f%% of labeled values re-rendered)\n",
+                    A.normalized, A.labeled, A.labeled ? 100.0 * A.normalized / A.labeled : 0);
+        std::printf("  BAR4 false-absent (in round-tripped text, not verbatim in output): %d/%d\n",
+                    A.false_absent, A.labeled);
+    };
+    report("EN", en);
+    report("DE", de);
+    Acc all;
+    all.cite_n=en.cite_n+de.cite_n; all.t1=en.t1+de.t1; all.t3=en.t3+de.t3;
+    all.used_spans=en.used_spans+de.used_spans; all.used_clear=en.used_clear+de.used_clear;
+    all.grounded=en.grounded+de.grounded; all.false_alarm=en.false_alarm+de.false_alarm;
+    all.labeled=en.labeled+de.labeled; all.normalized=en.normalized+de.normalized;
+    all.false_absent=en.false_absent+de.false_absent;
+    for (double p : en.used_peaks) all.used_peaks.push_back(p);
+    for (double p : de.used_peaks) all.used_peaks.push_back(p);
+    report("COMBINED", all);
+
+    std::printf("\n  BAR4 false-absent fields (%zu): ", false_absent_names.size());
+    for (auto& n : false_absent_names) std::printf("%s ", n.c_str());
+    std::printf("\n");
+
+    double t3 = all.cite_n ? 100.0 * all.t3 / all.cite_n : 0;
+    double fa = all.grounded ? 100.0 * all.false_alarm / all.grounded : 0;
+    bool pass = t3 >= 90 && fa < 10 && (all.used_spans ? (double)all.used_clear / all.used_spans >= 0.9 : false);
+    std::printf("\n── ARM T VERDICT: %s (top3 %.0f%%%s90, false-alarm %.0f%%%s10, used-clear %.0f%%) ──\n",
+                pass ? "PASS" : "FAIL", t3, t3 >= 90 ? "≥" : "<", fa, fa < 10 ? "<" : "≥",
+                all.used_spans ? 100.0 * all.used_clear / all.used_spans : 0);
+    return 0;
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // SS2 — the coverage-free stale-source alarm, on a grammar-constrained thread
 // extractor, at genuinely long (4K-8K token) context. Supersedes SS1
@@ -6282,7 +6439,7 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         std::vector<std::string> cands;  // deduped, document order (found-in-doc first)
     };
     struct DocOut { std::string tag, document; bool de; std::map<std::string, CandSet> per_key;
-                    std::set<std::string> uncontested; };
+                    std::set<std::string> uncontested; double p2_latency_s = 0; };
     std::vector<DocOut> docs_out;
 
     for (const QMessy& d : corpus) {
@@ -6320,8 +6477,11 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         std::string task = CAND_PASS2_TASK_PREFIX;
         for (size_t i = 0; i < keys.size(); ++i) task += (i ? ", " : "") + keys[i];
         std::string prompt = qdocs_chat_prompt(d.document, task);
+        auto p2_t0 = std::chrono::steady_clock::now();
         FreeRun P2 = run_freegen(fp, sched, tok, meta, prompt, "", /*tap_layers=*/{},
                                  700, /*capture_conf=*/false, /*close_char=*/'\x01');
+        double p2_latency_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - p2_t0).count();
         if (std::getenv("CAND_DEBUG"))
             std::printf("\n[%s%s] PASS2 raw (%zu gen tok):\n%s\n", d.tag.c_str(),
                         d.de ? " DE" : "", P2.gen_tokens.size(), P2.gen_text.c_str());
@@ -6367,7 +6527,44 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         for (auto& f : d.fields) truth_count[f.concept]++;
         for (auto& kv : truth_count) if (kv.second == 1) out.uncontested.insert(kv.first);
 
+        out.p2_latency_s = p2_latency_s;
         docs_out.push_back(std::move(out));
+    }
+
+    // ── CAND_PRED — dump pass-2's own candidate spans as a span-tagger-probe
+    // prediction file (docs/note-span-tagger-probe.md shape), so the shipped
+    // finder can be scored by the SAME unmodified scorer used for GLiNER/QA.
+    // Pass 2 emits no confidence, so every span gets score=1.0 (only the
+    // th=0.1 row of the scorer's threshold sweep is meaningful for this file).
+    // Text is the document-order span "text" already resolved by the shipped
+    // qinf::lens_apply_pass2_candidates() against the ORIGINAL document bytes
+    // (d.document, same corpus text run_cand_probe always used) — no new
+    // extraction or matching logic here, just a serializer over docs_out.
+    if (const char* pred_path = std::getenv("CAND_PRED")) {
+        std::ofstream pf(pred_path);
+        if (!pf) throw std::runtime_error("CAND_PRED: cannot open " + std::string(pred_path));
+        pf << "{\n  \"model_id\": \"pass2-cand-finder\",\n  \"per_doc\": {\n";
+        for (size_t i = 0; i < docs_out.size(); ++i) {
+            const DocOut& d = docs_out[i];
+            pf << "    \"" << jesc(d.tag) << "\": {\n"
+               << "      \"de\": " << (d.de ? "true" : "false") << ",\n"
+               << "      \"latency_s\": " << d.p2_latency_s << ",\n"
+               << "      \"spans\": [\n";
+            bool first = true;
+            for (auto& kv : d.per_key) {
+                for (auto& c : kv.second.cands) {
+                    if (!first) pf << ",\n";
+                    first = false;
+                    pf << "        {\"concept\": \"" << jesc(kv.first) << "\", \"text\": \""
+                       << jesc(c) << "\", \"score\": 1.0}";
+                }
+            }
+            pf << (first ? "" : "\n") << "      ]\n"
+               << "    }" << (i + 1 < docs_out.size() ? "," : "") << "\n";
+        }
+        pf << "  }\n}\n";
+        pf.close();
+        std::printf("\nCAND_PRED: wrote %zu docs to %s\n", docs_out.size(), pred_path);
     }
 
     // ── 1. THE KILL GATE — median candidate-set size on uncontested keys ─────
@@ -7026,6 +7223,28 @@ static int run_warm2_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
 }
 
 int main() {
+    // OCRDUMP — offline fixture dump for the OCR-lens probe step 2a
+    // (docs/plan-ocr-lens.md). No model load: writes each qdocs_messy_corpus()
+    // entry's raw .document to /tmp/ocr_probe/<tag>.txt and exits. The
+    // directory must already exist (mkdir -p /tmp/ocr_probe before running).
+    if (std::getenv("OCRDUMP")) {
+        auto corpus = qdocs_messy_corpus();
+        for (const QMessy& d : corpus) {
+            std::string dpath = "/tmp/ocr_probe/" + d.tag + ".txt";
+            FILE* f = std::fopen(dpath.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "OCRDUMP: expected %s to open for write, "
+                                     "actual fopen failure (mkdir -p /tmp/ocr_probe first)\n",
+                             dpath.c_str());
+                return 1;
+            }
+            std::fwrite(d.document.data(), 1, d.document.size(), f);
+            std::fclose(f);
+            std::printf("OCRDUMP: wrote %s (%zu bytes)\n", dpath.c_str(), d.document.size());
+        }
+        return 0;
+    }
+
     const char* env = std::getenv("QWEN36_MODEL_PATH");
     std::string path = env ? env : "models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf";
     const bool selftest = std::getenv("ATTN_TAP_SELFTEST") != nullptr;
@@ -7174,6 +7393,14 @@ int main() {
     // Qemmi-Docs P0 — leg C: messy-corpus robustness (frozen signals, 15 docs).
     if (std::getenv("QDOCS_C"))
         return run_qdocs_leg_c(fp.get(), sched, tok, meta, attn_layers);
+    // OCR-lens Arm T (docs/plan-ocr-lens.md): leg C cloned onto pdftotext
+    // round-tripped documents instead of QMessy.document. Same CTX group as
+    // QDOCS_C (unlisted below ⇒ 2048).
+    // OCR-lens Arm O (same doc, step 2): identical scoring code, fixture
+    // suffix switched to Vision-OCR text via OCR_SUFFIX/".ocr.txt" inside
+    // run_ocr_t_probe. Same CTX group as OCRT (unlisted below ⇒ 2048).
+    if (std::getenv("OCRT") || std::getenv("OCRO"))
+        return run_ocr_t_probe(fp.get(), sched, tok, meta, attn_layers);
     // Norm-weighted attention calibration (docs/note-lens-norm-weighted-metric.md):
     // Metric A (raw alpha) vs Metric B (alpha*||V||) on citation (Leg C corpus)
     // and coverage separation (COV1 corpus), paired, same pass.
