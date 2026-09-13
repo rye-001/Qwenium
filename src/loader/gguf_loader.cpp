@@ -813,6 +813,26 @@ void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std:
 }
 
 // Get raw pointer to tensor data in mmap'd file
+const void* GGUFLoader::mapped_base() const
+{
+    if (!file_mapper_) {
+        throw GGUFLoadError(
+            "mapped_base: file mapping expected to be live, got released "
+            "(release_file_mapping() already ran)");
+    }
+    return static_cast<const void*>(file_mapper_->data());
+}
+
+size_t GGUFLoader::mapped_size() const
+{
+    if (!file_mapper_) {
+        throw GGUFLoadError(
+            "mapped_size: file mapping expected to be live, got released "
+            "(release_file_mapping() already ran)");
+    }
+    return file_mapper_->size();
+}
+
 const void* GGUFLoader::get_tensor_data(const std::string& name) const
 {
     if (!is_loaded_) {

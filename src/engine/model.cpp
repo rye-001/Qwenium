@@ -160,57 +160,118 @@ void Model::load_tensors()
         loader_->load_tensor_metadata(model_context_, tensors);
         std::cout << "Loaded metadata for " << tensors.size() << " tensors" << std::endl;
 
-        // Step 3: Allocate backend buffer and associate all tensors with it
-        // CRITICAL: ggml_backend_alloc_ctx_tensors allocates buffer AND sets tensor->buffer
-        // On Apple Silicon with Metal, this uses unified memory that both CPU and GPU can access
-        std::cout << "Allocating Metal backend buffer and associating tensors..." << std::endl;
-        weights_buffer_ = ggml_backend_alloc_ctx_tensors(model_context_, backend_metal_);
-        if (!weights_buffer_) {
-            throw GGUFLoadError("Failed to allocate Metal backend buffer for tensors");
-        }
-        
-        // Verify buffer allocation
-        size_t buffer_size = ggml_backend_buffer_get_size(weights_buffer_);
-        std::cout << "Metal buffer allocated: " << buffer_size / (1024 * 1024) << " MB" << std::endl;
-
-        // Step 4: Copy tensor data from GGUF file into backend buffer
-        // Now tensor->buffer is properly set, so ggml_backend_tensor_set() will work
-        std::cout << "Copying tensor data to Metal backend buffer..." << std::endl;
-        size_t tensors_copied = 0;
-        size_t total_bytes_copied = 0;
-        
-        for (const auto& [name, tensor] : tensors) {
-            // Verify tensor buffer was set by ggml_backend_alloc_ctx_tensors
-            if (!tensor->buffer) {
-                throw GGUFLoadError("Tensor buffer not set after allocation for: " + name);
+        if (mmap_weights_) {
+            // ── mmap-backed weights ────────────────────────────────────────
+            // Wrap the GGUF's already-mapped pages in a backend buffer and
+            // point every tensor into them. No copy, so no 2x load-time peak
+            // (the copy path needs source mapping and destination buffer live
+            // at the same instant) and the weight pages stay clean/file-backed
+            // rather than dirty-anonymous. Byte-identical by construction:
+            // identical bytes, different provenance. The mapping is NOT
+            // released afterwards -- the tensors address it for the process
+            // lifetime.
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_metal_);
+            if (!dev) {
+                throw GGUFLoadError(
+                    "mmap-weights: ggml_backend_get_device expected a device for "
+                    "the Metal backend, got null");
             }
-            bool is_vocab_tensor = (name == "token_embd.weight" || name == "output.weight");
 
-            // For all other tensors, do a direct wholesale copy.
-            const void* src_data = loader_->get_tensor_data(name);
-            if (!src_data) {
-                throw GGUFLoadError("Failed to get data for tensor: " + name);
+            size_t max_tensor_size = 0;
+            for (const auto& [name, tensor] : tensors) {
+                const size_t nb = ggml_nbytes(tensor);
+                if (nb > max_tensor_size) max_tensor_size = nb;
             }
-            size_t data_size = ggml_nbytes(tensor);
+
+            void*  base  = const_cast<void*>(loader_->mapped_base());
+            size_t msize = loader_->mapped_size();
+
+            std::cout << "Mapping GGUF pages as Metal buffer (no copy): "
+                      << msize / (1024 * 1024) << " MB" << std::endl;
+
+            weights_buffer_ = ggml_backend_dev_buffer_from_host_ptr(
+                dev, base, msize, max_tensor_size);
+            if (!weights_buffer_) {
+                throw GGUFLoadError(
+                    "mmap-weights: ggml_backend_dev_buffer_from_host_ptr expected "
+                    "a buffer, got null (device reports buffer_from_host_ptr "
+                    "unsupported?)");
+            }
+
+            const std::byte* map_lo = static_cast<const std::byte*>(base);
+            const std::byte* map_hi = map_lo + msize;
+            for (const auto& [name, tensor] : tensors) {
+                const void* src = loader_->get_tensor_data(name);
+                if (!src) {
+                    throw GGUFLoadError("mmap-weights: failed to get data for tensor: " + name);
+                }
+                const std::byte* lo = static_cast<const std::byte*>(src);
+                const std::byte* hi = lo + ggml_nbytes(tensor);
+                if (lo < map_lo || hi > map_hi) {
+                    throw GGUFLoadError(
+                        "mmap-weights: tensor \"" + name + "\" expected to lie inside "
+                        "the mapping [0, " + std::to_string(msize) + "), actual offset " +
+                        std::to_string((size_t)(lo - map_lo)) + " size " +
+                        std::to_string(ggml_nbytes(tensor)));
+                }
+                tensor->data   = const_cast<void*>(src);
+                tensor->buffer = weights_buffer_;
+            }
+            std::cout << "Mapped " << tensors.size()
+                      << " tensors onto GGUF pages (0 bytes copied)" << std::endl;
+        } else {
+            // Step 3: Allocate backend buffer and associate all tensors with it
+            // CRITICAL: ggml_backend_alloc_ctx_tensors allocates buffer AND sets tensor->buffer
+            // On Apple Silicon with Metal, this uses unified memory that both CPU and GPU can access
+            std::cout << "Allocating Metal backend buffer and associating tensors..." << std::endl;
+            weights_buffer_ = ggml_backend_alloc_ctx_tensors(model_context_, backend_metal_);
+            if (!weights_buffer_) {
+                throw GGUFLoadError("Failed to allocate Metal backend buffer for tensors");
+            }
         
-            // Copy data to backend buffer
-            // On Metal with unified memory, this copies to memory accessible by both CPU and GPU
-            ggml_backend_tensor_set(tensor, src_data, 0, data_size);
-            tensors_copied++;
-            total_bytes_copied += data_size;
+            // Verify buffer allocation
+            size_t buffer_size = ggml_backend_buffer_get_size(weights_buffer_);
+            std::cout << "Metal buffer allocated: " << buffer_size / (1024 * 1024) << " MB" << std::endl;
+
+            // Step 4: Copy tensor data from GGUF file into backend buffer
+            // Now tensor->buffer is properly set, so ggml_backend_tensor_set() will work
+            std::cout << "Copying tensor data to Metal backend buffer..." << std::endl;
+            size_t tensors_copied = 0;
+            size_t total_bytes_copied = 0;
+        
+            for (const auto& [name, tensor] : tensors) {
+                // Verify tensor buffer was set by ggml_backend_alloc_ctx_tensors
+                if (!tensor->buffer) {
+                    throw GGUFLoadError("Tensor buffer not set after allocation for: " + name);
+                }
+                bool is_vocab_tensor = (name == "token_embd.weight" || name == "output.weight");
+
+                // For all other tensors, do a direct wholesale copy.
+                const void* src_data = loader_->get_tensor_data(name);
+                if (!src_data) {
+                    throw GGUFLoadError("Failed to get data for tensor: " + name);
+                }
+                size_t data_size = ggml_nbytes(tensor);
+        
+                // Copy data to backend buffer
+                // On Metal with unified memory, this copies to memory accessible by both CPU and GPU
+                ggml_backend_tensor_set(tensor, src_data, 0, data_size);
+                tensors_copied++;
+                total_bytes_copied += data_size;
             
-            // Progress indicator every 50 tensors
-            if (tensors_copied % 50 == 0) {
-                std::cout << "  Progress: " << tensors_copied << "/" << tensors.size() 
-                            << " tensors (" << (total_bytes_copied / (1024 * 1024)) << " MB)\r" 
-                            << std::flush;
+                // Progress indicator every 50 tensors
+                if (tensors_copied % 50 == 0) {
+                    std::cout << "  Progress: " << tensors_copied << "/" << tensors.size() 
+                                << " tensors (" << (total_bytes_copied / (1024 * 1024)) << " MB)\r" 
+                                << std::flush;
+                }
             }
-        }
-        std::cout << std::endl;
-        std::cout << "Successfully copied " << tensors_copied << " tensors ("
-                  << (total_bytes_copied / (1024 * 1024)) << " MB) to Metal backend buffer" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Successfully copied " << tensors_copied << " tensors ("
+                      << (total_bytes_copied / (1024 * 1024)) << " MB) to Metal backend buffer" << std::endl;
         
-        // Assign tensor pointers
+            // Assign tensor pointers
+        }
         assign_tensor_pointers(tensors);
     }
 
@@ -223,7 +284,9 @@ void Model::load_tensors()
     // and ~13 GB on a 27B. Nothing reads it after this point: metadata was
     // extracted into owning structures, tensor pointers address the backend
     // buffer, and the tokenizer builds from metadata_. Release it.
-    loader_->release_file_mapping();
+    if (!mmap_weights_) {
+        loader_->release_file_mapping();
+    }
 
     // Tokenizer config comes from the model registry, not the GGUF.  The
     // architecture knows its invariants (e.g. Gemma always needs BOS); GGUF

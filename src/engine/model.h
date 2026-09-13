@@ -188,6 +188,16 @@ public:
     void load_metadata(const std::string& model_path, bool allow_multimodal = false);
     void load_tensors();
 
+    // Opt-in: back the weights buffer with the GGUF's mmap'd pages
+    // (ggml_backend_dev_buffer_from_host_ptr) instead of allocating a fresh
+    // backend buffer and copying every tensor into it. Removes the load-time
+    // 2x peak (the copy needs source mapping and destination buffer live at
+    // the same instant) and leaves weight pages clean/file-backed rather than
+    // dirty. Byte-identical by construction: same bytes, different provenance.
+    // Must be set BEFORE load_tensors(). Metal path only.
+    void set_mmap_weights(bool on) { mmap_weights_ = on; }
+    bool mmap_weights() const { return mmap_weights_; }
+
 
     // Total trainable parameters, summed from the tensor inventory (every
     // tensor the GGUF ships, MoE experts and any NextN head included). This is
@@ -224,6 +234,7 @@ private:
     ggml_backend_t backend_metal_;
     ggml_backend_sched_t sched_;
     ggml_backend_buffer_t weights_buffer_;
+    bool mmap_weights_ = false;
 
     // Tensors
     struct ggml_tensor* token_embd_weight_;

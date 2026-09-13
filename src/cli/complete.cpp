@@ -132,6 +132,19 @@ int run_complete(
         // GGUF has no NextN head (D2). The head graphs run on a DEDICATED
         // scheduler: a new graph shape must not share galloc state with the
         // main graphs (docs/server-image-multirequest-bug.md precedent).
+        // --- Speculative step breakdown -------------------------------------
+        // Phase 4 measured MTP at 74-92% acceptance and ~3.3 tokens/step yet
+        // ~baseline tok/s (architecture.md §"MTP"), which means the tokens are
+        // being earned and then spent again somewhere in the round. These
+        // accumulators say where. Same spirit and same print style as the
+        // [Hybrid rollback] block above: diagnostic, speculative-only, zero
+        // cost on the normal decode path.
+        double spec_decode_ms = 0.0;   // the redundant 1-token full forward
+        double spec_draft_ms  = 0.0;   // MTP head, K drafting passes
+        double spec_verify_ms = 0.0;   // one K-token prefill through the model
+        double spec_sample_ms = 0.0;   // sampler on the decode logits
+        int64_t spec_rounds   = 0;     // speculative rounds entered
+
         const bool mtp_mode = use_speculative && args.speculative_mode == "mtp";
         std::unique_ptr<qinf::SpeculativeDecoder> mtp_spec;
         ggml_backend_sched_t mtp_sched = nullptr;
@@ -177,10 +190,14 @@ int run_complete(
                 mtp_sched = ggml_backend_sched_new(backends, nullptr, 1,
                                                    FP_GRAPH_SIZE, false, false);
             }
-            auto bridge_fn = [mtp_cap, mtp_sched](
+            auto bridge_fn = [mtp_cap, mtp_sched, &spec_draft_ms](
                 uint32_t slot, const std::vector<float>& h, int32_t t, int p,
                 uint32_t k) {
-                return mtp_cap->mtp_draft(slot, h, t, p, k, mtp_sched);
+                auto t0 = std::chrono::steady_clock::now();
+                auto r = mtp_cap->mtp_draft(slot, h, t, p, k, mtp_sched);
+                spec_draft_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                return r;
             };
             mtp_spec = std::make_unique<qinf::SpeculativeDecoder>(
                 std::make_unique<qinf::MtpDraft>(bridge_fn, args.mtp_max_draft),
@@ -241,6 +258,7 @@ int run_complete(
         double dn_checkpoint_ms = 0.0, dn_refeed_ms = 0.0;
         int    dn_restores = 0;
 
+
         auto t_decode_start = Clock::now();
         for (int i = 0; i < args.max_tokens; ++i) {
             std::string decoded_token = tokenizer->decode(next_token_id);
@@ -269,9 +287,13 @@ int run_complete(
                 int decode_pos = forward_pass->get_rope_pos(slot);
 
                 std::vector<float> last_hidden;
+                auto t_dec0 = Clock::now();
                 std::vector<float> decode_logits = forward_pass->run_prefill(
                     current_token_vec, decode_pos, slot, scheduler,
                     mtp_mode ? &last_hidden : nullptr);
+                spec_decode_ms += std::chrono::duration<double, std::milli>(
+                    Clock::now() - t_dec0).count();
+                spec_rounds++;
 
                 // Two different numbers, and they stopped being equal when
                 // M-RoPE landed: an image span writes nx*ny KV rows while
@@ -291,7 +313,10 @@ int run_complete(
                 // bookkeeping here.)
                 last_token_logits.assign(decode_logits.begin(),
                                          decode_logits.begin() + vocab_size);
+                auto t_smp0 = Clock::now();
                 int32_t y = sampler->sample(last_token_logits, tokens, vocab);
+                spec_sample_ms += std::chrono::duration<double, std::milli>(
+                    Clock::now() - t_smp0).count();
 
                 // Hybrid safety: verify advances the recurrent state over ALL
                 // draft tokens, and overwrite semantics can't rewind — so
@@ -313,7 +338,13 @@ int run_complete(
                     generated_tokens,
                     slot,
                     after_decode_pos,
-                    bridge.make_verify(slot),
+                    [&](int sid, const std::vector<int32_t>& d, int sp) {
+                        auto t0 = Clock::now();
+                        auto r = bridge.make_verify(slot)(sid, d, sp);
+                        spec_verify_ms += std::chrono::duration<double, std::milli>(
+                            Clock::now() - t0).count();
+                        return r;
+                    },
                     bridge.make_rewind(slot),
                     eos_token_id,
                     last_hidden,
@@ -425,6 +456,41 @@ int run_complete(
                       << " accept_rate=" << (int)(s.acceptance_rate() * 100) << "%"
                       << " tokens_per_step=" << s.tokens_per_step()
                       << std::endl;
+            {
+                const double wall = std::chrono::duration<double, std::milli>(
+                    t_decode_end - t_decode_start).count();
+                const double acct = spec_decode_ms + spec_draft_ms
+                                  + spec_verify_ms + spec_sample_ms
+                                  + dn_checkpoint_ms + dn_refeed_ms;
+                auto pct = [wall](double ms) {
+                    return wall > 0.0 ? (ms * 100.0 / wall) : 0.0;
+                };
+                std::cout << "[Step breakdown] rounds=" << spec_rounds
+                          << " wall=" << (int)wall << "ms"
+                          << "  decode=" << (int)spec_decode_ms << "ms ("
+                          << (int)pct(spec_decode_ms) << "%)"
+                          << "  draft=" << (int)spec_draft_ms << "ms ("
+                          << (int)pct(spec_draft_ms) << "%)"
+                          << "  verify=" << (int)spec_verify_ms << "ms ("
+                          << (int)pct(spec_verify_ms) << "%)"
+                          << "  sample=" << (int)spec_sample_ms << "ms ("
+                          << (int)pct(spec_sample_ms) << "%)"
+                          << "  checkpoint=" << (int)dn_checkpoint_ms << "ms ("
+                          << (int)pct(dn_checkpoint_ms) << "%)"
+                          << "  refeed=" << (int)dn_refeed_ms << "ms ("
+                          << (int)pct(dn_refeed_ms) << "%)"
+                          << "  unaccounted=" << (int)(wall - acct) << "ms ("
+                          << (int)pct(wall - acct) << "%)"
+                          << std::endl;
+                if (spec_rounds > 0) {
+                    std::cout << "[Per round] decode="
+                              << (spec_decode_ms / spec_rounds) << "ms"
+                              << " draft=" << (spec_draft_ms / spec_rounds) << "ms"
+                              << " verify=" << (spec_verify_ms / spec_rounds) << "ms"
+                              << " total_round=" << (acct / spec_rounds) << "ms"
+                              << std::endl;
+                }
+            }
             if (dn_checkpoint_ms > 0.0 || dn_restores > 0) {
                 std::cout << "[Hybrid rollback] checkpoint_total="
                           << (int)dn_checkpoint_ms << "ms"

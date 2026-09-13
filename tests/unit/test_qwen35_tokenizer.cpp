@@ -13,6 +13,7 @@
 
 #include "engine/model.h"
 #include "../../src/loader/tokenizer.h"
+#include "../../src/loader/gguf_loader.h"
 
 static std::string get_qwen35_model_path() {
     const char* path = std::getenv("QWEN35_MODEL_PATH");
@@ -209,5 +210,59 @@ TEST_F(Qwen35TokenizerTest, TokenIdsInRange) {
     for (size_t i = 0; i < tokens.size(); ++i) {
         EXPECT_GE(tokens[i], 0) << "Negative token ID at position " << i;
         EXPECT_LT(tokens[i], 248320) << "Token ID out of range at position " << i;
+    }
+}
+
+// ============================================================
+// Pre-tokenizer conformance — GOLDEN TOKEN IDS
+//
+// The roundtrip tests above pass under ANY segmentation, so they cannot see a
+// pre-tokenizer defect: encode/decode is lossless either way. These cases pin
+// the actual ids, taken from the reference tokenizer (Qwen3.8-9B
+// tokenizer.json via HF AutoTokenizer) and verified identical on
+// Qwen3.5-0.8B and Qwen3.8-9B.
+//
+// Each case is one of the ways the old GPT-2 pre-tokenization pattern deviated
+// from Qwen's (docs/note-lens-mlx-swift-server.md §7). Before the fix the first
+// three FAILED: "\n\n" split in two, ".example" split off its dot, and every
+// umlauted word was fragmented (St|ü|ckzahl). The last two are controls — they
+// passed before and must keep passing, so the fix is not over-merging.
+//
+// Deliberately NOT on the Qwen35TokenizerTest fixture: that fixture builds a
+// full Model, which needs the architecture registry the `unit-tests` target
+// does not link (its SetUpTestSuite throws "validate_architecture: expected one
+// of: , got \'qwen35\'"). A pre-tokenizer needs a vocabulary and nothing else,
+// so this loads metadata directly and stays runnable here.
+TEST(Qwen35PreTokenizer, MatchesReferenceTokenizer) {
+    SKIP_IF_NO_MODEL();
+    GGUFLoader loader;
+    loader.load_model(get_qwen35_model_path(), /*validate_as_text_model=*/false);
+    ModelMetadata md;
+    loader.extract_metadata(md);
+    ASSERT_EQ(md.tokenizer_pre, "qwen35")
+        << "this checkpoint selects a different pre-tokenizer; the golden ids below are qwen35's";
+    Tokenizer tok(&md);
+
+    struct Case { const char* name; const char* text; std::vector<int32_t> ids; };
+    const std::vector<Case> cases = {
+        // A whitespace run ending in newlines is ONE pre-token (\s*[\r\n]+).
+        {"paragraph break", "a\n\nb", {64, 271, 65}},
+        // A letter run may be prefixed by any non-letter, not just a space.
+        {"dotted word", "p.hayes@brightwork.example",
+         {79, 834, 347, 287, 31, 69665, 1715, 7479}},
+        // \p{L} covers non-ASCII letters; [a-zA-Z] did not.
+        {"umlaut word", "St\u00fcckzahl", {608, 18771, 45166}},
+        {"german sentence", "80 St\u00fcck zu je 24,90 EUR f\u00fcr die Bergblick GmbH",
+         {23, 15, 160949, 6194, 4606, 220, 17, 19, 11, 24, 15, 35858, 6954, 2659,
+          29681, 80929, 30443}},
+        // CONTROL: an em dash is punctuation, not a letter. A byte-class
+        // shortcut (every byte >= 0x80 is a letter) passes the umlaut case and
+        // breaks this one.
+        {"em dash", "Ltd \u2014 45 units", {91126, 1892, 220, 19, 20, 7896}},
+        // CONTROL: contractions, case-insensitive.
+        {"contractions", "they\'re I\'m IT\'S", {19458, 2224, 353, 2688, 8435, 12887}},
+    };
+    for (const Case& c : cases) {
+        EXPECT_EQ(tok.encode(c.text), c.ids) << "pre-tokenizer case: " << c.name;
     }
 }

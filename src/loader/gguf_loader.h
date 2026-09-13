@@ -104,6 +104,13 @@ public:
 
     const TensorMetadata& get_tensor_metadata(const std::string& name) const;
 
+    // Base/size of the live GGUF mapping, for backing a backend buffer with the
+    // mapped pages instead of copying into a fresh one (see Model::load_tensors,
+    // mmap-weights path). Fail-loud once release_file_mapping() has run: a
+    // buffer built over a released mapping would be a use-after-munmap.
+    const void* mapped_base() const;
+    size_t      mapped_size() const;
+
 private:
     std::string model_path_;
     std::unique_ptr<FileMapper> file_mapper_;

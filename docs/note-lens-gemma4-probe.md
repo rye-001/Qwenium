@@ -233,3 +233,74 @@ much closer to a coin flip than to that claim. Keep flash attention on Gemma 4.
 - **No 26B A4B run** (known-incoherent on probe prompts).
 - **No images** — `docs/note-image-lens-probe.md` closes that.
 - **`LensConstants` unchanged; the server architecture refusal untouched.**
+
+## Addendum 2026-09-10 — head aggregation does not rescue Gemma citations
+
+**The 0-of-768 result above was a single-head search. This tests whether the
+citation signal is *distributed* across heads** — the hypothesis that a
+single-head sweep would fail on exactly if the information were spread rather
+than concentrated. Motivated by `note-attn-coverage-probe.md`, where
+`max over heads` **beat** the frozen single head for the *coverage* signal.
+
+Arm `ATTN_HEAD_AGG=1` (`tests/perf/attn_provenance.cpp`), reusing
+`run_gemma4_search_dual`'s BOS + `Gemma4ChatTemplate` setup and
+`run_qdocs_leg_c`'s in-span scorer verbatim. Gemma n=397, Qwen n=413 — both match
+the documented corpora.
+
+| arm | Gemma 4 top-1 / top-3 | Qwen 3.8 top-1 / top-3 |
+|---|---|---|
+| single best head (baseline) | 41% / **51%** | 89% / **98%** |
+| A — max over heads, best layer *(FITTED, 1 param)* | 25.9% / 42.8% (L6) | 86.7% / 92.5% (L27) |
+| B — mean over heads, best layer *(FITTED, 1 param)* | 18.9% / 37.5% (L29) | 55.0% / 83.5% (L27) |
+| **C — max over ALL heads, zero parameters** | 0.0% / **11.8%** | 35.6% / **94.4%** |
+| **D — mean over ALL heads, zero parameters** | 0.0% / **0.0%** | 58.1% / 78.7% |
+
+### The decisive contrast
+
+Arm C is the clean comparison — zero parameters, nothing fitted, identical
+operator on both models. It asks: *does **any** head anywhere in this network
+spike on the right span?*
+
+**Qwen: 94.4% top-3. Gemma: 11.8%.**
+
+On Qwen the union operator nearly saturates, so it is a working instrument. On
+Gemma the same operator finds almost nothing. There is no head anywhere in Gemma
+4 that points at the source span — not one, not occasionally. **The
+distributed-signal hypothesis is refuted**: the single-head search did not fail
+because the signal was spread out; it failed because the signal is not there.
+
+### What the operators actually do — union vs selection
+
+Predicted in the brief, and visible in the data:
+
+- **`max` is a union operator: it preserves top-3 and destroys top-1.** On Qwen,
+  arm C holds top-3 within 4 points of the single-head ceiling while top-1 falls
+  **89% → 35.6%**. Mechanism: a global max over all (layer, head) lets one
+  miscalibrated or sink head with a near-1.0 spike on the *wrong* token hijack the
+  argmax, while the correct token can still reach a global top-3 if any head
+  favours it. Union suits *coverage* ("did any head look"), not *citation*
+  ("where did this come from").
+- **`mean` is worse on both metrics on both models.** Averaging 768 (Gemma) or
+  128 (Qwen) mostly-noisy candidates dilutes toward uniformity.
+- **Aggregation is worse than the single head even on Qwen** (92.5% or 94.4%
+  vs 98%). It is not a free upgrade where signal exists — pooling mixes in heads
+  that are not retrieval heads.
+
+### Scope — what this does and does not close
+
+**Closes**: a learned trust head justified by *"0/768 is what a distributed signal
+looks like"*. It isn't. If the information were linearly present across heads,
+mean-pooling would show something somewhere on Gemma; it shows 0.0%. A learned
+combiner would be fitting on 397 tokens from 15 self-authored documents, against
+this repo's own precedent that a 23-span recalibration was "not shippable"
+(`note-lens-norm-weighted-metric.md`).
+
+**Does NOT close**: the two Qwen arms that sit below their bars — the ungrounded
+alarm (89% vs a 90% PASS bar) and coverage (87%/84% vs ≥90%, on the stale 0.705
+threshold). This probe measured **citations only**. Improving a calibration where
+signal demonstrably exists is a different proposition from conjuring one where it
+does not, and it remains untested.
+
+**Caveat**: the Qwen arm sampled 8 attention layers (3,7,11,15,19,23,27,31)
+against Gemma's full 48. L27, the known-good layer, is in the set, so the control
+is sound — and a higher unsampled Qwen ceiling would only widen the gap.

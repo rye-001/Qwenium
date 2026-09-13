@@ -28,8 +28,8 @@ one engine:
   grammar-constrained output, speculative decoding, an opt-in persistent
   decode graph (`--persistent-graph`, §5), opt-in flash attention
   (`--flash-attn`, §5 — mutually exclusive with the attention lens), a
-  selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), and
-  session snapshots;
+  selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), opt-in
+  mmap-backed weights (`--mmap-weights`, §5), and session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
   them into one forward pass.
@@ -293,9 +293,41 @@ This fixes *steady-state* residency, not the **load-time peak**: the copy
 still needs the source mapping and the destination buffer live at the same
 instant, so peak stays ≈ 2× model size for any model large enough that the
 copy dominates (measured: 9B peak unchanged at ~10.6 GB). Capacity-plan
-loading against 2× and serving against 1×. Removing the peak means removing
-the copy — backing the backend buffer with the mmap'd pages — which is not
-done here.
+loading against 2× and serving against 1× on the default path.
+
+**`--mmap-weights` removes the copy, and with it the peak (opt-in, 2026-09-10).**
+`Model::set_mmap_weights(true)` before `load_tensors()` backs the weights buffer
+with the GGUF's own mapped pages via `ggml_backend_dev_buffer_from_host_ptr`
+(Metal declares `buffer_from_host_ptr` and implements it with
+`newBufferWithBytesNoCopy`, page-aligning internally) and assigns each tensor's
+`data` into the mapping. There is no copy, so the mapping is deliberately NOT
+released; a per-tensor bounds check fails loud rather than letting a tensor point
+outside the mapping. Measured on Qwen 3.6 35B-A3B Q2_K:
+
+| | copy (default) | `--mmap-weights` |
+|---|---|---|
+| peak RSS during load | 15894 MB | **104 MB** |
+| phys_footprint after a forward | 12349 MB | **361 MB** |
+| load wall time | 26.7 s | **4.1 s** |
+| warm prefill | 338.6 ms | 339.9 ms |
+
+**Byte-identical, gated cross-family**: the full logits vector hashes equal on
+`qwen35` (0.8B), `qwen35moe` (35B) and `gemma2` (10 GB), and the CLI's greedy
+output is identical with and without the flag — against a baseline-vs-baseline
+control, since the engine's default temperature is 0.7 and a greedy comparison
+needs `-t 0`. Load is **6.5× faster** because a 12 GB memcpy is gone; steady-state
+decode is unchanged.
+
+**What the footprint number does and does not mean.** The weights still occupy
+physical memory while hot — they must, for the GPU to read them. What changed is
+the *category*: dirty anonymous pages the kernel cannot reclaim become clean
+file-backed pages it can. `phys_footprint` stops attributing them to the process,
+which is exactly the accounting that makes third-party "peak active memory, page
+cache excluded" claims flattering — do not read 361 MB as "the model needs
+361 MB". What is really bought: the 2× load peak is gone, load is 6.5× faster,
+and the OS can reclaim weight pages under pressure instead of swapping or OOMing.
+**Degradation under actual memory pressure was NOT measured** — that is the
+mechanism's prediction, not a result. The default stays copy-and-release.
 
 **Prefill.** The prompt is tokenized and rendered through the family's
 `chat_template`. The recipe builds the *prefill graph* — all prompt tokens in
@@ -410,17 +442,28 @@ accepted prefix is re-fed (`feed_tokens`) — overwrite semantics can't rewind
   62% hit rate vs PLD's 26%, 2.64 tokens/step vs 1.61. Draft width defaults
   to 4 (`--suffix-max-draft`) — measured worse at 8 on Gemma 4-12B, the
   opposite of the usual wider-batch-is-cheaper intuition.
-- **MTP head** (`--speculative mtp`, depth `--mtp-max-draft`; Qwen 3.6 NextN:
+- **MTP head** (`--speculative mtp`, depth `--mtp-max-draft`, default 1; Qwen 3.6 NextN:
   an extra trained attention+MoE block held out of the main stack, drafting
   recursively from the last position's hidden state via
   `models/i_mtp_draftable.h` on a private KV + dedicated scheduler; the
   hidden is exposed by an opt-in, default-off graph output). MTP is a
   capability of MTP-converted GGUFs, mirroring how vision is a capability of
-  `--mmproj` — Qwen-only, as vision is Gemma-only. Status: **experimental** —
-  74–92% acceptance, ~3.3 tokens/step, but end-to-end ≈ baseline on M1 Pro
-  until the per-head-step dispatch overhead is attacked; measurements and the
-  five speculative-machinery bugs fixed en route live in `plan-mtp-decode.md`
-  §7/§9.
+  `--mmproj` — Qwen-only, as vision is Gemma-only. Status: **experimental, and
+  measured a net loss** — 74–92% acceptance, ~2.7 tokens/step, **0.92×
+  baseline** (28 vs 31 tok/s, Qwen 3.6 A3B Q2_K, M-series, 2026-09-11). The
+  cause is *not* per-step dispatch overhead: that hypothesis was measured and
+  refuted — graph build and CPU bookkeeping are 0–1% of the round, and the time
+  is in real forward passes. Two structural reasons, both outside the head's
+  control: (1) the MoE — verify costs ≈29 ms fixed + ≈9 ms/token, the fixed
+  part being one full decode, because top-8 routing re-reads expert weights per
+  token (`mul_mv_id` cannot share those loads; `mul_mm_id` needs `ne21 ≥ 32`);
+  (2) the hybrid — DeltaNet's overwrite semantics cannot rewind, so a partial
+  reject re-feeds the accepted prefix, 4.0 ms/token at depth 1. Ceiling with a
+  free, perfect rollback: 1.07×. Deeper drafting is self-defeating (acceptance
+  88/69/45% at depth 1/2/4 against rollback on 24/54/89% of rounds), hence the
+  default of 1. Round breakdown in `note-mtp-step-breakdown.md`; measurements
+  and the five speculative-machinery bugs fixed en route live in
+  `plan-mtp-decode.md` §7/§9.
 
 Emitted tokens are model-verified under the kernel path that computed them;
 batch-shape numerical forks (§11) mean speculative-on is token-stable, not

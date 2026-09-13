@@ -1920,6 +1920,24 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
 // =============================================================================
 // Main
 // =============================================================================
+// Fail-loud argument errors, same contract and same history as the CLI's
+// (src/cli/main.cpp): name the parameter, then the expectation, then what was
+// actually given.  The server's loop had no final else at all and takes no
+// positional arguments, so EVERY unrecognized argument was silently dropped --
+// a `--ctx 8192` typed as `--context 8192` started a 2048-token server without
+// a word.
+static void print_missing_value(const std::string& flag, const char* prog) {
+    std::cerr << flag << ": expected a value, actual: end of arguments\n"
+              << "Run '" << prog << " --help' for the list of options."
+              << std::endl;
+}
+
+static void print_unknown_option(const std::string& arg, const char* prog) {
+    std::cerr << "argument: expected a known flag, actual '" << arg << "'\n"
+              << "Run '" << prog << " --help' for the list of options."
+              << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     // Quiet ggml's INFO/WARN chatter (e.g. the gallocr "cannot reallocate
     // multi buffer graph" / sched "reserving" lines emitted on every image
@@ -1958,7 +1976,13 @@ int main(int argc, char* argv[]) {
     std::string speculative_mode = "pld";  // "pld" | "mtp" | "suffix"
     int pld_ngram_size = 3;
     int pld_max_draft = 5;
-    int mtp_max_draft = 2;
+    // Default 1, not 2. Measured 2026-09-11 on Qwen3.6-35B-A3B-MTP
+    // (docs/note-mtp-step-breakdown.md): depth is self-defeating on a
+    // hybrid recipe. Acceptance falls 88%/69%/45% at K=1/2/4 while the
+    // recurrent-state rollback (DeltaNet cannot rewind, so a partial
+    // reject re-feeds the accepted prefix) fires on 28%/61%/95% of
+    // rounds. Measured end-to-end: 28 / 23 / 18 tok/s.
+    int mtp_max_draft = 1;
     int suffix_max_match_len = 12;
     int suffix_min_match_len = 2;
     int suffix_max_draft = 4;
@@ -1966,25 +1990,34 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
+        if (arg == "--port" || arg == "-p") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             port = std::stoi(argv[++i]);
-        } else if ((arg == "--model" || arg == "-m") && i + 1 < argc) {
+        } else if (arg == "--model" || arg == "-m") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             model_path = argv[++i];
-        } else if ((arg == "--mmproj" || arg == "-j") && i + 1 < argc) {
+        } else if (arg == "--mmproj" || arg == "-j") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             mmproj_path = argv[++i];
-        } else if ((arg == "--ctx" || arg == "-c") && i + 1 < argc) {
+        } else if (arg == "--ctx" || arg == "-c") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             max_ctx = std::stoi(argv[++i]);
-        } else if ((arg == "--slots" || arg == "-s") && i + 1 < argc) {
+        } else if (arg == "--slots" || arg == "-s") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             max_slots = std::stoi(argv[++i]);
-        } else if (arg == "--image-embed-cache" && i + 1 < argc) {
+        } else if (arg == "--image-embed-cache") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             image_embed_cache_dir = argv[++i];
-        } else if (arg == "--image-prefix-cache" && i + 1 < argc) {
+        } else if (arg == "--image-prefix-cache") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             image_prefix_cache_dir = argv[++i];
-        } else if (arg == "--prefix-cache" && i + 1 < argc) {
+        } else if (arg == "--prefix-cache") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             prefix_cache_dir = argv[++i];
         } else if (arg == "--chat-prefix-cache") {
             chat_prefix_cache = true;
-        } else if (arg == "--token-log" && i + 1 < argc) {
+        } else if (arg == "--token-log") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             token_log_path = argv[++i];
         } else if (arg == "--conversational") {
             conversational = true;
@@ -1994,7 +2027,8 @@ int main(int argc, char* argv[]) {
             flash_attn = true;
         } else if (arg == "--kv-f16") {
             kv_type = GGML_TYPE_F16;   // alias, kept so existing invocations work
-        } else if (arg == "--kv-type" && i + 1 < argc) {
+        } else if (arg == "--kv-type") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             const std::string want = argv[++i];
             if (kv_type_from_string(want, &kv_type) != KvTypeSupport::Ok) {
                 std::cerr << "--kv-type: expected one of " << kv_type_choices()
@@ -2010,19 +2044,26 @@ int main(int argc, char* argv[]) {
                                  std::string(argv[i + 1]) == "suffix")) {
                 speculative_mode = argv[++i];
             }
-        } else if (arg == "--pld-ngram" && i + 1 < argc) {
+        } else if (arg == "--pld-ngram") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             pld_ngram_size = std::stoi(argv[++i]);
-        } else if (arg == "--pld-max-draft" && i + 1 < argc) {
+        } else if (arg == "--pld-max-draft") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             pld_max_draft = std::stoi(argv[++i]);
-        } else if (arg == "--mtp-max-draft" && i + 1 < argc) {
+        } else if (arg == "--mtp-max-draft") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             mtp_max_draft = std::stoi(argv[++i]);
-        } else if (arg == "--suffix-max-match" && i + 1 < argc) {
+        } else if (arg == "--suffix-max-match") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             suffix_max_match_len = std::stoi(argv[++i]);
-        } else if (arg == "--suffix-min-match" && i + 1 < argc) {
+        } else if (arg == "--suffix-min-match") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             suffix_min_match_len = std::stoi(argv[++i]);
-        } else if (arg == "--suffix-max-draft" && i + 1 < argc) {
+        } else if (arg == "--suffix-max-draft") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             suffix_max_draft = std::stoi(argv[++i]);
-        } else if (arg == "--suffix-max-indexed" && i + 1 < argc) {
+        } else if (arg == "--suffix-max-indexed") {
+            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             suffix_max_indexed_tokens = (size_t)std::stoul(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
@@ -2075,7 +2116,7 @@ int main(int argc, char* argv[]) {
                       << "  --pld-max-draft K         PLD max draft tokens "
                          "(default: 5)\n"
                       << "  --mtp-max-draft K         MTP head draft depth per "
-                         "step (default: 2)\n"
+                         "step (default: 1; deeper measured worse)\n"
                       << "  --suffix-max-match N      Suffix: longest n-gram "
                          "tried first (default: 12)\n"
                       << "  --suffix-min-match N      Suffix: shortest n-gram "
@@ -2086,6 +2127,12 @@ int main(int argc, char* argv[]) {
                          "session tokens (default: 8192)\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
+        } else {
+            // No final else existed here; the server accepts no positional
+            // arguments, so anything reaching this point is a typo or a flag
+            // this build does not have.  Reject it before the model load.
+            print_unknown_option(arg, argv[0]);
+            return 1;
         }
     }
 
