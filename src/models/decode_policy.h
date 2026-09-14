@@ -17,9 +17,19 @@
 //     kv_write_mode      — Cpy (default, baked-offset ggml_cpy) vs SetRows
 //       (value-driven, position is a graph input).
 //     decode_kv_bucket   — 0 (default, exact n_kv) vs B (round up to B).
-//     attn_impl          — Materialized (default, kq/soft_max/kqv written out)
-//       vs Flash (one ggml_flash_attn_ext). Flash never materializes kq_soft,
-//       so it is mutually exclusive with attention_taps — see below.
+//     attn_impl          — DECODE: Materialized (default, kq/soft_max/kqv
+//       written out) vs Flash (one ggml_flash_attn_ext). Flash never
+//       materializes kq_soft, so it is mutually exclusive with a tapped
+//       decode — see below.
+//     prefill_attn_impl  — the same choice, scoped to PREFILL. Separate
+//       because the two phases are tapped by different callers: `extract`
+//       taps decode and never taps prefill, so its prefill — the dominant
+//       cost on a lens workload — can run flash while the tapped decode
+//       stays materialized (docs/plan-lens-server-shape.md §4.2.1).
+//     truncate_after_layer — PREFILL-only: stop the layer loop after this
+//       physical layer instead of building every layer through the output
+//       head. -1 (default) = full stack. Introduced for teacher-forced lens
+//       verification (docs/plan-lens-server-shape.md §3.4) — see below.
 //
 // Invariant worth stating loudly: the DEFAULTS ARE THE BYTE-REPRODUCIBLE PATH.
 //   The opt-in seams are byte-inert when disarmed — an empty tap set marks no
@@ -66,6 +76,48 @@ struct DecodePolicy {
     KvWriteMode      kv_write_mode      = KvWriteMode::Cpy;
     AttnImpl         attn_impl          = AttnImpl::Materialized;
 
+    // PREFILL's attention implementation, independent of decode's. Default
+    // Materialized = today's path on every recipe. --flash-attn sets BOTH (it
+    // has always meant "flash everywhere"); the lens sets this one alone.
+    //
+    // Phase-scoping is sound because flash and materialized differ only in HOW
+    // the attention output is reduced, not in what is written to the KV cache
+    // — K and V are cached before either path runs. What it is NOT is
+    // byte-inert: the attention output feeds the residual stream, so a flash
+    // prefill changes every later layer's hidden state and therefore the K/V
+    // those layers write. A pass with flash prefill and materialized decode is
+    // a THIRD numerical configuration, not a mix of two known ones, which is
+    // why it is scored by the drift gate (BANDDRIFT arm `flash`) rather than
+    // assumed equivalent.
+    AttnImpl         prefill_attn_impl  = AttnImpl::Materialized;
+
+    // PREFILL-only. -1 (default) = build every layer, today's behaviour.
+    // Otherwise the physical layer index (0-based, inclusive) to stop the
+    // layer loop after. Causality is what makes this exact rather than an
+    // approximation: an attention layer cannot depend on a layer above it, so
+    // a prefill truncated after max(citation_layer, coverage_layer) produces
+    // IDENTICAL tapped rows to the untruncated pass, cheaper because the
+    // omitted layers' matmuls (and any MoE/DeltaNet dispatch in them) never
+    // run. Decode graphs ignore this field entirely — verify (the only caller)
+    // never decodes. See effective_layer_count() and
+    // docs/plan-lens-server-shape.md §3.4.
+    int truncate_after_layer = -1;
+
+    // The layer count a prefill graph should actually build, given the full
+    // stack depth `full`. truncate_after_layer < 0 ⇒ `full` unchanged (every
+    // recipe's default path); otherwise the smaller of `full` and
+    // truncate_after_layer + 1 (so truncate_after_layer == 0 means "build just
+    // layer 0"). Every recipe's build_prefill_graph bounds BOTH its mask-
+    // registration loop and its layer-body loop with this — registering a
+    // typed input for a layer whose node was never built would fail loud at
+    // set-input time (the tensor it looks up by name would not exist), so the
+    // two loops must agree.
+    uint32_t effective_layer_count(uint32_t full) const {
+        if (truncate_after_layer < 0) return full;
+        const uint32_t cut = static_cast<uint32_t>(truncate_after_layer) + 1;
+        return cut < full ? cut : full;
+    }
+
     // Bucket B ⇒ converted recipes size the decode graph's KV read width
     // (mask / gather / gathered views) at the next multiple of B instead of
     // exactly max_pos+1, so one graph shape — hence one allocation — stays valid
@@ -91,13 +143,21 @@ struct DecodePolicy {
     bool is_default_byte_reproducible() const {
         return slice_prefill_head && !output_hidden && attention_taps.empty()
             && kv_write_mode == KvWriteMode::Cpy && decode_kv_bucket == 0
-            && attn_impl == AttnImpl::Materialized;
+            && attn_impl == AttnImpl::Materialized
+            && prefill_attn_impl == AttnImpl::Materialized
+            && truncate_after_layer < 0;
     }
 
     // Flash attention and the lens tap cannot both be armed: Flash never
     // materializes kq_soft, so a tap on it would read a node that does not
     // exist. Callers check this and fail loud rather than silently dropping
     // one of the two — see the --flash-attn / --attention-lens pairing.
+    //
+    // DECODE only, and deliberately not mirrored for prefill. The one caller
+    // that taps prefill (teacher-forced verification) sets prefill_attn_impl
+    // itself for its tapped pass, and if that line were ever lost,
+    // mark_attention_taps already fails loud on the missing kq_soft node — a
+    // structural guard beats a predicate nothing calls.
     bool is_attn_impl_coherent() const {
         return attn_impl == AttnImpl::Materialized || attention_taps.empty();
     }

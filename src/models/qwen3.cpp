@@ -63,7 +63,11 @@ Qwen3ForwardPass::Qwen3ForwardPass(
 struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx, [[maybe_unused]] bool want_logits) {
     reset_context();
     ggml_cgraph* gf = new_graph();
-    int n_layers = meta_.block_count;        // Layers 0-27
+    // effective_layer_count truncates for teacher-forced lens verification
+    // (docs/plan-lens-server-shape.md §3.4); default policy is untruncated, so
+    // this is meta_.block_count unchanged.
+    int n_layers = static_cast<int>(
+        policy_.effective_layer_count(static_cast<uint32_t>(meta_.block_count)));  // Layers 0-27
     int hidden_dim = meta_.embedding_length;    // Model dimension
     int n_head = meta_.attention_head_count;       // Query heads
     int n_head_kv = meta_.attention_head_count_kv;       // KV heads (GQA: 2:1 ratio)
@@ -135,7 +139,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
                                        w, blk_hp, il, slot_idx,
                                        static_cast<uint32_t>(n_tokens),
                                        /*ple_residual=*/nullptr,
-                                       /*use_flash=*/use_flash_attn());
+                                       /*use_flash=*/use_flash_attn_prefill());
     }
 
     // 3. Final normalization and output projection

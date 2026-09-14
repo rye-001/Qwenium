@@ -68,7 +68,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --suffix-max-indexed N  Suffix: cap on indexed session tokens (default: 8192)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
     std::cout << "  --mmap-weights          Back weights with the GGUF's mmap'd pages instead of copying them in; byte-identical, removes the ~2x load peak\n";
-    std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
+    std::cout << "  --flash-attn            Flash attention on prefill AND decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
     std::cout << "  --kv-type <t>           Attention KV cache element type: f32|f16|q8_0|q4_0 (default f32); token-stable, not byte-identical. q8_0/q4_0 REQUIRE --flash-attn\n";
     std::cout << "  --kv-f16                Alias for --kv-type f16 (halves KV memory)\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";

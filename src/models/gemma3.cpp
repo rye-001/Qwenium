@@ -165,7 +165,12 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     reset_context();
     ggml_cgraph* gf = new_graph();
 
-    const int n_layers    = static_cast<int>(config_.n_layers);
+    // effective_layer_count truncates for teacher-forced lens verification
+    // (docs/plan-lens-server-shape.md §3.4 — Gemma carries no lens claim, but
+    // the cross-family rule requires the interface be expressible here too);
+    // default policy is untruncated, so this is config_.n_layers unchanged.
+    const int n_layers    = static_cast<int>(
+        policy_.effective_layer_count(config_.n_layers));
     const int hidden_dim  = static_cast<int>(config_.hidden_dim);
     const int n_head      = static_cast<int>(config_.n_head);
     const int n_head_kv   = static_cast<int>(config_.n_head_kv);
@@ -229,7 +234,7 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
-    for (uint32_t il = 0; il < config_.n_layers; ++il)
+    for (uint32_t il = 0; il < static_cast<uint32_t>(n_layers); ++il)
         graph_inputs_.add(std::make_unique<AttnMaskInput>(
             "kq_mask." + std::to_string(il), config_.layer_window[il],
             bidi_start, bidi_len));
@@ -297,7 +302,7 @@ ggml_cgraph* Gemma3ForwardPass::build_prefill_graph(
                                        w, blk_hp, il, slot_idx,
                                        static_cast<uint32_t>(n_tokens),
                                        /*ple_residual=*/nullptr,
-                                       /*use_flash=*/use_flash_attn());
+                                       /*use_flash=*/use_flash_attn_prefill());
 
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);

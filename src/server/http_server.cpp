@@ -360,7 +360,9 @@ public:
         attention_lens_enabled_ = true;
         std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
                      "(single-slot; document → audited key-value JSON; free decode, "
-                     "tolerant parse, 422 on unparseable output)" << std::endl;
+                     "tolerant parse, 422 on unparseable output) and POST /v1/verify "
+                     "(single-slot; document + extraction → the same report, teacher-"
+                     "forced, no decode loop)" << std::endl;
         std::cout << "  lens calibration: " << cal->model << " [" << cal->architecture << "/"
                   << cal->block_count << "] citation L" << lens_constants_.citation_layer
                   << "H" << lens_constants_.citation_head << ", coverage layer "
@@ -371,10 +373,25 @@ public:
     bool attention_lens_enabled() const { return attention_lens_enabled_; }
 
     // ── Flash attention (--flash-attn) ───────────────────────────────────────
-    // Decode-path only. Refused fail-loud on a recipe that does not thread it
-    // through, rather than accepting the flag and silently running the
-    // materialized path the operator asked to replace.
-    bool enable_flash_attn() {
+    // Refused fail-loud on a recipe that does not thread it through, rather
+    // than accepting the flag and silently running the materialized path the
+    // operator asked to replace.
+    //
+    // `lens_active` splits the flag by PHASE, and whether that split is allowed
+    // is a PER-MODEL question answered by the calibration table
+    // (LensConstants::flash_prefill_ok, server_lens.h — read its comment for
+    // the measurements). Without the lens the flag means what it always meant:
+    // flash everywhere. With the lens it can only ever mean flash in PREFILL,
+    // because a flash decode writes no kq_soft and the lens reads exactly that
+    // — and it means even that only on a model whose entry has been through
+    // the drift gate.
+    //
+    // This check cannot happen with the other flag validation in main(), which
+    // deliberately runs BEFORE the multi-GB model load. The answer depends on
+    // which model is loaded, so it necessarily costs the operator the load
+    // first. That is the price of the answer being per-model rather than a
+    // blanket refusal, and it is stated here so nobody "fixes" it back.
+    bool enable_flash_attn(bool lens_active) {
         if (!forward_pass_->supports_flash_attn()) {
             std::cerr << "--flash-attn: architecture '"
                       << model_.get_metadata().architecture
@@ -382,12 +399,58 @@ public:
                       << "(supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)" << std::endl;
             return false;
         }
+        if (lens_active) {
+            if (!lens_constants_.flash_prefill_ok) {
+                std::cerr << "expected at most one of --attention-lens / --flash-attn on "
+                             "this model, got: both. A flash PREFILL under the lens's "
+                             "materialized decode is buildable, but this model's "
+                             "calibration entry has not earned it: "
+                          << lens_constants_.flash_prefill_provenance
+                          << ". Re-run tests/smoke/lens_drift_gate.sh and set "
+                             "flash_prefill_ok in server_lens.h if it passes. "
+                             "(It FAILS on Qwen3.6-35B-A3B: expert routing is a top-k "
+                             "argmax, so the perturbation is discrete and no decision "
+                             "margin applies to it.)" << std::endl;
+                return false;
+            }
+            forward_pass_->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Flash);
+            std::cout << "Flash attention ON (--flash-attn) for PREFILL only: "
+                         "--attention-lens keeps the decode materialized, because "
+                         "flash never writes kq_soft and that is the tensor the lens "
+                         "reads. Token-stable, NOT byte-identical — reports carry "
+                         "config.attention=\"flash-prefill\" so they are not silently "
+                         "compared against materialized ones.\n"
+                         "  gate: " << lens_constants_.flash_prefill_provenance << std::endl;
+            return true;
+        }
         forward_pass_->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
-        std::cout << "Flash attention ON (--flash-attn): decode path, one fused "
-                     "kernel per attention layer. Token-stable, NOT "
+        std::cout << "Flash attention ON (--flash-attn): prefill and decode, one "
+                     "fused kernel per attention layer. Token-stable, NOT "
                      "byte-identical; attention receipts unavailable."
                   << std::endl;
         return true;
+    }
+
+    // ── The configuration stamp every lens report carries ────────────────────
+    // Derived in ONE place from the server's own state, never assembled at a
+    // call site: two builders is a place for two reports to disagree about one
+    // server. See LensReport::RuntimeConfig for why the report needs it at all.
+    qinf::LensReport::RuntimeConfig lens_config_stamp() const {
+        qinf::LensReport::RuntimeConfig c;
+        char hex[32];
+        std::snprintf(hex, sizeof(hex), "%016llx",
+                      (unsigned long long)model_.get_metadata().weights_hash);
+        // The weights hash, not the file name: it folds arch + shape + QUANT +
+        // layout, which is the axis `model` misses entirely — a Q8_0 and a
+        // Q4_K_M of one model share a calibration entry and do not share
+        // numerics.
+        c.weights   = hex;
+        c.attention = forward_pass_->use_flash_attn()
+                        ? "flash"
+                        : (forward_pass_->use_flash_attn_prefill() ? "flash-prefill"
+                                                                   : "materialized");
+        c.kv_type   = kv_type_name(kv_type_);
+        return c;
     }
 
     // ── Speculative decoding (--speculative [pld|mtp|suffix]) ───────────────
@@ -531,6 +594,29 @@ public:
             forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
             (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts,
             lens_constants_);
+        rep.config = lens_config_stamp();
+        return qinf::lens_report_to_json(rep);
+    }
+
+    // Run one verification and return the lens-format JSON — the /v1/verify
+    // driver (docs/plan-lens-server-shape.md §3). Same locking/slot discipline
+    // as extract_lens_json: EXCLUSIVE, holds the model lock for the whole
+    // teacher-forced tapped prefill, uses slot 0.
+    //
+    // Throws std::runtime_error on bad input (empty concepts/document/
+    // extraction, an oversized prompt) ⇒ the route maps that to 400;
+    // qinf::LensUnparseableError when `extraction` holds no parseable object
+    // ⇒ 422, same shape contract as extract.
+    std::string verify_lens_json(const std::string& document,
+                                 const std::string& extraction,
+                                 const std::vector<qinf::LensConcept>& concepts,
+                                 const std::vector<size_t>& message_offsets) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        qinf::LensReport rep = qinf::run_lens_verify(
+            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
+            (uint32_t)max_ctx_per_slot_, document, extraction, concepts,
+            message_offsets, lens_constants_);
+        rep.config = lens_config_stamp();
         return qinf::lens_report_to_json(rep);
     }
 
@@ -1903,6 +1989,130 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         }
     });
 
+    // Attention Lens verification endpoint (--attention-lens, same flag as
+    // /v1/extract — this is not a second feature, it is the other half of the
+    // one lens surface: docs/plan-lens-server-shape.md §3). Teacher-forces a
+    // KNOWN extraction instead of generating one: one prefill over the prompt,
+    // one head-less TAPPED prefill over the extraction text, no decode loop, no
+    // sampling. Same request shape as /v1/extract for (document|messages,
+    // key_vocabulary) plus the new required `extraction` — the exact text a
+    // prior report's `raw` field carried. Returns 404 when the feature is off,
+    // 400 on bad input, 422 when `extraction` holds no parseable JSON object
+    // (same shape contract as extract).
+    http.Post("/v1/verify", [&integration](const httplib::Request& req, httplib::Response& res) {
+        if (!integration.attention_lens_enabled()) {
+            res.status = 404;
+            res.set_content(json({{"error", "attention lens disabled — start the "
+                                            "server with --attention-lens"}}).dump(),
+                            "application/json");
+            return;
+        }
+        std::string document;
+        std::string extraction;
+        std::vector<size_t> message_offsets;
+        std::vector<qinf::LensConcept> concepts;
+        try {
+            json body = json::parse(req.body);
+            // Same EITHER/OR unit as /v1/extract — see that route for the
+            // reasoning (boundaries cannot be recovered from concatenated text).
+            const bool has_doc  = body.contains("document");
+            const bool has_msgs = body.contains("messages");
+            if (has_doc == has_msgs)
+                throw std::runtime_error(
+                    std::string("expected exactly one of \"document\" or \"messages\", actual ") +
+                    (has_doc ? "both" : "neither"));
+            if (has_doc) {
+                document = body.at("document").get<std::string>();
+            } else {
+                const json& msgs = body.at("messages");
+                if (!msgs.is_array() || msgs.empty())
+                    throw std::runtime_error(
+                        std::string("\"messages\" expected a non-empty array, actual ") +
+                        (msgs.is_array() ? "empty array" : msgs.type_name()));
+                for (size_t i = 0; i < msgs.size(); ++i) {
+                    const json& m = msgs[i];
+                    std::string text;
+                    if (m.is_string()) {
+                        text = m.get<std::string>();
+                    } else if (m.is_object() && m.contains("text")) {
+                        text = m.at("text").get<std::string>();
+                    } else {
+                        throw std::runtime_error(
+                            "messages[" + std::to_string(i) +
+                            "] expected a string or {\"text\": string} object, actual " +
+                            std::string(m.type_name()));
+                    }
+                    if (text.empty())
+                        throw std::runtime_error("messages[" + std::to_string(i) +
+                                                 "].text expected non-empty, actual empty");
+                    if (i) document += "\n\n";
+                    message_offsets.push_back(document.size());
+                    document += text;
+                }
+            }
+            // The exact text a prior /v1/extract report's `raw` field carried —
+            // teacher-forced verbatim (docs/plan-lens-server-shape.md §3.4). Not
+            // re-derived from `fields`: reconstructing JSON from parsed values
+            // does not promise the same token boundaries the original run had.
+            if (!body.contains("extraction"))
+                throw std::runtime_error(
+                    "expected an \"extraction\" member (the text a prior report's "
+                    "\"raw\" field carried), actual absent");
+            extraction = body.at("extraction").get<std::string>();
+            // key_vocabulary: identical shape/parse to /v1/extract's, because the
+            // report's field order and absent-by-omission marking both depend on
+            // it — verifying an extraction requires the SAME hint it was produced
+            // with, not just the document and the answer.
+            for (const auto& kv : body.at("key_vocabulary")) {
+                if (kv.is_string()) {
+                    concepts.push_back({kv.get<std::string>(), ""});
+                } else if (kv.is_object()) {
+                    qinf::LensConcept c;
+                    if (kv.contains("key"))      c.key = kv.at("key").get<std::string>();
+                    else if (kv.contains("id"))  c.key = kv.at("id").get<std::string>();
+                    else throw std::runtime_error(
+                        "key_vocabulary object expected a \"key\" or \"id\" member, "
+                        "actual neither");
+                    c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
+                    if (kv.contains("question")) {
+                        c.question = kv.at("question").get<std::string>();
+                        if (c.question.empty())
+                            throw std::runtime_error(
+                                "key_vocabulary \"question\" expected non-empty for key '" +
+                                c.key + "', actual empty string");
+                    }
+                    concepts.push_back(std::move(c));
+                } else {
+                    throw std::runtime_error("key_vocabulary element expected a "
+                                             "string, {\"key\",\"gloss\"} or "
+                                             "{\"id\",\"question\"} object");
+                }
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", std::string("bad request — expected "
+                "{(\"document\": string | \"messages\": [string|{\"text\": string},...]), "
+                "\"extraction\": string, "
+                "\"key_vocabulary\": [{\"key\",\"gloss\"}|string,...]}: ") + e.what()},
+                {"code", "bad_request"}}).dump(), "application/json");
+            return;
+        }
+        try {
+            std::string lens_json =
+                integration.verify_lens_json(document, extraction, concepts, message_offsets);
+            res.set_content(lens_json, "application/json");
+        } catch (const qinf::LensUnparseableError& e) {
+            res.status = 422;
+            res.set_content(json({{"error", e.what()},
+                                  {"code", "unparseable_extraction"},
+                                  {"raw", e.raw}}).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", e.what()},
+                                  {"code", "bad_request"}}).dump(), "application/json");
+        }
+    });
+
     // Models endpoint (for compatibility)
     http.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json response = {
@@ -2095,14 +2305,17 @@ int main(int argc, char* argv[]) {
                          "server. A conversation_id ('new' to start) retains KV "
                          "across turns and appends only the new turn (chat.cpp-grade; "
                          "warm != cold). Excludes --chat-prefix-cache; text path\n"
-                      << "  --flash-attn              Opt-in: flash attention on "
-                         "the decode path (one fused kernel per attention layer). "
-                         "Token-stable, not byte-identical; mutually exclusive "
-                         "with --attention-lens. Supported by every recipe.\n"
+                      << "  --flash-attn              Opt-in: flash attention "
+                         "(one fused kernel per attention layer) on prefill and "
+                         "decode. Token-stable, not byte-identical; refused "
+                         "together with --attention-lens. Every recipe.\n"
                       << "  --attention-lens          Opt-in: enable POST "
                          "/v1/extract — document + complete key vocabulary → "
                          "audited key-value JSON on the attention trust layer "
-                         "(single-slot; Qwen3.6). OpenAI endpoints untouched\n"
+                         "(single-slot; Qwen3.6/Qwen3.8) — and POST /v1/verify, "
+                         "which teacher-forces a known extraction (document + "
+                         "key vocabulary + extraction) to reproduce the same "
+                         "report without generating. OpenAI endpoints untouched\n"
                       << "  --speculative [pld|mtp|suffix]  Opt-in: speculative "
                          "decoding; bare/pld = Prompt Lookup, mtp = trained "
                          "NextN head (MTP GGUFs only), suffix = session-scoped "
@@ -2151,10 +2364,60 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (attention_lens && flash_attn) {
-        std::cerr << "expected at most one of --attention-lens / --flash-attn, "
-                     "got: both. Flash attention never materializes kq_soft, "
-                     "which is exactly the tensor the lens reads." << std::endl;
+    // --attention-lens + --flash-attn is NOT decided here, and deliberately so.
+    // Whether a flash prefill is admissible under the lens is a PER-MODEL
+    // question — Qwen3.8-9B passes the drift gate, Qwen3.6-35B-A3B fails it —
+    // and the answer lives in the calibration entry, which needs the model
+    // loaded. enable_flash_attn(lens_active) makes the call after the load.
+    // Everything else in this block stays pre-load: it is the flag pairing that
+    // became model-dependent, not the principle that argument errors should be
+    // cheap.
+    //
+    // A quantized KV cache is readable ONLY by the flash attention kernel. The
+    // materialized path transposes V (ggml_permute + ggml_cont), which moves the
+    // block dimension of a quantized type out of position; Metal's CPY/CONT has
+    // no quantized source case, so that node would take ggml's SILENT CPU
+    // fallback (architecture.md section 3) rather than fail. Refuse before load.
+    if (kv_type_is_quantized(kv_type) && !flash_attn) {
+        std::cerr << kv_type_requires_flash_refusal(kv_type) << std::endl;
+        return 1;
+    }
+
+    // --attention-lens + --flash-attn is NOT decided here, and deliberately so.
+    // Whether a flash prefill is admissible under the lens is a PER-MODEL
+    // question — Qwen3.8-9B passes the drift gate, Qwen3.6-35B-A3B fails it —
+    // so the answer lives in the calibration entry and needs the model loaded.
+    // enable_flash_attn(lens_active) makes the call after the load. It is the
+    // flag PAIRING that became model-dependent, not the principle that argument
+    // errors should be cheap; everything else in this block stays pre-load.
+    //
+    // A quantized KV cache does not come along for the ride, and that DOES stay
+    // here because it depends on nothing but the flags. The KV cache is written
+    // by prefill and READ BY DECODE, and the lens's decode is materialized by
+    // construction. The materialized path transposes V (ggml_permute +
+    // ggml_cont), which moves a quantized type's block dimension out of
+    // position; Metal's CPY/CONT has no quantized source case, so that node
+    // would take ggml's SILENT CPU fallback rather than fail.
+    //
+    // The refusal above (quantized ⇒ --flash-attn) used to exclude the lens
+    // transitively, through a blanket lens/flash refusal that no longer exists.
+    // plan-lens-server-shape.md §4.2.2 proposed that phase-scoped flash would
+    // UNBLOCK quantized KV for the lens: it does not, and cannot while the tap
+    // requires a materialized decode.
+    //
+    // This is LOAD-BEARING, not a standing guard. On a model whose entry allows
+    // a flash prefill, `--attention-lens --flash-attn --kv-type q8_0` satisfies
+    // the quantized⇒flash refusal above and would then meet a quantized V in
+    // the lens's materialized decode — the silent CPU fallback, on precisely
+    // the path the receipts come from. This line is the only thing stopping it,
+    // and unlike the pairing above it stays pre-load because it depends on
+    // nothing but the flags.
+    if (attention_lens && kv_type_is_quantized(kv_type)) {
+        std::cerr << "expected --attention-lens without a quantized --kv-type, got: "
+                     "--kv-type " << kv_type_name(kv_type) << ". A quantized KV cache "
+                     "is readable only by the flash kernel, and the lens decode must "
+                     "stay materialized to write kq_soft — the tensor the lens reads. "
+                     "Run the lens on an f32 or f16 cache." << std::endl;
         return 1;
     }
     // Same refusal shape as the pair above, same reason class: the lens is
@@ -2179,8 +2442,10 @@ int main(int argc, char* argv[]) {
         QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
                                           image_embed_cache_dir, image_prefix_cache_dir,
                                           prefix_cache_dir, kv_type);
+        // Order is load-bearing: enable_attention_lens resolves the calibration
+        // entry, and enable_flash_attn reads flash_prefill_ok off it.
         if (attention_lens && !integration.enable_attention_lens()) return 1;
-        if (flash_attn && !integration.enable_flash_attn()) return 1;
+        if (flash_attn && !integration.enable_flash_attn(attention_lens)) return 1;
         if (speculative && !integration.enable_speculative(
                 speculative_mode, pld_ngram_size, pld_max_draft,
                 suffix_max_match_len, suffix_min_match_len, suffix_max_draft,

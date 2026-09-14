@@ -27,7 +27,8 @@ one engine:
   chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
   decode graph (`--persistent-graph`, §5), opt-in flash attention
-  (`--flash-attn`, §5 — mutually exclusive with the attention lens), a
+  (`--flash-attn`, §5 — on the CLI this is both phases, which the lens
+  excludes; the server scopes it to prefill when the lens is on), a
   selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), opt-in
   mmap-backed weights (`--mmap-weights`, §5), and session snapshots;
 - an **HTTP server**: OpenAI-compatible `/v1/completions` and
@@ -234,7 +235,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens` `/v1/extract`: document → audited key-value JSON on the attention trust layer; pure lens computation + single-slot tapped-decode driver), `image_data_uri` |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -366,8 +367,10 @@ persistent-capable today; the write-mode/bucket are a differential seam gated
 byte-for-byte at exact width (`test_kv_write_setrows`, `test_decode_kv_bucket`,
 `test_decode_graph_cache`).
 
-**Flash attention** (CLI/server `--flash-attn`, `DecodePolicy::AttnImpl`): on
-**both prefill and decode**, one `ggml_flash_attn_ext` replaces the whole
+**Flash attention** (CLI/server `--flash-attn`, `DecodePolicy::AttnImpl` —
+one field per phase, `attn_impl` for decode and `prefill_attn_impl` for
+prefill): on **both prefill and decode** unless a caller scopes it (the lens
+does, below), one `ggml_flash_attn_ext` replaces the whole
 `kq` → `soft_max` → `kqv` chain *and* the V transpose — four Metal dispatches
 per attention layer become one. On decode the recipe casts its mask to F16 once
 per graph (Gemma 2/3/4 dedupe by window first); on prefill the mask is built per
@@ -410,14 +413,56 @@ and one flag on `Qwen35LayerCommon`. On the MoE hybrid only the 9 attention
 layers change; the 36 MoE routers keep their own `SOFT_MAX` and the experts
 their `MUL_MAT_ID`, untouched.
 
-**Flash attention and the receipts identity are mutually exclusive**, and this
-is enforced, not documented-and-hoped: the flash kernel never materializes
-`kq_soft`, which is precisely the tensor the attention lens taps (§1, §11).
-`DecodePolicy::is_attn_impl_coherent()` states the pairing, and the server
-refuses `--flash-attn` together with `--attention-lens` at startup. This is the
-first place where a speed lever and the receipts doctrine are in direct
-conflict; the resolution is a parameter on one operation with two
-implementations (llama's own `-fa on/off` split), not two attention modules.
+**Flash attention and the receipts identity are mutually exclusive IN A
+PHASE**, and this is enforced, not documented-and-hoped: the flash kernel never
+materializes `kq_soft`, which is precisely the tensor the attention lens taps
+(§1, §11). `DecodePolicy::is_attn_impl_coherent()` states the pairing for a
+tapped **decode** (`/v1/extract`); a tapped **prefill** (`/v1/verify`, §6) is
+protected structurally instead — `run_lens_verify` sets its own tapped pass
+materialized, and `mark_attention_taps` fails loud on the missing `kq_soft`
+node if that is ever lost.
+
+**Whether the flag may join `--attention-lens` is a PER-MODEL question**, and
+since 2026-09-13 the calibration table answers it
+(`LensConstants::flash_prefill_ok`, `server_lens.h`). `DecodePolicy` scopes the
+implementation per phase, so the lens can run a flash **prefill** (which
+`extract` never taps) over a materialized **decode** (which it does) — on a
+model that has earned it through the drift gate
+(`tests/perf/attn_provenance.cpp`, `BANDDRIFT=1 DRIFT_ARM=flash DRIFT_LANG=all`;
+`tests/smoke/lens_drift_gate.sh`). The two calibrated models answer differently:
+
+| model | decision margin | max \|Δpeak\| under flash prefill | verdict |
+|---|---|---|---|
+| Qwen3.8-9B-Q8_0 (dense) | 0.00126 | 0.00084 | **PASS** — enabled, 8.4% off the prefill |
+| **Qwen3.6-35B-A3B (MoE)** | 0.0237 | **0.0242** | **FAIL** — refused |
+
+On the 35B the sibling arm fails harder: a chunked prefill changes **one
+extraction in fifteen outright** (82 generated tokens against 109). That is MoE
+routing, demonstrated rather than inferred (`MOEROUTE=1`): **2.32% of routing
+decisions on the 35B and 6.37% on Gemma 4-26B-A4B select a different expert
+set**, first flip in both landing in the last slot of the top-8 — the expert
+nearest a tie. Two dense models under the same perturbation change nothing.
+**Expert selection is a top-k argmax**, so on an MoE the perturbation is not
+small, it is *discrete*, and no decision-margin argument applies to it at all.
+A `flash_prefill_ok` of `true` on an MoE entry would therefore be unsound even
+with a small measured drift, and the field **defaults to false** so an
+unmeasured model is refused rather than inheriting another model's permission.
+
+Three consequences worth naming. (a) The pairing check moved **after** the model
+load, which the rest of that block deliberately avoids — the answer depends on
+which model is loaded, and that is the price of it being per-model.
+(b) `--attention-lens` with a quantized `--kv-type` is now refused **directly**
+(`http_server.cpp`): it used to fall out of the blanket lens/flash refusal, and
+phase-scoping opened the hole, since the KV cache is read by the materialized
+decode where a quantized V would take ggml's silent CPU fallback (§9).
+(c) Every lens report now carries a `config` stamp — weights hash, attention
+implementation, KV type — because a licensed configuration is only safe if a
+report says which one it ran under (`lens-format.md`).
+
+This was the first place where a speed lever and the receipts doctrine were in
+direct conflict; the resolution is a parameter on one operation with two
+implementations (llama's own `-fa on/off` split), scoped per phase, not two
+attention modules.
 
 **Speculative decoding** (CLI `--speculative [pld|mtp|suffix]`): drafts come
 from an `IDraftSource` (`sampling/draft_source.h`) and are verified in one
@@ -618,8 +663,11 @@ the same check); a speculative step just widens how much can be thrown away
 per check, not how often the check runs.
 
 **`--speculative` is refused together with `--attention-lens` at server
-startup**, mirroring the existing `--flash-attn`/`--attention-lens` refusal
-and for the same class of reason (§11's receipts constraints): receipts-grade
+startup**, which used to mirror the `--flash-attn`/`--attention-lens` refusal.
+That one is now phase-scoped (§5) and this one is **not**, deliberately: flash
+moved because prefill is a phase the lens does not tap, whereas speculation
+changes the decode the lens reads. Same class of reason as before (§11's
+receipts constraints): receipts-grade
 determinism is single-slot and byte-identical, and speculative decoding is
 token-stable, **not** byte-identical — and, today, only ever engages on a
 single slot in the first place, which would be whichever slot the lens is
@@ -778,6 +826,60 @@ mechanism that keeps that honest; it is not an untested-family placeholder.
 [`note-lens-absent-attempt.md`](note-lens-absent-attempt.md); gates
 `tests/smoke/server_extract_smoke.sh` + `QDOCS_S1=1 bin/attn-provenance`.
 
+**Verify (opt-in `--attention-lens`, same flag; `POST /v1/verify`; Movement 1 of
+[`plan-lens-server-shape.md`](plan-lens-server-shape.md)).** The other half of
+the lens surface: `verify(document, key_vocabulary, extraction)` teacher-forces
+a KNOWN extraction — the exact text a prior `/v1/extract` report's `raw` field
+carried — instead of generating one, and reproduces the same report without a
+decode loop or sampling. Request shape mirrors `/v1/extract`'s
+(`document`|`messages`, `key_vocabulary`) plus the required `extraction`
+string; same 404-when-off, 400-bad-request, and 422-`unparseable_extraction`
+(the shape contract applied to the teacher-forced text). Driver:
+`run_lens_verify` (`server_lens.{h,cpp}`), wired via
+`QweniumServerIntegration::verify_lens_json`.
+
+Two things had to generalize, both **recipe-agnostic and byte-inert when
+unarmed** — the same discipline the P1 tap seam already keeps:
+
+- **Truncated prefill** (`DecodePolicy::truncate_after_layer` /
+  `effective_layer_count()`, `models/decode_policy.h`; setter
+  `ForwardPassBase::set_truncate_after_layer`). Causality is what makes this
+  *exact*, not an approximation: an attention layer cannot depend on a layer
+  above it, so a prefill stopped after `max(citation_layer, coverage_layer)`
+  produces identical tapped rows to the untruncated pass, cheaper because the
+  omitted layers' matmuls (and any MoE/DeltaNet dispatch inside them) never
+  run. Default `-1` (full stack) keeps `is_default_byte_reproducible()` true
+  and every recipe's default path node-for-node unchanged. **Every recipe
+  bounds its prefill layer loop(s) with `effective_layer_count()`** —
+  `qwen3`, `qwen35`, `qwen36`, `gemma1`, `gemma2`, `gemma3`, `gemma4` — which
+  is the cross-family proof this is a plain iteration-count parameter, not a
+  Qwen-shaped kernel capability requiring a `supports_*` gate the way
+  `--flash-attn`/`--persistent-graph` do. Verify is the only caller; decode
+  graphs never read the field, and Gemma carries no lens *claim* (still no
+  calibration entry, §12), only the interface proof.
+- **`get_attention_taps` learned the prefill shape** (`forward_pass_base.{h,cpp}`).
+  `kq_soft.<il>` is `[n_kv, 1, n_head]` at decode (one query row per step) and
+  `[n_kv, n_q, n_head]` at a tapped prefill (every query position the graph
+  processed in one pass). `AttentionTap` gained an `n_q` field (default 1,
+  decode's shape byte-for-byte unchanged) and the reader now sizes off the
+  tensor's own `ne[1]` instead of assuming 1 — no new method, since the tap
+  tensor is named identically either way. `server_lens.cpp`'s
+  `slice_prefill_tap_row` translates one query row of that block into the
+  same decode-shaped `[n_head][n_kv]` layout a `LensStep` already carries, so
+  `compute_lens_report` needed **zero changes** — it never learns there are
+  two shapes; the translation lives entirely in the new driver.
+
+**Correctness gate (§3.4.5 of the plan): not bit-for-bit, decision-for-decision.**
+The batch-vs-single-token numerical fork (§11, "…except where the hardware
+forbids it") applies here too — a teacher-forced multi-row prefill and a
+token-by-token decode take different Metal kernels. Measured drift 5.6e-4
+against a 0.019 decision margin (plan §2.1). The gate is self-checking (no
+corpus): `tests/smoke/server_verify_smoke.sh` extracts a document once, feeds
+that exact extraction back through `/v1/verify`, and diffs the two reports
+field-for-field — same values, same badges, same tiers, same top-1 citation by
+real-source membership (not exact mass), same `skipped[]` membership. **Passed
+on both calibrated entries** (Qwen 3.8-9B-Q8_0 and Qwen 3.6-35B-A3B-UD-Q3_K_XL).
+
 ---
 
 ## 7. Dataflow 3 — an image request
@@ -931,9 +1033,16 @@ which moves `ne[0]` — the block dimension of every quantized type — out of
 position, and Metal's `CPY`/`CONT` has no quantized *source* case, so the node
 would take ggml's silent CPU fallback (§3) rather than fail. Both front ends
 therefore refuse `q8_0`/`q4_0` without `--flash-attn`, fail-loud, before any
-weights load (`kv_type_requires_flash_refusal`, `state/kv_cache_simple.h`) — and
-that transitively excludes the attention lens, via the existing flash/lens
-refusal. Measured KV bytes on Qwen3-0.6B at ctx 2048: **896 / 448 / 238 /
+weights load (`kv_type_requires_flash_refusal`, `state/kv_cache_simple.h`).
+**The attention lens is excluded by a second, direct refusal** (`http_server.cpp`,
+2026-09-13). It used to fall out transitively from the flash/lens refusal; once
+that became phase-scoped, a quantized cache could have slipped through on
+`--attention-lens --flash-attn`. It must not: the cache is written by prefill
+and **read by decode**, and the lens decode is materialized by construction, so
+the V transpose above would meet a quantized source on exactly the path the
+receipts are read from. Phase-scoped flash therefore does **not** unblock a
+quantized KV cache for the lens, and cannot while the tap needs a materialized
+decode — the one place `plan-lens-server-shape.md` §4.2 guessed wrong. Measured KV bytes on Qwen3-0.6B at ctx 2048: **896 / 448 / 238 /
 126 MB** for f32 / f16 / q8_0 / q4_0. This is a **capacity** lever on the
 `ctx × slots` axis, not a speed one: KV is ~1% of decode bandwidth against the
 weights, so the decode ceiling is ~1% (§10, Amdahl). Note the ggml b10582
@@ -1089,7 +1198,23 @@ used only for the output-head matmul, overlapping with the next token's body.
   generation that ran batched cannot be byte-replayed without its batch;
   byte-replay claims (witnesses, counterfactual diffs) hold at B=1 — the lens
   path is single-slot for this reason too, not only the qwen36 gather bug
-  (§12). **KV element type is part of "config"**: an F16-cache generation
+  (§12). **What that leaves for a customer is a DECISION claim, and since
+  2026-09-13 it is measured rather than implied** (`lens-format.md`, honest
+  limits): identical bits within a config, and across configs a report whose
+  decisions are stable with measured room — **on the 9B**. The room there is
+  1.5× (margin 0.00126 against 0.00084 of observed movement, EN+DE; 25× on the
+  flattering English-only arm). **On the 35B the same gate FAILS**: drift 0.0242
+  against a 0.0237 margin, and a chunked-prefill control changes one extraction
+  in fifteen. Expert routing is a top-k argmax, so an MoE hybrid does not
+  perturb smoothly and the cross-configuration claim is not currently available
+  on the model the lens was calibrated on (`lens-format.md`, honest limits).
+  Which language binds is model-dependent too: German on the 9B, English on the
+  35B. Byte-identity was always both too strong (it forbids changes that
+  provably move no decision — phase-scoped flash, §5) and too weak (it does not
+  survive a driver, a GPU or a ggml bump, none of which this repo pins). The
+  drift gate is where a candidate change earns the claim:
+  `tests/perf/attn_provenance.cpp`, `BANDDRIFT=1 DRIFT_ARM=<arm>`, exit code 0
+  = PASS. **KV element type is part of "config"**: an F16-cache generation
   replays byte-identically only under F16, and the lens calibration numbers
   were measured under F32, so F16 is not a calibrated receipts path until
   re-measured. This is why `--kv-f16` is opt-in and F32 stays the default. (d) **Nondeterministic kernels are inadmissible on the receipts
@@ -1300,6 +1425,14 @@ Current, verified against the tree at time of writing:
   for Gemma — and as of 2026-09-04 that is a **settled measurement, not an
   unprobed gap**: 0 of 768 candidate heads clear a 70% bar (§6). The seam hosts
   the probe on any recipe; only Qwen models have a calibration entry.
+  **As of Movement 1 (`/v1/verify`, §6) `get_attention_taps` also reads a
+  tapped PREFILL block** — `kq_soft.<il>` at `[n_kv, n_q, n_head]`, one row per
+  query position processed in that pass, vs decode's `n_q==1` — via the same
+  reader (`AttentionTap::n_q`, sized off the tensor's own `ne[1]`), so decode's
+  shape and byte layout are unchanged. Paired with prefill truncation
+  (`DecodePolicy::truncate_after_layer`), also opt-in and byte-inert (default
+  `-1` = full stack) and honored by every recipe (Qwen and Gemma alike) as a
+  plain layer-loop bound, not a per-recipe kernel capability.
 
 - **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
   automated test** — but the two links most likely to fail quietly are now
