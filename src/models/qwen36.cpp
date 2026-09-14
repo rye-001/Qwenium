@@ -165,6 +165,11 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
 
     const auto& m        = meta_;
     const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
+    // n_main_layers_ excludes any NextN head block; effective_layer_count
+    // further truncates for teacher-forced lens verification
+    // (docs/plan-lens-server-shape.md §3.4) — default policy is untruncated,
+    // so this is n_main_layers_ unchanged.
+    const uint32_t n_layers = policy_.effective_layer_count(n_main_layers_);
 
     // Derive DeltaNet state hparams from the typed config for the helper.
     const uint32_t d_inner       = cfg_.ssm_inner_size;
@@ -194,7 +199,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     register_qwen35_common_inputs(graph_inputs_, cfg_);
     // Registered BEFORE the image splice, which is where this recipe has always
     // put them; qwen35 registers them after. Same set either way.
-    register_qwen35_prefill_masks(graph_inputs_, cfg_, n_main_layers_);
+    register_qwen35_prefill_masks(graph_inputs_, cfg_, n_layers);
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -256,9 +261,9 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // differ only in the FFN, which is the moe_hp parameter (non-null here).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        &moe_hp_, use_flash_attn()};
+        &moe_hp_, use_flash_attn_prefill()};
 
-    for (uint32_t il = 0; il < n_main_layers_; ++il) {
+    for (uint32_t il = 0; il < n_layers; ++il) {
         const bool ssm = cfg_.is_ssm_layer(il);
         const uint32_t dn_idx =
             ssm ? static_cast<uint32_t>(dn_layer_map_[il]) : 0u;

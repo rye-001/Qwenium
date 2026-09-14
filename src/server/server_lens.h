@@ -93,6 +93,36 @@ struct LensConstants {
     // receipts (it did — `run.model` was a literal "Qwen3.6" string until the
     // table landed, which a Qwen 3.8 extraction would have carried).
     const char* model_label     = "Qwen3.6 (attention lens)";
+
+    // ── Is a FLASH PREFILL admissible on this model? ─────────────────────────
+    // Per-model because the answer IS per-model, and measurably so. A flash
+    // prefill is not byte-inert — the attention output feeds the residual
+    // stream, so every later layer writes different K/V and the tapped decode
+    // reads a differently-written cache. Whether that moves a lens DECISION is
+    // what the drift gate scores (tests/perf/attn_provenance.cpp,
+    // BANDDRIFT=1 DRIFT_ARM=flash DRIFT_LANG=all), and the two calibrated
+    // models answer differently:
+    //
+    //   Qwen 3.8-9B   dense  — drift 0.00084 vs margin 0.00126, 0/98 decisions
+    //                          moved, 15/15 documents token-identical. PASS.
+    //   Qwen 3.6-35B  MoE    — drift 0.0242 vs margin 0.0237. FAIL, and the
+    //                          sibling chunked-prefill arm changes one
+    //                          extraction in fifteen outright.
+    //
+    // The 35B's failure is not a worse number, it is a different KIND of
+    // quantity: expert routing is a top-k argmax, so 2.3% of its selections
+    // pick a DIFFERENT EXPERT under the perturbation (MOEROUTE=1, and Gemma
+    // 4-26B-A4B reproduces it at 6.4% while two dense models change nothing).
+    // A margin argument does not apply to a discrete quantity at all, so no
+    // MoE entry should carry `true` on the strength of a small drift number.
+    //
+    // DEFAULT false, which is what makes this safe: a new entry is refused
+    // until someone runs the gate, rather than inheriting a permission
+    // measured on a different model. `flash_prefill_provenance` names the run,
+    // same discipline as LensCalibration::provenance — a bare boolean is a
+    // claim with no receipt.
+    bool        flash_prefill_ok = false;
+    const char* flash_prefill_provenance = "not scored by the drift gate";
 };
 
 // ── The calibration table — which models the lens may run on ─────────────────
@@ -160,7 +190,12 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
          "docs/note-lens-qwen38-probe.md §5.3; docs/note-ss2-thread-alarm.md",
          LensConstants{/*citation_head*/ 13, /*citation_layer*/ 27, /*coverage_layer*/ 11,
                        /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
-                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8 (attention lens)"}},
+                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8 (attention lens)",
+                       /*flash_prefill_ok*/ true,
+                       /*flash_prefill_provenance*/
+                       "drift gate 2026-09-13 (BANDDRIFT DRIFT_ARM=flash DRIFT_LANG=all): "
+                       "15/15 token-identical, 0/98 decisions crossed, max |dpeak| 0.000835 "
+                       "vs line-level margin 0.001259"}},
     };
     return kLensCalibrations;
 }
@@ -223,6 +258,16 @@ struct LensRun {
     // false ⇒ prompt exceeded the 4 K CALIBRATION floor (a disclosure on the
     // report, not an error). Unrelated to the 10 K workload envelope.
     bool validated_envelope = true;
+    // Where `gen_text` came from: false ⇒ this model emitted it (/v1/extract),
+    // true ⇒ the caller supplied it and it was teacher-forced (/v1/verify).
+    //
+    // This is the SINGLE source of the origin fact. compute_lens_report derives
+    // LensReport::extraction_origin from it, and the shape-contract refusal
+    // words itself from it — a refusal that blames "the model" for text the
+    // caller handed in sends the reader to inspect the wrong thing entirely.
+    // Defaults false so every existing producer (including the MLX leg's
+    // lens_from_run, which builds a LensRun by hand) keeps its exact meaning.
+    bool extraction_supplied = false;
 };
 
 // ── Lens report (the interchange format; P3 versions/documents it) ───────────
@@ -308,6 +353,66 @@ struct LensReport {
     // silence — see ../qemmi-lens ACCEPTED_FORMAT_VERSIONS, which must add
     // "qemmi-lens/v4" or every extract call fails its own fail-loud gate.
     std::string format_version = "qemmi-lens/v4";
+
+    // ── extraction_origin — who produced the values in this report ───────────
+    // "generated": THIS model emitted the JSON (POST /v1/extract). The report
+    //              describes where the producing model looked while writing it.
+    // "supplied":  the CALLER supplied the JSON and this model only read it
+    //              (POST /v1/verify, teacher-forced). The report describes where
+    //              THIS model attends to SOMEONE ELSE'S answer.
+    //
+    // Those are different claims and the format must not blur them. The lens
+    // sells "the record is faithful"; a verify report is faithful about this
+    // model's reading, NOT about how the values were arrived at — which is
+    // exactly the distinction docs/plan-lens-server-shape.md §3.6 flags before
+    // cross-model verification is ever offered as a feature.
+    //
+    // Set by compute_lens_report from LensRun::extraction_supplied — do NOT
+    // assign it at a call site. The same flag words the shape-contract refusal
+    // (lens_locate_or_throw), so a second place to set the origin is a place
+    // for a 422 to disagree with the report it would have produced.
+    //
+    // ADDITIVE, and deliberately NOT a version bump — unlike v4's
+    // `key_candidates`, whose absence was ambiguous. Absence here is not:
+    // a payload without this member came from a server that had no /v1/verify,
+    // so its values are necessarily "generated". An importer may therefore read
+    // absent as "generated" and be right. See docs/lens-format.md.
+    std::string extraction_origin = "generated";
+
+    // ── config — the numerical configuration that produced this report ───────
+    // `model` names the CALIBRATION ENTRY, which is a coarser thing than it
+    // looks: it says "Qwen3.8-9B", not which quantization, not which attention
+    // implementation, not which KV element type. Those all move decisions, and
+    // two reports that differ because of them would otherwise look like two
+    // reports that differ because the document changed — which is exactly the
+    // comparison /v1/verify and the client's diff view exist to support.
+    //
+    // Measured reason this is not hypothetical (plan-lens-server-shape.md §4):
+    // a permitted configuration change moves a coverage peak by ~8e-4 on a
+    // dense model, against a nearest-line margin of ~1.3e-3. On an MoE it
+    // changes the extraction outright on one document in fifteen. A report
+    // that cannot say which configuration produced it cannot be compared with
+    // another one honestly.
+    //
+    // Derived in ONE place from the server's own state
+    // (http_server.cpp's lens_config_stamp), never assembled at a call site:
+    // two builders is a place for two reports to disagree about one server.
+    // Empty ⇒ never stamped — which is the case for every in-process caller,
+    // including the unit tests — and the member is then omitted from the JSON
+    // entirely, leaving those payloads byte-identical to before it existed.
+    //
+    // ADDITIVE and NOT a version bump, same reasoning as extraction_origin:
+    // absence is unambiguous (a server too old to stamp it) and an importer
+    // that ignores it reads exactly the payload it read before. It is the
+    // reversible choice — a bump can be added later, un-bumping cannot.
+    struct RuntimeConfig {
+        std::string weights;    // metadata weights_hash, hex — arch+shape+QUANT+layout
+        std::string attention;  // "materialized" | "flash-prefill" | "flash"
+        std::string kv_type;    // "f32" | "f16" | ...
+        bool empty() const { return weights.empty() && attention.empty() && kv_type.empty(); }
+    };
+    RuntimeConfig config;
+
     std::string model;
     bool        validated_envelope = true;
     LensConstants k;
@@ -550,6 +655,53 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
                             const LensConstants& k,
                             GrammarVocab* control_arm_grammar = nullptr,
                             const std::vector<std::string>* control_arm_vocab = nullptr);
+
+// ── Verify: teacher-forced re-audit (docs/plan-lens-server-shape.md §3) ──────
+// POST /v1/verify's driver. Given a document, its COMPLETE key vocabulary (same
+// shape/order contract as extract's — the report's field ordering and absent-
+// by-omission marking both depend on it) and a KNOWN extraction, reproduce the
+// lens report WITHOUT generating: one prefill over the prompt, then one
+// head-less TAPPED prefill over the extraction text (teacher-forced as the
+// assistant's answer) — no decode loop, no sampling. The forward pass is
+// truncated after max(citation_layer, coverage_layer): causality means an
+// attention layer cannot depend on a layer above it, so the tapped rows are
+// IDENTICAL to what an untruncated pass (or the original decode-time
+// extraction) would have produced, and the layers above the cutoff never run.
+// See docs/plan-lens-server-shape.md §3.2-§3.3.
+//
+// `extraction` is teacher-forced VERBATIM as the assistant's answer — pass the
+// exact text a prior report's `raw` field carried for the tightest
+// reproduction. It is tokenized directly; no JSON re-serialization happens
+// here, because re-serializing a parsed value does not promise the same token
+// boundaries the original run produced.
+//
+// Not bit-for-bit identical to the report `extraction` was derived from: the
+// batch-vs-single-token numerical fork (architecture.md §11, "…except where
+// the hardware forbids it") means a teacher-forced multi-row prefill and a
+// token-by-token decode take different Metal kernels. Measured at 5.6e-4
+// against a 0.019 decision margin (plan §2.1) — decision-for-decision stable,
+// not byte-identical.
+//
+// Fails loud exactly like run_lens_extract: std::runtime_error on empty
+// concepts/document/extraction, a concept key empty, a mixed question/
+// identifier vocabulary, or a prompt+extraction exceeding the model's context;
+// LensUnparseableError (⇒ 422) when `extraction` holds no parseable JSON
+// object — verify cannot audit a value it cannot locate, same as extract
+// cannot emit one.
+//
+// Single-slot, exclusive — same discipline as run_lens_extract (slot 0, the
+// only correct qwen36 decode KV gather, architecture.md §12); the caller holds
+// the model lock for the whole call. No warm-document reuse in this version:
+// every call is a cold prefill of (document, extraction) — §4/§5's warm-verify
+// archive is client-side and out of scope here.
+LensReport run_lens_verify(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           ::Tokenizer* tok, const ModelMetadata& meta,
+                           uint32_t n_ctx_max,
+                           const std::string& document,
+                           const std::string& extraction,
+                           const std::vector<LensConcept>& concepts,
+                           const std::vector<size_t>& message_offsets,
+                           const LensConstants& k);
 
 // Pure: order `report.fields` by `concepts` and mark absent-by-omission — a
 // hinted concept the model did not emit (or emitted empty) becomes a value-null,

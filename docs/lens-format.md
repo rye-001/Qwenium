@@ -114,6 +114,14 @@ format *does* carry records *consideration*; each refusal below would assert
   not calibrated confidence. The most-attended value is not the most-likely-
   correct value; the confidence gap did not separate right answers from wrong.
   Do not threshold a mass as a correctness score.
+- **No claim about how a `supplied` value was produced.** On a
+  `extraction_origin: "supplied"` report (`POST /v1/verify`) the lens says where
+  *this* model attends to values it was **handed**. It does **not** say the
+  values were produced by this model, by any model, or by any particular
+  process. The honesty contract still holds — the record of where this model
+  looked is faithful — but it is a record of *reading*, not of *writing*, and an
+  importer must not present a `supplied` report as evidence of how the
+  extraction was arrived at.
 - **No correctness.** Nothing in the format asserts a value is *right*.
   `grounded` means "read from the document," not "read correctly"; a citation
   locates a source, it does not verify the copy. This is the point, not a
@@ -238,6 +246,8 @@ Done in that repo's working tree as of 2026-09-06 (uncommitted there).
 | `model` | string | The pinned model that produced this (Qwen3.6). |
 | `validated_envelope` | bool | `true` iff the prompt was ≤ 4K tokens — the measured envelope (plan §1.5). `false` is a **disclosure, not a rejection**: the extraction ran, but beyond where the signals were validated. |
 | `citation_source` | string | Human label for the citation head (L3H13, N3). |
+| `config` | object, **optional** | **The numerical configuration that produced this report** (2026-09-13): `weights` (16-hex-digit content hash of the tensor inventory — arch + shape + **quantization** + layout), `attention` (`"materialized"` \| `"flash-prefill"` \| `"flash"`), `kv_type` (`"f32"`, `"f16"`, …). `model` names the *calibration entry*, which is coarser than it looks — it says "Qwen3.8-9B", not which quantization — and all three of these move decisions. **Two reports are only comparable when this matches.** A diff that ignores it can show a config artifact as a change, which is the one way the `verify` re-audit flow could mislead. Absent ⇒ the server did not stamp it (too old, or the lens was driven in-process); additive, **not** a version bump, same reasoning as `extraction_origin`. |
+| `extraction_origin` | `"generated"` \| `"supplied"` | **Who produced the values.** `generated` = this model emitted the JSON (`POST /v1/extract`); the report says where the producing model looked while writing it. `supplied` = the caller handed the JSON in and this model only read it (`POST /v1/verify`, teacher-forced); the report says where **this** model attends to **someone else's** answer. Additive, **not** a version bump: absence is unambiguous — a payload without this member came from a server with no `/v1/verify`, so its values are necessarily `generated`. |
 | `coverage_source` | string | Human label for the coverage source (layer-11 max-heads, COV1). |
 | `used_threshold` | number | Coverage span-peak ≥ this ⇒ a span was "consulted" (0.705). |
 | `ungrounded_threshold` | number | `body_mass` ≥ this ⇒ `grounded` (0.538, N3b). |
@@ -454,6 +464,54 @@ Consumed by the Attention Lens viewer; an importer can ignore these.
   coverage bar and the grounded/ungrounded threshold were **not** re-measured at
   that length. Raising this number means re-measuring all three arms, not editing
   a constant.
+- **Reproducibility is bounded, the bound is measured, and on the 35B the
+  measurement says NO** (2026-09-13). Two runs of the same request against the
+  same binary, machine and flags produce a **byte-identical** report: the
+  engine's default configuration is byte-reproducible and the lens path runs
+  inside it (`architecture.md` §11). Across configurations — another GPU or
+  driver, a ggml bump, a different batch width, a flash prefill — the **bits are
+  not promised, and never were**. What can be said instead is a bounded
+  *decision* claim, and it holds on one calibrated model and not the other:
+
+  | | margin (nearest line to 0.705) | largest observed drift | verdict |
+  |---|---|---|---|
+  | Qwen3.8-9B-Q8_0, EN+DE, 15 docs / 98 lines | 0.00126 | 0.00084 | PASS, 1.5× — thin |
+  | **Qwen3.6-35B-A3B, EN+DE** | 0.0237 | **0.0242** | **FAIL** |
+
+  On the 9B, no line crossed and no document changed a token: a permitted config
+  change moved nothing. On the **35B — the model the lens was calibrated on —
+  drift is roughly 30× larger**, it exceeds the margin, and the control arm
+  (a chunked prefill) changed **one extraction in fifteen outright**, 82
+  generated tokens against 109. No report decision crossed the threshold on
+  either model, so nothing here says a *shipped* report is wrong. It says the
+  35B does not currently earn a cross-configuration promise, and you should not
+  be given one.
+
+  **The mechanism is measured, not guessed, and it predicts where else this
+  bites.** The 35B is an MoE hybrid, and expert routing is a top-k argmax:
+  reading the selections directly under the perturbation shows **2.3% of
+  routing decisions (Qwen 3.6-35B) and 6.4% (Gemma 4-26B) pick a different
+  expert**, with the first flip in both models landing in the *last* slot of
+  the top-8 — the expert nearest a tie. Two dense models under the same
+  perturbation changed nothing at all. So "small numeric change ⇒ small output
+  change" — the intuition this bounded claim rests on — is a **dense-model**
+  intuition. On an MoE the quantity is not continuous, and no margin argument
+  applies to it.
+
+  Most flips are absorbed: 2–6% of routing decisions change and only one
+  document in fifteen changes its answer. That is redundancy doing its job, not
+  a guarantee — nothing says which flip will not be absorbed.
+
+  Read all of it narrowly. The corpora are 15 documents; a document with a line
+  sitting 0.0005 from the threshold is protected by none of this. An untested
+  change has no measured drift, not a small one. Each candidate is scored before
+  it reaches this path (`tests/perf/attn_provenance.cpp`, `BANDDRIFT=1`, or
+  `tests/smoke/lens_drift_gate.sh`) — and the gate has already refused one
+  change on these grounds (flash prefill, `plan-lens-server-shape.md` §4.2.1).
+
+  Which language binds is **model-dependent**: German sets the margin on the 9B
+  (0.00126 against English's 0.0153), English sets it on the 35B (0.0237 against
+  German's 0.0539). Run both.
 
 ## Request
 

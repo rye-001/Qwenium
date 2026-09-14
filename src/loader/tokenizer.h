@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 #include <regex>
+#include <functional>
 #include <mutex>
 
 // Custom hash for std::pair, enabling its use as a key in std::unordered_map.
@@ -54,11 +55,30 @@ private:
     std::unordered_set<int32_t> special_token_ids_;
     std::unordered_map<std::string, int32_t> special_tokens_;
     
-    // Pre-tokenization regex
+    // ── Pre-tokenization ─────────────────────────────────────────────────────
+    // Which pattern to segment with. This is a property of the CHECKPOINT, not
+    // of the architecture: the GGUF states it in `tokenizer.ggml.pre`, and two
+    // models of the same family can differ (Qwen3-1.7B says "qwen2",
+    // Qwen3.5/3.6/3.8 say "qwen35"). Gpt2 is the fallback for any value we have
+    // not measured, so an unknown checkpoint keeps today's behaviour rather
+    // than silently acquiring someone else's segmentation.
+    //
+    // Qwen2 and Qwen35 differ only in whether combining marks join a letter
+    // run: Qwen35 uses [\p{L}\p{M}]+, Qwen2 uses \p{L}+.
+    enum class PreTokenizerKind { Gpt2, Qwen2, Qwen35 };
+    PreTokenizerKind pre_kind_ = PreTokenizerKind::Gpt2;
+
+    // Gpt2 only. The Qwen kinds cannot use std::regex at all — see
+    // pretokenize_qwen().
     std::regex pretokenization_regex_;
-    
-    // Pre-tokenization
+
     std::vector<std::string> pretokenize(const std::string& text) const;
+    std::vector<std::string> pretokenize_gpt2(const std::string& text) const;
+    std::vector<std::string> pretokenize_qwen(const std::string& text) const;
+    // Emits special tokens as whole pre-tokens and hands the gaps to `scan`.
+    std::vector<std::string> split_on_special_tokens(
+        const std::string& text,
+        const std::function<void(const std::string&, std::vector<std::string>&)>& scan) const;
     
     // BPE core algorithm
     std::vector<int32_t> apply_bpe(const std::vector<int32_t>& byte_tokens) const;

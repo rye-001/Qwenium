@@ -334,11 +334,28 @@ public:
     // set_decode_inputs → compute → get_attention_taps(gf). Marking must happen
     // after build and before graph alloc (galloc would otherwise reuse the
     // buffer). Single query token per call (decode); the row is [n_kv, n_head].
+    //
+    // ── Prefill shape (teacher-forced verification, plan-lens-server-shape.md
+    //    §3.4) ─────────────────────────────────────────────────────────────
+    // The SAME tensor at PREFILL covers every query position the graph
+    // processed in one pass: ggml ne = [n_kv, n_q, n_head] (n_q == 1 collapses
+    // to exactly today's decode shape/layout, byte-for-byte). get_attention_taps
+    // reads whatever n_q the tensor actually has — no separate method, no
+    // recipe change, since the tap tensor is named identically either way. A
+    // caller reading a prefill tap must know the memory order: ggml's ne[0] is
+    // fastest-varying, so `rows` is flat index kv + n_kv*(q + n_q*head), i.e.
+    // row-major [head][q][kv] — NOT [q][head][kv]. Slicing out one query row's
+    // decode-shaped [head][kv] block is therefore a strided read (server_lens.cpp
+    // does this; see its slice_prefill_tap_row).
     struct AttentionTap {
         int layer;                 // attention layer index (il), as requested
         int n_kv;                  // KV positions in the row (= tensor ne[0])
         int n_head;                // attention heads (= tensor ne[2])
-        std::vector<float> rows;   // row-major [n_head][n_kv]; row h sums to ~1
+        int n_q = 1;                // query rows this tap covers (= tensor ne[1]);
+                                     // 1 at decode (today's shape, unchanged), >1 at
+                                     // a tapped prefill block (verify).
+        std::vector<float> rows;   // flat kv + n_kv*(q + n_q*head); n_q==1 is
+                                    // exactly today's row-major [n_head][n_kv]
     };
     void set_attention_taps(std::vector<int> layers) { policy_.attention_taps = std::move(layers); }
     const std::vector<int>& attention_taps() const { return policy_.attention_taps; }
@@ -350,6 +367,19 @@ public:
     // attention_taps()[i]. Fail-loud if a tap tensor is missing (the caller
     // forgot mark_attention_taps before alloc).
     std::vector<AttentionTap> get_attention_taps(ggml_cgraph* gf);
+
+    // ── Prefill truncation: opt-in, default-off (docs/plan-lens-server-shape.md
+    //    §3.4) ─────────────────────────────────────────────────────────────
+    // Stop build_prefill_graph's layer loop after physical layer `il`
+    // (inclusive); -1 (default) = full stack, byte-reproducible, today's
+    // behaviour. Every recipe honors this the same way — bound its layer
+    // loop(s) with policy_.effective_layer_count() — because it is a plain
+    // iteration-count change, not a per-recipe kernel capability like
+    // --flash-attn or --persistent-graph, so there is no "supports_*" gate.
+    // Decode graphs never read this field. See DecodePolicy::
+    // truncate_after_layer for the exactness argument (causality).
+    void set_truncate_after_layer(int il) { policy_.truncate_after_layer = il; }
+    int  truncate_after_layer() const { return policy_.truncate_after_layer; }
 
 protected:
     const ModelMetadata& meta_;
@@ -556,16 +586,34 @@ public:
     // not valid to resume under the other. Stamping here rather than at each
     // make_snapshot_header call site means none of the ~10 of them can forget.
     void set_attn_impl(AttnImpl a) {
-        policy_.attn_impl = a;
-        const uint64_t salt =
-            (a == AttnImpl::Flash)
-                ? static_cast<uint64_t>(std::hash<std::string>{}("attn=flash"))
-                : 0ull;
-        for (simple_kv_cache* c : snapshot_kv_caches())
-            if (c) c->set_path_salt(salt);
+        policy_.attn_impl         = a;
+        policy_.prefill_attn_impl = a;
+        restamp_attn_path_salt();
     }
+
+    // Prefill only, leaving decode where it is. The lens path is the caller:
+    // `extract` taps decode and never taps prefill, so the prefill — the
+    // dominant cost on a document workload — can run flash while the tapped
+    // decode stays materialized (plan-lens-server-shape.md §4.2.1). Stamps the
+    // salt too: a flash prefill writes different K/V from layer 1 onward, so a
+    // blob frozen under one prefill implementation is not resumable under the
+    // other.
+    void set_prefill_attn_impl(AttnImpl a) {
+        policy_.prefill_attn_impl = a;
+        restamp_attn_path_salt();
+    }
+
     AttnImpl attn_impl() const { return policy_.attn_impl; }
+    AttnImpl prefill_attn_impl() const { return policy_.prefill_attn_impl; }
+
+    // DECODE's implementation. Recipes read this in build_decoding_graph.
     bool use_flash_attn() const { return policy_.attn_impl == AttnImpl::Flash; }
+
+    // PREFILL's implementation. Recipes read this in build_prefill_graph —
+    // never use_flash_attn(), which now answers only for decode.
+    bool use_flash_attn_prefill() const {
+        return policy_.prefill_attn_impl == AttnImpl::Flash;
+    }
 
     // True ⇒ this recipe's build_decoding_graph is persistent-graph capable:
     // every step-varying quantity is a graph-input VALUE (tokens, positions,
@@ -578,7 +626,10 @@ public:
     // AND casts its kq_mask to F16 (ggml_flash_attn_ext hard-asserts an F16
     // mask). A recipe that does neither would silently keep the materialized
     // path, so --flash-attn refuses rather than pretending it applied.
-    // Prefill is materialized on every recipe — see attention.h.
+    // Every recipe threads it into PREFILL too (the prefill mask is cast
+    // per layer inside attention.cpp, not by the recipe), so this one answer
+    // covers both phases — there is no recipe with flash decode and
+    // materialized-only prefill.
     virtual bool supports_flash_attn() const { return false; }
 
     // ── Decode n_kv bucketing ────────────────────────────────────────────────
@@ -602,6 +653,25 @@ public:
     const DecodePolicy& decode_policy() const { return policy_; }
 
 protected:
+    // One salt per (prefill, decode) implementation pair, not per phase: the
+    // three reachable configurations (materialized, flash-prefill-only, flash
+    // everywhere) each produce a different KV cache, and a snapshot must not
+    // resume across them. Stamping here rather than at each make_snapshot_header
+    // call site means none of the ~10 of them can forget.
+    void restamp_attn_path_salt() {
+        const bool fp_flash = policy_.prefill_attn_impl == AttnImpl::Flash;
+        const bool dp_flash = policy_.attn_impl == AttnImpl::Flash;
+        uint64_t salt = 0ull;
+        if (fp_flash && dp_flash)
+            salt = static_cast<uint64_t>(std::hash<std::string>{}("attn=flash"));
+        else if (fp_flash)
+            salt = static_cast<uint64_t>(std::hash<std::string>{}("attn=flash-prefill"));
+        else if (dp_flash)
+            salt = static_cast<uint64_t>(std::hash<std::string>{}("attn=flash-decode"));
+        for (simple_kv_cache* c : snapshot_kv_caches())
+            if (c) c->set_path_salt(salt);
+    }
+
     uint32_t decode_kv_len(uint32_t max_pos_plus_1, uint32_t n_ctx_max) const {
         return policy_.decode_kv_len(max_pos_plus_1, n_ctx_max);
     }

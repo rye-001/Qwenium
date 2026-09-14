@@ -61,13 +61,14 @@ void print_usage(const char* program_name) {
     std::cout << "                          suffix = session-scoped adaptive-length lookup\n";
     std::cout << "  --pld-ngram N           PLD n-gram match size (default: 3)\n";
     std::cout << "  --pld-max-draft K       PLD max draft tokens (default: 5)\n";
-    std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 2)\n";
+    std::cout << "  --mtp-max-draft K       MTP head draft depth per step (default: 1; deeper measured worse)\n";
     std::cout << "  --suffix-max-match N    Suffix: longest n-gram tried first (default: 12)\n";
     std::cout << "  --suffix-min-match N    Suffix: shortest n-gram tried (default: 2)\n";
     std::cout << "  --suffix-max-draft K    Suffix: draft width B (default: 4; wider measured worse)\n";
     std::cout << "  --suffix-max-indexed N  Suffix: cap on indexed session tokens (default: 8192)\n";
     std::cout << "  --persistent-graph      Reuse one decode graph across steps (measured 1.32x on Qwen3.6); token-stable, not byte-identical; Qwen3.5/3.6 + Gemma3\n";
-    std::cout << "  --flash-attn            Flash attention on decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
+    std::cout << "  --mmap-weights          Back weights with the GGUF's mmap'd pages instead of copying them in; byte-identical, removes the ~2x load peak\n";
+    std::cout << "  --flash-attn            Flash attention on prefill AND decode (one fused kernel per attention layer); token-stable, not byte-identical; no attention receipts; all recipes\n";
     std::cout << "  --kv-type <t>           Attention KV cache element type: f32|f16|q8_0|q4_0 (default f32); token-stable, not byte-identical. q8_0/q4_0 REQUIRE --flash-attn\n";
     std::cout << "  --kv-f16                Alias for --kv-type f16 (halves KV memory)\n";
     std::cout << "  --image FILE            (chat) Attach an image to the first user turn\n";
@@ -88,6 +89,33 @@ void print_usage(const char* program_name) {
     std::cout << "  " << program_name << " -v -n 50 -p \"Explain quantum computing\" model.gguf\n";
 }
 
+// Fail-loud argument errors.  The CLI's argument loop is a module boundary:
+// every rejection names the parameter, then what was expected, then what was
+// actually given (CLAUDE.md error contract, src/qinf_error.h).
+//
+// Why this exists: the loop used to end at `else if (args.model_path.empty())`
+// with no final else, so an argument that matched nothing was SILENTLY
+// DROPPED.  Measured cost, 2026-09-10: a verification run passed `--temp 0`
+// meaning greedy decoding.  The real flag is `-t` / `--temperature`; `--temp`
+// and its `0` were both swallowed, the run sampled at the default 0.7 with a
+// random seed, and the resulting text difference was nearly attributed to the
+// change under test.  A typo must cost one line of stderr, not one debugging
+// session.
+static bool missing_value(const std::string& flag, const char* prog) {
+    std::cerr << flag << ": expected a value, actual: end of arguments\n"
+              << "Run '" << prog << " --help' for the list of options."
+              << std::endl;
+    return false;
+}
+
+static bool unknown_option(const std::string& arg, const char* prog) {
+    std::cerr << "argument: expected a known flag or the MODEL_PATH positional, "
+              << "actual '" << arg << "'\n"
+              << "Run '" << prog << " --help' for the list of options."
+              << std::endl;
+    return false;
+}
+
 bool parse_args(int argc, char** argv, CliArgs& args) {
     if (argc < 2) {
         return false;
@@ -106,42 +134,42 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = true;
         } else if (arg == "-n" || arg == "--max-tokens") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.max_tokens = std::stoi(argv[++i]);
         } else if (arg == "-t" || arg == "--temperature") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.temperature = std::stof(argv[++i]);
         } else if (arg == "--top-k") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.top_k = std::stoi(argv[++i]);
         } else if (arg == "--top-p") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.top_p = std::stof(argv[++i]);
         } else if (arg == "--repeat-penalty") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.repetition_penalty = std::stof(argv[++i]);
             args.repetition_penalty_set = true;
         } else if (arg == "-p" || arg == "--prompt") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.prompt = argv[++i];
         } else if (arg == "--chat") {
             args.chat_mode = true;
         } else if (arg == "--vocab-prune-list-path") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.vocab_prune_list_path = argv[++i];
         } else if (arg == "--system-prompt") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.system_prompt = argv[++i];
         } else if (arg == "--grammar-file") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.grammar_file = argv[++i];
         } else if (arg == "--hide-thinking") {
             args.show_thinking = false;
         } else if (arg == "--log-tokens-to") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.token_log_path = argv[++i];
         } else if (arg == "--ctx-size") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.context_length = std::stoi(argv[++i]);
         } else if (arg == "--speculative") {
             args.speculative = true;
@@ -152,22 +180,28 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
                 args.speculative_mode = argv[++i];
             }
         } else if (arg == "--suffix-max-match") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.suffix_max_match_len = std::stoi(argv[++i]);
         } else if (arg == "--suffix-min-match") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.suffix_min_match_len = std::stoi(argv[++i]);
         } else if (arg == "--suffix-max-draft") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.suffix_max_draft = std::stoi(argv[++i]);
         } else if (arg == "--suffix-max-indexed") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.suffix_max_indexed_tokens = (size_t)std::stoul(argv[++i]);
+        } else if (arg == "--mmap-weights") {
+            args.mmap_weights = true;
         } else if (arg == "--persistent-graph") {
             args.persistent_graph = true;
         } else if (arg == "--kv-f16") {
             args.kv_type = GGML_TYPE_F16;   // alias, kept so existing invocations work
-        } else if (arg == "--kv-type" && i + 1 < argc) {
+        } else if (arg == "--kv-type") {
+            // The arity check lives INSIDE the branch, not in the condition.
+            // As `arg == "--kv-type" && i + 1 < argc` it silently fell through
+            // to the positional fallback when given last.
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             const std::string want = argv[++i];
             if (kv_type_from_string(want, &args.kv_type) != KvTypeSupport::Ok) {
                 std::cerr << "--kv-type: expected one of " << kv_type_choices()
@@ -177,40 +211,54 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--flash-attn") {
             args.flash_attn = true;
         } else if (arg == "--mtp-max-draft") {
-            if (i + 1 >= argc) { std::cerr << "--mtp-max-draft needs a value\n"; return false; }
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.mtp_max_draft = std::stoi(argv[++i]);
         } else if (arg == "--pld-ngram") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.pld_ngram_size = std::stoi(argv[++i]);
         } else if (arg == "--pld-max-draft") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.pld_max_draft = std::stoi(argv[++i]);
         } else if (arg == "--image") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.image_path = argv[++i];
         } else if (arg == "--mmproj") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.mmproj_path = argv[++i];
         } else if (arg == "--image-embed-cache") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.image_embed_cache_dir = argv[++i];
         } else if (arg == "--prefix-cache") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.prefix_cache_dir = argv[++i];
         } else if (arg == "--image-prefix-cache") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.image_prefix_cache_dir = argv[++i];
         } else if (arg == "--save-session") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.save_session_path = argv[++i];
         } else if (arg == "--load-session") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.load_session_path = argv[++i];
         } else if (arg == "--save-session-at") {
-            if (i + 1 >= argc) return false;
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.save_session_at = std::stoi(argv[++i]);
+        } else if (!arg.empty() && arg[0] == '-') {
+            // Anything flag-shaped that matched nothing above is a typo or a
+            // flag this build does not have.  Checked BEFORE the positional
+            // fallback so a mistyped flag can never be taken for MODEL_PATH.
+            // No bare "-" or "--" sentinel exists in this parser, so rejecting
+            // every leading-dash argument is safe.
+            return unknown_option(arg, argv[0]);
         } else if (args.model_path.empty()) {
             args.model_path = arg;
+        } else {
+            std::cerr << "MODEL_PATH: expected exactly one positional path, "
+                      << "actual a second one '" << arg << "' (already have '"
+                      << args.model_path << "')\n"
+                      << "Run '" << argv[0] << " --help' for the list of options."
+                      << std::endl;
+            return false;
         }
         i++;
     }
@@ -280,6 +328,8 @@ int main(int argc, char** argv) {
     
     // Initialize and load model
     Model model;
+    // Must precede load_tensors(): it selects the weight-buffer strategy.
+    model.set_mmap_weights(args.mmap_weights);
     try {
         register_builtin_models();
         // --mmproj signals the vision pipeline: allow a checkpoint carrying

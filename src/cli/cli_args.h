@@ -57,7 +57,13 @@ struct CliArgs {
     int pld_max_draft = 5;
     // --mtp-max-draft: tokens drafted BY THE HEAD per step (the sampled token
     // rides the verify batch in addition); upstream guidance: start at 2.
-    int mtp_max_draft = 2;
+    // Default 1, not 2. Measured 2026-09-11 on Qwen3.6-35B-A3B-MTP
+    // (docs/note-mtp-step-breakdown.md): depth is self-defeating on a
+    // hybrid recipe. Acceptance falls 88%/69%/45% at K=1/2/4 while the
+    // recurrent-state rollback (DeltaNet cannot rewind, so a partial
+    // reject re-feeds the accepted prefix) fires on 28%/61%/95% of
+    // rounds. Measured end-to-end: 28 / 23 / 18 tok/s.
+    int mtp_max_draft = 1;
     // SuffixDecoding config (docs/architecture.md §5). Defaults match the
     // offline replay's measured settings — see suffix_decoding.h for why.
     int suffix_max_match_len = 12;
@@ -72,6 +78,7 @@ struct CliArgs {
     // modulo ties (same status as speculative). Qwen3.5/3.6 + Gemma3 only
     // (persistent-capable recipes).
     bool persistent_graph = false;  // --persistent-graph
+    bool mmap_weights = false;      // --mmap-weights
     // Attention KV cache element type. F32 (default) is the byte-identical
     // historical behaviour; F16 halves KV memory and is token-stable but not
     // byte-identical, so receipts baselines are per-kv-type. Recurrent

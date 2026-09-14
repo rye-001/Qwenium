@@ -39,6 +39,8 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 #include "engine/model.h"
 #include "../../src/models/model_registry.h"
@@ -407,7 +409,8 @@ static FreeRun run_freegen(ForwardPassBase* fp, ggml_backend_sched_t sched,
                            Tokenizer* tok, const ModelMetadata& meta,
                            const std::string& body_text, const std::string& instr_text,
                            const std::vector<int>& tap_layers, int max_new,
-                           bool capture_conf = false, char close_char = '}') {
+                           bool capture_conf = false, char close_char = '}',
+                           int prefill_chunk = 0) {
     FreeRun R;
     R.body_text = body_text;
     R.n_head = (int)meta.attention_head_count;
@@ -425,7 +428,27 @@ static FreeRun run_freegen(ForwardPassBase* fp, ggml_backend_sched_t sched,
     for (int k = 0; k < R.P; ++k) if (cum[k] >= body_end) { R.instr_tok = k; break; }
 
     fp->clear_slot(0); fp->set_cache_pos(0, 0);
-    std::vector<float> logits = fp->run_prefill(R.prompt_tokens, 0, 0, sched);
+    // prefill_chunk == 0 is the shipped single-batch prefill and is the default
+    // for every existing caller — byte-identical. > 0 drives the SAME tokens as
+    // a chunk sequence over one shared KV (engine/multimodal_prefill.cpp's
+    // pattern: feed_tokens for every chunk but the last, run_prefill for the
+    // tail). Mathematically identical, numerically not: this is the documented
+    // single-vs-chunked Metal precision divergence, and it is the perturbation
+    // BANDDRIFT measures against.
+    std::vector<float> logits;
+    if (prefill_chunk <= 0 || R.P <= prefill_chunk) {
+        logits = fp->run_prefill(R.prompt_tokens, 0, 0, sched);
+    } else {
+        int pos = 0;
+        while (R.P - pos > prefill_chunk) {
+            std::vector<int32_t> c(R.prompt_tokens.begin() + pos,
+                                   R.prompt_tokens.begin() + pos + prefill_chunk);
+            fp->feed_tokens(c, 0, sched, pos);
+            pos += prefill_chunk;
+        }
+        std::vector<int32_t> tail(R.prompt_tokens.begin() + pos, R.prompt_tokens.end());
+        logits = fp->run_prefill(tail, pos, 0, sched);
+    }
     int32_t next = 0;
     for (int j = 1; j < (int)logits.size(); ++j) if (logits[j] > logits[next]) next = j;
 
@@ -2865,6 +2888,38 @@ static bool qdocs_span_in_prompt(Tokenizer* tok, const FreeRun& R,
     return lo >= 0;
 }
 
+// EVERY token span covering `text`, not just the first (qdocs_span_in_prompt
+// stops at the first). The filler negatives in Leg C are cut from positions
+// outside a labelled value's span, and "the span" meant the FIRST occurrence —
+// so a value restated later in the document stayed in filler territory and its
+// decoy was cut straight through the answer. Measured on English: m_en2 labels
+// order_number "5590-B", which appears in the Subject line AND the body; the
+// Subject copy was occupied, the body copy was cut into two filler windows
+// ("PO number 559" and "0-B.  Regards") and both scored as false positives
+// because the model reads the order number there, correctly.
+//
+// A match must not sit inside a longer alphanumeric run, or short numeric
+// values would over-mark ("300" inside "3005") and shrink filler territory for
+// the wrong reason.
+static std::vector<std::pair<int,int>> qdocs_all_spans_in_prompt(
+        Tokenizer* tok, const FreeRun& R, const std::string& text) {
+    std::vector<std::pair<int,int>> out;
+    if (text.empty()) return out;
+    const std::vector<size_t> pcum = cum_bytes(tok, R.prompt_tokens);
+    for (size_t b0 = R.body_text.find(text); b0 != std::string::npos;
+         b0 = R.body_text.find(text, b0 + 1)) {
+        const size_t b1 = b0 + text.size();
+        const bool lpad = b0 == 0 || !std::isalnum((unsigned char)R.body_text[b0 - 1]);
+        const bool rpad = b1 >= R.body_text.size() || !std::isalnum((unsigned char)R.body_text[b1]);
+        if (!lpad || !rpad) continue;
+        int lo = -1, hi = -1;
+        for (int k = 0; k < R.P; ++k)
+            if (pcum[k] < b1 && pcum[k + 1] > b0) { if (lo < 0) lo = k; hi = k; }
+        if (lo >= 0) out.push_back({lo, hi});
+    }
+    return out;
+}
+
 // Per grounded field: citation (frozen L3H13, top-1/3-in-span), coverage
 // (frozen layer-11 max-heads peak over the SOURCE span — valid even if the
 // value was normalized), and body_mass (N3b ungrounded discriminator, L3H13
@@ -3397,6 +3452,162 @@ static int run_qdocs_leg_c(ForwardPassBase* fp, ggml_backend_sched_t sched,
     double fa = all.grounded ? 100.0 * all.false_alarm / all.grounded : 0;
     bool pass = t3 >= 90 && fa < 10 && (all.used_spans ? (double)all.used_clear / all.used_spans >= 0.9 : false);
     std::printf("\n── LEG C VERDICT: %s (top3 %.0f%%%s90, false-alarm %.0f%%%s10, used-clear %.0f%%) ──\n",
+                pass ? "PASS" : "FAIL", t3, t3 >= 90 ? "≥" : "<", fa, fa < 10 ? "<" : "≥",
+                all.used_spans ? 100.0 * all.used_clear / all.used_spans : 0);
+    return 0;
+}
+
+// Read a whole file into a string, fail-loud (no silent empty-string fallback —
+// a missing fixture must stop the run, not silently score against "").
+static std::string read_file_or_die(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "read_file_or_die: expected fixture %s to open, "
+                             "actual fopen failure (run OCRDUMP + the cupsfilter/"
+                             "pdftotext round-trip first)\n", path.c_str());
+        std::exit(1);
+    }
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::string s;
+    if (sz > 0) { s.resize((size_t)sz); std::fread(&s[0], 1, (size_t)sz, f); }
+    std::fclose(f);
+    return s;
+}
+
+// Arm T (docs/plan-ocr-lens.md) — clone of run_qdocs_leg_c with EXACTLY ONE
+// change: the document text handed to qdocs_chat_prompt/qdocs_span_in_prompt
+// comes from the pdftotext -layout round-trip of the corpus document
+// (/tmp/ocr_probe/<tag>.rt.txt) instead of QMessy.document itself. Prompt
+// construction, the frozen-head citation read, the top1/top3 in-span scorer,
+// false-alarm and used-clear are byte-identical to leg C — this is a paired
+// comparison, so a reimplemented metric would make the delta meaningless.
+// The labeled field VALUES are NOT round-tripped (ground truth doesn't
+// change); only the surrounding document body is.
+//
+// Additive only (does not touch the leg-C scoring above): bar 4's
+// false-absent tally. The harness has no independent "model wrote key=null"
+// signal — qdocs_eval_field's only verbatim/not-verbatim bit is
+// found_verbatim. So "false absent" here is read as: the value string DOES
+// occur in the round-tripped source (cov_peak >= 0, i.e. qdocs_span_in_prompt
+// found it) but the model's generated JSON did not reproduce it verbatim
+// (found_verbatim == false) — the closest available proxy for "the model
+// reported this field absent/unrecoverable when it was actually on the page,"
+// without adding any new scoring math.
+static int run_ocr_t_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta,
+                           const std::vector<int32_t>& attn_layers) {
+    // Fixture suffix is env-selectable so Arm T and Arm O (docs/plan-ocr-lens.md
+    // step 2) share this exact scoring code — OCRO=1 selects the Vision-OCR
+    // fixture, OCR_SUFFIX overrides directly, default is Arm T's pdftotext one.
+    std::string ocr_suffix = std::getenv("OCR_SUFFIX") ? std::getenv("OCR_SUFFIX")
+                            : std::getenv("OCRO") ? ".ocr.txt" : ".rt.txt";
+
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ OCR-LENS ARM %s — 15 docs EN+DE, fixture suffix %-13s ║\n",
+                std::getenv("OCRO") ? "O" : "T", ocr_suffix.c_str());
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps10(attn_layers.begin(), attn_layers.end());
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+
+    struct Acc { int cite_n=0, t1=0, t3=0; int used_spans=0, used_clear=0;
+                 std::vector<double> used_peaks; int grounded=0, false_alarm=0;
+                 int labeled=0, normalized=0; int false_absent=0; };
+    Acc en, de;
+    auto pick = [&](bool d) -> Acc& { return d ? de : en; };
+    std::vector<std::string> false_absent_names;
+
+    for (const QMessy& d : corpus) {
+        std::string rt_doc = read_file_or_die("/tmp/ocr_probe/" + d.tag + ocr_suffix);
+        std::string prompt = qdocs_chat_prompt(rt_doc, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps10,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        std::printf("\n[%s%s] %s\n", d.tag.c_str(), d.de ? " DE" : "", R.gen_text.c_str());
+
+        int doc_lo, doc_hi;
+        if (!qdocs_span_in_prompt(tok, R, rt_doc, doc_lo, doc_hi)) {
+            doc_lo = 0; doc_hi = R.P - 1;
+        }
+        Acc& A = pick(d.de);
+        for (const QLabel& f : d.fields) {
+            A.labeled++;
+            QFieldEval e = qdocs_eval_field(tok, R, f.value, doc_lo, doc_hi, attn_layers, TOL);
+            if (e.cov_peak >= 0) {
+                A.used_spans++; A.used_peaks.push_back(e.cov_peak);
+                if (e.cov_peak >= 0.705) A.used_clear++;
+            }
+            if (!e.found_verbatim) { A.normalized++;
+                if (e.cov_peak >= 0) {
+                    A.false_absent++;
+                    false_absent_names.push_back(d.tag + "." + f.concept);
+                }
+                std::printf("    %-13s \"%s\"  NORMALIZED (not verbatim in output)  cov=%.3f%s\n",
+                            f.concept.c_str(), f.value.c_str(), e.cov_peak,
+                            e.cov_peak >= 0 ? "  << BAR4 FALSE-ABSENT" : "");
+                continue;
+            }
+            A.cite_n += e.cite_n; A.t1 += e.cite_t1; A.t3 += e.cite_t3;
+            A.grounded++;
+            bool alarm = e.body_mass < 0.538;
+            if (alarm) A.false_alarm++;
+            std::printf("    %-13s \"%s\"  cite t1 %d/%d t3 %d/%d  cov=%.3f  body_mass=%.3f%s\n",
+                        f.concept.c_str(), f.value.c_str(), e.cite_t1, e.cite_n, e.cite_t3, e.cite_n,
+                        e.cov_peak, e.body_mass, alarm ? "  << FALSE ALARM" : "");
+        }
+    }
+
+    auto med = [](std::vector<double> v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end());
+        return v[v.size() / 2]; };
+    auto report = [&](const char* label, const Acc& A) {
+        std::printf("\n──────── %s ────────\n", label);
+        std::printf("  citation (frozen L%dH%d) on value tokens: top1 %d/%d (%.0f%%)  top3 %d/%d (%.0f%%)  [bar top3 ≥90%%]\n",
+                    (*g_attn_layers)[FROZEN_SLOT], FROZEN_HEAD,
+                    A.t1, A.cite_n, A.cite_n ? 100.0 * A.t1 / A.cite_n : 0,
+                    A.t3, A.cite_n, A.cite_n ? 100.0 * A.t3 / A.cite_n : 0);
+        std::printf("  coverage: used spans clearing 0.705 = %d/%d (%.0f%%)  median used-peak %.3f  [COV1 USED median 0.937]\n",
+                    A.used_clear, A.used_spans, A.used_spans ? 100.0 * A.used_clear / A.used_spans : 0,
+                    med(A.used_peaks));
+        std::printf("  ungrounded false-alarm on grounded fields: %d/%d (%.0f%%)  [bar <10%%]\n",
+                    A.false_alarm, A.grounded, A.grounded ? 100.0 * A.false_alarm / A.grounded : 0);
+        std::printf("  verbatim-ness: normalized %d/%d (%.0f%% of labeled values re-rendered)\n",
+                    A.normalized, A.labeled, A.labeled ? 100.0 * A.normalized / A.labeled : 0);
+        std::printf("  BAR4 false-absent (in round-tripped text, not verbatim in output): %d/%d\n",
+                    A.false_absent, A.labeled);
+    };
+    report("EN", en);
+    report("DE", de);
+    Acc all;
+    all.cite_n=en.cite_n+de.cite_n; all.t1=en.t1+de.t1; all.t3=en.t3+de.t3;
+    all.used_spans=en.used_spans+de.used_spans; all.used_clear=en.used_clear+de.used_clear;
+    all.grounded=en.grounded+de.grounded; all.false_alarm=en.false_alarm+de.false_alarm;
+    all.labeled=en.labeled+de.labeled; all.normalized=en.normalized+de.normalized;
+    all.false_absent=en.false_absent+de.false_absent;
+    for (double p : en.used_peaks) all.used_peaks.push_back(p);
+    for (double p : de.used_peaks) all.used_peaks.push_back(p);
+    report("COMBINED", all);
+
+    std::printf("\n  BAR4 false-absent fields (%zu): ", false_absent_names.size());
+    for (auto& n : false_absent_names) std::printf("%s ", n.c_str());
+    std::printf("\n");
+
+    double t3 = all.cite_n ? 100.0 * all.t3 / all.cite_n : 0;
+    double fa = all.grounded ? 100.0 * all.false_alarm / all.grounded : 0;
+    bool pass = t3 >= 90 && fa < 10 && (all.used_spans ? (double)all.used_clear / all.used_spans >= 0.9 : false);
+    std::printf("\n── ARM T VERDICT: %s (top3 %.0f%%%s90, false-alarm %.0f%%%s10, used-clear %.0f%%) ──\n",
                 pass ? "PASS" : "FAIL", t3, t3 >= 90 ? "≥" : "<", fa, fa < 10 ? "<" : "≥",
                 all.used_spans ? 100.0 * all.used_clear / all.used_spans : 0);
     return 0;
@@ -4988,6 +5199,1384 @@ static int run_norm_weighted_probe(ForwardPassBase* fp, ggml_backend_sched_t sch
     return 0;
 }
 
+
+// ═════════════════════════════════════════════════════════════════════════
+// COVSEARCH — coverage layer × threshold search. docs/plan-coverage-layer-search.md
+//
+// The incumbent (layer 11, peak, ≥0.705) is a 48-candidate argmax scored on
+// COV1's 12 calibration spans (run_coverage_probe above; note-attn-coverage-
+// probe.md §3). It went 100% there and scores 84%/87% on Leg C's 75. This leg
+// re-runs the selection with the three things that one lacked:
+//
+//   1. an evaluation corpus that took no part in choosing (Leg C, 6x larger),
+//   2. AUC — threshold-free and two-sided — instead of calibration accuracy,
+//   3. a plateau requirement, so a lone spike on 23 spans cannot win.
+//
+// It costs no extra forward passes: span_scalars() already fills every tapped
+// layer's peak in one pass, and the shipped metric throws all but one away.
+//
+// The scalar SHAPE is held at `peak` deliberately (plan §2): sweeping shapes
+// too would rebuild the same 48-way argmax this leg exists to replace.
+// ═════════════════════════════════════════════════════════════════════════
+// BANDDRIFT — the DRIFT GATE. Does a candidate transform MOVE a lens decision?
+//
+// This is the standing gate of docs/plan-lens-server-shape.md §4.3: any
+// optimisation that changes the numerics is scored the same way and passes or
+// fails against a MEASURED budget, instead of being argued about. Generalised
+// 2026-09-13 from a probe that knew exactly one transform.
+//
+// The shape is always: arm A = the shipped configuration, arm B = the
+// candidate, same weights, same tokens, same prompt. Pick the candidate with
+// DRIFT_ARM (default `chunk`, today's behaviour):
+//
+//   chunk  — the SAME prompt driven as a chunk sequence over one shared KV.
+//            Different matmul widths, which Metal does not reduce identically
+//            (project_metal_mm_mv_fork; engine/multimodal_prefill.cpp names it
+//            outright). Chunk size: ATTN_BAND_CHUNK, default 128.
+//   flash  — flash attention in PREFILL with the decode left materialized
+//            (§4.2.1). Not a mix of two known configurations: the attention
+//            output feeds the residual stream, so a flash prefill changes every
+//            later layer's K/V, and the tapped decode then reads a cache that
+//            was written differently. That is precisely what is being scored.
+//
+// THREE CRITERIA, all reported, all required to PASS:
+//
+//   1. Token identity. A document whose two arms emit different tokens is
+//      EXCLUDED from the drift statistics and FAILS the gate — comparing peaks
+//      across two different generations would measure divergence, not drift.
+//      This is the repo's standard token-stable gate, not a new bar.
+//   2. No decision crossed the threshold. This is the one that matters: the
+//      lens publishes `skipped[]`, and a decision that crossed is a line that
+//      appeared or vanished from a customer's report.
+//   3. Max |delta peak| below the decision margin — the early-warning
+//      criterion. Nothing crossed *this* corpus, but a drift larger than the
+//      margin means the next document could.
+//
+// UNITS (fixed 2026-09-13, §4.3). The margin is measured on the SAME unit the
+// drift is: BODY LINES. The lens's decision unit is the line — that is what a
+// reader sees withdrawn or asserted — so the budget is the distance from 0.705
+// to the nearest line peak in arm A. The earlier verdict compared line drift
+// against 0.0034, which is a *span*-level margin from BAND COST; lines sum
+// 10–40 tokens and spans 1–3, so the two are not the same scale and that
+// comparison was meaningless in the safe direction (it flattered nothing — the
+// line margin is the wider of the two — but it was not a measurement of this).
+//
+// LANGUAGE: DRIFT_LANG=en (default, the optimistic arm) or `all`. The German
+// spans are the ones crowding the threshold (BAND COST), so an EN-only margin
+// is the best case and an EN-only PASS is a weaker statement than it looks.
+// Run `all` before claiming a transform is safe for the shipped, bilingual
+// path — the margin is what changes, not usually the drift.
+//
+// Exit code is the gate: 0 = PASS, 1 = FAIL. Wire it into a script and an
+// optimisation is tested rather than debated.
+struct DriftArm {
+    const char* name;
+    const char* what;
+    int         prefill_chunk = 0;     // 0 = today's single-batch prefill
+    bool        flash_prefill = false;
+};
+
+// Default `en` keeps today's behaviour and today's published numbers.
+static bool drift_en_only() {
+    const char* l = std::getenv("DRIFT_LANG");
+    if (!l || std::string(l) == "en") return true;
+    if (std::string(l) == "all") return false;
+    throw std::runtime_error(
+        std::string("drift_en_only: slot 'DRIFT_LANG' expected one of en|all, got: ") + l);
+}
+
+static DriftArm drift_arm_from_env() {
+    std::string want = "chunk";
+    if (const char* a = std::getenv("DRIFT_ARM")) want = a;
+    int CH = 128;
+    if (const char* c = std::getenv("ATTN_BAND_CHUNK")) CH = std::atoi(c);
+    if (want == "chunk")
+        return {"chunk", "chunked prefill over one shared KV (Metal mm-vs-mv fork)",
+                CH, false};
+    if (want == "flash")
+        return {"flash", "flash PREFILL + materialized decode (plan §4.2.1)",
+                0, true};
+    throw std::runtime_error(
+        "drift_arm_from_env: slot 'DRIFT_ARM' expected one of chunk|flash, got: " + want);
+}
+
+struct BandLine { int lo, hi; double peak; std::string text; };
+
+static std::vector<BandLine> band_body_lines(Tokenizer* tok, const FreeRun& R,
+                                             int doc_lo, int doc_hi, int cov_slot) {
+    const int G = (int)R.rows.size();
+    std::vector<BandLine> out;
+    int lstart = doc_lo;
+    for (int p = doc_lo; p <= doc_hi && p < R.P; ++p) {
+        std::string tt = tok->decode(R.prompt_tokens[p]);
+        const bool nl = tt.find('\n') != std::string::npos;
+        if (!nl && p != doc_hi) continue;
+        const int lo = lstart, hi = p;
+        double sp = 0;
+        for (int t = 0; t < G; ++t) {
+            const int n_kv = R.n_kv_at_step[t];
+            double sum = 0;
+            for (int q = lo; q <= hi; ++q) {
+                if (q >= n_kv) continue;
+                double m = 0;
+                for (int h = 0; h < R.n_head; ++h) {
+                    const double v = R.rows[t][cov_slot][(size_t)h * n_kv + q];
+                    if (v > m) m = v;
+                }
+                sum += m;
+            }
+            if (sum > sp) sp = sum;
+        }
+        std::string tx;
+        for (int q = lo; q <= hi; ++q) tx += tok->decode(R.prompt_tokens[q]);
+        out.push_back({lo, hi, sp, tx});
+        lstart = p + 1;
+    }
+    return out;
+}
+
+static int run_band_drift_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                Tokenizer* tok, const ModelMetadata& meta,
+                                const std::vector<int32_t>& attn_layers) {
+    // No covsearch_require_expressible here: that guard exists for span_scalars'
+    // 12-slot layout, which this leg does not use — it reads one tapped layer.
+    const DriftArm arm = drift_arm_from_env();
+    const bool en_only = drift_en_only();
+    const int cov_layer = attn_layers[L11_SLOT];
+    // The SHIPPED operating point by default. DRIFT_THR (with ATTN_COV_SLOT for
+    // the layer) scores a CANDIDATE one instead — which is the other half of a
+    // recalibration: COVSEARCH says a layer reports more of the consulted
+    // spans, and this says whether its decisions survive a permitted config
+    // change. A constant that wins the first and loses the second is not
+    // shippable, and before 2026-09-14 there was no way to ask.
+    double THR = 0.705;
+    if (const char* t = std::getenv("DRIFT_THR")) THR = std::atof(t);
+
+    // Fail loud rather than silently scoring the shipped path against itself:
+    // a recipe that does not thread use_flash would run arm B materialized and
+    // report a perfect zero, which is the most misleading result this gate
+    // could produce.
+    if (arm.flash_prefill && !fp->supports_flash_attn()) {
+        std::fprintf(stderr,
+            "drift gate: slot 'DRIFT_ARM=flash' expected a recipe that threads "
+            "flash attention, actual: this recipe does not support it — arm B "
+            "would run materialized and the gate would pass vacuously\n");
+        return 1;
+    }
+
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ DRIFT GATE — does a candidate transform move a decision?       ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("  arm A  shipped: single-batch prefill, materialized attention\n");
+    std::printf("  arm B  %-6s: %s\n", arm.name, arm.what);
+    if (arm.prefill_chunk > 0)
+        std::printf("         chunk %d tok\n", arm.prefill_chunk);
+    std::printf("  coverage layer L%d @ %.3f%s | %s\n", cov_layer, THR,
+                std::getenv("DRIFT_THR") ? " (CANDIDATE operating point)" : "",
+                en_only ? "ENGLISH ONLY (optimistic arm)"
+                        : "EN + DE (the shipped, bilingual path)");
+
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+    const std::vector<int> taps{cov_layer};
+
+    // Restore the perturbation on EVERY exit path, not just the loop's happy
+    // one: `fp` is shared with every other leg in this binary, and a leaked
+    // prefill implementation would silently re-score whatever ran next. Same
+    // class of bug as the lens drivers' EngineRestore, same one-line fix.
+    struct ArmRestore {
+        ForwardPassBase* fp;
+        ForwardPassBase::AttnImpl impl;
+        ~ArmRestore() { fp->set_prefill_attn_impl(impl); }
+    } arm_restore{fp, fp->prefill_attn_impl()};
+
+    struct DRec { std::string tag; double a, b, d; std::string text; bool de; };
+    std::vector<DRec> recs;
+    int n_docs = 0, n_diverged = 0, n_shape = 0, n_perturbed = 0;
+
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        if (en_only && d.de) continue;
+        n_docs++;
+        const std::string prompt = qdocs_chat_prompt(d.document, TASK);
+
+        FreeRun A = run_freegen(fp, sched, tok, meta, prompt, "", taps, 320, false, '}', 0);
+
+        // Arm B under the candidate configuration, restored immediately after:
+        // every other leg in this binary shares this forward pass and must not
+        // inherit the perturbation. The tap set is untouched — only PREFILL
+        // moves — because the lens reads decode rows and a flash decode would
+        // have no kq_soft to read.
+        if (arm.flash_prefill)
+            fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Flash);
+        FreeRun B = run_freegen(fp, sched, tok, meta, prompt, "", taps, 320, false, '}',
+                                arm.prefill_chunk);
+        if (arm.flash_prefill)
+            fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+
+        // Did arm B actually differ from arm A on this document? run_freegen
+        // falls back to the single-batch path when the prompt is shorter than
+        // the chunk, which would score the shipped path against itself and
+        // report a perfect zero — the same vacuous pass the flash guard above
+        // refuses, arriving by a quieter route.
+        if (arm.flash_prefill || (arm.prefill_chunk > 0 && A.P > arm.prefill_chunk))
+            n_perturbed++;
+
+        if (A.gen_tokens != B.gen_tokens) {
+            n_diverged++;
+            std::printf("  [%s] TOKENS DIVERGED (%zu vs %zu gen tokens) — excluded\n",
+                        d.tag.c_str(), A.gen_tokens.size(), B.gen_tokens.size());
+            continue;
+        }
+        int alo, ahi;
+        if (!qdocs_span_in_prompt(tok, A, d.document, alo, ahi)) { alo = 0; ahi = A.P - 1; }
+        std::vector<BandLine> la = band_body_lines(tok, A, alo, ahi, 0);
+        std::vector<BandLine> lb = band_body_lines(tok, B, alo, ahi, 0);
+        if (la.size() != lb.size()) { n_shape++; continue; }
+
+        for (size_t i = 0; i < la.size(); ++i) {
+            bool has = false;
+            for (char c : la[i].text) if (std::isalnum((unsigned char)c)) has = true;
+            if (!has) continue;
+            recs.push_back({d.tag, la[i].peak, lb[i].peak,
+                            std::fabs(la[i].peak - lb[i].peak), la[i].text, d.de});
+        }
+    }
+
+    std::printf("\n  %d %s documents | %d token-diverged (excluded) | %d line-shape mismatch\n",
+                n_docs, en_only ? "English" : "EN+DE", n_diverged, n_shape);
+    if (recs.empty()) { std::printf("  no comparable lines — nothing to report\n"); return 1; }
+    if (n_perturbed == 0) {
+        std::fprintf(stderr,
+            "drift gate: arm '%s' expected at least one document to take the "
+            "perturbed path, actual 0 of %d — every prompt was shorter than the "
+            "%d-token chunk, so both arms ran the shipped path and any PASS here "
+            "would be vacuous\n", arm.name, n_docs, arm.prefill_chunk);
+        return 1;
+    }
+    if (n_perturbed < n_docs)
+        std::printf("  NOTE: %d of %d documents actually took the perturbed path\n",
+                    n_perturbed, n_docs);
+
+    std::vector<double> ds;
+    for (auto& r : recs) ds.push_back(r.d);
+    std::sort(ds.begin(), ds.end());
+    auto q = [&](double f) { return ds[(size_t)(f * (ds.size() - 1))]; };
+
+    int crossed = 0;
+    for (auto& r : recs) if ((r.a >= THR) != (r.b >= THR)) crossed++;
+
+    std::printf("\n  ---- drift over %zu body lines ----\n", recs.size());
+    std::printf("    |delta peak|   p50 %.6f   p90 %.6f   p99 %.6f   MAX %.6f\n",
+                q(0.50), q(0.90), q(0.99), ds.back());
+    std::printf("    decisions that CROSSED %.3f : %d / %zu\n", THR, crossed, recs.size());
+
+    std::printf("\n  ---- the 10 largest movers ----\n");
+    std::sort(recs.begin(), recs.end(),
+              [](const DRec& x, const DRec& y) { return x.d > y.d; });
+    std::printf("  %-8s %9s %9s %10s  %s\n", "tag", "shipped", arm.name, "|delta|", "line");
+    for (size_t i = 0; i < recs.size() && i < 10; ++i) {
+        std::string t = recs[i].text;
+        for (char& c : t) if (c == '\n' || c == '\r') c = ' ';
+        if (t.size() > 46) t = t.substr(0, 46) + "...";
+        std::printf("  %-8s %9.5f %9.5f %10.6f  %s%s\n",
+                    recs[i].tag.c_str(), recs[i].a, recs[i].b, recs[i].d, t.c_str(),
+                    ((recs[i].a >= THR) != (recs[i].b >= THR)) ? "   << CROSSED" : "");
+    }
+
+    // ── the budget ───────────────────────────────────────────────────────────
+    // Measured, on the unit the drift is measured on: the closest any body
+    // line in arm A comes to the threshold. A transform whose drift stays
+    // under this could not have moved any decision on this corpus, and the
+    // margin says how much room the NEXT document would have.
+    double margin = 1e9, margin_en = 1e9, margin_de = 1e9;
+    std::string nearest;
+    int n_de_lines = 0;
+    for (auto& r : recs) {
+        const double m = std::fabs(r.a - THR);
+        if (m < margin) { margin = m; nearest = r.text; }
+        if (r.de) { n_de_lines++; if (m < margin_de) margin_de = m; }
+        else if (m < margin_en) margin_en = m;
+    }
+    for (char& c : nearest) if (c == '\n' || c == '\r') c = ' ';
+    if (nearest.size() > 46) nearest = nearest.substr(0, 46) + "...";
+
+    const bool tokens_ok   = (n_diverged == 0);
+    const bool nothing_crossed = (crossed == 0);
+    const bool inside_budget   = (ds.back() < margin);
+    const bool pass = tokens_ok && nothing_crossed && inside_budget;
+
+    std::printf("\n  ---- GATE: arm B `%s` against the shipped arm ----\n", arm.name);
+    std::printf("    1. token identity        : %d/%d documents        %s\n",
+                n_docs - n_diverged, n_docs, tokens_ok ? "PASS" : "FAIL");
+    std::printf("    2. decisions crossed     : %d / %zu lines          %s\n",
+                crossed, recs.size(), nothing_crossed ? "PASS" : "FAIL");
+    std::printf("    3. max drift vs margin   : %.6f vs %.6f   %s\n",
+                ds.back(), margin, inside_budget ? "PASS" : "FAIL");
+    std::printf("       line-level margin measured on %zu %s body lines; nearest line to %.3f:\n",
+                recs.size(), en_only ? "EN" : "EN+DE", THR);
+    std::printf("       \"%s\"\n", nearest.c_str());
+    // The whole point of the language axis: which arm is setting the budget.
+    if (n_de_lines > 0)
+        std::printf("       by language: EN %.6f (%zu lines) | DE %.6f (%d lines)\n",
+                    margin_en, recs.size() - (size_t)n_de_lines, margin_de, n_de_lines);
+    const double headroom = (ds.back() > 0) ? margin / ds.back() : 1e9;
+    if (inside_budget && ds.back() > 0) {
+        std::printf("       headroom: %.1fx\n", headroom);
+        // A pass with 1.5x of room is not the same statement as a pass with
+        // 25x, and rounding them both to "2x" / "25x" hides which one you got.
+        // Thin means: this corpus is clean, and a document whose line sits
+        // closer to the threshold than the drift would not be protected.
+        if (headroom < 5.0)
+            std::printf("       ^^ THIN. Passing here says this corpus is clean, not that "
+                        "the transform is safe.\n"
+                        "          A line within %.6f of %.3f could be moved across by it.\n",
+                        ds.back(), THR);
+    }
+    std::printf("\n  VERDICT: %s\n", pass
+        ? "PASS — this transform moves no lens decision on this corpus"
+        : "FAIL — do not ship this transform on the lens path without reading the rows above");
+    return pass ? 0 : 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOEROUTE — WHICH mechanism makes an MoE model irreproducible?
+//
+// The 2x2 (Qwen dense/MoE x Gemma dense/MoE, docs/plan-lens-server-shape.md
+// §4.3) established that MoE-ness predicts instability under a chunked prefill:
+// dense models drift ~8e-4 and never change a token, MoE models drift ~2.2e-2
+// and each changed one extraction in fifteen. It did NOT establish why, and two
+// mechanisms fit the same data with very different consequences:
+//
+//   ROUTING FLIP — top-k expert selection is an argmax, so a 1e-4 perturbation
+//     picks a DIFFERENT EXPERT. Discrete, inherent to the architecture, not
+//     fixable by better kernels.
+//   DISPATCH ARITHMETIC — the same experts are chosen, and ggml_mul_mat_id
+//     simply reduces differently at a different batch width. A kernel property:
+//     bounded, possibly fixable, and not special to MoE except in degree.
+//
+// This leg separates them by reading the selection itself. `moe_idx.<il>` is
+// already a named [top_k, n_tokens] I32 node in every MoE graph
+// (layers/moe.cpp), so pinning it as a graph output costs no compute and needs
+// no engine change — the same trick mark_attention_taps plays on kq_soft.
+//
+// Prefill only, no decode: the perturbation is a prefill-shape change, and
+// prefill is where the two arms first differ. Head-less on BOTH arms so the
+// output head cannot be confused for a difference (it is downstream of every
+// router anyway).
+//
+// READING THE RESULT:
+//   any position where the top-k SET differs        ⇒ routing flips are real
+//   sets identical everywhere, outputs still differ ⇒ dispatch arithmetic
+// The first flip's LAYER matters too: an early flip means the perturbation is
+// amplified through the whole stack, a late one that it stayed small until the
+// end.
+// `moe_idx.<il>` is a ggml_view_2d of the argsort output — the top_k prefix of
+// each token's full expert ranking, carrying the PARENT's row stride. Pinning
+// and reading the view directly segfaults: ggml_backend_tensor_get copies
+// ggml_nbytes() contiguous bytes, which for a strided view is neither the right
+// bytes nor, at the last row, necessarily mapped memory. (Found the hard way —
+// the first version of this leg died with no message.) So pin the contiguous
+// PARENT and slice host-side, which also yields the full ranking for free.
+struct MoePin { ggml_tensor* src; int il, top_k, n_exp, n_tok; };
+
+// Must run AFTER build and BEFORE alloc, exactly like mark_attention_taps.
+static std::vector<MoePin> moe_pin_idx(ggml_cgraph* gf, uint32_t n_blocks) {
+    std::vector<MoePin> out;
+    for (uint32_t il = 0; il < n_blocks; ++il) {
+        const std::string nm = "moe_idx." + std::to_string(il);
+        ggml_tensor* t = ggml_graph_get_tensor(gf, nm.c_str());
+        if (!t) continue;
+        ggml_tensor* src = t->view_src ? t->view_src : t;
+        ggml_set_output(src);
+        ggml_build_forward_expand(gf, src);
+        out.push_back({src, (int)il, (int)t->ne[0], (int)src->ne[0], (int)t->ne[1]});
+    }
+    return out;
+}
+
+static void moe_read_idx(const std::vector<MoePin>& pins,
+                         std::map<int, std::vector<int32_t>>& acc,
+                         std::map<int, int>& top_k_of) {
+    for (const MoePin& p : pins) {
+        std::vector<int32_t> full((size_t)p.n_exp * p.n_tok);
+        ggml_backend_tensor_get(p.src, full.data(), 0, ggml_nbytes(p.src));
+        top_k_of[p.il] = p.top_k;
+        std::vector<int32_t>& dst = acc[p.il];
+        for (int t = 0; t < p.n_tok; ++t) {
+            const int32_t* row = full.data() + (size_t)t * p.n_exp;
+            dst.insert(dst.end(), row, row + p.top_k);
+        }
+    }
+}
+
+// One prefill of `toks`, single-batch or chunked, returning the routing it took.
+// Head-less throughout: routing is upstream of the head.
+static std::map<int, std::vector<int32_t>>
+moe_prefill_routing(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                    const ModelMetadata& meta, const std::vector<int32_t>& toks,
+                    int chunk, std::map<int, int>& top_k_of) {
+    std::map<int, std::vector<int32_t>> acc;
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+
+    auto one_pass = [&](const std::vector<int32_t>& part, int pos) {
+        ggml_backend_sched_reset(sched);
+        ggml_cgraph* gf = fp->build_prefill_graph(part, pos, 0, /*want_logits=*/false);
+        std::vector<MoePin> pins = moe_pin_idx(gf, meta.block_count);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, part, pos);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(sched, gf), "moe_prefill_routing");
+        moe_read_idx(pins, acc, top_k_of);
+        fp->advance_cache((uint32_t)part.size(), 0);
+    };
+
+    const int P = (int)toks.size();
+    if (chunk <= 0 || P <= chunk) {
+        one_pass(toks, 0);
+    } else {
+        int pos = 0;
+        while (P - pos > chunk) {
+            one_pass(std::vector<int32_t>(toks.begin() + pos, toks.begin() + pos + chunk), pos);
+            pos += chunk;
+        }
+        one_pass(std::vector<int32_t>(toks.begin() + pos, toks.end()), pos);
+    }
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    return acc;
+}
+
+static int run_moe_route_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                               Tokenizer* tok, const ModelMetadata& meta) {
+    int CH = 128;
+    if (const char* c = std::getenv("ATTN_BAND_CHUNK")) CH = std::atoi(c);
+
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ MOEROUTE — routing flip, or dispatch arithmetic?              ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("  arch %s | %u blocks | chunk %d tok | prefill only, head-less\n",
+                meta.architecture.c_str(), meta.block_count, CH);
+
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    long long tot_pos = 0, set_diff = 0, order_diff = 0;
+    int first_layer = -1, first_pos = -1, docs_with_flip = 0, n_docs = 0;
+    std::string first_tag, first_a, first_b;
+    std::map<int, long long> flips_by_layer;
+
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        const std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<int32_t> toks = tok->encode(prompt);
+        if ((int)toks.size() <= CH) continue;          // never chunked ⇒ vacuous
+        n_docs++;
+        if (const char* m = std::getenv("MOEROUTE_MAX"))
+            if (n_docs > std::atoi(m)) { n_docs--; break; }
+
+        // Flushed per step: this leg aborted silently once, and a buffered
+        // stdout discards exactly the line that would have said where.
+        std::printf("  [%s] %d prompt tokens, arm A...", d.tag.c_str(), (int)toks.size());
+        std::fflush(stdout);
+        std::map<int, int> tkA, tkB;
+        std::map<int, std::vector<int32_t>> A =
+            moe_prefill_routing(fp, sched, meta, toks, 0,  tkA);
+        std::printf(" arm B..."); std::fflush(stdout);
+        std::map<int, std::vector<int32_t>> B =
+            moe_prefill_routing(fp, sched, meta, toks, CH, tkB);
+        std::printf(" compared."); std::fflush(stdout);
+
+        if (A.empty()) {
+            std::fprintf(stderr,
+                "MOEROUTE: expected at least one `moe_idx.<il>` node, actual 0 — "
+                "arch '%s' is not a mixture-of-experts recipe, so there is no "
+                "routing to compare\n", meta.architecture.c_str());
+            return 1;
+        }
+
+        bool doc_flip = false;
+        for (const auto& kv : A) {
+            const int il = kv.first;
+            if (!B.count(il) || tkA[il] != tkB[il]) continue;
+            const int K = tkA[il];
+            const std::vector<int32_t>& a = kv.second;
+            const std::vector<int32_t>& b = B.at(il);
+            const size_t n = std::min(a.size(), b.size()) / (size_t)K;
+            for (size_t t = 0; t < n; ++t) {
+                const int32_t* pa = a.data() + t * K;
+                const int32_t* pb = b.data() + t * K;
+                tot_pos++;
+                if (std::equal(pa, pa + K, pb)) continue;
+                std::vector<int32_t> sa(pa, pa + K), sb(pb, pb + K);
+                std::sort(sa.begin(), sa.end()); std::sort(sb.begin(), sb.end());
+                if (sa == sb) { order_diff++; continue; }
+                set_diff++;
+                flips_by_layer[il]++;
+                doc_flip = true;
+                if (first_layer < 0) {
+                    first_layer = il; first_pos = (int)t; first_tag = d.tag;
+                    for (int k = 0; k < K; ++k) {
+                        first_a += (k ? "," : "") + std::to_string(pa[k]);
+                        first_b += (k ? "," : "") + std::to_string(pb[k]);
+                    }
+                }
+            }
+        }
+        if (doc_flip) docs_with_flip++;
+        std::printf(" %s\n", doc_flip ? "routing DIFFERS" : "routing identical");
+        std::fflush(stdout);
+    }
+
+    std::printf("\n  ---- %lld (layer, token) routing decisions compared over %d documents ----\n",
+                tot_pos, n_docs);
+    std::printf("    different expert SET   : %lld  (%.4f%%)\n",
+                set_diff, tot_pos ? 100.0 * (double)set_diff / (double)tot_pos : 0.0);
+    std::printf("    same set, different ORDER: %lld\n", order_diff);
+    std::printf("    documents with at least one flip: %d / %d\n", docs_with_flip, n_docs);
+
+    if (set_diff > 0) {
+        std::printf("\n    first flip: %s layer %d token %d — experts [%s] vs [%s]\n",
+                    first_tag.c_str(), first_layer, first_pos,
+                    first_a.c_str(), first_b.c_str());
+        std::printf("    flips by layer (top 10):\n");
+        std::vector<std::pair<int, long long>> v(flips_by_layer.begin(), flips_by_layer.end());
+        std::sort(v.begin(), v.end(),
+                  [](const std::pair<int,long long>& x, const std::pair<int,long long>& y) {
+                      return x.second > y.second; });
+        for (size_t i = 0; i < v.size() && i < 10; ++i)
+            std::printf("      L%-3d %lld\n", v[i].first, v[i].second);
+        std::printf("\n  VERDICT: ROUTING FLIPS ARE REAL. The perturbation changes WHICH\n"
+                    "           expert runs, not just how its arithmetic rounds. This is\n"
+                    "           inherent to top-k selection and no kernel fixes it.\n");
+    } else {
+        std::printf("\n  VERDICT: ROUTING IS IDENTICAL on this corpus. Every token took the\n"
+                    "           same experts in both arms, so the divergence measured by the\n"
+                    "           drift gate comes from the DISPATCH ARITHMETIC (mul_mat_id\n"
+                    "           reducing differently at a different batch width), not from\n"
+                    "           selection — a kernel property, not an architectural one.\n");
+    }
+    return 0;
+}
+
+struct CovSpanRec {
+    std::string tag, marker;
+    bool de   = false;            // Leg C language split (COV1 records leave it false)
+    int label = -1;               // 1 = consulted (positive), 0 = not (negative)
+    int len   = 0;                // span length in tokens
+    int lo = -1, hi = -1;         // token span in the prompt
+    std::string text;             // the span's decoded text (filler audit)
+    std::vector<double> peak;     // per attention-layer-slot span peak
+};
+
+// span_scalars indexes per-layer sources at sc[1+slot] in a double[12], so it
+// can only express the first 10 tapped layers. Both calibrated Qwen models put
+// attention every 4th block (8 and 10 layers), so this never fires there — it
+// is the guard for the day a denser model is calibrated, because silently
+// searching a truncated layer list would report a winner picked from a subset.
+static void covsearch_require_expressible(const std::vector<int32_t>& attn_layers) {
+    if (attn_layers.size() > 10)
+        throw std::runtime_error(
+            "COVSEARCH attn_layers: expected at most 10 tapped attention layers "
+            "(span_scalars stores per-layer sources at sc[1+slot] in a double[12]), actual " +
+            std::to_string(attn_layers.size()) + " — widen span_scalars before searching");
+}
+
+static std::vector<double> covsearch_peaks(const FreeRun& R, int lo, int hi,
+                                           const std::vector<int32_t>& attn_layers) {
+    double sc[12][4];
+    span_scalars(R, lo, hi, sc, attn_layers);
+    std::vector<double> v((int)attn_layers.size());
+    for (int s = 0; s < (int)attn_layers.size(); ++s) v[s] = sc[1 + s][0];
+    return v;
+}
+
+// ── ARM 1 — COV1 separation curve. The only corpus with a HARD negative: a
+// span the model was asked about and declined to use.
+static void covsearch_arm1(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta,
+                           const std::vector<int32_t>& attn_layers,
+                           std::vector<CovSpanRec>& cal, std::vector<CovSpanRec>& hel) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COVSEARCH ARM 1 — COV1 separation curve (hard negatives)      ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    auto run_set = [&](std::vector<CovPrompt> set, std::vector<CovSpanRec>& out) {
+        for (auto& cp : set) {
+            FreeRun R = run_freegen(fp, sched, tok, meta, cp.body, cp.instr,
+                                    taps, 320, false, cp.close);
+            std::string gt = R.gen_text; for (char& c : gt) if (c == '\n') c = ' ';
+            if (gt.size() > 110) gt = gt.substr(0, 110) + "...";
+            std::printf("[%s] gen=%zu  %s\n", cp.tag.c_str(), R.gen_tokens.size(), gt.c_str());
+            for (auto& tg : cp.tg) {
+                if (tg.cls != CT_TARGET) continue;   // anchors are not labelled USED/DROPPED
+                int lo, hi;
+                if (!find_token_span(tok, R.prompt_tokens, cp.body, tg.marker, lo, hi)) {
+                    std::printf("  WARN marker not found: %s\n", tg.marker.c_str());
+                    continue;
+                }
+                CovSpanRec r;
+                r.tag = cp.tag; r.marker = tg.marker; r.len = hi - lo + 1;
+                r.label = R.gen_text.find(tg.used) != std::string::npos ? 1 : 0;
+                r.peak = covsearch_peaks(R, lo, hi, attn_layers);
+                out.push_back(r);
+            }
+        }
+    };
+    std::printf("\n---- calib ----\n");  run_set(cov_calib(), cal);
+    std::printf("---- held ----\n");     run_set(cov_held(),  hel);
+}
+
+// ── ARM 2 — Leg C ambient curve. Positives are the exact 75-span population
+// the >=90% bar is quoted on. Negatives are LENGTH-MATCHED filler windows:
+// the span peak sums attention mass over the span, so a longer negative scores
+// higher for free, and comparing short values against whole filler lines would
+// measure length, not consultation.
+// ATTN_LENS_EN_ONLY=1 restricts Leg C to the English documents. NOT a
+// convenience filter: the German deficit is a property of the MODEL's German
+// competence, not of the lens signal, so pooling the two halves reports a
+// number that is neither the lens ceiling nor the model's. English-only is the
+// CEILING arm — what the omission report achieves when language competence is
+// not the binding constraint. Quote it as a ceiling, never as the shipped rate.
+static bool band_en_only() {
+    static const bool v = std::getenv("ATTN_LENS_EN_ONLY") != nullptr;
+    return v;
+}
+
+// ── The product defect (found 2026-09-13) ───────────────────────────────────
+// Leg C's filler negatives are cut from any document position outside a
+// LABELLED value's span. But the TASK prompt every arm uses says:
+//
+//   "prefer keys like: customer, PRODUCT, quantity, unit_price, total, ..."
+//
+// `product` is asked for and the model extracts it — correctly — yet no
+// document labels it. So the product name sits in filler territory, the model
+// attends to it for the right reason, and the span is scored as a FALSE
+// POSITIVE. Measured on English: 3 of the incumbent's 9 filler-clears are
+// product names (m_en2 0.973, m_en4 0.994, m_en6 0.994). The matched-FPR pin
+// that COVSEARCH uses to select layers is therefore pinned to a partly
+// fictional quantity.
+//
+// `product` is the ONLY such gap: every other key in the TASK list is either
+// labelled where the document states it, or absent from the document entirely.
+//
+// OPT-IN (ATTN_PRODUCT_OCCUPIED=1) on purpose. qdocs_messy_corpus() is shared
+// by leg C, the S2/S3 thread work and QKEY; editing it would silently rewrite
+// their stored comparison points. With the flag off, every leg is byte-identical.
+//
+// Occupancy ONLY — the product is NOT added as a positive. That keeps the
+// recall denominator at its published value so the change isolates the filler
+// population, which is the half that is broken. English only: the flag exists
+// to measure the EN ceiling (see band_en_only) and the German products were
+// not transcribed.
+// Mark EVERY occurrence of a labelled value occupied, not just the first
+// (see qdocs_all_spans_in_prompt). Opt-in and independent of the product flag
+// so the two negative-set defects can be attributed separately.
+static bool all_occurrences_occupied() {
+    static const bool v = std::getenv("ATTN_ALL_OCCURRENCES") != nullptr;
+    return v;
+}
+static bool product_occupied() {
+    static const bool v = std::getenv("ATTN_PRODUCT_OCCUPIED") != nullptr;
+    return v;
+}
+static const char* qdocs_product_for(const std::string& tag) {
+    if (tag == "m_en1") return "Matte Black Easel Stand";
+    if (tag == "m_en2") return "Nitrile Exam Gloves";
+    if (tag == "m_en3") return "galvanised coach bolt 10mm";
+    if (tag == "m_en4") return "Cold-Pressed Coconut Oil";
+    if (tag == "m_en5") return "Insulated Flask 750ml";
+    if (tag == "m_en6") return "Stainless Cleat 6in";
+    if (tag == "m_en7") return "Anti-Reflective Lens Blank";
+    if (tag == "m_en8") return "Rubber Grip Tape";
+    return nullptr;   // German documents: not transcribed, no extra occupancy
+}
+
+static void covsearch_arm2(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           Tokenizer* tok, const ModelMetadata& meta,
+                           const std::vector<int32_t>& attn_layers,
+                           std::vector<CovSpanRec>& out, int& cite_n, int& cite_t1, int& cite_t3) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COVSEARCH ARM 2 — Leg C ambient curve (length-matched filler) ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    // Byte-identical to run_qdocs_leg_c's TASK — Arm 2's positives must be the
+    // same population leg C reports, or the gate compares two different things.
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    cite_n = cite_t1 = cite_t3 = 0;
+    int neg_skipped = 0;
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        if (band_en_only() && d.de) continue;   // CEILING arm — see band_en_only()
+        std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        int doc_lo, doc_hi;
+        if (!qdocs_span_in_prompt(tok, R, d.document, doc_lo, doc_hi)) { doc_lo = 0; doc_hi = R.P - 1; }
+
+        // Positives, and the occupancy map the negatives are cut around.
+        std::vector<char> occupied(R.P, 0);
+        std::vector<std::pair<int,int>> pos_spans;   // (lo,hi) of every labelled value found
+        std::vector<CovSpanRec> pos;
+        // Keep the product out of filler territory — it is asked for by the
+        // TASK prompt and extracted correctly, so a decoy cut on it is not a
+        // decoy. Occupancy only: it does not become a positive.
+        if (product_occupied()) {
+            if (const char* prod = qdocs_product_for(d.tag)) {
+                int plo, phi;
+                if (qdocs_span_in_prompt(tok, R, prod, plo, phi))
+                    for (int p = std::max(0, plo - TOL); p <= std::min(R.P - 1, phi + TOL); ++p)
+                        occupied[p] = 1;
+                if (all_occurrences_occupied())
+                    for (auto& sp : qdocs_all_spans_in_prompt(tok, R, prod))
+                        for (int p = std::max(0, sp.first - TOL);
+                             p <= std::min(R.P - 1, sp.second + TOL); ++p) occupied[p] = 1;
+            }
+        }
+        for (const QLabel& f : d.fields) {
+            int slo, shi;
+            if (!qdocs_span_in_prompt(tok, R, f.value, slo, shi)) continue;  // leg C skips these too
+            for (int p = std::max(0, slo - TOL); p <= std::min(R.P - 1, shi + TOL); ++p) occupied[p] = 1;
+            // The POSITIVE record still uses the first occurrence (what leg C
+            // scores); only OCCUPANCY widens to every restatement.
+            if (all_occurrences_occupied())
+                for (auto& sp : qdocs_all_spans_in_prompt(tok, R, f.value))
+                    for (int p = std::max(0, sp.first - TOL);
+                         p <= std::min(R.P - 1, sp.second + TOL); ++p) occupied[p] = 1;
+            pos_spans.push_back({slo, shi});
+            CovSpanRec r;
+            r.tag = d.tag; r.de = d.de; r.marker = f.concept; r.label = 1; r.len = shi - slo + 1;
+            r.lo = slo; r.hi = shi;
+            r.text = tok->decode(std::vector<int32_t>(R.prompt_tokens.begin() + slo,
+                                                      R.prompt_tokens.begin() + shi + 1));
+            r.peak = covsearch_peaks(R, slo, shi, attn_layers);
+            pos.push_back(r);
+            // Citation propagation check (plan §7 G4) — same head, same scorer
+            // as leg C, so the printed top-1/top-3 must reproduce the known run.
+            QFieldEval e = qdocs_eval_field(tok, R, f.value, doc_lo, doc_hi, attn_layers, TOL);
+            cite_n += e.cite_n; cite_t1 += e.cite_t1; cite_t3 += e.cite_t3;
+        }
+
+        // Eligible filler = document positions inside no labelled value's span
+        // (plus TOL margin). Position 0 is excluded: it is the attention sink
+        // and carries mass for reasons that have nothing to do with coverage.
+        std::vector<std::pair<int,int>> runs;   // (start, len) of contiguous eligible positions
+        {
+            int p = std::max(1, doc_lo), lim = std::min(R.P - 1, doc_hi);
+            while (p <= lim) {
+                if (occupied[p]) { ++p; continue; }
+                int s0 = p; while (p <= lim && !occupied[p]) ++p;
+                runs.push_back({s0, p - s0});
+            }
+        }
+        // Deterministic cut: walk the runs with a cursor, never reusing a
+        // position, so each positive gets its own distinct length-matched twin.
+        size_t ri = 0; int roff = 0, nfiller = 0;
+        for (const CovSpanRec& P : pos) {
+            int L = P.len;
+            while (ri < runs.size() && runs[ri].second - roff < L) { ++ri; roff = 0; }
+            if (ri >= runs.size()) { neg_skipped++; continue; }
+            int nlo = runs[ri].first + roff, nhi = nlo + L - 1;
+            roff += L;
+            CovSpanRec n;
+            n.tag = d.tag; n.de = d.de; n.marker = "filler:" + P.marker; n.label = 0; n.len = L;
+            n.lo = nlo; n.hi = nhi;
+            n.text = tok->decode(std::vector<int32_t>(R.prompt_tokens.begin() + nlo,
+                                                      R.prompt_tokens.begin() + nhi + 1));
+            n.peak = covsearch_peaks(R, nlo, nhi, attn_layers);
+            out.push_back(n);
+            nfiller++;
+        }
+        for (const CovSpanRec& P : pos) out.push_back(P);
+        std::printf("  [%s%s] positives %zu  filler %d  eligible runs %zu\n",
+                    d.tag.c_str(), d.de ? " DE" : "", pos.size(), nfiller, runs.size());
+    }
+    if (neg_skipped)
+        std::printf("  NOTE: %d positive(s) had no length-matched filler window available\n", neg_skipped);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// COVCOMBINE — does COMBINING tapped layers beat the best SINGLE layer?
+//
+// Single-layer selection has been searched to exhaustion and keeps returning
+// KEEP: on English L7 is 37/40 against the incumbent L11's 36/40 (one span,
+// n=40, noise) and the §7 candidate L3 buys 98% recall by taking filler-clear
+// from 24% to 38%. The untried direction is combining layers, and it needs no
+// engine change — the probe already taps every full-attention layer.
+//
+// WHY A VOTE AND NOT max/mean ACROSS LAYERS.  Per-layer peaks are on different
+// scales: the matched-FPR thresholds run 0.586 (L3) to 0.919 (L27). A raw max
+// across layers is therefore dominated by whichever layer runs hottest and
+// collapses to L27 alone; a raw mean is dominated the same way. So every layer
+// votes against ITS OWN threshold and we count votes — scale-free by
+// construction, and parameter-free once (subset, k, r) are fixed.
+//
+// OPERATING POINT IS PINNED, NOT FITTED.  `r` is how many filler spans each
+// layer admits individually; sweeping r moves all thresholds together. We keep
+// the largest r whose COMBINED filler-clear stays at or below the incumbent's
+// own filler count. So no combiner may buy used-clear with silent misses —
+// the same discipline as the MATCHED-FPR table (plan-coverage-layer-search §6).
+//
+// THIS IS A SEARCH AND IT IS SCORED AS ONE.  Subsets are pre-declared (not
+// swept over 2^8) and the winner must survive a DOCUMENT split-half: choose
+// (k,r) on one half of the documents, score on the other. EN-only leaves no
+// DE half, so the document split is the substitute for the EN/DE stability
+// test. A candidate that wins pooled but not cross-half is a fit, not a find.
+struct CombSpec { const char* name; std::vector<int> slots; };
+
+static int run_coverage_combiner(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                 Tokenizer* tok, const ModelMetadata& meta,
+                                 const std::vector<int32_t>& attn_layers) {
+    const int S = (int)attn_layers.size();
+    const double THR = 0.705;
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COVCOMBINE — multi-layer vote vs the best single layer        ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    if (!band_en_only())
+        std::printf("  NOTE: pooled EN+DE. Set ATTN_LENS_EN_ONLY=1 for the ceiling arm.\n");
+
+    std::vector<CovSpanRec> cal, hel, legc;
+    int cite_n = 0, cite_t1 = 0, cite_t3 = 0;
+    covsearch_arm2(fp, sched, tok, meta, attn_layers, legc, cite_n, cite_t1, cite_t3);
+
+    // Incumbent's own operating point on this population — the pin.
+    int target_fp = 0, n_pos = 0, n_neg = 0;
+    for (auto& r : legc) {
+        if (r.label == 1) { n_pos++; continue; }
+        n_neg++;
+        if (r.peak[L11_SLOT] >= THR) target_fp++;
+    }
+    int inc_used = 0;
+    for (auto& r : legc) if (r.label == 1 && r.peak[L11_SLOT] >= THR) inc_used++;
+    std::printf("\n  population %zu spans (%d positive / %d filler)\n", legc.size(), n_pos, n_neg);
+    std::printf("  incumbent L%d @ %.3f : used %d/%d = %.0f%%   filler %d/%d = %.0f%%  << the pin\n",
+                attn_layers[L11_SLOT], THR, inc_used, n_pos, 100.0 * inc_used / n_pos,
+                target_fp, n_neg, 100.0 * target_fp / n_neg);
+
+    // Per-layer thresholds admitting exactly r fillers, from the filler
+    // distribution of whichever span set is in scope.
+    auto thresholds_for = [&](const std::vector<CovSpanRec>& v, int slot, int r) {
+        std::vector<double> f;
+        for (auto& x : v) if (x.label == 0) f.push_back(x.peak[slot]);
+        std::sort(f.begin(), f.end(), std::greater<double>());
+        if (r <= 0) return 1e9;
+        if (r > (int)f.size()) return -1e9;
+        return f[r - 1];
+    };
+    // Evaluate one (subset,k,r) on a span set: {used, filler}.
+    auto eval = [&](const std::vector<CovSpanRec>& v, const std::vector<CovSpanRec>& fit,
+                    const std::vector<int>& slots, int k, int r) {
+        std::vector<double> t;
+        for (int sl : slots) t.push_back(thresholds_for(fit, sl, r));
+        int u = 0, fl = 0;
+        for (auto& x : v) {
+            int votes = 0;
+            for (size_t i = 0; i < slots.size(); ++i)
+                if (x.peak[slots[i]] >= t[i]) votes++;
+            const bool on = votes >= k;
+            if (x.label == 1) { if (on) u++; }
+            else              { if (on) fl++; }
+        }
+        return std::pair<int,int>(u, fl);
+    };
+
+    auto slot_of = [&](int layer) {
+        for (int i = 0; i < S; ++i) if (attn_layers[i] == layer) return i;
+        return -1;
+    };
+    std::vector<CombSpec> specs = {
+        {"L11 (control)",      {slot_of(11)}},
+        {"L7+L11",             {slot_of(7), slot_of(11)}},
+        {"L3+L11",             {slot_of(3), slot_of(11)}},
+        {"L3+L7+L11",          {slot_of(3), slot_of(7), slot_of(11)}},
+        {"L3+L7+L11+L23",      {slot_of(3), slot_of(7), slot_of(11), slot_of(23)}},
+        {"all attention",      {}},
+    };
+    for (int i = 0; i < S; ++i) specs.back().slots.push_back(i);
+    for (auto& sp : specs)
+        for (int sl : sp.slots)
+            if (sl < 0) throw std::runtime_error("COVCOMBINE: a named layer is not tapped by this model");
+
+    // Pick (k,r) maximising used-clear subject to filler <= the incumbent's.
+    auto best_kr = [&](const std::vector<CovSpanRec>& fitset, const std::vector<int>& slots,
+                       int cap, int& bk, int& br) {
+        int bu = -1; bk = 1; br = 0;
+        for (int k = 1; k <= (int)slots.size(); ++k)
+            for (int r = 0; r <= n_neg; ++r) {
+                auto uf = eval(fitset, fitset, slots, k, r);
+                if (uf.second > cap) continue;
+                if (uf.first > bu) { bu = uf.first; bk = k; br = r; }
+            }
+        return bu;
+    };
+
+    // Dump the scored spans so validation design can be iterated WITHOUT
+    // re-running inference. One corpus pass, then arbitrary offline analysis —
+    // the split-half defect below is exactly the kind of thing that needs
+    // several attempts to get right, and each attempt should not cost a GPU run.
+    if (const char* dp = std::getenv("COVCOMBINE_DUMP")) {
+        FILE* f = std::fopen(dp, "w");
+        if (!f) throw std::runtime_error(std::string("COVCOMBINE_DUMP: cannot open ") + dp);
+        std::fprintf(f, "tag,marker,de,label,len,lo,hi,text");
+        for (int i = 0; i < S; ++i) std::fprintf(f, ",L%d", attn_layers[i]);
+        std::fprintf(f, "\n");
+        for (auto& r : legc) {
+            std::string tx = r.text;
+            for (char& c : tx) if (c == ',' || c == '\n' || c == '\r') c = ' ';
+            std::fprintf(f, "%s,%s,%d,%d,%d,%d,%d,%s", r.tag.c_str(), r.marker.c_str(),
+                         r.de ? 1 : 0, r.label, r.len, r.lo, r.hi, tx.c_str());
+            for (int i = 0; i < S; ++i) std::fprintf(f, ",%.6f", r.peak[i]);
+            std::fprintf(f, "\n");
+        }
+        std::fclose(f);
+        std::printf("\n  [dump] %zu spans -> %s\n", legc.size(), dp);
+    }
+
+    std::printf("\n  ---- pooled (fit and scored on the same %zu spans) ----\n", legc.size());
+    std::printf("  %-18s %3s %4s %14s %14s\n", "combiner", "k", "r", "used-clear", "filler-clear");
+    for (auto& sp : specs) {
+        int k, r;
+        best_kr(legc, sp.slots, target_fp, k, r);
+        auto uf = eval(legc, legc, sp.slots, k, r);
+        std::printf("  %-18s %3d %4d %7d/%-3d %3.0f%% %7d/%-3d %3.0f%%%s\n",
+                    sp.name, k, r, uf.first, n_pos, 100.0 * uf.first / n_pos,
+                    uf.second, n_neg, 100.0 * uf.second / n_neg,
+                    uf.first > inc_used ? "   << beats incumbent" : "");
+    }
+
+    // ── DOCUMENT SPLIT-HALF: choose on one half, score on the other ──────────
+    std::vector<std::string> tags;
+    for (auto& r : legc)
+        if (std::find(tags.begin(), tags.end(), r.tag) == tags.end()) tags.push_back(r.tag);
+    std::sort(tags.begin(), tags.end());
+    std::vector<CovSpanRec> hA, hB;
+    for (auto& r : legc) {
+        size_t i = (size_t)(std::find(tags.begin(), tags.end(), r.tag) - tags.begin());
+        (i % 2 ? hB : hA).push_back(r);
+    }
+    auto npos_of = [](const std::vector<CovSpanRec>& v) {
+        int n = 0; for (auto& r : v) if (r.label == 1) n++; return n; };
+    auto nneg_of = [](const std::vector<CovSpanRec>& v) {
+        int n = 0; for (auto& r : v) if (r.label == 0) n++; return n; };
+    auto cap_of = [&](const std::vector<CovSpanRec>& v) {
+        int n = 0; for (auto& r : v) if (r.label == 0 && r.peak[L11_SLOT] >= THR) n++; return n; };
+
+    std::printf("\n  ---- DOCUMENT split-half: FIT on one half, SCORE on the other ----\n");
+    std::printf("  half A %zu spans (%d pos) | half B %zu spans (%d pos)  [%zu documents]\n",
+                hA.size(), npos_of(hA), hB.size(), npos_of(hB), tags.size());
+    std::printf("  %-18s %16s %16s\n", "combiner", "fit A -> score B", "fit B -> score A");
+    for (auto& sp : specs) {
+        int ka, ra, kb, rb;
+        best_kr(hA, sp.slots, cap_of(hA), ka, ra);
+        best_kr(hB, sp.slots, cap_of(hB), kb, rb);
+        auto ab = eval(hB, hA, sp.slots, ka, ra);
+        auto ba = eval(hA, hB, sp.slots, kb, rb);
+        std::printf("  %-18s   %4d/%-3d f%-3d   %4d/%-3d f%-3d\n",
+                    sp.name, ab.first, npos_of(hB), ab.second,
+                    ba.first, npos_of(hA), ba.second);
+    }
+    std::printf("\n  read: a combiner is REAL only if it beats the incumbent pooled AND\n"
+                "  holds up in BOTH out-of-sample columns. Beating pooled alone is a fit.\n"
+                "  (f = filler spans admitted out-of-sample; compare against %d/%d pooled.)\n",
+                target_fp, n_neg);
+    return 0;
+}
+
+static int run_coverage_layer_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                     Tokenizer* tok, const ModelMetadata& meta,
+                                     const std::vector<int32_t>& attn_layers) {
+    covsearch_require_expressible(attn_layers);
+    const int S = (int)attn_layers.size();
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COVSEARCH — coverage layer x threshold search                 ║\n");
+    std::printf("║ docs/plan-coverage-layer-search.md — selection rule is §6      ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    if (band_en_only())
+        std::printf("  *** ENGLISH-ONLY (ATTN_LENS_EN_ONLY=1) — CEILING ARM, not the shipped rate ***\n");
+    std::printf("  candidate layers (%d):", S);
+    for (int s = 0; s < S; ++s) std::printf(" %d", attn_layers[s]);
+    std::printf("   |  incumbent: layer %d @ 0.705 (slot %d)\n", attn_layers[L11_SLOT], L11_SLOT);
+
+    std::vector<CovSpanRec> cal, hel, legc;
+    int cite_n = 0, cite_t1 = 0, cite_t3 = 0;
+    covsearch_arm1(fp, sched, tok, meta, attn_layers, cal, hel);
+    covsearch_arm2(fp, sched, tok, meta, attn_layers, legc, cite_n, cite_t1, cite_t3);
+
+    auto pairs = [&](const std::vector<CovSpanRec>& v, int s) {
+        std::vector<std::pair<double, bool>> d;
+        for (auto& r : v) d.push_back({r.peak[s], r.label == 1});
+        return d;
+    };
+    auto med_of = [&](const std::vector<CovSpanRec>& v, int s, int lab) {
+        std::vector<double> x; for (auto& r : v) if (r.label == lab) x.push_back(r.peak[s]);
+        return median(x);
+    };
+    auto npos = [&](const std::vector<CovSpanRec>& v) {
+        int n = 0; for (auto& r : v) if (r.label == 1) n++; return n; };
+
+    std::vector<CovSpanRec> cov_all = cal; cov_all.insert(cov_all.end(), hel.begin(), hel.end());
+    std::printf("\n  COV1  calib %zu spans (%d USED)  held %zu (%d USED)   |   "
+                "Leg C %zu spans (%d positive)\n",
+                cal.size(), npos(cal), hel.size(), npos(hel), legc.size(), npos(legc));
+
+    // ── Arm 1 curve ──────────────────────────────────────────────────────────
+    std::printf("\n---- ARM 1: COV1 separation per layer (hard negatives) ----\n");
+    std::printf("  %-7s %9s %9s %9s   %9s %9s\n",
+                "layer", "AUC calib", "AUC held", "AUC pool", "med USED", "med DROP");
+    std::vector<double> auc_held(S), auc_pool(S);
+    for (int s = 0; s < S; ++s) {
+        auc_held[s] = auc_of(pairs(hel, s));
+        auc_pool[s] = auc_of(pairs(cov_all, s));
+        std::printf("  L%-6d %9.3f %9.3f %9.3f   %9.3f %9.3f%s\n",
+                    attn_layers[s], auc_of(pairs(cal, s)), auc_held[s], auc_pool[s],
+                    med_of(cov_all, s, 1), med_of(cov_all, s, 0),
+                    s == L11_SLOT ? "   << incumbent" : "");
+    }
+
+    // ── Arm 2 curve ──────────────────────────────────────────────────────────
+    std::printf("\n---- ARM 2: Leg C separation per layer (ambient, length-matched) ----\n");
+    std::printf("  %-7s %9s   %9s %9s\n", "layer", "AUC legC", "med value", "med filler");
+    std::vector<double> auc_legc(S);
+    for (int s = 0; s < S; ++s) {
+        auc_legc[s] = auc_of(pairs(legc, s));
+        std::printf("  L%-6d %9.3f   %9.3f %9.3f%s\n",
+                    attn_layers[s], auc_legc[s], med_of(legc, s, 1), med_of(legc, s, 0),
+                    s == L11_SLOT ? "   << incumbent" : "");
+    }
+
+    // ── The decisive comparison: used-clear at MATCHED filler-clear ──────────
+    // AUC ranks layers over every operating point at once, and the two rate
+    // columns above are each read at a DIFFERENT point, so neither answers the
+    // only question that moves a constant: at the incumbent's own false-positive
+    // rate, does any layer report more of the genuinely-consulted spans? The
+    // operating point here is PINNED by the incumbent (admit exactly as many
+    // filler spans as layer 11 @ 0.705 does) and is therefore not fitted — no
+    // layer gets to buy used-clear with silent misses, which is exactly how the
+    // §7 candidate reached 99%.
+    int inc_fp = 0, n_neg = 0, n_pos = 0;
+    for (auto& r : legc) {
+        if (r.label == 1) { n_pos++; continue; }
+        n_neg++;
+        if (r.peak[L11_SLOT] >= 0.705) inc_fp++;
+    }
+    std::printf("\n---- MATCHED-FPR: used-clear when every layer admits %d/%d filler spans ----\n",
+                inc_fp, n_neg);
+    std::printf("  (operating point pinned by the incumbent, not fitted)\n");
+    std::printf("  %-7s %10s %14s %14s\n", "layer", "threshold", "filler-clear", "used-clear");
+    int best_m = -1, best_m_clear = -1;
+    std::vector<int> mfpr_uc((size_t)S, 0);      // pooled matched-FPR used-clear, per layer
+    for (int s = 0; s < S; ++s) {
+        std::vector<double> neg;
+        for (auto& r : legc) if (r.label == 0) neg.push_back(r.peak[s]);
+        std::sort(neg.begin(), neg.end(), std::greater<double>());
+        // Admit the inc_fp highest-scoring filler spans; ties can push the
+        // realised count above inc_fp, so the achieved rate is printed, never assumed.
+        double t = (inc_fp > 0 && inc_fp <= (int)neg.size()) ? neg[inc_fp - 1]
+                 : (neg.empty() ? 0.0 : neg.front() + 1e-6);
+        int fc = 0, uc = 0;
+        for (auto& r : legc) {
+            if (r.peak[s] < t) continue;
+            if (r.label == 1) uc++; else fc++;
+        }
+        std::printf("  L%-6d %10.3f %9d/%-4d %9d/%-4d  %5.0f%%%s\n",
+                    attn_layers[s], t, fc, n_neg, uc, n_pos, n_pos ? 100.0 * uc / n_pos : 0,
+                    s == L11_SLOT ? "   << incumbent" : "");
+        mfpr_uc[(size_t)s] = uc;
+        if (uc > best_m_clear) { best_m_clear = uc; best_m = s; }
+    }
+    std::printf("  >>> best at matched FPR: layer %d (%d/%d = %.0f%%)   incumbent layer %d\n",
+                attn_layers[best_m], best_m_clear, n_pos,
+                n_pos ? 100.0 * best_m_clear / n_pos : 0, attn_layers[L11_SLOT]);
+
+    // ── Split-half stability. The winner above was chosen on Leg C and scored
+    // on Leg C: 8 candidates against 75 positives, which is far better than the
+    // incumbent's 48-against-12 but is still selection and evaluation on one
+    // corpus. EN (8 docs) and DE (7 docs) are disjoint halves of it, so a layer
+    // that wins BOTH independently is not a fluke of which spans we happened to
+    // have. Each half re-pins its own operating point to the incumbent's rate on
+    // that half — comparing halves at a shared threshold would smuggle the
+    // pooled fit back in.
+    std::printf("\n---- MATCHED-FPR split-half stability (EN %d docs / DE %d docs) ----\n", 8, 7);
+    std::printf("  %-7s %18s %18s\n", "layer", "EN used-clear", "DE used-clear");
+    int win_en = -1, win_de = -1, bc_en = -1, bc_de = -1;
+    std::vector<int> uc_en((size_t)S, 0), uc_de((size_t)S, 0);
+    int np_en = 0, np_de = 0;
+    for (int s = 0; s < S; ++s) {
+        int uc[2] = {0, 0}, np[2] = {0, 0};
+        for (int half = 0; half < 2; ++half) {
+            const bool want_de = (half == 1);
+            std::vector<double> neg;
+            int fp_here = 0;
+            for (auto& r : legc) {
+                if (r.de != want_de) continue;
+                if (r.label == 1) { np[half]++; continue; }
+                neg.push_back(r.peak[s]);
+                if (r.peak[L11_SLOT] >= 0.705) fp_here++;
+            }
+            std::sort(neg.begin(), neg.end(), std::greater<double>());
+            double t = (fp_here > 0 && fp_here <= (int)neg.size()) ? neg[fp_here - 1]
+                     : (neg.empty() ? 0.0 : neg.front() + 1e-6);
+            for (auto& r : legc)
+                if (r.de == want_de && r.label == 1 && r.peak[s] >= t) uc[half]++;
+        }
+        std::printf("  L%-6d %11d/%-4d %11d/%-4d   %3.0f%% / %3.0f%%%s\n",
+                    attn_layers[s], uc[0], np[0], uc[1], np[1],
+                    np[0] ? 100.0 * uc[0] / np[0] : 0, np[1] ? 100.0 * uc[1] / np[1] : 0,
+                    s == L11_SLOT ? "   << incumbent" : "");
+        uc_en[(size_t)s] = uc[0]; uc_de[(size_t)s] = uc[1];
+        np_en = np[0]; np_de = np[1];
+        if (uc[0] > bc_en) { bc_en = uc[0]; win_en = s; }
+        if (uc[1] > bc_de) { bc_de = uc[1]; win_de = s; }
+    }
+    std::printf("  >>> EN winner: layer %d    DE winner: layer %d    => %s\n",
+                attn_layers[win_en], attn_layers[win_de],
+                win_en == win_de ? "AGREE (the winner survives a disjoint split)"
+                                 : "DISAGREE — the pooled winner is not stable across halves");
+
+    // ── §6 selection — rebuilt 2026-09-14, because the old one could not fail ─
+    //
+    // It used to select on Arm 1 HELD AUC and require a neighbour to beat the
+    // median AUC. Run bilingually on the corrected negatives, both calibrated
+    // models printed `best held AUC 1.000, median 1.000`: the metric is
+    // SATURATED, so no layer can strictly beat the median and the plateau test
+    // failed by construction — on the candidate AND on every alternative. A
+    // test whose outcome is fixed by its metric's ceiling is not a test, and it
+    // was reporting FAIL for a reason that had nothing to do with the layer.
+    //
+    // The replacement uses the split the corpus already has. EN (8 documents)
+    // and DE (7 documents) are disjoint, each re-pins its own operating point
+    // to the incumbent's filler rate on that half, and each carries enough
+    // positives (40 / 35) not to saturate. So:
+    //
+    //   SELECT on one language, SCORE on the other, in BOTH directions.
+    //
+    // That is genuinely out-of-sample, it cannot be satisfied by a layer that
+    // wins on one language and collapses on the other — which is exactly what
+    // the 9B's L7 does (98% EN, 51% DE) and what an English-only harness said
+    // was a win — and it is STRICTER than what it replaces, not looser. The
+    // AUC line is still printed, as a diagnostic, labelled for what it is.
+    const int inc_pool = mfpr_uc[(size_t)L11_SLOT];
+    int best = best_m;                       // pooled matched-FPR winner
+    double med_auc = median(auc_held);
+    std::printf("\n---- §6 SELECTION (matched-FPR, cross-language) ----\n");
+    int auc_best = 0;
+    for (int s = 1; s < S; ++s) if (auc_held[s] > auc_held[auc_best]) auc_best = s;
+    std::printf("  diagnostic only, NOT a gate: best held AUC layer %d (%.3f), median %.3f%s\n",
+                attn_layers[auc_best], auc_held[auc_best], med_auc,
+                (auc_held[auc_best] >= 0.999 && med_auc >= 0.999)
+                    ? "  << SATURATED — this is why it is no longer a criterion" : "");
+
+    // Cross-half generalisation: the layer chosen on one language must beat the
+    // incumbent ON THE OTHER, both ways, and the two halves must choose the
+    // same layer.
+    const bool en_to_de = uc_de[(size_t)win_en] > uc_de[(size_t)L11_SLOT];
+    const bool de_to_en = uc_en[(size_t)win_de] > uc_en[(size_t)L11_SLOT];
+    const bool halves_agree = (win_en == win_de);
+    std::printf("  select on EN (L%d) -> score on DE: %d/%d vs incumbent %d/%d  %s\n",
+                attn_layers[win_en], uc_de[(size_t)win_en], np_de,
+                uc_de[(size_t)L11_SLOT], np_de, en_to_de ? "BEATS" : "does not beat");
+    std::printf("  select on DE (L%d) -> score on EN: %d/%d vs incumbent %d/%d  %s\n",
+                attn_layers[win_de], uc_en[(size_t)win_de], np_en,
+                uc_en[(size_t)L11_SLOT], np_en,
+                de_to_en ? "BEATS"
+                         : (win_de == L11_SLOT ? "does not beat (this half's winner IS the incumbent"
+                                                 " — it fields no challenger)"
+                                               : "does not beat"));
+    std::printf("  the two halves %s on a winner\n",
+                halves_agree ? "AGREE" : "DISAGREE");
+
+    // Plateau, re-based on the same quantity the decision is made on: an
+    // ADJACENT layer must also beat the incumbent at the matched budget. A real
+    // signal occupies a region of the stack; one layer alone on 75 spans is a
+    // coincidence until a neighbour corroborates it.
+    const bool nb_lo = best > 0     && mfpr_uc[(size_t)best - 1] > inc_pool;
+    const bool nb_hi = best + 1 < S && mfpr_uc[(size_t)best + 1] > inc_pool;
+    const bool plateau = nb_lo || nb_hi;
+    {
+        std::string nb;
+        if (nb_lo) nb += "L" + std::to_string(attn_layers[best - 1]);
+        if (nb_hi) { if (!nb.empty()) nb += " and "; nb += "L" + std::to_string(attn_layers[best + 1]); }
+        std::printf("  plateau (a neighbour of L%d must also beat the incumbent at matched FPR): %s%s%s\n",
+                    attn_layers[best], plateau ? "PASS — " : "FAIL",
+                    plateau ? nb.c_str() : " — lone spike",
+                    plateau ? "" : "");
+    }
+
+    Thr thr = best_threshold(pairs(cal, best));   // calib split ONLY
+    std::printf("  threshold on the COV1 CALIB split only: %.3f dir%+d (calib acc %.0f%%)\n",
+                thr.t, thr.dir, 100 * thr.acc);
+
+    // ── §7 gate, scored on Arm 2 (which chose nothing) ───────────────────────
+    auto rates = [&](int s, double t, int dir, int& pc, int& pn, int& nc, int& nn) {
+        pc = pn = nc = nn = 0;
+        for (auto& r : legc) {
+            bool clear = dir > 0 ? r.peak[s] >= t : r.peak[s] <= t;
+            if (r.label == 1) { pn++; if (clear) pc++; } else { nn++; if (clear) nc++; }
+        }
+    };
+    int cpc, cpn, cnc, cnn, fpc, fpn, fnc, fnn;
+    rates(best,      thr.t, thr.dir, cpc, cpn, cnc, cnn);
+    rates(L11_SLOT,  0.705, +1,      fpc, fpn, fnc, fnn);
+    auto pc100 = [](int a, int b) { return b ? 100.0 * a / b : 0.0; };
+    std::printf("\n---- §7 GATE — out-of-sample on Leg C ----\n");
+    std::printf("  %-34s %14s %14s\n", "", "used-clear", "filler-clear");
+    std::printf("  incumbent  L%-2d @ 0.705          %9d/%-4d %9d/%-4d\n",
+                attn_layers[L11_SLOT], fpc, fpn, fnc, fnn);
+    std::printf("  %-34s %11.0f%%   %11.0f%%\n", "", pc100(fpc, fpn), pc100(fnc, fnn));
+    std::printf("  candidate  L%-2d @ %.3f dir%+d     %9d/%-4d %9d/%-4d\n",
+                attn_layers[best], thr.t, thr.dir, cpc, cpn, cnc, cnn);
+    std::printf("  %-34s %11.0f%%   %11.0f%%\n", "", pc100(cpc, cpn), pc100(cnc, cnn));
+
+    // ── The criteria ─────────────────────────────────────────────────────────
+    // G2 changed 2026-09-14. It used to compare the candidate's filler-clear at
+    // its FITTED threshold against the incumbent's at 0.705 — two different
+    // operating points, so a candidate was penalised for where its threshold
+    // happened to land rather than for what it can do. The matched-FPR table
+    // above already pins both to the same filler budget; G2 now reads that,
+    // and demands the win survive being chosen on one language and scored on
+    // the other. Strictly harder than what it replaces: the old G2 could be
+    // passed by a layer that never generalises across the split.
+    bool g1 = pc100(cpc, cpn) >= 90.0;
+    bool g2 = halves_agree && en_to_de && de_to_en;
+    bool g3 = plateau;
+    double t3 = pc100(cite_t3, cite_n);
+    std::printf("\n  G1 used-clear >=90%%            : %s (%.0f%%)\n", g1 ? "PASS" : "FAIL", pc100(cpc, cpn));
+    std::printf("  G2 beats incumbent at matched FPR, cross-language : %s\n", g2 ? "PASS" : "FAIL");
+    std::printf("       (pooled: candidate L%d %d/%d vs incumbent L%d %d/%d)\n",
+                attn_layers[best], mfpr_uc[(size_t)best], n_pos,
+                attn_layers[L11_SLOT], inc_pool, n_pos);
+    std::printf("  G3 plateau at matched FPR      : %s\n", g3 ? "PASS" : "FAIL");
+    std::printf("  G4 citation unchanged (L%dH%d)  : top1 %.1f%%  top3 %.1f%%  over %d value tokens\n"
+                "     (propagation check — compare against the known leg C run for this model)\n",
+                attn_layers[FROZEN_SLOT], FROZEN_HEAD, pc100(cite_t1, cite_n), t3, cite_n);
+    std::printf("\n── COVSEARCH VERDICT: %s ──\n",
+                (g1 && g2 && g3) ? "candidate clears G1-G3 — record it, then re-run on the other "
+                                   "calibrated model AND through the drift gate "
+                                   "(BANDDRIFT, plan-lens-server-shape.md §4.4) before moving "
+                                   "any constant"
+                                 : "KEEP layer 11 @ 0.705 — the candidate did not clear the gate");
+
+    // ── BAND COST — what decision stability costs at the shipped threshold ────
+    // The v5 "decision stability" proposal publishes a BAND around the coverage
+    // threshold inside which our own arithmetic cannot resolve the span:
+    //     |peak - 0.705| <= band  =>  "borderline", not "skipped"/"consulted".
+    //
+    // That question has two halves and they are separable:
+    //   COST        how many of the report's decisions a band of width w
+    //               withdraws. Needs NO config change — measured here.
+    //   REQUIREMENT how far peaks actually MOVE under a config change we intend
+    //               to permit (flash prefill, batch shape, driver). Needs a
+    //               perturbation; measured separately.
+    //
+    // The decisive number is the ZERO-COST BAND: the smallest |peak - 0.705|
+    // over all scored spans. Any band narrower than that withdraws nothing at
+    // all, so it is exactly the drift we can absorb for free. If it is wide, we
+    // can pick a generous band NOW and be safe against drift not yet measured.
+    //
+    // Population is Leg C (out-of-sample: labelled values + length-matched
+    // filler negatives), scored at the incumbent slot — the same spans and the
+    // same scalar the §7 gate above reports.
+    {
+        const double THR = 0.705;
+        std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+        std::printf("║ BAND COST — decision stability at L%-2d @ %.3f                  ║\n",
+                    attn_layers[L11_SLOT], THR);
+        std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+        struct BRec { double peak, dist; int label; const char* tag; const char* marker; bool de; };
+        std::vector<BRec> br;
+        for (auto& r : legc)
+            br.push_back({r.peak[L11_SLOT], std::fabs(r.peak[L11_SLOT] - THR),
+                          r.label, r.tag.c_str(), r.marker.c_str(), r.de});
+        std::sort(br.begin(), br.end(),
+                  [](const BRec& a, const BRec& b) { return a.dist < b.dist; });
+
+        int tot = (int)br.size(), P = 0, N = 0, cur_skipped = 0;
+        for (auto& b : br) { if (b.label == 1) P++; else N++; if (b.peak < THR) cur_skipped++; }
+        std::printf("  population: %d spans (%d positive / %d filler) | currently in skipped[] : %d\n",
+                    tot, P, N, cur_skipped);
+
+        // Peak distribution — is the mass bimodal AROUND the threshold, or piled ON it?
+        auto qtile = [&](int lab, double q) {
+            std::vector<double> x;
+            for (auto& r : legc) if (r.label == lab) x.push_back(r.peak[L11_SLOT]);
+            if (x.empty()) return 0.0;
+            std::sort(x.begin(), x.end());
+            size_t i = (size_t)(q * (x.size() - 1));
+            return x[i];
+        };
+        std::printf("\n  peak distribution at L%d           p05     p25     p50     p75     p95\n",
+                    attn_layers[L11_SLOT]);
+        std::printf("    positive (consulted)         %7.3f %7.3f %7.3f %7.3f %7.3f\n",
+                    qtile(1, 0.05), qtile(1, 0.25), qtile(1, 0.50), qtile(1, 0.75), qtile(1, 0.95));
+        std::printf("    filler   (not consulted)     %7.3f %7.3f %7.3f %7.3f %7.3f\n",
+                    qtile(0, 0.05), qtile(0, 0.25), qtile(0, 0.50), qtile(0, 0.75), qtile(0, 0.95));
+
+        std::printf("\n  ZERO-COST BAND = %.4f   (nearest span to the threshold)\n",
+                    br.empty() ? 0.0 : br[0].dist);
+
+        std::printf("\n  ---- the %d spans closest to %.3f (these flip first) ----\n",
+                    (int)std::min<size_t>(12, br.size()), THR);
+        std::printf("  %-8s %-3s %-18s %-9s %7s %8s\n", "tag", "lg", "marker", "label", "peak", "dist");
+        for (size_t i = 0; i < br.size() && i < 12; ++i)
+            std::printf("  %-8s %-3s %-18s %-9s %7.4f %8.4f\n",
+                        br[i].tag, br[i].de ? "de" : "en", br[i].marker,
+                        br[i].label == 1 ? "positive" : "filler", br[i].peak, br[i].dist);
+
+        // Recall without its false-positive rate is not a ceiling. The
+        // split-half table above splits used-clear by language but NOT
+        // filler-clear, so this is the missing half.
+        {
+            int up = 0, un = 0, fpn = 0, fnn = 0;
+            for (auto& r : legc) {
+                const bool clear = r.peak[L11_SLOT] >= THR;
+                if (r.label == 1) { un++; if (clear) up++; }
+                else              { fnn++; if (clear) fpn++; }
+            }
+            std::printf("\n  operating point L%d @ %.3f on THIS population:\n",
+                        attn_layers[L11_SLOT], THR);
+            std::printf("    used-clear   %3d/%-3d = %3.0f%%   (recall)\n",
+                        up, un, un ? 100.0 * up / un : 0.0);
+            std::printf("    filler-clear %3d/%-3d = %3.0f%%   (false-positive rate)\n",
+                        fpn, fnn, fnn ? 100.0 * fpn / fnn : 0.0);
+        }
+
+        std::printf("\n  ---- cost curve: what a band of width w withdraws ----\n");
+        std::printf("  %8s %10s %10s %10s   %12s\n",
+                    "band w", "borderln", "of which+", "of which f", "% of skipped[]");
+        const double ws[] = {0.005, 0.010, 0.020, 0.030, 0.050, 0.075, 0.100, 0.150};
+        for (double w : ws) {
+            int nb = 0, nbp = 0, nbf = 0, nbs = 0;
+            for (auto& b : br) {
+                if (b.dist > w) continue;
+                nb++;
+                if (b.label == 1) nbp++; else nbf++;
+                if (b.peak < THR) nbs++;
+            }
+            std::printf("  %8.3f %6d/%-4d %10d %10d   %11.0f%%\n",
+                        w, nb, tot, nbp, nbf, cur_skipped ? 100.0 * nbs / cur_skipped : 0.0);
+        }
+        std::printf("\n  read: a band of width w is AFFORDABLE if the right-hand column stays\n"
+                    "  small — that is the fraction of today's omission claims it withdraws.\n"
+                    "  It is SUFFICIENT if w exceeds the measured drift (not measured here).\n");
+    }
+
+    return 0;
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // GEMMA4 candidate-space SEARCH — every (layer,head) candidate scored on the
 // Leg C messy corpus DIRECTLY, Metric A and Metric B in the same pass. Gated
@@ -5436,6 +7025,375 @@ static int run_gemma4_search_dual(ForwardPassBase* fp, ggml_backend_sched_t sche
             break;
         }
     }
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// MLXCMP — cross-RUNTIME head-survival dump. Does the frozen citation head
+// found under ggml stay the best head under MLX's kernels?
+//
+// The lens ships a single (layer, head) coordinate per calibrated model. That
+// coordinate was found under ggml+Metal. Porting the tap to MLX (docs: the
+// iPhone envelope) replaces every kernel upstream of the softmax — RoPE,
+// q/k-norm, the projections, matmul order — so the coordinate is only portable
+// if head IDENTITY is a property of the weights rather than of the kernels.
+//
+// This probe dumps everything the MLX side needs to recompute the SAME metric
+// on the SAME tokens, plus the ggml-side per-(layer,head) table to compare
+// against. It TEACHER-FORCES: the MLX run consumes the exact prompt+generated
+// ids recorded here, so tokenizer differences, sampling and grammar divergence
+// are all removed as variables and the only thing left is numerics.
+//
+// Scorer is qdocs_eval_field's verbatim: topk_head (position 0 excluded — the
+// attention sink), in-span with TOL=2, top-1 and top-3. cite_n is reported per
+// the §4.2 rule, because a field the model got WRONG leaves the denominator.
+//
+// Gated MLXCMP=1; MLXCMP_OUT names the JSON (default mlxcmp.json).
+// ═════════════════════════════════════════════════════════════════════════
+static int run_mlx_compare_dump(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                Tokenizer* tok, const ModelMetadata& meta,
+                                const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ MLXCMP — cross-runtime head-survival dump (ggml reference)    ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    std::printf("tapped layers=%d heads=%d candidates=%d\n", S, H, S * H);
+
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+
+    // Byte-identical TASK to run_qdocs_leg_c / run_head_aggregation_probe, so
+    // the ggml table below is comparable to the published ARM A numbers.
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    nlohmann::json out;
+    out["arch"]        = g_arch;
+    out["n_head"]      = H;
+    out["attn_layers"] = attn_layers;
+    out["tol"]         = TOL;
+    out["docs"]        = nlohmann::json::array();
+
+    // ggml-side per-(layer,head) citation table.
+    std::vector<std::vector<long>> t1(S, std::vector<long>(H, 0));
+    std::vector<std::vector<long>> t3(S, std::vector<long>(H, 0));
+    int cite_n = 0, fields_total = 0, fields_dropped = 0;
+
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        int doc_lo, doc_hi;
+        if (!qdocs_span_in_prompt(tok, R, d.document, doc_lo, doc_hi)) { doc_lo = 0; doc_hi = R.P - 1; }
+
+        nlohmann::json jd;
+        jd["tag"]        = d.tag;
+        jd["de"]         = d.de;
+        jd["P"]          = R.P;
+        jd["prompt_ids"] = R.prompt_tokens;
+        jd["gen_ids"]    = R.gen_tokens;
+        jd["gen_text"]   = R.gen_text;
+        jd["doc_lo"]     = doc_lo;
+        jd["doc_hi"]     = doc_hi;
+        jd["n_kv_at_step"] = R.n_kv_at_step;
+        jd["fields"]     = nlohmann::json::array();
+
+        std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+        int doc_cite = 0;
+        for (const QLabel& f : d.fields) {
+            fields_total++;
+            int slo, shi;
+            if (!qdocs_span_in_prompt(tok, R, f.value, slo, shi)) { fields_dropped++; continue; }
+            size_t gb = R.gen_text.find(f.value);
+            if (gb == std::string::npos) { fields_dropped++; continue; }  // §4.2: leaves the denominator
+            size_t ge = gb + f.value.size();
+
+            std::vector<int> gpos;
+            for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+                if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+                if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+                gpos.push_back(g);
+                const int n_kv = R.n_kv_at_step[g - 1];
+                cite_n++; doc_cite++;
+                auto in = [&](int p) { return p >= slo - TOL && p <= shi + TOL; };
+                for (int s = 0; s < S; ++s) {
+                    for (int h = 0; h < H; ++h) {
+                        auto tk = topk_head(R.rows[g - 1][s], h, n_kv, 3);
+                        if (!tk.empty() && in(tk[0].first)) t1[s][h]++;
+                        for (auto& pr : tk) if (in(pr.first)) { t3[s][h]++; break; }
+                    }
+                }
+            }
+            nlohmann::json jf;
+            jf["concept"] = f.concept;
+            jf["value"]   = f.value;
+            jf["slo"]     = slo;
+            jf["shi"]     = shi;
+            jf["gpos"]    = gpos;
+            jd["fields"].push_back(jf);
+        }
+        // Coverage spans, built by covsearch_arm2's rule verbatim: positives are
+        // every labelled value found in the prompt (NOT conditioned on the model
+        // emitting it — coverage is not subject to §4.2), negatives are
+        // length-matched filler windows cut deterministically from the document
+        // positions no value occupies. The MLX legs need these to recompute the
+        // coverage span-peak, which is a MAGNITUDE, unlike the citation rank.
+        {
+            std::vector<char> occupied(R.P, 0);
+            std::vector<std::pair<int,int>> pos;   // (lo,hi)
+            for (const QLabel& f : d.fields) {
+                int slo, shi;
+                if (!qdocs_span_in_prompt(tok, R, f.value, slo, shi)) continue;
+                for (int p = std::max(0, slo - TOL); p <= std::min(R.P - 1, shi + TOL); ++p)
+                    occupied[p] = 1;
+                pos.push_back({slo, shi});
+            }
+            std::vector<std::pair<int,int>> runs;
+            {
+                int p = std::max(1, doc_lo), lim = std::min(R.P - 1, doc_hi);
+                while (p <= lim) {
+                    if (occupied[p]) { ++p; continue; }
+                    int s0 = p; while (p <= lim && !occupied[p]) ++p;
+                    runs.push_back({s0, p - s0});
+                }
+            }
+            jd["cov_spans"] = nlohmann::json::array();
+            for (auto& pr : pos) {
+                nlohmann::json j; j["lo"] = pr.first; j["hi"] = pr.second; j["label"] = 1;
+                jd["cov_spans"].push_back(j);
+            }
+            size_t ri = 0; int roff = 0;
+            for (auto& pr : pos) {
+                int L = pr.second - pr.first + 1;
+                while (ri < runs.size() && runs[ri].second - roff < L) { ++ri; roff = 0; }
+                if (ri >= runs.size()) continue;
+                int nlo = runs[ri].first + roff;
+                roff += L;
+                nlohmann::json j; j["lo"] = nlo; j["hi"] = nlo + L - 1; j["label"] = 0;
+                jd["cov_spans"].push_back(j);
+            }
+            // ggml's own per-layer span peak for each span, by span_scalars'
+            // definition — the reference the MLX legs' magnitudes are compared
+            // against. The shipped coverage constant was measured on THIS side.
+            for (auto& j : jd["cov_spans"]) {
+                double sc[12][4];
+                span_scalars(R, j["lo"].get<int>(), j["hi"].get<int>(), sc, attn_layers);
+                std::vector<double> per_layer;
+                for (int s2 = 0; s2 < S; ++s2) per_layer.push_back(sc[1 + s2][0]);
+                j["ggml_peak"] = per_layer;
+            }
+        }
+        std::printf("  [%-6s%s] P=%4d G=%3zu fields=%2zu scored_pos=%3d cov_spans=%zu\n",
+                    d.tag.c_str(), d.de ? " DE" : "   ", R.P, R.gen_tokens.size(),
+                    d.fields.size(), doc_cite, jd["cov_spans"].size());
+        out["docs"].push_back(jd);
+    }
+
+    out["ggml"]["cite_n"]          = cite_n;
+    out["ggml"]["fields_total"]    = fields_total;
+    out["ggml"]["fields_dropped"]  = fields_dropped;
+    out["ggml"]["t1"]              = t1;
+    out["ggml"]["t3"]              = t3;
+
+    // ── ggml reference table ────────────────────────────────────────────────
+    std::printf("\n---- ggml per-(layer,head) top-3 in-span, over %d scored value tokens ----\n", cite_n);
+    std::printf("  (%d of %d labelled fields left the denominator — §4.2)\n",
+                fields_dropped, fields_total);
+    std::printf("  %-7s", "layer");
+    for (int h = 0; h < H; ++h) std::printf(" %5s%-2d", "H", h);
+    std::printf("\n");
+    int bs = 0, bh = 0; long bt3 = -1;
+    for (int s = 0; s < S; ++s) {
+        std::printf("  L%-6d", attn_layers[s]);
+        for (int h = 0; h < H; ++h) {
+            std::printf(" %6.1f%%", cite_n ? 100.0 * t3[s][h] / cite_n : 0.0);
+            if (t3[s][h] > bt3) { bt3 = t3[s][h]; bs = s; bh = h; }
+        }
+        std::printf("\n");
+    }
+    std::printf("  >>> ggml argmax head: L%dH%d  top3 %.1f%%  top1 %.1f%%\n",
+                attn_layers[bs], bh, cite_n ? 100.0 * bt3 / cite_n : 0.0,
+                cite_n ? 100.0 * t1[bs][bh] / cite_n : 0.0);
+    out["ggml"]["argmax_slot"] = bs;
+    out["ggml"]["argmax_head"] = bh;
+
+    const char* op = std::getenv("MLXCMP_OUT");
+    std::string path = op ? op : "mlxcmp.json";
+    std::ofstream os(path);
+    if (!os) {
+        std::fprintf(stderr, "MLXCMP: cannot open output path '%s' for writing\n", path.c_str());
+        return 1;
+    }
+    os << out.dump();
+    os.close();
+    std::printf("\n  wrote %s\n", path.c_str());
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// HEAD AGGREGATION PROBE — does a parameter-free aggregation over attention
+// heads recover the citation signal where per-head search failed (Gemma 4:
+// best single head L4H7 41%/51% vs a >=90% bar; docs/note-lens-gemma4-probe.md
+// §6)? Reuses the same corpus/task/scorer as run_qdocs_leg_c and
+// run_gemma4_search_dual verbatim (same TOL=2, same in-span definition, same
+// 15-doc EN+DE messy corpus, same top3_positions scan) but replaces the
+// per-(layer,head) CANDIDATE search with FOUR aggregation arms computed on
+// the raw attention weights alpha (Metric A shape only -- no ||V||):
+//   A: max over the H heads within a layer, swept over every tapped layer.
+//   B: mean over the H heads within a layer, swept over every tapped layer.
+//   C: max over every (layer,head) pair. Zero parameters.
+//   D: mean over every (layer,head) pair. Zero parameters.
+// Architecture-agnostic by construction: it reads R.rows[step][slot], the
+// tap output every FreeRun already carries via run_freegen_grammar (which
+// goes through qdocs_chat_prompt/prompt_with_bos, so Gemma 4's leading BOS
+// and Gemma4ChatTemplate are honoured exactly as run_gemma4_search_dual's
+// setup path honours them -- this function calls the same helper, not a
+// reimplementation). It never touches a KV-cache tensor, so it needs none of
+// run_gemma4_search_dual's gemma4-only global/swa cache-splitting -- that
+// machinery exists only for Metric B's ||V||, which this probe does not
+// compute. Gated ATTN_HEAD_AGG=1.
+// ═════════════════════════════════════════════════════════════════════════
+static int run_head_aggregation_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                      Tokenizer* tok, const ModelMetadata& meta,
+                                      const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ HEAD AGGREGATION PROBE -- max/mean over heads, per-layer+global ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int TOL = 2;
+    const std::vector<std::string>& vocab = tok->get_vocabulary();
+    const uint32_t vocab_size = (uint32_t)vocab.size();
+    qinf::TokenTrie trie; trie.build(vocab);
+    auto gr = qinf::GrammarVocab::parse_impl(QDOCS_GBNF);
+    gr->set_token_trie(&trie);
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    // Byte-identical TASK to run_qdocs_leg_c / run_gemma4_search_dual.
+    const char* TASK = "\n\nExtract every fact from the email above into a flat JSON "
+        "object of \"key\": \"value\" pairs. Use short snake_case keys — prefer keys like: "
+        "customer, product, quantity, unit_price, total, order_date, delivery, order_number. "
+        "Copy each value verbatim from the email. Output ONLY the JSON object, nothing else.";
+
+    auto corpus = qdocs_messy_corpus();
+
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    std::printf("layers=%d heads=%d\n", S, H);
+
+    std::vector<long> t1_max(S, 0), t3_max(S, 0), t1_mean(S, 0), t3_mean(S, 0);
+    long t1_gmax = 0, t3_gmax = 0, t1_gmean = 0, t3_gmean = 0;
+    int cite_n = 0;
+
+    std::vector<float> rowMax, rowMean, gRowMax, gRowMean;
+
+    for (const QMessy& d : corpus) {
+        std::string prompt = qdocs_chat_prompt(d.document, TASK);
+        std::vector<GStep> tr;
+        FreeRun R = run_freegen_grammar(fp, sched, tok, meta, prompt, "", taps,
+                                        320, gr.get(), vocab, vocab_size, &tr);
+        std::printf("\n[%s%s] %s\n", d.tag.c_str(), d.de ? " DE" : "", R.gen_text.c_str());
+
+        std::vector<size_t> gcum = cum_bytes(tok, R.gen_tokens);
+        for (const QLabel& f : d.fields) {
+            int slo, shi;
+            if (!qdocs_span_in_prompt(tok, R, f.value, slo, shi)) continue;
+            size_t gb = R.gen_text.find(f.value);
+            if (gb == std::string::npos) continue;   // normalized away, unscoreable
+            size_t ge = gb + f.value.size();
+            auto in = [&](int p) { return p >= 1 && p >= slo - TOL && p <= shi + TOL; };
+
+            for (int g = 0; g < (int)R.gen_tokens.size(); ++g) {
+                if (!(gcum[g] < ge && gcum[g + 1] > gb)) continue;
+                if (g < 1 || g - 1 >= (int)R.rows.size()) continue;
+                int n_kv = R.n_kv_at_step[g - 1];
+                cite_n++;
+
+                gRowMax.assign(n_kv, -1e30f);
+                gRowMean.assign(n_kv, 0.0f);
+                for (int s = 0; s < S; ++s) {
+                    const float* rowBase = R.rows[g - 1][s].data();
+                    rowMax.assign(n_kv, -1e30f);
+                    rowMean.assign(n_kv, 0.0f);
+                    for (int h = 0; h < H; ++h) {
+                        const float* r = rowBase + (size_t)h * n_kv;
+                        for (int j = 0; j < n_kv; ++j) {
+                            float x = r[j];
+                            if (x > rowMax[j]) rowMax[j] = x;
+                            rowMean[j] += x;
+                        }
+                    }
+                    for (int j = 0; j < n_kv; ++j) rowMean[j] /= H;
+
+                    int a1, a2, a3;
+                    top3_positions(rowMax.data(), n_kv, a1, a2, a3);
+                    if (in(a1)) t1_max[s]++;
+                    if (in(a1) || in(a2) || in(a3)) t3_max[s]++;
+
+                    int b1, b2, b3;
+                    top3_positions(rowMean.data(), n_kv, b1, b2, b3);
+                    if (in(b1)) t1_mean[s]++;
+                    if (in(b1) || in(b2) || in(b3)) t3_mean[s]++;
+
+                    for (int j = 0; j < n_kv; ++j) {
+                        if (rowMax[j] > gRowMax[j]) gRowMax[j] = rowMax[j];
+                        gRowMean[j] += rowMean[j];
+                    }
+                }
+                for (int j = 0; j < n_kv; ++j) gRowMean[j] /= S;
+
+                int c1, c2, c3;
+                top3_positions(gRowMax.data(), n_kv, c1, c2, c3);
+                if (in(c1)) t1_gmax++;
+                if (in(c1) || in(c2) || in(c3)) t3_gmax++;
+
+                int e1, e2, e3;
+                top3_positions(gRowMean.data(), n_kv, e1, e2, e3);
+                if (in(e1)) t1_gmean++;
+                if (in(e1) || in(e2) || in(e3)) t3_gmean++;
+            }
+        }
+    }
+
+    auto pct = [&](long n) { return cite_n ? 100.0 * n / cite_n : 0.0; };
+    std::printf("\nscored value tokens: %d\n", cite_n);
+
+    std::printf("\n── ARM A: max over heads, per layer (FULL CURVE, %d layers) ──\n", S);
+    int bestA = 0;
+    for (int s = 0; s < S; ++s) {
+        std::printf("  L%-3d  top1 %ld/%d (%.1f%%)  top3 %ld/%d (%.1f%%)\n",
+                    attn_layers[s], t1_max[s], cite_n, pct(t1_max[s]), t3_max[s], cite_n, pct(t3_max[s]));
+        if (t3_max[s] > t3_max[bestA]) bestA = s;
+    }
+    std::printf("  >>> best layer under A (FITTED: 1 parameter chosen over %d layers): L%d  "
+                "top1 %.1f%%  top3 %.1f%%\n", S, attn_layers[bestA], pct(t1_max[bestA]), pct(t3_max[bestA]));
+
+    std::printf("\n── ARM B: mean over heads, per layer (FULL CURVE, %d layers) ──\n", S);
+    int bestB = 0;
+    for (int s = 0; s < S; ++s) {
+        std::printf("  L%-3d  top1 %ld/%d (%.1f%%)  top3 %ld/%d (%.1f%%)\n",
+                    attn_layers[s], t1_mean[s], cite_n, pct(t1_mean[s]), t3_mean[s], cite_n, pct(t3_mean[s]));
+        if (t3_mean[s] > t3_mean[bestB]) bestB = s;
+    }
+    std::printf("  >>> best layer under B (FITTED: 1 parameter chosen over %d layers): L%d  "
+                "top1 %.1f%%  top3 %.1f%%\n", S, attn_layers[bestB], pct(t1_mean[bestB]), pct(t3_mean[bestB]));
+
+    std::printf("\n── ARM C: max over ALL (layer,head) pairs -- ZERO PARAMETERS ──\n");
+    std::printf("  top1 %ld/%d (%.1f%%)  top3 %ld/%d (%.1f%%)\n",
+                t1_gmax, cite_n, pct(t1_gmax), t3_gmax, cite_n, pct(t3_gmax));
+
+    std::printf("\n── ARM D: mean over ALL (layer,head) pairs -- ZERO PARAMETERS ──\n");
+    std::printf("  top1 %ld/%d (%.1f%%)  top3 %ld/%d (%.1f%%)\n",
+                t1_gmean, cite_n, pct(t1_gmean), t3_gmean, cite_n, pct(t3_gmean));
+
     return 0;
 }
 
@@ -6282,7 +8240,7 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         std::vector<std::string> cands;  // deduped, document order (found-in-doc first)
     };
     struct DocOut { std::string tag, document; bool de; std::map<std::string, CandSet> per_key;
-                    std::set<std::string> uncontested; };
+                    std::set<std::string> uncontested; double p2_latency_s = 0; };
     std::vector<DocOut> docs_out;
 
     for (const QMessy& d : corpus) {
@@ -6320,8 +8278,11 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         std::string task = CAND_PASS2_TASK_PREFIX;
         for (size_t i = 0; i < keys.size(); ++i) task += (i ? ", " : "") + keys[i];
         std::string prompt = qdocs_chat_prompt(d.document, task);
+        auto p2_t0 = std::chrono::steady_clock::now();
         FreeRun P2 = run_freegen(fp, sched, tok, meta, prompt, "", /*tap_layers=*/{},
                                  700, /*capture_conf=*/false, /*close_char=*/'\x01');
+        double p2_latency_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - p2_t0).count();
         if (std::getenv("CAND_DEBUG"))
             std::printf("\n[%s%s] PASS2 raw (%zu gen tok):\n%s\n", d.tag.c_str(),
                         d.de ? " DE" : "", P2.gen_tokens.size(), P2.gen_text.c_str());
@@ -6367,7 +8328,44 @@ static int run_cand_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
         for (auto& f : d.fields) truth_count[f.concept]++;
         for (auto& kv : truth_count) if (kv.second == 1) out.uncontested.insert(kv.first);
 
+        out.p2_latency_s = p2_latency_s;
         docs_out.push_back(std::move(out));
+    }
+
+    // ── CAND_PRED — dump pass-2's own candidate spans as a span-tagger-probe
+    // prediction file (docs/note-span-tagger-probe.md shape), so the shipped
+    // finder can be scored by the SAME unmodified scorer used for GLiNER/QA.
+    // Pass 2 emits no confidence, so every span gets score=1.0 (only the
+    // th=0.1 row of the scorer's threshold sweep is meaningful for this file).
+    // Text is the document-order span "text" already resolved by the shipped
+    // qinf::lens_apply_pass2_candidates() against the ORIGINAL document bytes
+    // (d.document, same corpus text run_cand_probe always used) — no new
+    // extraction or matching logic here, just a serializer over docs_out.
+    if (const char* pred_path = std::getenv("CAND_PRED")) {
+        std::ofstream pf(pred_path);
+        if (!pf) throw std::runtime_error("CAND_PRED: cannot open " + std::string(pred_path));
+        pf << "{\n  \"model_id\": \"pass2-cand-finder\",\n  \"per_doc\": {\n";
+        for (size_t i = 0; i < docs_out.size(); ++i) {
+            const DocOut& d = docs_out[i];
+            pf << "    \"" << jesc(d.tag) << "\": {\n"
+               << "      \"de\": " << (d.de ? "true" : "false") << ",\n"
+               << "      \"latency_s\": " << d.p2_latency_s << ",\n"
+               << "      \"spans\": [\n";
+            bool first = true;
+            for (auto& kv : d.per_key) {
+                for (auto& c : kv.second.cands) {
+                    if (!first) pf << ",\n";
+                    first = false;
+                    pf << "        {\"concept\": \"" << jesc(kv.first) << "\", \"text\": \""
+                       << jesc(c) << "\", \"score\": 1.0}";
+                }
+            }
+            pf << (first ? "" : "\n") << "      ]\n"
+               << "    }" << (i + 1 < docs_out.size() ? "," : "") << "\n";
+        }
+        pf << "  }\n}\n";
+        pf.close();
+        std::printf("\nCAND_PRED: wrote %zu docs to %s\n", docs_out.size(), pred_path);
     }
 
     // ── 1. THE KILL GATE — median candidate-set size on uncontested keys ─────
@@ -7026,6 +9024,28 @@ static int run_warm2_probe(ForwardPassBase* fp, ggml_backend_sched_t sched,
 }
 
 int main() {
+    // OCRDUMP — offline fixture dump for the OCR-lens probe step 2a
+    // (docs/plan-ocr-lens.md). No model load: writes each qdocs_messy_corpus()
+    // entry's raw .document to /tmp/ocr_probe/<tag>.txt and exits. The
+    // directory must already exist (mkdir -p /tmp/ocr_probe before running).
+    if (std::getenv("OCRDUMP")) {
+        auto corpus = qdocs_messy_corpus();
+        for (const QMessy& d : corpus) {
+            std::string dpath = "/tmp/ocr_probe/" + d.tag + ".txt";
+            FILE* f = std::fopen(dpath.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "OCRDUMP: expected %s to open for write, "
+                                     "actual fopen failure (mkdir -p /tmp/ocr_probe first)\n",
+                             dpath.c_str());
+                return 1;
+            }
+            std::fwrite(d.document.data(), 1, d.document.size(), f);
+            std::fclose(f);
+            std::printf("OCRDUMP: wrote %s (%zu bytes)\n", dpath.c_str(), d.document.size());
+        }
+        return 0;
+    }
+
     const char* env = std::getenv("QWEN36_MODEL_PATH");
     std::string path = env ? env : "models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf";
     const bool selftest = std::getenv("ATTN_TAP_SELFTEST") != nullptr;
@@ -7174,6 +9194,14 @@ int main() {
     // Qemmi-Docs P0 — leg C: messy-corpus robustness (frozen signals, 15 docs).
     if (std::getenv("QDOCS_C"))
         return run_qdocs_leg_c(fp.get(), sched, tok, meta, attn_layers);
+    // OCR-lens Arm T (docs/plan-ocr-lens.md): leg C cloned onto pdftotext
+    // round-tripped documents instead of QMessy.document. Same CTX group as
+    // QDOCS_C (unlisted below ⇒ 2048).
+    // OCR-lens Arm O (same doc, step 2): identical scoring code, fixture
+    // suffix switched to Vision-OCR text via OCR_SUFFIX/".ocr.txt" inside
+    // run_ocr_t_probe. Same CTX group as OCRT (unlisted below ⇒ 2048).
+    if (std::getenv("OCRT") || std::getenv("OCRO"))
+        return run_ocr_t_probe(fp.get(), sched, tok, meta, attn_layers);
     // Norm-weighted attention calibration (docs/note-lens-norm-weighted-metric.md):
     // Metric A (raw alpha) vs Metric B (alpha*||V||) on citation (Leg C corpus)
     // and coverage separation (COV1 corpus), paired, same pass.
@@ -7184,6 +9212,31 @@ int main() {
     // reads have no Qwen equivalent). docs/note-lens-gemma-norm-weighted.md.
     if (std::getenv("GEMMA4_SEARCH_DUAL"))
         return run_gemma4_search_dual(fp.get(), sched, tok, meta, attn_layers);
+    // HEAD AGGREGATION PROBE -- parameter-free max/mean aggregation over
+    // heads (per-layer full curve + global), Metric A shape, architecture-
+    // agnostic (Gemma 4 and Qwen both). One-off probe, not in any doc yet.
+    // MLXCMP -- cross-runtime head-survival dump (ggml reference + teacher-
+    // forcing payload for the MLX leg).
+    if (std::getenv("MLXCMP"))
+        return run_mlx_compare_dump(fp.get(), sched, tok, meta, attn_layers);
+    if (std::getenv("ATTN_HEAD_AGG"))
+        return run_head_aggregation_probe(fp.get(), sched, tok, meta, attn_layers);
+    // COVSEARCH -- coverage layer x threshold search (docs/plan-coverage-layer-
+    // search.md). Re-runs the incumbent's selection with an independent
+    // evaluation corpus, AUC instead of calibration accuracy, and a plateau
+    // requirement. Probe only: moves no constant.
+    if (std::getenv("COVSEARCH"))
+        return run_coverage_layer_search(fp.get(), sched, tok, meta, attn_layers);
+    // BANDDRIFT — the "requirement" half of decision stability (see the leg).
+    if (std::getenv("BANDDRIFT"))
+        return run_band_drift_probe(fp.get(), sched, tok, meta, attn_layers);
+
+    // MOEROUTE — which mechanism makes an MoE irreproducible (see the leg).
+    if (std::getenv("MOEROUTE"))
+        return run_moe_route_probe(fp.get(), sched, tok, meta);
+    // COVCOMBINE — multi-layer vote vs the best single layer (see the leg).
+    if (std::getenv("COVCOMBINE"))
+        return run_coverage_combiner(fp.get(), sched, tok, meta, attn_layers);
     // Qemmi-Docs P0 — leg D: context length (1K/2K/4K buckets, real token counts).
     if (std::getenv("QDOCS_D"))
         return run_qdocs_leg_d(fp.get(), sched, tok, meta, attn_layers);

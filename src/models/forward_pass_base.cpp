@@ -291,8 +291,9 @@ ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
         AttentionTap tap;
         tap.layer  = il;
         tap.n_kv   = (int)ts->ne[0];
-        tap.n_head = (int)ts->ne[2];   // shape [n_kv, 1, n_head, 1] at decode
-        tap.rows.resize((size_t)tap.n_kv * tap.n_head);
+        tap.n_q    = (int)ts->ne[1];   // 1 at decode; >1 at a tapped prefill block
+        tap.n_head = (int)ts->ne[2];   // shape [n_kv, n_q, n_head, 1]
+        tap.rows.resize((size_t)tap.n_kv * tap.n_q * tap.n_head);
         ggml_backend_tensor_get(ts, tap.rows.data(), 0, ggml_nbytes(ts));
         out.push_back(std::move(tap));
     }

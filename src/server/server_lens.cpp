@@ -230,23 +230,39 @@ bool lens_find_json_object(const std::string& raw, size_t& lo, size_t& hi) {
 
 namespace {
 
-// Locate the emitted object or FAIL LOUDLY. Named error: endpoint, expectation,
-// actual (CLAUDE.md's fail-loud contract). Never a partial extraction — the
-// grammar's whole sin was corrupting output to avoid failing.
-void lens_locate_or_throw(const std::string& raw, size_t& lo, size_t& hi) {
+// Locate the object or FAIL LOUDLY. Named error: endpoint, expectation, actual
+// (CLAUDE.md's fail-loud contract). Never a partial extraction — the grammar's
+// whole sin was corrupting output to avoid failing.
+//
+// The wording follows `supplied`, because the two routes fail for different
+// reasons and send the reader to different places. On /v1/extract the model
+// wrote something unusable: the output is the suspect. On /v1/verify nothing
+// was generated at all — the caller's own `extraction` argument holds no
+// object, and naming "the model" there points at the one component that is
+// provably not at fault.
+void lens_locate_or_throw(const std::string& raw, bool supplied, size_t& lo, size_t& hi) {
+    const char* route = supplied ? "/v1/verify" : "/v1/extract";
     if (!lens_find_json_object(raw, lo, hi))
         throw LensUnparseableError(
-            "/v1/extract: expected the model to emit a JSON object (a ``` fence and "
-            "surrounding prose are tolerated) actual=no complete {...} found in " +
-            std::to_string(raw.size()) + " bytes of output — extraction refused, "
-            "never partially reported", raw);
+            std::string(route) + ": expected " +
+            (supplied ? "the supplied \"extraction\" to hold a JSON object"
+                      : "the model to emit a JSON object") +
+            " (a ``` fence and surrounding prose are tolerated) actual=no complete {...} found in " +
+            std::to_string(raw.size()) + " bytes of " +
+            (supplied ? "the supplied extraction — audit refused, nothing was generated "
+                        "and nothing was partially reported"
+                      : "output — extraction refused, never partially reported"), raw);
     const std::string obj = raw.substr(lo, hi - lo);
     try {
         nlohmann::json::parse(obj);
     } catch (const std::exception& e) {
         throw LensUnparseableError(
-            "/v1/extract: expected the emitted JSON object to parse actual=" +
-            std::string(e.what()) + " — extraction refused, never partially reported",
+            std::string(route) + ": expected the " +
+            (supplied ? "supplied" : "emitted") + " JSON object to parse actual=" +
+            std::string(e.what()) +
+            (supplied ? " — audit refused, nothing was generated and nothing was "
+                        "partially reported"
+                      : " — extraction refused, never partially reported"),
             raw);
     }
 }
@@ -316,6 +332,9 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
     LensReport r;
     r.model              = run.model;
     r.validated_envelope = run.validated_envelope;
+    // Derived from the run, never assigned separately by a caller: the origin
+    // is one fact, and two places to set it is two places to forget.
+    r.extraction_origin  = run.extraction_supplied ? "supplied" : "generated";
     r.k                  = k;
     r.prompt_len         = P;
     r.doc_lo             = doc_lo;
@@ -424,7 +443,7 @@ LensReport compute_lens_report(const LensRun& run, const LensConstants& k) {
     // and validate it, or refuse loudly. Free output is not shape-guaranteed the
     // way the grammar pretended to be, so this is where that pretence is replaced.
     size_t obj_lo = 0, obj_hi = run.gen_text.size();
-    lens_locate_or_throw(run.gen_text, obj_lo, obj_hi);
+    lens_locate_or_throw(run.gen_text, run.extraction_supplied, obj_lo, obj_hi);
     const std::string obj = run.gen_text.substr(obj_lo, obj_hi - obj_lo);
 
     // Byte offsets from `obj` are relative to the OBJECT; the gen-token span math
@@ -768,6 +787,23 @@ std::string lens_report_to_json(const LensReport& r) {
     o += "{\n";
     o += "\"format_version\":\"" + jesc(r.format_version) + "\",\n";
     o += "\"model\":\"" + jesc(r.model) + "\",\n";
+    // Always emitted (see LensReport::extraction_origin): "generated" from
+    // /v1/extract, "supplied" from /v1/verify. A consumer must be able to tell
+    // "this model wrote these values" from "this model only read them".
+    o += "\"extraction_origin\":\"" + jesc(r.extraction_origin) + "\",\n";
+    // ── config (see LensReport::RuntimeConfig) ───────────────────────────────
+    // Omitted entirely when unstamped, so a caller that drives the lens
+    // in-process — every unit test, and any embedder that is not the HTTP
+    // server — gets the byte-identical payload it got before this member
+    // existed. Present, it says which numerical configuration produced the
+    // report, which is what makes two reports comparable.
+    if (!r.config.empty()) {
+        o += "\"config\":{";
+        o += "\"weights\":\"" + jesc(r.config.weights) + "\",";
+        o += "\"attention\":\"" + jesc(r.config.attention) + "\",";
+        o += "\"kv_type\":\"" + jesc(r.config.kv_type) + "\"";
+        o += "},\n";
+    }
     o += "\"validated_envelope\":" + std::string(r.validated_envelope ? "true" : "false") + ",\n";
     // ── Question vocabulary (docs/plan-question-keys.md) ─────────────────────
     // Both members are ABSENT in ordinary key mode, so a v4 importer that never
@@ -1268,6 +1304,24 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     //    now using the P1 attention-tap seam). Constrained, or free when
     //    grammar == nullptr. ─────────────────────────────────────────────────
     const bool free_decode = (grammar == nullptr);
+
+    // ── Restore the engine on EVERY exit path (see run_lens_verify's twin) ───
+    // The disarm + clear_slot at the bottom of this function used to be
+    // straight-line, so any of the four throw sites between here and there
+    // (prefill/decode require_compute_success, the tap-order assertion, the
+    // tap-shape assertion) skipped them. The slot leak is the one already
+    // MEASURED, in the comment at the bottom of this function: an extract left
+    // cache_pos=138, the next 24-token request decoded at n_kv=162 over stale
+    // lens KV, and its output changed. That was fixed for the happy path only;
+    // on a throw it is still live. RAII closes it.
+    struct EngineRestore {
+        ForwardPassBase* fp;
+        ~EngineRestore() {
+            fp->set_attention_taps({});  // byte-inert for the next request
+            fp->clear_slot(0);           // leave slot 0 as found
+        }
+    } engine_restore{fp};
+
     fp->set_attention_taps({k.citation_layer, k.coverage_layer});
     if (!free_decode) grammar->reset();
 
@@ -1406,8 +1460,11 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             if (closed || next == eos || next < 0) break;
         }
     }
-    fp->set_attention_taps({});  // disarm — leave the engine byte-inert for the next request
-    // ...and restore the SLOT too, not just the tap. This driver runs slot 0
+    // Disarm + slot restore now happen in ~EngineRestore at the top of this
+    // function, so they also run when it throws. The reasoning that made them
+    // necessary in the first place is kept here because it is the evidence:
+    //
+    //    ...restore the SLOT too, not just the tap. This driver runs slot 0
     // directly (clear_slot/set_cache_pos/run_prefill above), so the
     // InferenceServer's slot lifecycle never learns slot 0 was used and no
     // release ever fires for it. Without this, the slot is left at
@@ -1417,8 +1474,7 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     // extract left cache_pos=138, the next 24-token request decoded at n_kv=162,
     // and its output differed from the same request run before the extract
     // (exactly one request deep, since that request's own release then cleared
-    // the slot). Symmetric with the disarm above: leave the engine as found.
-    fp->clear_slot(0);
+    // the slot). Symmetric with the disarm: leave the engine as found.
 
     run.gen_tok_text.resize(gen_tokens.size());
     for (size_t i = 0; i < gen_tokens.size(); ++i) run.gen_tok_text[i] = tok->decode(gen_tokens[i]);
@@ -1700,6 +1756,265 @@ LensReport apply_absent_by_omission(LensReport report,
         out.push_back(f);
     }
     report.fields = std::move(out);
+    return report;
+}
+
+namespace {
+
+// Slice query row `q` out of a PREFILL-shaped AttentionTap (ForwardPassBase::
+// get_attention_taps read at a tapped prefill: tensor ne = [n_kv, n_q, n_head]).
+// ggml's ne[0] is fastest-varying, so the raw buffer is flat index
+// kv + n_kv*(q + n_q*head) — row-major [head][q][kv], NOT [q][head][kv] — a
+// fixed head-to-head stride of n_kv*n_q, not a contiguous per-row block.
+// Returns a decode-shaped [n_head][n_kv] flat vector (row-major [head][kv]),
+// exactly LensStep::citation_row / coverage_row's layout, so
+// compute_lens_report reads a teacher-forced row exactly like a decode-time
+// one — it never learns the prefill shape at all; this is the translation.
+std::vector<float> slice_prefill_tap_row(const ForwardPassBase::AttentionTap& tap, int q) {
+    std::vector<float> out((size_t)tap.n_head * (size_t)tap.n_kv);
+    for (int h = 0; h < tap.n_head; ++h) {
+        const float* src = tap.rows.data() +
+            (size_t)tap.n_kv * ((size_t)q + (size_t)tap.n_q * (size_t)h);
+        std::copy(src, src + tap.n_kv, out.data() + (size_t)h * tap.n_kv);
+    }
+    return out;
+}
+
+}  // namespace
+
+// ═════════════════════════════════════════════════════════════════════════
+// Driver — verify: teacher-forced re-audit, one prefill, no decode loop
+// (docs/plan-lens-server-shape.md §3)
+// ═════════════════════════════════════════════════════════════════════════
+LensReport run_lens_verify(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                           ::Tokenizer* tok, const ModelMetadata& meta,
+                           uint32_t n_ctx_max,
+                           const std::string& document,
+                           const std::string& extraction,
+                           const std::vector<LensConcept>& concepts,
+                           const std::vector<size_t>& message_offsets,
+                           const LensConstants& k) {
+    if (concepts.empty())
+        throw std::runtime_error(
+            "run_lens_verify: concepts expected non-empty (the same complete "
+            "concept hint the extraction was produced with) actual=empty");
+    if (document.empty())
+        throw std::runtime_error(
+            "run_lens_verify: document expected non-empty actual=empty");
+    if (extraction.empty())
+        throw std::runtime_error(
+            "run_lens_verify: extraction expected non-empty actual=empty — "
+            "nothing to teacher-force");
+
+    // Same vocabulary/instruction validation as run_lens_extract, so the two
+    // routes refuse the same malformed requests the same way.
+    std::vector<std::string> keys, questions;
+    keys.reserve(concepts.size());
+    int n_questions = 0;
+    for (const LensConcept& c : concepts) {
+        if (c.key.empty())
+            throw std::runtime_error(
+                "run_lens_verify: concept key expected non-empty actual=empty");
+        keys.push_back(c.key);
+        questions.push_back(c.question);
+        if (!c.question.empty()) n_questions++;
+    }
+    if (n_questions != 0 && n_questions != (int)concepts.size())
+        throw std::runtime_error(
+            "run_lens_verify: key_vocabulary expected either all questions or no "
+            "questions, actual " + std::to_string(n_questions) + " of " +
+            std::to_string(concepts.size()) +
+            " entries carry one — a mixed vocabulary is an unmeasured prompt regime "
+            "(docs/plan-question-keys.md §9)");
+    const bool question_mode = n_questions > 0;
+    const std::string instruction_suffix = question_mode
+        ? lens_build_question_instruction(keys, questions)
+        : lens_build_instruction(keys);
+
+    // ── Render + tokenize — identical shape to the extract driver's prompt
+    //    (ChatML, thinking off, document embedded verbatim) so the document's
+    //    token range and the citation/coverage math land on the same
+    //    coordinates a prior extraction of this document used. ────────────
+    QwenChatTemplate ct;
+    std::vector<ChatMessage> hist = {{"user", document + instruction_suffix}};
+    const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true,
+                                              /*enable_thinking=*/false);
+    std::vector<int32_t> prompt_tokens = tok->encode(prompt_text);
+    std::vector<int32_t> answer_tokens = tok->encode(extraction);
+    if ((uint64_t)prompt_tokens.size() + (uint64_t)answer_tokens.size() >= n_ctx_max)
+        throw std::runtime_error(
+            "run_lens_verify: prompt+extraction tokens expected < n_ctx_max=" +
+            std::to_string(n_ctx_max) + " actual=" +
+            std::to_string(prompt_tokens.size() + answer_tokens.size()));
+
+    LensRun run;
+    run.model              = k.model_label;
+    run.n_head             = (int)meta.attention_head_count;
+    run.document            = document;
+    // Same disclosure as run_lens_tapped_decode — see the comment there. Not
+    // the workload envelope (10K); the CALIBRATION floor the lens constants
+    // were measured under.
+    run.validated_envelope = prompt_tokens.size() <= 4096;
+    run.message_offsets    = message_offsets;
+    if (!run.message_offsets.empty() && run.message_offsets.back() >= document.size())
+        throw std::runtime_error(
+            "run_lens_verify: message_offsets expected offsets within the document "
+            "(< " + std::to_string(document.size()) + " bytes), actual last offset " +
+            std::to_string(run.message_offsets.back()));
+
+    // Locate the document's token range within the rendered prompt (same
+    // mechanics as run_lens_tapped_decode — duplicated rather than shared so
+    // this new driver cannot perturb that one's already-gated behaviour).
+    const size_t doc_pos = prompt_text.find(document);
+    if (doc_pos == std::string::npos)
+        throw std::runtime_error(
+            "run_lens_verify: document expected to appear verbatim in the "
+            "rendered prompt actual=not found — chat template altered it");
+    const size_t doc_end = doc_pos + document.size();
+    std::vector<size_t> pcum = cum_bytes(tok, prompt_tokens);
+    const int P = (int)prompt_tokens.size();
+    run.doc_byte_offset = doc_pos;
+    run.doc_lo = P; run.doc_hi = 0;
+    for (int i = 0; i < P; ++i)
+        if (pcum[i] < doc_end && pcum[i + 1] > doc_pos) {
+            if (i < run.doc_lo) run.doc_lo = i;
+            run.doc_hi = i + 1;
+        }
+    if (run.doc_lo > run.doc_hi) { run.doc_lo = 0; run.doc_hi = 0; }
+    run.prompt_cum = pcum;
+    run.prompt_text.resize(P);
+    for (int i = 0; i < P; ++i) run.prompt_text[i] = tok->decode(prompt_tokens[i]);
+
+    // ── Teacher-forced tapped prefill ────────────────────────────────────────
+    // Truncate after the deeper tapped layer FIRST (before either prefill
+    // call), so the prompt chunk below writes KV for only the layers the
+    // answer chunk will actually read — the prompt is not re-processed at
+    // full depth for no reason. Causality is what makes this exact rather
+    // than an approximation (plan §3.2): an attention layer cannot depend on
+    // a layer above it.
+    const int cutoff = std::max(k.citation_layer, k.coverage_layer);
+
+    // ── Restore the engine on EVERY exit path, not just the happy one ────────
+    // Between the arm below and the end of this function there are four throw
+    // sites (two require_compute_success, two tap-shape assertions) plus
+    // compute_lens_report's LensUnparseableError. `fp` is the ONE
+    // ForwardPassBase every other request shares, so a straight-line disarm
+    // leaks state to the next caller whenever any of them fires.
+    //
+    // The two leaks are not equally bad. A leaked `attention_taps` only costs
+    // byte-reproducibility. A leaked `truncate_after_layer` is SILENT
+    // CORRUPTION: it is read unconditionally by every build_prefill_graph, so
+    // the next ordinary /v1/completions would build a partial stack and then
+    // run the output head over that truncated residual stream — plausible
+    // logits, no error, wrong answer. The same leaked-state class was already
+    // measured once on the extract path (see run_lens_tapped_decode's
+    // clear_slot comment: an extract left cache_pos=138 and changed the NEXT
+    // request's output). Cheap guard, loud class of bug.
+    struct EngineRestore {
+        ForwardPassBase* fp;
+        ForwardPassBase::AttnImpl prefill_impl;
+        ~EngineRestore() {
+            fp->set_attention_taps({});                 // byte-inert for the next request
+            fp->set_truncate_after_layer(-1);           // full stack for the next request
+            fp->set_prefill_attn_impl(prefill_impl);    // see the tapped pass below
+            fp->clear_slot(0);                          // leave slot 0 as found
+        }
+    } engine_restore{fp, fp->prefill_attn_impl()};
+
+    fp->set_truncate_after_layer(cutoff);
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+
+    // Prompt: head-less (no logits needed — nothing is generated) and
+    // tap-less (LensStep only ever covers the AUDITED tokens, exactly as it
+    // only ever covered the GENERATED tokens for extract; the document's own
+    // attention rows are never part of the report).
+    {
+        ggml_cgraph* gf = fp->build_prefill_graph(prompt_tokens, 0, 0, /*want_logits=*/false);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, prompt_tokens, 0);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(sched, gf), "run_lens_verify(prompt)");
+        fp->advance_cache((uint32_t)prompt_tokens.size(), 0);
+    }
+
+    // Extraction: head-less, TAPPED, one pass over every extraction token —
+    // the "no decode loop" §3.1 promises. n_q of the tapped tensors is the
+    // extraction's own token count.
+    const int G = (int)answer_tokens.size();
+
+    // The TAPPED pass must be materialized — flash never writes kq_soft.
+    //
+    // Today this is belt-and-braces: the server refuses --attention-lens with
+    // --flash-attn, so the prefill is already materialized when we get here.
+    // It is set explicitly anyway because the refusal is a startup policy that
+    // measurement could lift (plan-lens-server-shape.md §4.2.1), while this is
+    // a structural requirement of tapping a prefill at all. Scoped to THIS
+    // pass, not the prompt pass above: whatever configuration the prompt pass
+    // runs under is by construction the one extract's prompt ran under, which
+    // is what keeps the two comparable. Restored by EngineRestore on every
+    // exit path.
+    fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+    fp->set_attention_taps({k.citation_layer, k.coverage_layer});
+    {
+        ggml_cgraph* gf = fp->build_prefill_graph(answer_tokens, P, 0, /*want_logits=*/false);
+        fp->mark_attention_taps(gf);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, answer_tokens, P);
+        qinf::engine::require_compute_success(
+            ggml_backend_sched_graph_compute(sched, gf), "run_lens_verify(extraction)");
+
+        std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
+        // Same fail-loud order assertion as run_lens_tapped_decode's decode
+        // loop: taps[i] corresponds to attention_taps()[i], the order armed
+        // above, NOT layer order (Qwen 3.8 arms {27, 11} — descending).
+        if (taps.size() != 2 || taps[0].layer != k.citation_layer ||
+            taps[1].layer != k.coverage_layer)
+            throw std::runtime_error(
+                "run_lens_verify: attention taps expected {citation_layer " +
+                std::to_string(k.citation_layer) + ", coverage_layer " +
+                std::to_string(k.coverage_layer) + "}, actual " +
+                (taps.size() != 2 ? std::to_string(taps.size()) + " taps"
+                                  : "{" + std::to_string(taps[0].layer) + ", " +
+                                    std::to_string(taps[1].layer) + "}"));
+        if (taps[0].n_q != G || taps[1].n_q != G)
+            throw std::runtime_error(
+                "run_lens_verify: tapped prefill query rows expected=" +
+                std::to_string(G) + " (one per extraction token) actual citation=" +
+                std::to_string(taps[0].n_q) + " coverage=" + std::to_string(taps[1].n_q));
+
+        run.steps.resize(G);
+        for (int t = 0; t < G; ++t) {
+            run.steps[t].n_kv         = taps[0].n_kv;
+            run.steps[t].citation_row = slice_prefill_tap_row(taps[0], t);
+            run.steps[t].coverage_row = slice_prefill_tap_row(taps[1], t);
+        }
+        fp->advance_cache((uint32_t)answer_tokens.size(), 0);
+    }
+
+    // Disarm + slot cleanup happen in ~EngineRestore above, so they also run
+    // when this function throws. Nothing below touches `fp`.
+
+    run.gen_tok_text.resize(answer_tokens.size());
+    for (size_t i = 0; i < answer_tokens.size(); ++i)
+        run.gen_tok_text[i] = tok->decode(answer_tokens[i]);
+    run.gen_text = tok->decode(answer_tokens);
+    run.gen_cum  = cum_bytes(tok, answer_tokens);
+    // The one fact that distinguishes this run from an extract's: the values
+    // were SUPPLIED by the caller and merely read here, not written by this
+    // model. Set BEFORE compute_lens_report, because it words that function's
+    // shape-contract refusal as well as filling in the report's
+    // extraction_origin — a 422 raised on this path must not blame the model
+    // for text the caller handed in.
+    run.extraction_supplied = true;
+
+    // Throws LensUnparseableError (⇒ 422) if `extraction` holds no parseable
+    // object — same shape contract as extract, applied to the teacher-forced
+    // text instead of generated text.
+    LensReport report = apply_absent_by_omission(compute_lens_report(run, k), concepts);
+    report.question_vocabulary = question_mode;
     return report;
 }
 

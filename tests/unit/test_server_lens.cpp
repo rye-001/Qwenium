@@ -1784,3 +1784,52 @@ TEST(LensCandidateWire, AnchorResolvesToThePrecedingLabelLine) {
     nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
     EXPECT_EQ(j["key_candidates"]["monthly_rent"][0]["anchor"], "2. RENT:");
 }
+
+// ── The per-model flash-prefill gate (docs/plan-lens-server-shape.md §4.2.1) ──
+// A flash prefill is admissible per MODEL, not per build, because the drift
+// gate answers per model: the dense 9B passes it and the MoE 35B fails. The
+// table is the record of that, and the two properties worth pinning are that
+// the permission travels with the entry and that the DEFAULT is refusal — a
+// new model must earn it rather than inherit it.
+TEST(LensCalibration, FlashPrefillIsPerModelAndDefaultsToRefused) {
+    const LensCalibration* dense = lens_calibration_for("qwen35", 33);
+    ASSERT_NE(dense, nullptr) << "Qwen3.8-9B must stay calibrated";
+    EXPECT_TRUE(dense->constants.flash_prefill_ok)
+        << "the 9B passed the drift gate: 0/98 decisions moved";
+    EXPECT_NE(std::string(dense->constants.flash_prefill_provenance).find("drift gate"),
+              std::string::npos)
+        << "a bare boolean is a claim with no receipt";
+
+    for (uint32_t blocks : {40u, 41u}) {
+        const LensCalibration* moe = lens_calibration_for("qwen35moe", blocks);
+        ASSERT_NE(moe, nullptr) << "Qwen3.6-35B-A3B must stay calibrated";
+        EXPECT_FALSE(moe->constants.flash_prefill_ok)
+            << "the 35B FAILED the drift gate, and on an MoE the failure is "
+               "categorical: expert routing is an argmax, so no margin applies";
+    }
+
+    // The default is what protects a model nobody has measured yet.
+    EXPECT_FALSE(LensConstants{}.flash_prefill_ok);
+}
+
+// The configuration stamp is additive: a report nobody stamped serializes
+// exactly as it did before the member existed. Every in-process caller — these
+// tests included — is in that case, so this is also what keeps the rest of this
+// file honest.
+TEST(LensReportConfig, UnstampedReportOmitsTheMemberEntirely) {
+    LensReport r;
+    EXPECT_TRUE(r.config.empty());
+    nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
+    EXPECT_FALSE(j.contains("config"));
+
+    r.config.weights   = "0123456789abcdef";
+    r.config.attention = "flash-prefill";
+    r.config.kv_type   = "f16";
+    nlohmann::json j2 = nlohmann::json::parse(lens_report_to_json(r));
+    ASSERT_TRUE(j2.contains("config"));
+    EXPECT_EQ(j2["config"]["weights"],   "0123456789abcdef");
+    EXPECT_EQ(j2["config"]["attention"], "flash-prefill");
+    EXPECT_EQ(j2["config"]["kv_type"],   "f16");
+    EXPECT_EQ(j2["format_version"], "qemmi-lens/v4")
+        << "additive, not a version bump — same reasoning as extraction_origin";
+}

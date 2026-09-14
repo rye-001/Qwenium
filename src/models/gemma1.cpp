@@ -62,7 +62,12 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
     reset_context();
     ggml_cgraph* gf = new_graph();
 
-    const int n_layers     = meta_.block_count;
+    // effective_layer_count truncates for teacher-forced lens verification
+    // (docs/plan-lens-server-shape.md §3.4 — Gemma carries no lens claim, but
+    // the cross-family rule requires the interface be expressible here too);
+    // default policy is untruncated, so this is meta_.block_count unchanged.
+    const int n_layers     = static_cast<int>(
+        policy_.effective_layer_count(static_cast<uint32_t>(meta_.block_count)));
     const int hidden_dim   = meta_.embedding_length;
     const int n_head       = meta_.attention_head_count;
     const int n_head_kv    = meta_.attention_head_count_kv;
@@ -133,7 +138,7 @@ ggml_cgraph* Gemma1ForwardPass::build_prefill_graph(
                                        w, blk_hp, il, slot_idx,
                                        static_cast<uint32_t>(n_tokens),
                                        /*ple_residual=*/nullptr,
-                                       /*use_flash=*/use_flash_attn());
+                                       /*use_flash=*/use_flash_attn_prefill());
         // Diagnostic: keep each layer's output alive so we can compare per-layer.
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);

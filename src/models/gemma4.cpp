@@ -485,7 +485,7 @@ ggml_tensor* Gemma4ForwardPass::build_block(
                               /*il=*/static_cast<int>(il),
                               head_dim, head_dim, n_kv_heads,
                               /*softcap=*/0.0f,
-                              /*use_flash=*/use_flash_attn());
+                              /*use_flash=*/use_flash_attn_prefill());
     }
 
     cur = ggml_mul_mat(arena_.ctx(), w.attn_output, cur);
@@ -577,6 +577,11 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     ggml_cgraph* gf = new_graph();
 
     const uint32_t n_tokens = static_cast<uint32_t>(tokens.size());
+    // effective_layer_count truncates for teacher-forced lens verification
+    // (docs/plan-lens-server-shape.md §3.4 — Gemma carries no lens claim, but
+    // the cross-family rule requires the interface be expressible here too);
+    // default policy is untruncated, so this is config_.n_layers unchanged.
+    const uint32_t n_layers = policy_.effective_layer_count(config_.n_layers);
 
     // 1. Embedding + sqrt(d_model) scale (fp32; consistent with G1/G2/G3).
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -607,7 +612,7 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     graph_inputs_.clear();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
-    for (uint32_t il = 0; il < config_.n_layers; ++il)
+    for (uint32_t il = 0; il < n_layers; ++il)
         graph_inputs_.add(std::make_unique<AttnMaskInput>(
             "kq_mask." + std::to_string(il),
             config_.is_global[il] ? 0u : config_.sliding_window));
@@ -631,7 +636,7 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     // 3. Transformer stack (manual composition; build_transformer_layer
     //    can't host this — see the gemma4.h scope comment).
     const AttnPhase prefill_phase{ /*slot_idx=*/slot_idx };
-    for (uint32_t il = 0; il < config_.n_layers; ++il) {
+    for (uint32_t il = 0; il < n_layers; ++il) {
         inpL = build_block(gf, inpL, inp_pos, il, n_tokens, prefill_phase);
         char dbg[64];
         std::snprintf(dbg, sizeof(dbg), "layer_out.%u", il);

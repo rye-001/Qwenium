@@ -111,6 +111,19 @@ Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& confi
         special_token_pattern + "|" + base_pattern,
         std::regex_constants::ECMAScript
     );
+
+    // Which pre-tokenizer this CHECKPOINT asks for. Unknown values keep the
+    // GPT-2 pattern: a model nobody measured must not silently inherit
+    // someone else's segmentation. The mapping mirrors llama.cpp's
+    // llama-vocab.cpp so a GGUF tokenizes the same here as it does there.
+    const std::string& pre = metadata_->tokenizer_pre;
+    if (pre == "qwen35") {
+        pre_kind_ = PreTokenizerKind::Qwen35;
+    } else if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "megrez") {
+        pre_kind_ = PreTokenizerKind::Qwen2;
+    } else {
+        pre_kind_ = PreTokenizerKind::Gpt2;
+    }
 }
 
 
@@ -180,7 +193,267 @@ void Tokenizer::initialize_byte_mapping() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Qwen pre-tokenization
+//
+// Qwen's reference pattern (tokenizer.json, and llama.cpp's
+// LLAMA_VOCAB_PRE_TYPE_QWEN35) is:
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+//   | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+//   | \p{N}
+//   |  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+//   | \s*[\r\n]+
+//   | \s+(?!\S)
+//   | \s+
+//
+// This is NOT expressible in std::regex: ECMAScript has no \p{...} Unicode
+// property classes, and std::regex matches bytes, so a UTF-8 'ü' is two
+// non-ASCII bytes rather than one letter. Hence a hand-written scanner over
+// codepoints. Alternatives are tried IN ORDER and the first that matches wins
+// (leftmost-first, as ECMAScript and Python's `regex` do) — not longest-match.
+//
+// What the old GPT-2 pattern got wrong, measured 2026-09-11 against the
+// reference tokenizer (docs/note-lens-mlx-swift-server.md §7):
+//   · no \s*[\r\n]+ alternative     ⇒ "\n\n" became two tokens, not one
+//   · letter runs only space-prefixed ⇒ ".example" became two tokens, not one
+//   · [a-zA-Z] instead of \p{L}     ⇒ "Stückzahl" became St|ü|ckzahl
+// German prompts ran 11–16% longer in tokens, and every umlauted word was fed
+// to the model in a segmentation it was never trained on.
+
+namespace {
+
+// ── UTF-8 ───────────────────────────────────────────────────────────────────
+// Decodes one codepoint at `i`, advancing it. Invalid bytes are returned as
+// themselves and consume one byte, so a malformed input still terminates.
+uint32_t utf8_next(const std::string& s, size_t& i) {
+    const unsigned char c = (unsigned char)s[i];
+    size_t len = 1;
+    uint32_t cp = c;
+    if      ((c & 0x80) == 0x00) { len = 1; cp = c; }
+    else if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+    else                         { i += 1; return c; }
+    if (i + len > s.size()) { i += 1; return c; }
+    for (size_t k = 1; k < len; ++k) {
+        const unsigned char cc = (unsigned char)s[i + k];
+        if ((cc & 0xC0) != 0x80) { i += 1; return c; }   // truncated sequence
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    i += len;
+    return cp;
+}
+
+bool in_any(uint32_t cp, const std::pair<uint32_t, uint32_t>* r, size_t n) {
+    for (size_t k = 0; k < n; ++k) if (cp >= r[k].first && cp <= r[k].second) return true;
+    return false;
+}
+#define RANGES(name) name, sizeof(name) / sizeof(name[0])
+
+// ── Character classes ───────────────────────────────────────────────────────
+// ECMAScript/`regex` \s, including the Unicode spaces both treat as whitespace.
+const std::pair<uint32_t, uint32_t> kSpace[] = {
+    {0x0009, 0x000D}, {0x0020, 0x0020}, {0x0085, 0x0085}, {0x00A0, 0x00A0},
+    {0x1680, 0x1680}, {0x2000, 0x200A}, {0x2028, 0x2029}, {0x202F, 0x202F},
+    {0x205F, 0x205F}, {0x3000, 0x3000}, {0xFEFF, 0xFEFF},
+};
+bool is_space(uint32_t cp) { return in_any(cp, RANGES(kSpace)); }
+
+// \p{M} — combining marks. The ranges that occur in the scripts this engine is
+// used on, plus the general-purpose combining blocks.
+const std::pair<uint32_t, uint32_t> kMark[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x05BF, 0x05BF},
+    {0x05C1, 0x05C2}, {0x05C4, 0x05C5}, {0x05C7, 0x05C7}, {0x0610, 0x061A},
+    {0x064B, 0x065F}, {0x0670, 0x0670}, {0x06D6, 0x06DC}, {0x06DF, 0x06E4},
+    {0x06E7, 0x06E8}, {0x06EA, 0x06ED}, {0x0900, 0x0903}, {0x093A, 0x094F},
+    {0x0951, 0x0957}, {0x0962, 0x0963}, {0x0E31, 0x0E31}, {0x0E34, 0x0E3A},
+    {0x0E47, 0x0E4E}, {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF}, {0x20D0, 0x20F0},
+    {0x2CEF, 0x2CF1}, {0x302A, 0x302F}, {0x3099, 0x309A}, {0xFE00, 0xFE0F},
+    {0xFE20, 0xFE2F},
+};
+bool is_mark(uint32_t cp) { return in_any(cp, RANGES(kMark)); }
+
+// \p{N} — numbers. ASCII digits plus the decimal-digit blocks likely to appear
+// in real documents. A digit outside these is classed as a letter by the
+// fallback below, which is the same bucket the old pattern's punctuation class
+// would NOT have used — see the scope note on is_letter().
+const std::pair<uint32_t, uint32_t> kNumber[] = {
+    {0x0030, 0x0039}, {0x00B2, 0x00B3}, {0x00B9, 0x00B9}, {0x00BC, 0x00BE},
+    {0x0660, 0x0669}, {0x06F0, 0x06F9}, {0x0966, 0x096F}, {0x0E50, 0x0E59},
+    {0x2070, 0x2070}, {0x2074, 0x2079}, {0x2080, 0x2089}, {0x2150, 0x218F},
+    {0xFF10, 0xFF19},
+};
+bool is_number(uint32_t cp) { return in_any(cp, RANGES(kNumber)); }
+
+// Non-letter non-ASCII: punctuation, symbols, currency, arrows, emoji, and the
+// modifier/format blocks. Everything else non-ASCII is treated as a letter.
+const std::pair<uint32_t, uint32_t> kNotLetter[] = {
+    {0x00A1, 0x00A9}, {0x00AB, 0x00AD}, {0x00AE, 0x00B1}, {0x00B4, 0x00B4},
+    {0x00B6, 0x00B8}, {0x00BB, 0x00BB}, {0x00BF, 0x00BF}, {0x00D7, 0x00D7},
+    {0x00F7, 0x00F7}, {0x02B0, 0x02FF}, {0x0375, 0x0375}, {0x037E, 0x037E},
+    {0x0384, 0x0385}, {0x0387, 0x0387}, {0x055A, 0x055F}, {0x0589, 0x058A},
+    {0x05BE, 0x05BE}, {0x05C0, 0x05C0}, {0x05C3, 0x05C3}, {0x05C6, 0x05C6},
+    {0x05F3, 0x05F4}, {0x0600, 0x0605}, {0x060C, 0x060D}, {0x061B, 0x061F},
+    {0x066A, 0x066D}, {0x06D4, 0x06D4}, {0x0964, 0x0965}, {0x0970, 0x0970},
+    {0x1360, 0x1368}, {0x1800, 0x180E}, {0x2010, 0x206F}, {0x20A0, 0x20CF},
+    {0x2100, 0x214F}, {0x2190, 0x2BFF}, {0x2E00, 0x2E7F}, {0x3001, 0x3020},
+    {0x3030, 0x303F}, {0xA670, 0xA67F}, {0xFB29, 0xFB29}, {0xFD3E, 0xFD3F},
+    {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF01, 0xFF0F}, {0xFF1A, 0xFF20},
+    {0xFF3B, 0xFF40}, {0xFF5B, 0xFF65}, {0xFFE0, 0xFFEE}, {0xFFF9, 0xFFFF},
+    {0x10100, 0x1013F}, {0x1D000, 0x1D7FF}, {0x1F000, 0x1FBFF},
+};
+
+// \p{L}. APPROXIMATION, and deliberately a conservative one: most assigned
+// non-ASCII codepoints ARE letters, so the rule is "letter unless classed
+// otherwise". The residual error is confined to unassigned codepoints and to
+// punctuation/symbol blocks not listed above — where this over-merges, exactly
+// as the old pattern under-merged. It is bounded and in the right direction;
+// full \p{L} needs the Unicode tables, which is a dependency decision, not
+// a bug fix.
+bool is_letter(uint32_t cp) {
+    if (cp < 0x80) return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z');
+    if (is_space(cp) || is_mark(cp) || is_number(cp)) return false;
+    return !in_any(cp, RANGES(kNotLetter));
+}
+#undef RANGES
+
+}  // namespace
+
+// Scans one special-token-free stretch of text, appending pre-tokens to `out`.
+// `marks_join_words` selects Qwen35 ([\p{L}\p{M}]+) over Qwen2 (\p{L}+).
+static void qwen_scan(const std::string& s, bool marks_join_words,
+                      std::vector<std::string>& out) {
+    // Decode once: the scanner backtracks, and re-decoding UTF-8 per attempt
+    // would make it quadratic.
+    std::vector<uint32_t>  cp;     // codepoints
+    std::vector<size_t>    at;     // byte offset of each codepoint
+    for (size_t i = 0; i < s.size();) { at.push_back(i); cp.push_back(utf8_next(s, i)); }
+    at.push_back(s.size());
+    const size_t N = cp.size();
+
+    auto word_cp = [&](size_t k) {
+        return is_letter(cp[k]) || (marks_join_words && is_mark(cp[k]));
+    };
+    // The negated class of alternative 4: [^\s\p{L}\p{M}\p{N}] (Qwen35) or
+    // [^\s\p{L}\p{N}] (Qwen2).
+    auto punct_cp = [&](size_t k) {
+        if (is_space(cp[k]) || is_letter(cp[k]) || is_number(cp[k])) return false;
+        if (marks_join_words && is_mark(cp[k])) return false;
+        return true;
+    };
+    auto lower = [](uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; };
+
+    size_t i = 0;
+    while (i < N) {
+        const size_t start = i;
+
+        // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (cp[i] == '\'' && i + 1 < N) {
+            const uint32_t a = lower(cp[i + 1]);
+            size_t len = 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') len = 2;
+            else if (i + 2 < N) {
+                const uint32_t b = lower(cp[i + 2]);
+                if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
+                    (a == 'l' && b == 'l')) len = 3;
+            }
+            if (len) {
+                i += len;
+                out.push_back(s.substr(at[start], at[i] - at[start]));
+                continue;
+            }
+        }
+
+        // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+   (the optional prefix is one
+        //    codepoint that is neither a newline, a letter, nor a number —
+        //    which is what lets ".example" and " units" be single pre-tokens)
+        {
+            size_t j = i;
+            if (cp[j] != '\r' && cp[j] != '\n' && !is_letter(cp[j]) && !is_number(cp[j]))
+                ++j;
+            if (j < N && word_cp(j)) {
+                while (j < N && word_cp(j)) ++j;
+                i = j;
+                out.push_back(s.substr(at[start], at[i] - at[start]));
+                continue;
+            }
+        }
+
+        // 3. \p{N}  — ONE number codepoint, never a run
+        if (is_number(cp[i])) {
+            ++i;
+            out.push_back(s.substr(at[start], at[i] - at[start]));
+            continue;
+        }
+
+        // 4.  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+        {
+            size_t j = i;
+            if (cp[j] == ' ') ++j;
+            if (j < N && punct_cp(j)) {
+                while (j < N && punct_cp(j)) ++j;
+                while (j < N && (cp[j] == '\r' || cp[j] == '\n')) ++j;
+                i = j;
+                out.push_back(s.substr(at[start], at[i] - at[start]));
+                continue;
+            }
+        }
+
+        // 5. \s*[\r\n]+  — greedy \s* with backtracking, i.e. the whitespace
+        //    run truncated at its LAST newline. This is the alternative the
+        //    GPT-2 pattern lacks, and the reason "\n\n" used to split.
+        {
+            size_t j = i, last_nl = std::string::npos;
+            while (j < N && is_space(cp[j])) {
+                if (cp[j] == '\r' || cp[j] == '\n') last_nl = j;
+                ++j;
+            }
+            if (last_nl != std::string::npos) {
+                i = last_nl + 1;
+                out.push_back(s.substr(at[start], at[i] - at[start]));
+                continue;
+            }
+        }
+
+        // 6. \s+(?!\S)  — a whitespace run only up to the last character when
+        //    more text follows (the GPT-2 "keep one space for the next word"
+        //    rule); the whole run at end of input.
+        if (is_space(cp[i])) {
+            size_t j = i;
+            while (j < N && is_space(cp[j])) ++j;
+            const size_t end = (j == N) ? j : j - 1;
+            if (end > i) {
+                i = end;
+                out.push_back(s.substr(at[start], at[i] - at[start]));
+                continue;
+            }
+            // 7. \s+
+            i = j;
+            out.push_back(s.substr(at[start], at[i] - at[start]));
+            continue;
+        }
+
+        // No alternative matched. Unreachable for well-formed input; emit one
+        // codepoint rather than spin, so a pathological byte cannot hang the
+        // server.
+        ++i;
+        out.push_back(s.substr(at[start], at[i] - at[start]));
+    }
+}
+
 std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+    switch (pre_kind_) {
+        case PreTokenizerKind::Qwen2:
+        case PreTokenizerKind::Qwen35:
+            return pretokenize_qwen(text);
+        case PreTokenizerKind::Gpt2:
+        default:
+            return pretokenize_gpt2(text);
+    }
+}
+
+std::vector<std::string> Tokenizer::pretokenize_gpt2(const std::string& text) const {
     std::vector<std::string> tokens;
     std::sregex_iterator iter(text.begin(), text.end(), pretokenization_regex_);
     std::sregex_iterator end;
@@ -192,6 +465,41 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         }
     }
     return tokens;
+}
+
+std::vector<std::string> Tokenizer::pretokenize_qwen(const std::string& text) const {
+    const bool marks_join_words = (pre_kind_ == PreTokenizerKind::Qwen35);
+    return split_on_special_tokens(
+        text, [&](const std::string& chunk, std::vector<std::string>& out) {
+            qwen_scan(chunk, marks_join_words, out);
+        });
+}
+
+// Special tokens are matched before any pattern alternative and emitted whole —
+// the same precedence the GPT-2 path gets from putting them first in its regex
+// alternation. LONGEST match wins at a position, so a token that is a prefix of
+// another (e.g. "<|im_start|>" vs a hypothetical "<|im_start|>x") cannot shadow
+// it; the regex path took them in unordered-map order, which was arbitrary.
+std::vector<std::string> Tokenizer::split_on_special_tokens(
+    const std::string& text,
+    const std::function<void(const std::string&, std::vector<std::string>&)>& scan) const {
+    std::vector<std::string> out;
+    size_t plain = 0;   // start of the current non-special stretch
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t best = 0;
+        for (const auto& [tok, id] : special_tokens_) {
+            (void)id;
+            if (tok.size() > best && text.compare(i, tok.size(), tok) == 0) best = tok.size();
+        }
+        if (best == 0) { ++i; continue; }
+        if (i > plain) scan(text.substr(plain, i - plain), out);
+        out.push_back(text.substr(i, best));
+        i += best;
+        plain = i;
+    }
+    if (plain < text.size()) scan(text.substr(plain), out);
+    return out;
 }
 
 // Gets all pairs of adjacent tokens.

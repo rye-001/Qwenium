@@ -14,7 +14,7 @@
 # Drives the free tapped extraction + the server-side lens computation (citations
 # L3H13 / coverage layer-11 / badge body_mass) on EN + DE order emails, asserting:
 #
-#   1. Well-formed: HTTP 200, format_version qemmi-lens/v3, one field per hinted
+#   1. Well-formed: HTTP 200, format_version qemmi-lens/v4, one field per hinted
 #      {key,gloss} concept (Leg B: complete hint ⇒ no naming zoo), present values
 #      verbatim-lifted (found_in_document), a badge per field, coverage present.
 #   2. Signal reproduction (N3, end to end): for present distinctive fields the
@@ -163,7 +163,11 @@ def check_superset(name, doc, present_order, absent_keys, min_inspan):
     concepts = kv(*present_order, *absent_keys)
     d = extract(doc, concepts)
     open(f"{outdir}/lens_{name}.json", "w").write(json.dumps(d, indent=1))
-    assert d.get("format_version") == "qemmi-lens/v3", f"{name}: bad format_version"
+    assert d.get("format_version") == "qemmi-lens/v4", f"{name}: bad format_version"
+    # /v1/extract always generates its own values; /v1/verify is the only verb
+    # that reports "supplied" (lens-format.md, extraction_origin).
+    assert d.get("extraction_origin") == "generated", \
+        f"{name}: extraction_origin expected 'generated', actual {d.get('extraction_origin')!r}"
     # v3: a key may appear several times (one field per emitted occurrence), so
     # collapse consecutive repeats before comparing. The property this gate is
     # really asserting is unchanged — concept ORDER and COMPLETENESS, i.e. the
@@ -364,7 +368,7 @@ code, rep = post({"document": INVOICE,
                                      "quantity","unit_price","subtotal","tax","total"],
                   "max_tokens": 300})
 assert code == 200, (code, rep)
-assert rep["format_version"] == "qemmi-lens/v3", rep["format_version"]
+assert rep["format_version"] == "qemmi-lens/v4", rep["format_version"]
 
 def occurrences(key):
     return [f for f in rep["fields"] if f["key"] == key and f["value"] is not None]

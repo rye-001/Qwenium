@@ -216,7 +216,10 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     reset_context();
     ggml_cgraph* gf = new_graph();
 
-    const uint32_t n_layers = n_main_layers_;   // excludes any NextN head block
+    // excludes any NextN head block; effective_layer_count further truncates
+    // for teacher-forced lens verification (docs/plan-lens-server-shape.md
+    // §3.4) — default policy is untruncated, so this is n_main_layers_ unchanged.
+    const uint32_t n_layers = policy_.effective_layer_count(n_main_layers_);
     const size_t n_tokens   = tokens.size();
 
     // Typed inputs for this graph (replaces set_inputs). Cleared here so
@@ -289,7 +292,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // a parameter (moe_hp null here ⇒ dense SwiGLU).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        /*moe_hp=*/nullptr, use_flash_attn()};
+        /*moe_hp=*/nullptr, use_flash_attn_prefill()};
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         const uint32_t dn_idx = cfg_.is_ssm_layer(il)

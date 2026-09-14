@@ -1436,6 +1436,50 @@ target_link_libraries(decode-breakdown PRIVATE
 )
 target_compile_features(decode-breakdown PRIVATE cxx_std_17)
 
+# Verify-pass cost curve — flat-vs-rising K-token prefill timing (speculative
+# decoding verify cost check).
+add_executable(verify-cost-curve
+    perf/verify_cost_curve.cpp
+)
+target_link_libraries(verify-cost-curve PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(verify-cost-curve PRIVATE cxx_std_17)
+
+# Closed-form draft head probe (capture stage) — dumps (h_t, generated
+# token) pairs from greedy decoding for offline ridge-regression fitting.
+# Uncommitted probe artifact; see docs/note-closed-form-draft-head.md.
+add_executable(draft-head-capture
+    perf/draft_head_capture.cpp
+)
+target_link_libraries(draft-head-capture PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(draft-head-capture PRIVATE cxx_std_17)
+
+# Closed-form draft head probe (scoring stage) — applies the model's own
+# output-weight matmul to numpy-fit ridge predictions. Uncommitted probe
+# artifact; see docs/note-closed-form-draft-head.md.
+add_executable(draft-head-score
+    perf/draft_head_score.cpp
+)
+target_link_libraries(draft-head-score PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(draft-head-score PRIVATE cxx_std_17)
+
 # Alloc-reuse confirmation — is the galloc replan defeated by KV shape growth?
 add_executable(alloc-reuse
     perf/alloc_reuse.cpp
@@ -1576,3 +1620,68 @@ target_link_libraries(norms-breakdown PRIVATE
 )
 
 target_compile_features(norms-breakdown PRIVATE cxx_std_17)
+
+# mmap-backed weights probe — copy-vs-mmap load path: peak/steady RSS plus a
+# logits checksum proving byte-identity. Uncommitted probe artifact.
+add_executable(mmap-weights-probe
+    perf/mmap_weights_probe.cpp
+)
+target_link_libraries(mmap-weights-probe PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(mmap-weights-probe PRIVATE cxx_std_17)
+
+# ---------------------------------------------------------------------------
+# Argument-parser fail-loud contract (both front ends).
+#
+# Regression guard for 2026-09-10: a verification run passed `--temp 0` meaning
+# greedy decoding.  The real flag is `-t` / `--temperature`; neither front end
+# had a final `else`, so `--temp` and its `0` were silently dropped and the run
+# sampled at the default 0.7 with a random seed.  The text difference that
+# produced was nearly attributed to the change under test, and was caught only
+# by a baseline-vs-baseline control.
+#
+# These run in milliseconds and need no GGUF: argument parsing happens before
+# any model load, which is the property being asserted.  Each rejection is
+# tested twice on purpose -- WILL_FAIL proves the EXIT CODE is non-zero, and
+# the paired PASS_REGULAR_EXPRESSION proves it failed for the RIGHT REASON
+# (ctest ignores the exit code when a pass-regex is set, so neither property
+# is sufficient alone).  The `--help` tests are the positive control: without
+# them a binary that crashed on startup for any reason would satisfy WILL_FAIL.
+add_test(NAME cli-help-exits-zero COMMAND qwenium-cli --help)
+add_test(NAME server-help-exits-zero COMMAND http_server --help)
+
+add_test(NAME cli-rejects-unknown-flag COMMAND qwenium-cli --no-such-flag)
+set_tests_properties(cli-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)
+add_test(NAME cli-rejects-unknown-flag-reason COMMAND qwenium-cli --no-such-flag)
+set_tests_properties(cli-rejects-unknown-flag-reason PROPERTIES
+    PASS_REGULAR_EXPRESSION "expected a known flag.*actual '--no-such-flag'")
+
+# The exact incident: a flag-shaped typo AFTER the positional model path, where
+# the old parser dropped it instead of taking it for MODEL_PATH.  The pass-regex
+# is load-bearing here -- a bare exit-code check would also pass if the parser
+# accepted the typo and then failed to open the (nonexistent) model.
+add_test(NAME cli-rejects-temp-typo
+         COMMAND qwenium-cli /nonexistent-model.gguf -p hi --temp 0)
+set_tests_properties(cli-rejects-temp-typo PROPERTIES
+    PASS_REGULAR_EXPRESSION "expected a known flag.*actual '--temp'")
+
+# A known flag given last must say which flag is missing its value, not be
+# mistaken for an unknown one -- that is why the arity checks moved out of the
+# `arg == "--x" && i + 1 < argc` conditions and into the branch bodies.
+add_test(NAME cli-rejects-flag-without-value COMMAND qwenium-cli --kv-type)
+set_tests_properties(cli-rejects-flag-without-value PROPERTIES
+    PASS_REGULAR_EXPRESSION "--kv-type: expected a value")
+
+add_test(NAME server-rejects-unknown-flag COMMAND http_server --no-such-flag)
+set_tests_properties(server-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)
+add_test(NAME server-rejects-unknown-flag-reason COMMAND http_server --no-such-flag)
+set_tests_properties(server-rejects-unknown-flag-reason PROPERTIES
+    PASS_REGULAR_EXPRESSION "expected a known flag.*actual '--no-such-flag'")
+add_test(NAME server-rejects-flag-without-value COMMAND http_server --ctx)
+set_tests_properties(server-rejects-flag-without-value PROPERTIES
+    PASS_REGULAR_EXPRESSION "--ctx: expected a value")
