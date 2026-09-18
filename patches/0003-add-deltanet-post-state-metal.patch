@@ -31,7 +31,7 @@ Files touched:
   ggml/src/ggml-metal/ggml-metal-device.m   — supports_op case
   ggml/src/ggml-metal/ggml-metal-ops.h      — op-fn decl
   ggml/src/ggml-metal/ggml-metal-ops.cpp    — dispatch case + op fn
-  ggml/src/ggml-metal/ggml-metal.metal      — kernel_deltanet_post_state_f32
+  ggml/src/ggml-metal/kernels/gated_delta_net.metal — kernel_deltanet_post_state_f32
 
 Ported 2026-08-23 from ggml b6c83aad5 (libggml-metal 0.9.7) to b10582 /
 e85caa81e (libggml-metal 0.21.0). The added content is unchanged
@@ -39,12 +39,23 @@ line-for-line; only anchor positions moved, plus the GGML_OP_COUNT
 static_assert (upstream added 4 ops after GATED_DELTA_NET, so the two
 qinf ops now follow DSV4_HC_POST in the enum and in both string tables).
 
+
+Re-ported 2026-09-14 from b10582 to b10964 / 41abbfd599 (see
+docs/note-ggml-upgrade-b10964.md). Upstream split the monolithic
+ggml-metal.metal (11887 lines) into per-op files under kernels/ two days
+after b10582 (b615f5b4b, "metal: per-op source split + parallel compile"),
+so the kernel body relocates to kernels/gated_delta_net.metal — the same
+file upstream's own kernel_gated_delta_net now lives in, and the same
+relative insertion point (immediately after its template instantiations).
+All other files: position drift only. Verified: added-line multiset
+identical to the b10582 patch, byte for byte (grep '^+' | sort | diff).
+
 ---
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index 52043696e..a2e8cba90 100644
+index bf3d07e78..9cc5f5a79 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -673,6 +673,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+@@ -696,6 +696,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
      return res;
  }
  
@@ -77,11 +88,11 @@ index 52043696e..a2e8cba90 100644
      char base[256];
      char name[256];
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
-index b7d466058..683298228 100644
+index ced33aadf..2af7531aa 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.h
 +++ b/ggml/src/ggml-metal/ggml-metal-device.h
-@@ -132,6 +132,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_
- struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+@@ -133,6 +133,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 +struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_deltanet_post_state(ggml_metal_library_t lib, const struct ggml_tensor * op); // qinf downstream patch
@@ -89,10 +100,10 @@ index b7d466058..683298228 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 312b00dc4..e0a038363 100644
+index 5654c5004..028b0ee60 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1385,6 +1385,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1829,6 +1829,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
              return true;
          case GGML_OP_GATED_DELTA_NET:
              return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
@@ -107,14 +118,14 @@ index 312b00dc4..e0a038363 100644
 +                && ggml_is_contiguous(op->src[2])
 +                && op->src[0]->ne[0] % 32 == 0;
          case GGML_OP_SOLVE_TRI:
+             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_MUL_MAT:
-         case GGML_OP_MUL_MAT_ID:
 diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
-index f0b779979..c77022e3c 100644
+index 7ad21341e..db8efa521 100644
 --- a/ggml/src/ggml-metal/ggml-metal-impl.h
 +++ b/ggml/src/ggml-metal/ggml-metal-impl.h
-@@ -960,6 +960,23 @@ typedef struct {
-     uint64_t nb3;
+@@ -988,6 +988,23 @@ typedef struct {
+     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
  } ggml_metal_kargs_gated_delta_net;
  
 +// qinf downstream patch — see qwen-inference/patches/0003-add-deltanet-post-state-metal.patch
@@ -138,10 +149,10 @@ index f0b779979..c77022e3c 100644
      int32_t  ne00;
      int32_t  ne01;
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 8311544b3..18ffb5e81 100644
+index b4e87cb2c..59e9bfc39 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-@@ -351,6 +351,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+@@ -359,6 +359,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
              {
                  n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
              } break;
@@ -152,8 +163,8 @@ index 8311544b3..18ffb5e81 100644
          case GGML_OP_SOLVE_TRI:
              {
                  n_fuse = ggml_metal_op_solve_tri(ctx, idx);
-@@ -1890,6 +1894,65 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
-     return 1;
+@@ -1973,6 +1977,65 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     return n_fuse;
  }
  
 +// qinf downstream patch — Metal dispatch for fused DeltaNet post-state op.
@@ -219,10 +230,10 @@ index 8311544b3..18ffb5e81 100644
      ggml_tensor * op = ctx->node(idx);
  
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
-index 159a628d0..fa4877a30 100644
+index 4dd8ce7af..16af5f6f0 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.h
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.h
-@@ -62,6 +62,7 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+@@ -64,6 +64,7 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
@@ -230,14 +241,15 @@ index 159a628d0..fa4877a30 100644
  int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
-diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index 27f97b5e0..17b9f513f 100644
---- a/ggml/src/ggml-metal/ggml-metal.metal
-+++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -2942,6 +2942,65 @@ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index 5e4861ece..5467f898a 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -262,3 +262,62 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
+ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float2, 2>;
  template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
  #endif
- 
++
 +// qinf downstream patch — fused DeltaNet post-state.
 +// gated[i] = (x[i] / rms(x_row) * w_norm[i]) * silu(z[i])
 +// with rms(x_row) = sqrt(mean(x_row^2) + eps).
@@ -296,7 +308,3 @@ index 27f97b5e0..17b9f513f 100644
 +        y[i00] = x[i00] * scale * w[i00] * silu_zi;
 +    }
 +}
-+
- constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
- constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
- constant short FC_solve_tri_k   [[function_constant(FC_SOLVE_TRI + 2)]];

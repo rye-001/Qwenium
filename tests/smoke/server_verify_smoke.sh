@@ -25,7 +25,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/Qwen3.8-9B-Q8_0.gguf}"
 PORT="${PORT:-18098}"
 CTX="${CTX:-4096}"
@@ -50,6 +50,27 @@ start_server() {  # $1 = extra args, $2 = log file
     echo -n "."; sleep 1
   done
   echo " FAIL: server never came up"; exit 1
+}
+
+# Like start_server, but a DEAD server is an answer rather than a failure.
+# Sets TWO globals: SERVER_PID (so the next leg and the EXIT trap can kill it)
+# and TRY_STATE = up | refused | timeout.
+#
+# It must NOT be called as `X="$(try_start_server ...)"`. Command substitution
+# runs the function in a SUBSHELL, so `SERVER_PID=$!` would be discarded and the
+# started server would outlive the leg, still holding $PORT — which then makes
+# the "no --attention-lens => 404" leg below talk to the PREVIOUS server and
+# read 200. That is a real bug this comment exists to prevent, not a hypothetical.
+TRY_STATE=""
+try_start_server() {  # $1 = extra args, $2 = log file
+  "$SERVER" -m "$MODEL" -c "$CTX" -s 1 -p "$PORT" $1 >"$2" 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 240); do
+    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then TRY_STATE="up"; return 0; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then SERVER_PID=""; TRY_STATE="refused"; return 0; fi
+    sleep 1
+  done
+  TRY_STATE="timeout"; return 0
 }
 
 echo "=== --attention-lens: /v1/extract then /v1/verify on the SAME extraction ==="
@@ -224,10 +245,30 @@ echo "=== --attention-lens --flash-attn: flash prefill, materialized tapped pass
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
-start_server "--attention-lens --flash-attn" "$WORK/flash.log"
-grep -q "PREFILL only" "$WORK/flash.log" || { echo "FAIL: server did not report a prefill-scoped flash"; sed -n '1,40p' "$WORK/flash.log"; exit 1; }
-grep -q "drift gate" "$WORK/flash.log" || { echo "FAIL: the banner did not name the gate that licensed it"; exit 1; }
-python3 "$WORK/check.py" "$PORT" "$WORK" flash-prefill
+# BOTH directions are gated, because flash_prefill_ok is per model and BOTH
+# answers are correct answers. A model that earned the licence must cash it; a
+# model that has not must REFUSE the flag and say which gate it failed. Before
+# 2026-09-18 this leg assumed the first case, so the whole script could only run
+# on the 9B — the 35B and Ternary-Bonsai-27B, which both carry
+# flash_prefill_ok=false, died here with a correct refusal scored as a failure.
+try_start_server "--attention-lens --flash-attn" "$WORK/flash.log"
+FLASH_STATE="$TRY_STATE"
+if [[ "$FLASH_STATE" == "up" ]]; then
+  grep -q "PREFILL only" "$WORK/flash.log" || { echo "FAIL: server did not report a prefill-scoped flash"; sed -n '1,40p' "$WORK/flash.log"; exit 1; }
+  grep -q "drift gate" "$WORK/flash.log" || { echo "FAIL: the banner did not name the gate that licensed it"; exit 1; }
+  python3 "$WORK/check.py" "$PORT" "$WORK" flash-prefill
+elif [[ "$FLASH_STATE" == "refused" ]]; then
+  # The refusal must name the parameter, the model's own provenance, and the
+  # remedy — a bare "not allowed" would leave an operator guessing.
+  grep -q "at most one of --attention-lens / --flash-attn" "$WORK/flash.log" || {
+    echo "FAIL: flash was refused but the message did not name the flag pair"; sed -n '1,40p' "$WORK/flash.log"; exit 1; }
+  grep -q "drift gate" "$WORK/flash.log" || {
+    echo "FAIL: the refusal did not name the gate that would license it"; exit 1; }
+  echo "  SKIP flash-prefill agreement: this model has not earned flash prefill,"
+  echo "       and REFUSED the flag fail-loud, which is the gate for that case."
+else
+  echo "FAIL: server neither came up nor refused within the timeout"; exit 1
+fi
 
 echo "=== /v1/verify WITHOUT --attention-lens -> 404 ==="
 kill "$SERVER_PID" 2>/dev/null || true

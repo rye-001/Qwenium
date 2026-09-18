@@ -22,7 +22,7 @@ decode config (--temperature) and document shapes the synthetic corpus lacks
 (--corpus real). Parse-rate is the metric at risk in both.
 
 Usage:
-    build-metal/bin/http_server -m models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf \
+    build-metal/bin/qwenium-server -m models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf \
       -c 4096 -s 1 -p 18098 --attention-lens
     python3 py/lens_legc_nogrammar.py                        # greedy, both arms
     python3 py/lens_legc_nogrammar.py --temperature 0.7      # S1.4 second config

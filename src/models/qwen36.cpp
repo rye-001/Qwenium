@@ -138,7 +138,8 @@ static ggml_tensor* build_moe_layer(
     ggml_tensor*  cur,
     const TransformerBlock& blk,
     const MoELayer::Hparams& hp,
-    int il)
+    int il,
+    RoutingSource routing)
 {
     MoELayer moe(
         blk.moe_router_weight,
@@ -149,7 +150,8 @@ static ggml_tensor* build_moe_layer(
         blk.moe_shexp_up_weight,
         blk.moe_shexp_down_weight,
         blk.moe_shexp_gate,
-        hp);
+        hp,
+        routing);
     return moe.build(ctx, gf, cur, Phase::Prefill, il);
 }
 
@@ -197,6 +199,7 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // whatever the buffer held — the model then sees periodic noise rather than
     // the image. gemma3, gemma4 and qwen35 all order it this way.
     register_qwen35_common_inputs(graph_inputs_, cfg_);
+    add_routing_replay_input();
     // Registered BEFORE the image splice, which is where this recipe has always
     // put them; qwen35 registers them after. Same set either way.
     register_qwen35_prefill_masks(graph_inputs_, cfg_, n_layers);
@@ -261,7 +264,8 @@ ggml_cgraph* Qwen36ForwardPass::build_prefill_graph(
     // differ only in the FFN, which is the moe_hp parameter (non-null here).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        &moe_hp_, use_flash_attn_prefill()};
+        &moe_hp_, use_flash_attn_prefill(),
+        policy_.routing_source()};
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         const bool ssm = cfg_.is_ssm_layer(il);
@@ -383,6 +387,7 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     register_qwen35_decode_inputs(graph_inputs_, cfg_,
                                   kv_cache_->get_n_ctx_max(),
                                   /*with_kv_write_indices=*/kv_write_idx != nullptr);
+    add_routing_replay_input();
 
     // Flash attention (opt-in --flash-attn) needs an F16 mask —
     // ggml_flash_attn_ext hard-asserts it. Cast ONCE per graph, not once per
@@ -398,7 +403,8 @@ ggml_cgraph* Qwen36ForwardPass::build_decoding_graph(
     // Layer body shared with qwen35 — models/qwen35_family.h.
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        &moe_hp_, use_flash_attn()};
+        &moe_hp_, use_flash_attn(),
+        policy_.routing_source()};
 
     for (uint32_t il = 0; il < n_main_layers_; ++il) {
         const bool ssm = cfg_.is_ssm_layer(il);
@@ -491,7 +497,8 @@ ggml_cgraph* Qwen36ForwardPass::build_mtp_graph(uint32_t n_past)
 
     ggml_tensor* ffn_inp = cur;
     cur = build_norm(gf, cur, blk.ffn_norm_weight, il);
-    cur = build_moe_layer(arena_.ctx(), gf, cur, blk, moe_hp_, static_cast<int>(il));
+    cur = build_moe_layer(arena_.ctx(), gf, cur, blk, moe_hp_, static_cast<int>(il),
+                              policy_.routing_source());
     cur = ggml_add(arena_.ctx(), cur, ffn_inp);
 
     // shared_head_norm → chained hidden out; then the SHARED output head.

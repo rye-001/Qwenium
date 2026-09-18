@@ -41,7 +41,7 @@ target_link_libraries(inference_server INTERFACE
 # =============================================================================
 # The reusable halves of the server: the Lens extraction shape contract and the
 # data: URI decoder for OpenAI-style image_url payloads. Both were compiled
-# directly into http_server AND into three test targets until 2026-08-30 — the
+# directly into qwenium-server AND into three test targets until 2026-08-30 — the
 # same one-source-many-copies arrangement slot_snapshot had.
 #
 # http_server.cpp and server_vision.cpp stay in the executable: the first owns
@@ -78,12 +78,12 @@ set_target_properties(qinf-server PROPERTIES
 # =============================================================================
 # HTTP Server Executable
 # =============================================================================
-add_executable(http_server
+add_executable(qwenium-server
     http_server.cpp
     server_vision.cpp
 )
 
-target_link_libraries(http_server PRIVATE
+target_link_libraries(qwenium-server PRIVATE
     qinf-server
     qinf-snapshot
     qinf-orchestration
@@ -100,12 +100,12 @@ target_link_libraries(http_server PRIVATE
     Threads::Threads
 )
 
-target_compile_features(http_server PRIVATE cxx_std_17)
+target_compile_features(qwenium-server PRIVATE cxx_std_17)
 
 # =============================================================================
 # Install
 # =============================================================================
-install(TARGETS http_server
+install(TARGETS qwenium-server
     RUNTIME DESTINATION bin
 )
 

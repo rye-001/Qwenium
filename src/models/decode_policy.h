@@ -47,6 +47,7 @@
 //
 // Unit test: tests/unit/test_decode_policy.cpp
 
+#include "../layers/routing_trace.h"
 #include <cstdint>
 #include <vector>
 
@@ -102,6 +103,30 @@ struct DecodePolicy {
     // never decodes. See effective_layer_count() and
     // docs/plan-lens-server-shape.md §3.4.
     int truncate_after_layer = -1;
+
+    // MoE ONLY. Null (default) = the router chooses, byte-identical to the
+    // behaviour that predates this field and the only path a dense recipe can
+    // take. Non-null = every MoE layer's top-k operand becomes a graph input
+    // filled from this trace, so the pass takes the SAME expert selections the
+    // trace recorded.
+    //
+    // This exists because a top-k is an argmax: reproducible per configuration,
+    // not across configurations. A ~1e-4 perturbation — a different prefill
+    // shape, batch width, driver or ggml build — selects a different expert,
+    // and on Qwen3.6-35B-A3B that changes 1 extraction in 15 while dense
+    // stacks stay token-identical. Replaying the selection removes that
+    // discrete channel and leaves the arithmetic residue dense models already
+    // carry (measured: worst 1.447e-02 pinned vs the dense 9B's own 1.384e-02,
+    // docs/note-moe-cache-transparency.md §8).
+    //
+    // Borrowed, not owned; must outlive every graph built under it.
+    const RoutingTrace* routing_replay = nullptr;
+
+    // What a MoE layer should do about routing under this policy. One place
+    // decides, so no call site has to spell the conditional out.
+    RoutingSource routing_source() const {
+        return routing_replay ? RoutingSource::Replay : RoutingSource::Router;
+    }
 
     // The layer count a prefill graph should actually build, given the full
     // stack depth `full`. truncate_after_layer < 0 ⇒ `full` unchanged (every

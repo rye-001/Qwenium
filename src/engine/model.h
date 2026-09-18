@@ -186,7 +186,23 @@ public:
     // tokens is expected, not a misuse. Default false keeps the fail-loud
     // guard for the text-only path.
     void load_metadata(const std::string& model_path, bool allow_multimodal = false);
-    void load_tensors();
+    // `max_blocks` (default: every block — byte-for-byte the pre-existing
+    // behavior): when finite, loads token_embd.weight plus blk.{0..max_blocks-1}.*
+    // only, skipping output_norm.weight, output.weight, and every block from
+    // max_blocks on. This is --lens-verify-only's mechanism (server_lens.h,
+    // http_server.cpp): a /v1/verify pass truncated at
+    // DecodePolicy::truncate_after_layer == max_blocks-1 never reads a block
+    // at or past max_blocks (causality — an attention layer cannot depend on
+    // one above it), so the omitted weights are provably unreachable, not a
+    // guess. Blocks beyond max_blocks stay in `blocks_` (sized block_count,
+    // for index validity) as default-constructed — every pointer nullptr.
+    //
+    // Metal-only: the copy-avoiding filter lives in the backend-buffer load
+    // path (Path B below); the CPU-only path (Path A) still loads every
+    // tensor regardless of max_blocks, so a partial request without a Metal
+    // backend is refused fail-loud rather than silently loading (and paying
+    // for) the full model while claiming a saving that did not happen.
+    void load_tensors(uint32_t max_blocks = UINT32_MAX);
 
     // Opt-in: back the weights buffer with the GGUF's mmap'd pages
     // (ggml_backend_dev_buffer_from_host_ptr) instead of allocating a fresh
@@ -243,8 +259,18 @@ private:
 
     std::vector<TransformerBlock> blocks_;
     
-    // Helper method for tensor assignment (reduces code duplication)
-    void assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors);
+    // Helper method for tensor assignment (reduces code duplication).
+    // `loaded_blocks`: how many leading blocks actually have tensors in
+    // `tensors` (see load_tensors' max_blocks). Blocks [loaded_blocks,
+    // block_count) are left default-constructed (all-nullptr) instead of
+    // require()'d — a partial load's whole point is that those tensors were
+    // never read off disk. output_norm.weight / output.weight are require()'d
+    // only when loaded_blocks == block_count (an ordinary full load): a real
+    // GGUF always carries them, so this is not a softened guarantee on the
+    // path that matters; on a partial load they are known-absent by
+    // construction and read as optional instead.
+    void assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors,
+                                 uint32_t loaded_blocks);
 
     // Tokenizer
     std::unique_ptr<Tokenizer> tokenizer_;

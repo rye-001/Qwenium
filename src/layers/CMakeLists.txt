@@ -7,6 +7,7 @@ add_library(qinf-layers STATIC
     ffn.cpp
     deltanet.cpp
     moe.cpp
+    routing_trace.cpp
     norm.cpp
     ple.cpp           # Per-Layer Embedding lookup + projection
     transformer_block.cpp

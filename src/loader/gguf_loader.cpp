@@ -787,15 +787,48 @@ void GGUFLoader::skip_gguf_value_from_mem(size_t& offset, GGUFValueType type)
 
 std::unique_ptr<GGUFLoader> create_gguf_loader() { return std::make_unique<GGUFLoader>(); }
 
+namespace {
+// True iff `name` is a per-block tensor ("blk.<i>.<rest>") whose index is
+// >= max_blocks — i.e. a block the caller asked to skip. Anything that is
+// not "blk.<i>." at all (token_embd.weight, output_norm.weight, ...) is
+// never skipped by THIS predicate; the block-count-vs-partial decision for
+// those lives at the call site, which knows whether this is a partial load
+// at all (max_blocks == UINT32_MAX must be a pure no-op, byte-identical to
+// the loader before this parameter existed — a std::stoul on every name
+// would be wasted work on the hot default path, so callers short-circuit).
+bool is_skipped_block_tensor(const std::string& name, uint32_t max_blocks) {
+    static const std::string kPrefix = "blk.";
+    if (name.rfind(kPrefix, 0) != 0) return false;  // not a block tensor at all
+    const size_t idx_start = kPrefix.size();
+    const size_t dot = name.find('.', idx_start);
+    if (dot == std::string::npos) return false;  // malformed name; let it through, require() below will judge it
+    const uint32_t block_index = static_cast<uint32_t>(std::stoul(name.substr(idx_start, dot - idx_start)));
+    return block_index >= max_blocks;
+}
+}  // namespace
+
 // Load tensor metadata only (no data copying)
-void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors)
+void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors,
+                                       uint32_t max_blocks)
 {
     if (!file_mapper_) {
         throw GGUFLoadError("Model not loaded or mapped.");
     }
 
+    // Partial iff the caller asked for fewer blocks than the file carries.
+    // Kept as one bool rather than re-comparing per tensor so the ordinary
+    // (full-load) path never evaluates the skip predicate at all.
+    const bool partial = max_blocks < metadata_.block_count;
+
     for (const auto &[name, meta] : metadata_.tensor_inventory)
     {
+        if (partial) {
+            // The output head and final norm are never read by a forward pass
+            // truncated after any block < block_count — verify never decodes,
+            // so there is no logit to compute and nothing reads them.
+            if (name == "output_norm.weight" || name == "output.weight") continue;
+            if (is_skipped_block_tensor(name, max_blocks)) continue;
+        }
         std::vector<int64_t> shape(meta.shape.begin(), meta.shape.end());
         ggml_tensor *tensor = ggml_new_tensor(ctx, meta.type, shape.size(), shape.data());
         if (!tensor)
@@ -804,12 +837,14 @@ void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std:
         }
         ggml_set_name(tensor, name.c_str());
 
-        // NOTE: tensor->data is NOT set here. 
+        // NOTE: tensor->data is NOT set here.
         // Caller must use get_tensor_data() and ggml_backend_tensor_set()
-        
+
         tensors[name] = tensor;
     }
-    std::cout << "Successfully created " << tensors.size() << " tensor metadata entries." << std::endl;
+    std::cout << "Successfully created " << tensors.size() << " tensor metadata entries."
+              << (partial ? " (partial load: max_blocks=" + std::to_string(max_blocks) + ")" : "")
+              << std::endl;
 }
 
 // Get raw pointer to tensor data in mmap'd file

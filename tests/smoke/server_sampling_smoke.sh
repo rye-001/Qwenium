@@ -23,7 +23,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/Qwen3.5-0.8B-BF16.gguf}"
 PROMPT="${PROMPT:-Write one sentence about the ocean.}"
 PORT="${PORT:-18096}"

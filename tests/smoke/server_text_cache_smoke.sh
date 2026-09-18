@@ -19,7 +19,18 @@
 #                 for R2 and R3.
 #   2. SKIP     — one .snap blob, byte-unchanged after R1 (store only on a miss →
 #                 an untouched blob proves the system prefill was skipped).
-#   3. TRANSPARENT — R3 answer byte-identical to R1 (cached KV == re-prefill).
+#   3. FIDELITY   — R3 answer byte-identical to R1 (restored KV == recomputed KV).
+#                 NOTE THE SCOPE, it is narrower than it looks: all three
+#                 requests run against ONE server started WITH --prefix-cache,
+#                 so R1 is a cache MISS, not a no-cache run — and a miss already
+#                 prefills the system block as its own pass. R1 and R3 therefore
+#                 share a prefill SHAPE, and this gate compares restore against
+#                 recompute. It does NOT compare flag-ON against flag-OFF, which
+#                 is what architecture.md's flag table means by "transparent"
+#                 and what a user sees when they turn the flag on. That
+#                 comparison is untested here and is FALSE on MoE: measured
+#                 2 of 3 documents changed on Qwen3.6-35B-A3B
+#                 (docs/note-moe-cache-transparency.md §4).
 #   4. COHERENT — R1 and R2 are real prose, not degenerate token soup.
 #
 # Heavy: loads a model on Metal. Run ONE model at a time.
@@ -36,7 +47,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/Qwen3.5-0.8B-BF16.gguf}"
 SYSTEM="${SYSTEM:-You are a terse assistant for a warehouse order-management system. Answer in one short sentence. Never apologize. Always state units explicitly.}"
 Q1="${Q1:-How many pallets fit on a standard truck?}"
@@ -122,11 +133,12 @@ PSIG2="$(stat -f '%z %m' "${PREFIX_BLOB[0]}")"
 [[ "$PSIG1" == "$PSIG2" ]] || { echo "FAIL: .snap changed ($PSIG1 -> $PSIG2) — system prefill not skipped"; exit 1; }
 echo "[skip]         prefix blob unchanged -> PASS"
 
-# Gate 3: result-transparency (same system+question → byte-identical answer).
+# Gate 3: snapshot FIDELITY — a restored system-prompt KV is an exact
+# substitute for recomputing it. Not flag transparency; see the header note.
 [[ -n "$(printf '%s' "$ANS1" | tr -d '[:space:]')" ]] || { echo "FAIL: R1 answer empty"; exit 1; }
 if [[ "$ANS1" != "$ANS3" ]]; then
   echo "FAIL: R3 (HIT) differs from R1 (cold) — cache is NOT result-transparent"
   echo "--- R1 ---"; printf '%s\n' "$ANS1"; echo "--- R3 ---"; printf '%s\n' "$ANS3"; exit 1
 fi
-echo "[transparency] R3 byte-identical to R1 -> PASS"
+echo "[fidelity] R3 byte-identical to R1 (restore == recompute) -> PASS"
 echo "================ SERVER TEXT-CACHE SMOKE PASS ================"

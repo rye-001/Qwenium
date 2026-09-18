@@ -8,7 +8,7 @@
 # coherence smoke; there is no byte-exact reference for the generation).
 #
 # Heavy: loads a ~12 GB model on the Metal device. Run ONE model at a time
-# (never two qwenium/http_server processes concurrently). ~25 s/turn.
+# (never two qwenium-server processes concurrently). ~25 s/turn.
 #
 # Usage:
 #   tests/smoke/server_image_smoke.sh                 # defaults below
@@ -33,7 +33,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/gemma-4-12B-it-Q8_0.gguf}"
 MMPROJ="${MMPROJ:-models/mmproj-gemma-4-12B-it-Q8_0.gguf}"
 IMAGE="${IMAGE:-IMG_4210.jpg}"

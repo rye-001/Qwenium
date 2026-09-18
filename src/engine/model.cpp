@@ -7,6 +7,7 @@
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
@@ -104,10 +105,29 @@ void Model::load_metadata(const std::string &model_path, bool allow_multimodal)
     is_loaded_ = true;
 }
 
-void Model::load_tensors()
+void Model::load_tensors(uint32_t max_blocks)
 {
     if (!is_loaded_) {
         throw GGUFLoadError("Metadata must be loaded before loading tensors.");
+    }
+
+    // Clamp: a caller passing block_count (or anything >=) means "everything",
+    // same as the UINT32_MAX default -- both take the ordinary full-load path
+    // below byte-for-byte. `partial` is the one flag every later branch reads.
+    const uint32_t loaded_blocks = std::min(max_blocks, metadata_.block_count);
+    const bool partial = loaded_blocks < metadata_.block_count;
+
+    // Partial loading skips the copy for most weights, so it is Metal-only:
+    // Path A (CPU-only, below) has no filtering and would silently load —
+    // and pay to copy — every tensor while claiming a saving that never
+    // happened. Refuse rather than lie about what ran.
+    if (partial && !backend_metal_) {
+        throw GGUFLoadError(
+            "Model::load_tensors: parameter 'max_blocks' expected block_count (" +
+            std::to_string(metadata_.block_count) + ", i.e. a full load) when no Metal "
+            "backend is available, actual " + std::to_string(max_blocks) +
+            " — partial loading is implemented only for the Metal backend-buffer "
+            "load path (Path B); the CPU-only path loads every tensor unconditionally");
     }
 
     // Calculate memory needed for model weights
@@ -117,7 +137,7 @@ void Model::load_tensors()
     // Choose loading path based on backend availability
     // Path A: CPU-only (backward compatible, original behavior)
     // Path B: Backend-based (new, for GPU offloading preparation)
-    
+
     if (!backend_metal_) {
         // ===== PATH A: CPU-ONLY (Original behavior) =====
         std::cout << "[Load Path] Using CPU-only mode (original)" << std::endl;
@@ -132,13 +152,14 @@ void Model::load_tensors()
             throw GGUFLoadError("Failed to allocate model context.");
         }
 
-        // Load tensors with data (original method)
+        // Load tensors with data (original method). Path A never sees a
+        // partial request (refused above), so this is always a full load.
         std::unordered_map<std::string, ggml_tensor *> tensors;
         loader_->load_all_tensors(model_context_, tensors);
-        
+
         // Assign tensor pointers
-        assign_tensor_pointers(tensors);
-        
+        assign_tensor_pointers(tensors, metadata_.block_count);
+
     } else {
         // ===== PATH B: BACKEND-BASED (New for Metal GPU) =====
         std::cout << "[Load Path] Using backend-based loading (Metal available)" << std::endl;
@@ -155,10 +176,16 @@ void Model::load_tensors()
             throw GGUFLoadError("Failed to create ggml context.");
         }
 
-        // Step 2: Load tensor metadata (creates ggml_tensor structs without data)
+        // Step 2: Load tensor metadata (creates ggml_tensor structs without data).
+        // `loaded_blocks` filters this to token_embd.weight + blk.{0..loaded_blocks-1}.*
+        // when partial -- everything downstream (the copy loop and the mmap
+        // wiring loop below both just iterate `tensors`) shrinks for free.
         std::unordered_map<std::string, ggml_tensor *> tensors;
-        loader_->load_tensor_metadata(model_context_, tensors);
-        std::cout << "Loaded metadata for " << tensors.size() << " tensors" << std::endl;
+        loader_->load_tensor_metadata(model_context_, tensors, loaded_blocks);
+        std::cout << "Loaded metadata for " << tensors.size() << " tensors"
+                  << (partial ? " (partial load: " + std::to_string(loaded_blocks) + "/" +
+                                std::to_string(metadata_.block_count) + " blocks)" : "")
+                  << std::endl;
 
         if (mmap_weights_) {
             // ── mmap-backed weights ────────────────────────────────────────
@@ -272,7 +299,7 @@ void Model::load_tensors()
         
             // Assign tensor pointers
         }
-        assign_tensor_pointers(tensors);
+        assign_tensor_pointers(tensors, loaded_blocks);
     }
 
     std::cout << "All tensors loaded and assigned successfully." << std::endl;
@@ -299,8 +326,10 @@ void Model::load_tensors()
     std::cout << "Tokenizer initialized." << std::endl;
 }
 
-void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors)
+void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_tensor*>& tensors,
+                                    uint32_t loaded_blocks)
 {
+    const bool partial = loaded_blocks < metadata_.block_count;
     try {
         // Fail-loud tensor lookup: names the architecture and the missing tensor.
         // Every REQUIRED tensor goes through this. It used to serve only the
@@ -321,7 +350,21 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
         };
 
         token_embd_weight_ = require("token_embd.weight");
-        output_norm_weight_ = require("output_norm.weight");
+        // A real GGUF always carries output_norm.weight, so on an ordinary
+        // full load this stays require()'d -- no softened guarantee there.
+        // A partial load (--lens-verify-only) never asked the loader for it
+        // (GGUFLoader::load_tensor_metadata skips it whenever max_blocks <
+        // block_count) -- it is known-absent by construction, not a load
+        // failure, so read it optionally and leave it nullptr. Nothing
+        // dereferences it on this path: verify always calls
+        // build_prefill_graph(..., want_logits=false), and the output head is
+        // the only reader.
+        if (partial) {
+            auto norm_it = tensors.find("output_norm.weight");
+            output_norm_weight_ = (norm_it != tensors.end()) ? norm_it->second : nullptr;
+        } else {
+            output_norm_weight_ = require("output_norm.weight");
+        }
 
         auto it = tensors.find("output.weight");
         if (it != tensors.end()) {
@@ -331,6 +374,18 @@ void Model::assign_tensor_pointers(const std::unordered_map<std::string, ggml_te
         blocks_.resize(metadata_.block_count);
 
         for (uint32_t i = 0; i < metadata_.block_count; ++i) {
+            // Partial load: block i's tensors were never asked of the loader
+            // (see GGUFLoader::load_tensor_metadata's max_blocks filter), so
+            // there is nothing in `tensors` to require() here -- leave
+            // blocks_[i] default-constructed (every TransformerBlock pointer
+            // nullptr) and move on. Safe because the only reader of blocks_[i]
+            // is a recipe's build_prefill_graph layer loop, and every recipe
+            // bounds that loop with DecodePolicy::effective_layer_count() --
+            // for i >= loaded_blocks that loop never runs (architecture.md
+            // §6/§11: causality means a truncated pass cannot depend on a
+            // layer at or past its cutoff, so it never needs to).
+            if (i >= loaded_blocks) continue;
+
             std::string prefix = "blk." + std::to_string(i) + ".";
 
             // Shared: attention norm (pre-attention RMS norm)

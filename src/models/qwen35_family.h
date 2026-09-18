@@ -58,6 +58,11 @@ struct Qwen35LayerCommon {
     // ggml_flash_attn_ext requires an F16 mask. Default false keeps the
     // byte-reproducible materialized path.
     bool                     use_flash = false;
+    // Where this layer's MoE gets its expert selection. Router (default) is
+    // today's behaviour and the only value a dense config can take; Replay
+    // makes the top-k operand a graph input. Set from
+    // DecodePolicy::routing_source(), same as use_flash is set from the policy.
+    RoutingSource            routing = RoutingSource::Router;
 };
 
 // ── Typed graph inputs ──────────────────────────────────────────────────────

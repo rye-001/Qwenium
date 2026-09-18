@@ -96,10 +96,12 @@ public:
         std::vector<float>* hidden_out) {
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        if (routing_capture_) mark_moe_routing(gf);   // before alloc, like the taps
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(scheduler, gf), "run_prefill");
+        if (routing_capture_) read_moe_routing(gf, *routing_capture_, pos);
         advance_cache(tokens.size(), slot_idx);
         if (hidden_out) *hidden_out = get_output_hidden(gf);
         return get_output_logits(gf);
@@ -201,10 +203,12 @@ public:
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf =
             build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
+        if (routing_capture_) mark_moe_routing(gf);
         ggml_backend_sched_alloc_graph(scheduler, gf);
         set_prefill_inputs(gf, tokens, pos);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(scheduler, gf), "feed_tokens");
+        if (routing_capture_) read_moe_routing(gf, *routing_capture_, pos);
         advance_cache(static_cast<uint32_t>(tokens.size()), slot);
         // No get_output_logits: head-less by contract.
     }
@@ -281,6 +285,11 @@ public:
         step.sparse_ids = sparse_decode_ids_.empty()
             ? nullptr : &sparse_decode_ids_;
         graph_inputs_.set_input(step);
+        // Bind the trace to the tokens it is being captured over. Here rather
+        // than at the call sites because a trace replayed onto DIFFERENT tokens
+        // pins one token's experts onto another, and the only defence is a
+        // binding no caller can forget to make.
+        if (routing_capture_) routing_capture_->note_tokens((size_t)pos, tokens);
         sparse_decode_ids_.clear();
         mrope_img_grid_w_ = 0;  // consume-on-use, like sparse_decode_ids_
         mrope_kv_base_    = -1;
@@ -299,6 +308,8 @@ public:
         step.sparse_ids = sparse_decode_ids_.empty()
             ? nullptr : &sparse_decode_ids_;
         graph_inputs_.set_input(step);
+        if (routing_capture_ && !positions.empty())
+            routing_capture_->note_tokens((size_t)positions[0], tokens);
         sparse_decode_ids_.clear();
     }
 
@@ -363,6 +374,39 @@ public:
     // when the layer set is empty (byte-inert). Fail-loud if an armed layer's
     // tap tensor is absent from the graph (names the layer, expected, actual).
     void mark_attention_taps(ggml_cgraph* gf);
+
+    // ── Routing capture / replay (MoE only) ──────────────────────────────
+    //
+    // Same build -> mark -> alloc -> compute -> read ordering as the attention
+    // taps, and for the same reason: marking a tensor as a graph output has to
+    // happen before allocation or its buffer is reused.
+    //
+    // CAPTURE marks every `moe_idx.<il>` and reads the selections out after
+    // compute. `pos` is the batch's base position, because a trace is indexed
+    // by where a token sits in the SEQUENCE, not in this batch — prefill may
+    // be chunked and decode arrives one row at a time.
+    void mark_moe_routing(ggml_cgraph* gf);
+    // Returns the number of MoE layers captured. ZERO means this recipe is
+    // dense — a legitimate answer, not an error.
+    int  read_moe_routing(ggml_cgraph* gf, RoutingTrace& trace, int pos);
+
+    // CAPTURE, as a standing mode rather than a per-call-site chore. Borrowed;
+    // null (default) captures nothing and is byte-identical to before.
+    //
+    // A mode, not N call sites, on purpose: the extract path prefills through
+    // run_prefill, which builds AND computes internally, so wiring capture at
+    // the server's visible graph sites would have silently missed every
+    // document position and produced a fingerprint of the generation only —
+    // a digest that looks complete and is not. Callers that build their own
+    // graphs (the lens tapped decode) still call mark/read themselves.
+    void set_routing_capture(RoutingTrace* trace) { routing_capture_ = trace; }
+    RoutingTrace* routing_capture() const { return routing_capture_; }
+
+    // REPLAY. Borrowed; must outlive every graph built after this call. Null
+    // restores the router path. Takes effect at the next graph build, because
+    // the selection's source is a graph-construction choice, not a run-time one.
+    void set_routing_replay(const RoutingTrace* trace) { policy_.routing_replay = trace; }
+    const RoutingTrace* routing_replay() const { return policy_.routing_replay; }
     // Read the marked rows back after compute. Result[i] corresponds to
     // attention_taps()[i]. Fail-loud if a tap tensor is missing (the caller
     // forgot mark_attention_taps before alloc).
@@ -392,6 +436,13 @@ protected:
     // Typed inputs for the current graph. Each recipe rebuilds this in its
     // build_*_graph; run_prefill / decode_step fan set_input over it.
     GraphInputSet graph_inputs_;
+    RoutingTrace* routing_capture_ = nullptr;
+
+    // Register the routing-replay input iff the policy asks for it. Every
+    // recipe that can host a MoE calls this unconditionally after clearing
+    // graph_inputs_; the one conditional lives here so no recipe has to spell
+    // it out, and absence of the input IS the router path, not an error.
+    void add_routing_replay_input();
 
     // Sparse decode: host-side valid token ids armed before graph build.
     // build_output_head registers a SparseHeadInput when this is non-empty;

@@ -373,7 +373,7 @@ untested (§4's T2/O2-col was not built).
 ## 11. Bar 3 — byte span → pixel box, Arm O, 2026-09-08
 
 240 citations (every `fields[].citations[]` entry, not just top-1) across 6
-documents, via the **shipped route** — `http_server --attention-lens` on
+documents, via the **shipped route** — `qwenium-server --attention-lens` on
 Qwen3.8-9B, real `POST /v1/extract` responses, not harness internals.
 Per-character boxes from `VNRecognizedText.boundingBox(for:)`; index built during
 document assembly, never by re-search, as §5 requires.

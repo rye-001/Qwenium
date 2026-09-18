@@ -23,6 +23,7 @@
 #include <string>
 #include <memory>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <unordered_map>
 #include <stdexcept>
@@ -79,8 +80,26 @@ public:
     // Original method - backward compatible (copies data into context)
     void load_all_tensors(ggml_context* ctx, std::unordered_map<std::string, ggml_tensor*>& tensors);
     
-    // NEW: Load tensor structs only (for backend usage)
-    void load_tensor_metadata(ggml_context* ctx, std::unordered_map<std::string, ggml_tensor*>& tensors);
+    // NEW: Load tensor structs only (for backend usage).
+    //
+    // `max_blocks` (default: every block, i.e. today's behavior byte-for-byte):
+    // when finite, restricts the struct set to token_embd.weight plus
+    // blk.{0..max_blocks-1}.* — no output_norm.weight, no output.weight, no
+    // blk.{max_blocks..block_count-1}.*. This is the exact subset a forward
+    // pass truncated at DecodePolicy::truncate_after_layer == max_blocks-1 can
+    // ever read (architecture.md §6, causality: a layer cannot depend on one
+    // above it), which is what makes the omission safe rather than a guess.
+    // Used by --lens-verify-only (Model::load_tensors) to skip the SSD
+    // read + backend copy for blocks the lens calibration will never tap.
+    // Does NOT touch ModelMetadata::weights_hash — that is computed once in
+    // GGUFLoader::load_model from the FULL parsed tensor inventory, before
+    // this method (or its caller) ever runs, so a partial load and a full
+    // load of the same file stamp the identical hash. Hashing only the
+    // loaded subset would make a verify-only report incomparable with a
+    // full-server one, which is exactly what config.weights exists to
+    // prevent (docs/lens-format.md).
+    void load_tensor_metadata(ggml_context* ctx, std::unordered_map<std::string, ggml_tensor*>& tensors,
+                               uint32_t max_blocks = UINT32_MAX);
     
     // NEW: Get raw tensor data pointer (for backend copying)
     const void* get_tensor_data(const std::string& name) const;

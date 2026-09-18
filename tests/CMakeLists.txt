@@ -12,6 +12,7 @@ add_executable(unit-tests
     unit/test_vocab_file_loading.cpp
     unit/test_qwen35_metadata.cpp
     unit/test_qwen35_tensor_loading.cpp
+    unit/test_model.cpp
     unit/test_qwen35_tokenizer.cpp
     unit/test_qwen35_hybrid_cache.cpp
     unit/test_qwen35_forward_attn.cpp
@@ -23,6 +24,8 @@ add_executable(unit-tests
     unit/test_mrope_image_positions.cpp
     unit/test_gather_indices_input.cpp
     unit/test_sparse_head_input.cpp
+    unit/test_routing_trace.cpp
+    unit/test_routing_replay_input.cpp
 )
 
 # Absolute path to the repo's model directory, so model-file tests can find a
@@ -1653,7 +1656,7 @@ target_compile_features(mmap-weights-probe PRIVATE cxx_std_17)
 # is sufficient alone).  The `--help` tests are the positive control: without
 # them a binary that crashed on startup for any reason would satisfy WILL_FAIL.
 add_test(NAME cli-help-exits-zero COMMAND qwenium-cli --help)
-add_test(NAME server-help-exits-zero COMMAND http_server --help)
+add_test(NAME server-help-exits-zero COMMAND qwenium-server --help)
 
 add_test(NAME cli-rejects-unknown-flag COMMAND qwenium-cli --no-such-flag)
 set_tests_properties(cli-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)
@@ -1677,11 +1680,11 @@ add_test(NAME cli-rejects-flag-without-value COMMAND qwenium-cli --kv-type)
 set_tests_properties(cli-rejects-flag-without-value PROPERTIES
     PASS_REGULAR_EXPRESSION "--kv-type: expected a value")
 
-add_test(NAME server-rejects-unknown-flag COMMAND http_server --no-such-flag)
+add_test(NAME server-rejects-unknown-flag COMMAND qwenium-server --no-such-flag)
 set_tests_properties(server-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)
-add_test(NAME server-rejects-unknown-flag-reason COMMAND http_server --no-such-flag)
+add_test(NAME server-rejects-unknown-flag-reason COMMAND qwenium-server --no-such-flag)
 set_tests_properties(server-rejects-unknown-flag-reason PROPERTIES
     PASS_REGULAR_EXPRESSION "expected a known flag.*actual '--no-such-flag'")
-add_test(NAME server-rejects-flag-without-value COMMAND http_server --ctx)
+add_test(NAME server-rejects-flag-without-value COMMAND qwenium-server --ctx)
 set_tests_properties(server-rejects-flag-without-value PROPERTIES
     PASS_REGULAR_EXPRESSION "--ctx: expected a value")

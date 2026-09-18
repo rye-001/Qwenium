@@ -15,7 +15,7 @@ The corpus is extracted from tests/perf/attn_provenance.cpp at runtime, so it
 cannot drift from the canonical one.
 
 Usage:
-    build-metal/bin/http_server -m models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf \
+    build-metal/bin/qwenium-server -m models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf \
       -c 4096 -s 1 -p 18098 --attention-lens
     python3 py/lens_legc_endpoint.py [--port 18098]
 """
