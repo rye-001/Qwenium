@@ -39,7 +39,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/medgemma-1.5-4b-it-BF16.gguf}"
 MMPROJ="${MMPROJ:-models/mmproj-BF16.gguf}"
 IMAGE="${IMAGE:-IMG_4210.jpg}"

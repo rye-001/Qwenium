@@ -13,6 +13,7 @@ add_library(qinf-graph-inputs STATIC
     output_ids_input.cpp
     image_embeddings_input.cpp
     image_embedding_section.cpp
+    routing_replay_input.cpp
 )
 
 target_include_directories(qinf-graph-inputs PUBLIC

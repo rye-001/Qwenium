@@ -69,7 +69,7 @@ endif()
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
-  GIT_TAG        b10582
+  GIT_TAG        b10964
   SOURCE_SUBDIR  ggml
   PATCH_COMMAND  bash "${CMAKE_SOURCE_DIR}/patches/apply-all.sh" "${CMAKE_SOURCE_DIR}/patches"
 )

@@ -1,4 +1,9 @@
 #include "forward_pass_base.h"
+
+#include <cstdlib>
+#include <cstdio>
+
+#include "../graph_inputs/routing_replay_input.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
 #include "../layers/norm.h"
@@ -275,6 +280,52 @@ void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
     }
 }
 
+void ForwardPassBase::add_routing_replay_input() {
+    if (policy_.routing_replay)
+        graph_inputs_.add(std::make_unique<RoutingReplayInput>(policy_.routing_replay));
+}
+
+void ForwardPassBase::mark_moe_routing(ggml_cgraph* gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor* t = ggml_graph_node(gf, i);
+        if (std::string(ggml_get_name(t)).rfind("moe_idx.", 0) != 0) continue;
+        // `moe_idx.<il>` is a ggml_view_2d of the argsort output carrying the
+        // PARENT's row stride. Pinning and reading the view directly copies
+        // ggml_nbytes() contiguous bytes, which for a strided view is neither
+        // the right bytes nor, at the last row, necessarily mapped memory. Pin
+        // the contiguous parent and slice host-side in read_moe_routing.
+        ggml_tensor* src = t->view_src ? t->view_src : t;
+        ggml_set_output(src);
+        ggml_build_forward_expand(gf, src);
+    }
+}
+
+int ForwardPassBase::read_moe_routing(ggml_cgraph* gf, RoutingTrace& trace, int pos) {
+    int found = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor* t = ggml_graph_node(gf, i);
+        const std::string nm = ggml_get_name(t);
+        if (nm.rfind("moe_idx.", 0) != 0) continue;
+        const int il    = std::stoi(nm.substr(8));
+        const int top_k = (int)t->ne[0];
+        const int n_tok = (int)t->ne[1];
+        ggml_tensor* src = t->view_src ? t->view_src : t;
+        const int n_exp = (int)src->ne[0];
+
+        std::vector<int32_t> full((size_t)n_exp * n_tok);
+        ggml_backend_tensor_get(src, full.data(), 0, ggml_nbytes(src));
+        for (int r = 0; r < n_tok; ++r)
+            trace.write(il, (size_t)(pos + r), full.data() + (size_t)r * n_exp, top_k);
+        found++;
+    }
+    // Zero is a legitimate answer, not an error: a DENSE recipe has no routing
+    // to capture. The dangerous case — asking to replay a graph that was built
+    // with RoutingSource::Router — is caught on the other side, by
+    // RoutingReplayInput, which refuses a graph with no 'moe_routing' slots.
+    // Callers that require an MoE check the returned count.
+    return found;
+}
+
 std::vector<ForwardPassBase::AttentionTap>
 ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
     std::vector<AttentionTap> out;
@@ -295,6 +346,42 @@ ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
         tap.n_head = (int)ts->ne[2];   // shape [n_kv, n_q, n_head, 1]
         tap.rows.resize((size_t)tap.n_kv * tap.n_q * tap.n_head);
         ggml_backend_tensor_get(ts, tap.rows.data(), 0, ggml_nbytes(ts));
+        // ── The tap must BE a softmax. Fail loud if it is not. ──────────────
+        // Post-softmax attention weights live in [0, 1] — always, with or
+        // without sinks. A value outside that range means these bytes are not
+        // this pass's softmax output, and the only way that happens is memory
+        // the graph reused underneath a tensor we flagged OUTPUT.
+        //
+        // That is not hypothetical. Measured 2026-09-18: on a --lens-verify-only
+        // server, a preceding /v1/locate left a galloc plan in which
+        // `kq_soft.<citation_layer>` was NOT an output (locate marks one layer,
+        // verify marks two). ggml_gallocr_needs_realloc keys on node count and
+        // node SIZES — never on the OUTPUT flag — and verify's graph has the
+        // same node count and strictly smaller tensors, so galloc reused
+        // locate's plan verbatim and handed the tap's block to DeltaNet layers
+        // 4 and 6. Every later /v1/verify then returned a confident, well-formed
+        // report computed from pre-softmax scores: body_mass went negative and
+        // four of seven badges flipped. No error, no warning.
+        //
+        // The scheduler split that caused it is fixed at the call site. This
+        // guard is the backstop, because the failure is SILENT and the product
+        // is the receipt: a lens that cannot tell whether it read its own
+        // attention should refuse, not report.
+        for (size_t i = 0; i < tap.rows.size(); ++i) {
+            const float v = tap.rows[i];
+            if (v >= -1e-3f && v <= 1.0f + 1e-3f) continue;
+            throw std::runtime_error(
+                "get_attention_taps: tap 'kq_soft." + std::to_string(il) +
+                "' expected post-softmax weights within [0, 1], actual " +
+                std::to_string(v) + " at element " + std::to_string(i) + " of " +
+                std::to_string(tap.rows.size()) + " (shape [" +
+                std::to_string(tap.n_kv) + "," + std::to_string(tap.n_q) + "," +
+                std::to_string(tap.n_head) + "]) — these bytes are not this "
+                "pass's attention. The graph reused the tap's memory: a "
+                "previously allocated graph on this scheduler had a different "
+                "set of tapped layers, so galloc's cached plan does not protect "
+                "this one. Give the differing pass its own scheduler.");
+        }
         out.push_back(std::move(tap));
     }
     return out;

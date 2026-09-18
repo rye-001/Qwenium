@@ -95,7 +95,8 @@ ggml_tensor* build_family_ffn(const Qwen35LayerCommon& c,
                  blk.moe_shexp_up_weight,
                  blk.moe_shexp_down_weight,
                  blk.moe_shexp_gate,
-                 *c.moe_hp);
+                 *c.moe_hp,
+                 c.routing);
     return moe.build(c.ctx, c.gf, cur, phase, static_cast<int>(il));
 }
 

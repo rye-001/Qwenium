@@ -1,5 +1,7 @@
 #include "moe.h"
 
+#include <cstdlib>
+
 #include "ggml.h"
 
 #include <cstdio>
@@ -27,6 +29,65 @@ static void moe_set_name(ggml_cgraph* gf, ggml_tensor* t, const char* base, int 
 
 // ── MoELayer ──────────────────────────────────────────────────────────────────
 
+ggml_tensor* moe_build_expert_idx(ggml_context* ctx,
+                                  ggml_cgraph*  gf,
+                                  ggml_tensor*  logits,
+                                  int           top_k,
+                                  int64_t       n_tokens,
+                                  RoutingSource routing,
+                                  int           il)
+{
+    // The ONLY branch routing replay introduces, and it is a choice of
+    // PRODUCER, not a change to the math: ggml_mul_mat_id already takes the
+    // top-k index list as a tensor operand, so supplying it is the same shape
+    // of thing as computing it. Every consumer downstream is identical on both
+    // paths and does not know which one ran.
+    if (routing == RoutingSource::Replay) {
+        // Supplied: RoutingReplayInput fills this before compute.
+        // Deliberately named differently from `moe_idx` — a replayed selection
+        // is not a computed one, and anything that CAPTURES routing (which
+        // looks for `moe_idx.<il>`) must not silently re-capture what it just
+        // replayed.
+        ggml_tensor* idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+        ggml_set_input(idx);
+        moe_set_name(gf, idx, "moe_routing", il);
+
+        // The router logits must OUTLIVE this branch, and on the Replay path
+        // nothing else keeps them alive. On the Router path the argsort is a
+        // second consumer of `logits`; remove it and the only remaining
+        // reference is a reshape VIEW, after which gallocr reuses the logits
+        // buffer before ggml_get_rows gathers the gating weights from it. The
+        // selection is then perfectly correct and the WEIGHTS are garbage —
+        // which is worse than not pinning at all, because it looks like a
+        // working replay.
+        //
+        // Measured on Gemma 4-26B-A4B: replayed ids verified identical for all
+        // 30 layers and all 285 rows, and the last-position logits still moved
+        // by 22 — an order of magnitude larger than the drift under study. Two
+        // independent probes agree on the mechanism and produce bitwise-equal
+        // output: pinning the logits (this line) and restoring the argsort
+        // purely as a consumer.
+        //
+        // Qwen's MoELayer never showed it, so this cost a cross-family run to
+        // find — which is what that rule is for.
+        //
+        // Costs n_experts * n_tokens * 4 bytes per MoE layer that the Router
+        // path does not pay (~4.4 MB on Gemma 4 at 285 tokens): the price of
+        // replay, not a leak.
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+        return idx;
+    }
+    // Computed: sorted_idx is [n_experts, n_tokens] I32, and the result is the
+    // top_k prefix of each token's ranking. It carries the PARENT's row stride,
+    // so a reader must pin and slice sorted_idx rather than copy these bytes.
+    ggml_tensor* sorted_idx = ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC);
+    ggml_tensor* idx = ggml_view_2d(ctx, sorted_idx, top_k, n_tokens,
+                                    sorted_idx->nb[1], 0);
+    moe_set_name(gf, idx, "moe_idx", il);
+    return idx;
+}
+
 MoELayer::MoELayer(
     ggml_tensor* w_router,
     ggml_tensor* w_exp_gate,
@@ -36,7 +97,8 @@ MoELayer::MoELayer(
     ggml_tensor* w_sh_up,
     ggml_tensor* w_sh_down,
     ggml_tensor* w_sh_norm,
-    const Hparams& hp)
+    const Hparams& hp,
+    RoutingSource routing)
     : w_router_(w_router)
     , w_exp_gate_(w_exp_gate)
     , w_exp_up_(w_exp_up)
@@ -46,6 +108,7 @@ MoELayer::MoELayer(
     , w_sh_down_(w_sh_down)
     , w_sh_norm_(w_sh_norm)
     , hp_(hp)
+    , routing_(routing)
 {
     if (hp_.has_shared_expert) {
         if (!w_sh_gate_ || !w_sh_up_ || !w_sh_down_) {
@@ -75,15 +138,20 @@ ggml_tensor* MoELayer::build(
     ggml_tensor* logits = ggml_mul_mat(ctx, w_router_, input);
     moe_set_name(gf, logits, "moe_logits", il);
 
-    // Get indices of top-k experts
-    // sorted_idx: [n_experts, n_tokens] I32
-    ggml_tensor* sorted_idx = ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC);
-    // expert_idx: [top_k, n_tokens] I32
-    ggml_tensor* expert_idx = ggml_view_2d(ctx, sorted_idx,
-        top_k, n_tokens,
-        sorted_idx->nb[1],
-        0);
-    moe_set_name(gf, expert_idx, "moe_idx", il);
+    // The ONLY branch routing replay introduces, and it is a choice of
+    // PRODUCER, not a change to the math: ggml_mul_mat_id already takes the
+    // top-k index list as a tensor operand, so supplying it is the same shape
+    // of thing as computing it. Everything below this point is identical on
+    // both paths and does not know which one ran.
+    //
+    // Note what stays on BOTH paths: the router matmul above. Replay pins the
+    // discrete selection only — the gating weights are still gathered from the
+    // real logits, at the replayed indices. Freezing the gate as well would be
+    // a different and much stronger claim than the one measured.
+    // Replay pins the discrete selection only — the gating weights below are
+    // still gathered from the real router logits, at the replayed indices.
+    ggml_tensor* expert_idx =
+        moe_build_expert_idx(ctx, gf, logits, top_k, n_tokens, routing_, il);
 
     // Gather the actual logit values for the top-k experts
     // To use ggml_get_rows per token, we reshape logits to [1, n_experts, n_tokens]

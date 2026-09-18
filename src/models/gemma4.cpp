@@ -3,6 +3,7 @@
 #include "engine/model.h"
 #include "../layers/attention.h"
 #include "../layers/ffn.h"
+#include "../layers/moe.h"
 #include "../layers/norm.h"
 #include "../graph_inputs/tokens_input.h"
 #include "../graph_inputs/positions_input.h"
@@ -329,10 +330,11 @@ ggml_tensor* Gemma4ForwardPass::build_moe_geglu(
     ggml_tensor* logits = ggml_mul_mat(arena_.ctx(), w.moe_router, router_in);
     set_tensor_name(gf, logits, "moe_logits", static_cast<int>(il));
 
-    ggml_tensor* sorted_idx = ggml_argsort(arena_.ctx(), logits, GGML_SORT_ORDER_DESC);
-    ggml_tensor* expert_idx = ggml_view_2d(arena_.ctx(), sorted_idx,
-        top_k, n_tokens, sorted_idx->nb[1], 0);
-    set_tensor_name(gf, expert_idx, "moe_idx", static_cast<int>(il));
+    // Shared with MoELayer so the two families cannot drift: one place decides
+    // whether the selection is computed or replayed (layers/moe.h).
+    ggml_tensor* expert_idx = moe_build_expert_idx(
+        arena_.ctx(), gf, logits, top_k, static_cast<int64_t>(n_tokens),
+        policy_.routing_source(), static_cast<int>(il));
 
     // Reshape logits to [1, n_experts, n_tokens] so ggml_get_rows picks
     // from the n_experts dim.
@@ -610,6 +612,7 @@ ggml_cgraph* Gemma4ForwardPass::build_prefill_graph(
     // then revisit bidi. To re-arm: pass `pos + image_span_start_` and
     // `image_n_tokens_` as the bidi_start/bidi_len args below (image-armed only).
     graph_inputs_.clear();
+    add_routing_replay_input();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
     for (uint32_t il = 0; il < n_layers; ++il)
@@ -743,6 +746,7 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     //    backend scheduler's split-input cap on Metal. Shared gather indices are
     //    sized by the (common) cache n_ctx_max. Text-only decode — no image span.
     graph_inputs_.clear();
+    add_routing_replay_input();
     graph_inputs_.add(std::make_unique<TokensInput>());
     graph_inputs_.add(std::make_unique<PositionsInput>());
     std::vector<ggml_tensor*> layer_masks = build_decode_layer_masks(

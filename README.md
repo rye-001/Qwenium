@@ -13,10 +13,12 @@ Every answer comes with the working notes behind it: which parts of your input
 it used, which parts it never touched, and a byte-identical re-run whenever you
 want to check. No other local engine does this.
 
-With `--flash-attn` decode is within **7%** of llama.cpp on the same file (23%
-behind without it); prefill and memory footprint match it, and the forward pass
-agrees token-for-token with HuggingFace `transformers` — the model's own
-definition — not merely with another engine.
+With `--flash-attn --persistent-graph` decode is within **21%** of llama.cpp
+on the same ggml revision (see [Performance](#performance) for the history —
+this gap has moved with upstream ggml churn, not with anything in this
+engine); prefill and memory footprint match it, and the forward pass agrees
+token-for-token with HuggingFace `transformers` — the model's own definition
+— not merely with another engine.
 
 Three things it is built to be:
 
@@ -126,7 +128,7 @@ make -j$(nproc)
 ### Start the server
 
 ```bash
-./bin/http_server --model path/to/model.gguf --port 8080
+./bin/qwenium-server --model path/to/model.gguf --port 8080
 # optional: --mmproj vision.gguf (image input) · --slots N · --ctx N
 #           --prefix-cache DIR | --chat-prefix-cache | --conversational
 #           --flash-attn (faster; excludes --attention-lens)
@@ -224,18 +226,41 @@ token IDs. M1 Pro (32 GB), Qwen3.5-0.8B BF16, 756-token prompt, 128 decode
 steps. Each of our runs is immediately followed by llama's, so every ratio comes
 from one thermal moment — this machine's per-step cost drifts ~8% with
 temperature and ours drifts more than llama's, which makes un-paired numbers
-worthless (2026-08-30; llama.cpp `e85caa81e`, ours on the same ggml revision):
+worthless.
+
+**Current, 2026-09-14, both engines on the same ggml lineage again**
+(ours: vendored `b10964`; llama.cpp: `41abbfd`, 4 commits ahead of our pin —
+negligible). We bumped our vendored ggml this session specifically to close
+a vintage gap that had opened up (see history below), then re-measured:
 
 | Metric | Qwenium | llama.cpp |
 |---|---|---|
-| Prefill, 756 tok | ~2150 tok/s | ~2110 tok/s |
-| Prefill, 3000 tok | 2155 tok/s (`--flash-attn`) · 1676 without | 2263 tok/s |
-| Decode (batch 1) | **73.8 tok/s** (`--flash-attn`) · 64.6 without | 79.1 tok/s |
-| Steady-state RSS | 1.75 GB | 1.72 GB |
+| Prefill, 756 tok | ~2150 tok/s (~2340 `--flash-attn`) | ~2170 tok/s |
+| Decode (batch 1) | **69 tok/s** (`--flash-attn --persistent-graph`, range 67–72) · 64 without | 85 tok/s |
 
-**Decode is 1.07× behind llama.cpp with `--flash-attn`, 1.23× without.** The
-remaining gap is unattributed; the standing analysis is in
-[`docs/decode-gap-status.md`](docs/decode-gap-status.md).
+**Decode is 1.21× behind with our best config, 1.34× without.** The ggml
+bump closed the *vintage* confound but did not close the *speed* gap — see
+[`docs/decode-gap-status.md`](docs/decode-gap-status.md) §21 for why (the
+short version: whatever upstream's Metal work bought llama.cpp's decode path
+this cycle, our graph shape didn't capture a comparable share of it).
+
+<details>
+<summary>Gap history, all measured the same way (756 tokens, 128 decode
+steps, M1 Pro, interleaved runs)</summary>
+
+| date | ggml pins | best config | ratio |
+|---|---|---|---|
+| 2026-08-30 | both `e85caa81e` | `--flash-attn --persistent-graph` | 1.04–1.07× |
+| 2026-09-14 AM | ours `e85caa81e`, llama ~3wk newer | `--flash-attn --persistent-graph` | 1.16× |
+| 2026-09-14, post-bump | both `b10964`/`41abbfd` | `--flash-attn --persistent-graph` | **1.21×** (current) |
+
+The 09-14-AM number moved because llama.cpp's *own* ggml had drifted ahead of
+ours, not because of anything in this engine — bumping our pin to match
+confirmed that (llama's decode throughput didn't change across the bump;
+ours barely did either). Full analysis, including the porting story for our
+two custom Metal kernels across an upstream per-op kernel-file split, is in
+[`docs/note-ggml-upgrade-b10964.md`](docs/note-ggml-upgrade-b10964.md).
+</details>
 
 **Prefill parity depends on prompt length.** At 756 tokens the two engines
 match. At 3000 tokens Qwenium is 0.95× of llama with `--flash-attn` and 0.74×

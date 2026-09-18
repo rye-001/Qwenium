@@ -226,6 +226,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // build_output_head can append SparseHeadInput when the sparse path is
     // armed; per-attention-layer masks are added in the layer loop.
     register_qwen35_common_inputs(graph_inputs_, cfg_);
+    add_routing_replay_input();
 
     // 1. Token embedding
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -292,7 +293,8 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
     // a parameter (moe_hp null here ⇒ dense SwiGLU).
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        /*moe_hp=*/nullptr, use_flash_attn_prefill()};
+        /*moe_hp=*/nullptr, use_flash_attn_prefill(),
+        policy_.routing_source()};
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         const uint32_t dn_idx = cfg_.is_ssm_layer(il)
@@ -392,6 +394,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     register_qwen35_decode_inputs(graph_inputs_, cfg_,
                                   kv_cache_->get_n_ctx_max(),
                                   /*with_kv_write_indices=*/kv_write_idx != nullptr);
+    add_routing_replay_input();
 
     // 4. Layer loop
     ggml_tensor* cur;
@@ -409,7 +412,8 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     // Shared layer body — see the prefill loop above and qwen35_family.h.
     const Qwen35LayerCommon lc{
         arena_.ctx(), gf, &cfg_, &meta_, kv_cache_.get(), dn_state_.get(),
-        /*moe_hp=*/nullptr, use_flash_attn()};
+        /*moe_hp=*/nullptr, use_flash_attn(),
+        policy_.routing_source()};
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         const uint32_t dn_idx = cfg_.is_ssm_layer(il)

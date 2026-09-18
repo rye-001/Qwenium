@@ -34,12 +34,16 @@ line-for-line; only anchor positions moved, plus the GGML_OP_COUNT
 static_assert (upstream added 4 ops after GATED_DELTA_NET, so the two
 qinf ops now follow DSV4_HC_POST in the enum and in both string tables).
 
+Re-ported 2026-09-14 from b10582 to b10964 / 41abbfd599 (see
+docs/note-ggml-upgrade-b10964.md). Position drift only; GGML_OP_COUNT
+unchanged at 103 (no ops added to the core enum in this window).
+
 ---
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 4c00b250b..582b30917 100644
+index ac203c6c1..aa3a26908 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -576,6 +576,7 @@ extern "C" {
+@@ -587,6 +587,7 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
          GGML_OP_DSV4_HC_POST,
@@ -47,7 +51,7 @@ index 4c00b250b..582b30917 100644
  
          GGML_OP_UNARY,
  
-@@ -2651,6 +2652,17 @@ extern "C" {
+@@ -2718,6 +2719,17 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -66,10 +70,10 @@ index 4c00b250b..582b30917 100644
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 87ac0a702..15deb3e14 100644
+index 87a329f26..c414b2a9c 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2060,6 +2060,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2085,6 +2085,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_gated_delta_net(params, tensor);
              } break;
@@ -80,7 +84,7 @@ index 87ac0a702..15deb3e14 100644
          case GGML_OP_LIGHTNING_INDEXER:
              {
                  ggml_compute_forward_lightning_indexer(params, tensor);
-@@ -2256,6 +2260,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2281,6 +2285,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_COUNT_EQUAL:
          case GGML_OP_SOLVE_TRI:
          case GGML_OP_GATED_DELTA_NET:
@@ -89,10 +93,10 @@ index 87ac0a702..15deb3e14 100644
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index b869f4bdd..f7b93d0f1 100644
+index 266261c5e..53e925c8e 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -11246,6 +11246,89 @@ void ggml_compute_forward_dsv4_hc_post(
+@@ -11389,6 +11389,89 @@ void ggml_compute_forward_dsv4_hc_post(
      }
  }
  
@@ -183,10 +187,10 @@ index b869f4bdd..f7b93d0f1 100644
  
  static void ggml_compute_forward_rwkv_wkv7_f32(
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 4c1642a67..cc9662772 100644
+index 2728b08b6..a19c7ce58 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -105,6 +105,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
+@@ -104,6 +104,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
  void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -195,10 +199,10 @@ index 4c1642a67..cc9662772 100644
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 1a60fec79..02d28eb37 100644
+index 5ef03e190..755910ad9 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
@@ -206,7 +210,7 @@ index 1a60fec79..02d28eb37 100644
  
      "UNARY",
  
-@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
@@ -215,7 +219,7 @@ index 1a60fec79..02d28eb37 100644
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_comb(mixes, scale, base)",
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
@@ -223,7 +227,7 @@ index 1a60fec79..02d28eb37 100644
  
      "unary(x)",
  
-@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
@@ -232,7 +236,7 @@ index 1a60fec79..02d28eb37 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -6492,6 +6494,42 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+@@ -6580,6 +6582,42 @@ struct ggml_tensor * ggml_dsv4_hc_post(
      return result;
  }
  

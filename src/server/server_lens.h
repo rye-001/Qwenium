@@ -49,8 +49,9 @@
 // head WITHIN a calibrated model is therefore unguarded at runtime; it is
 // caught, if at all, by the offline probe (tests/perf/attn_provenance.cpp).
 //
-// Two calibrated models today, both Qwen: Qwen 3.6-35B-A3B (L3H13) and
-// Qwen 3.8-9B (L27H13). No lens claims for other families, and that is a
+// Three calibrated models today, all Qwen: Qwen 3.6-35B-A3B (L3H13),
+// Qwen 3.8-9B (L27H13) and Qwen 3.8-27B (L19H20). No lens claims for other
+// families, and that is a
 // MEASURED position, not neglect — Gemma was searched properly and 0 of 768
 // candidate heads clear even a 70% bar against the 90% requirement
 // (docs/note-lens-gemma4-probe.md, docs/note-lens-gemma-norm-weighted.md). The
@@ -94,6 +95,19 @@ struct LensConstants {
     // table landed, which a Qwen 3.8 extraction would have carried).
     const char* model_label     = "Qwen3.6 (attention lens)";
 
+    // Which probe measured the two coordinates, as the receipt reports them.
+    // These were the LITERALS "N3" and "COV1" in the report builder until
+    // 2026-09-18 — correct for the 35B whose defaults these are, and a false
+    // receipt for every row added since: the 9B's head comes from
+    // note-lens-qwen38-probe.md, the 27B's and Bonsai's from LEGCSEARCH, and
+    // their coverage layers from COVSEARCH. Exactly the defect class the
+    // `citation_source` comment in server_lens.cpp already describes for the
+    // layer/head numbers themselves. A row whose constant is INHERITED rather
+    // than measured must say so here, because this string is the only place a
+    // caller reading one report can see it.
+    const char* citation_probe  = "N3";
+    const char* coverage_probe  = "COV1";
+
     // ── Is a FLASH PREFILL admissible on this model? ─────────────────────────
     // Per-model because the answer IS per-model, and measurably so. A flash
     // prefill is not byte-inert — the attention output feeds the residual
@@ -123,6 +137,46 @@ struct LensConstants {
     // claim with no receipt.
     bool        flash_prefill_ok = false;
     const char* flash_prefill_provenance = "not scored by the drift gate";
+
+    // ── Where does a KEY token look? (/v1/locate) ────────────────────────────
+    // A SECOND, independent pair, and the independence is the finding. Locate
+    // read the citation head for one day on the assumption that a retrieval
+    // head is a retrieval head; the LOCHEAD sweep (2026-09-18, Leg C messy
+    // corpus, 15 documents EN+DE, 75 keys, scored like LEGCSEARCH) put that
+    // head at RANK 107 OF 160 for this regime — 41.3% top1, 68.0% top3. The
+    // generated→source head is not the key→source head.
+    //
+    // Chosen 2026-09-18 by the user: **L11 h=5, 82.7% top1 / 89.3% top3.**
+    // The decision was depth, not score. Locate truncates after its OWN layer,
+    // and layer 11 is exactly `max(citation_layer, coverage_layer)` on this
+    // model — so locate costs a `--lens-verify-only` server nothing at all: not
+    // one additional block. L23 h=5 measured 100% top3 in BOTH languages and was
+    // declined at 24/40 blocks, which would have doubled the verifier slice and
+    // ended the "the auditor is 30% of the weights" property (§5 of
+    // docs/plan-lens-only-engine.md). L15 h=8 (96.0%, 16/40) is the middle row
+    // if 89.3% ever proves too loose.
+    //
+    // What 89.3% top3 MEANS for the caller, stated plainly because the cut flow
+    // depends on it: about one key in nine has its answer outside all three
+    // returned spans. A client that cuts a document to those spans deletes that
+    // answer, and the later extraction is confidently wrong with a clean
+    // receipt. That is why the flow keeps a human looking at the cut
+    // (../qemmi-lens/docs/plan-locate-and-cut.md §5 rule 5), and why `top_k` ≥ 3
+    // is not a preference.
+    //
+    // DEFAULT -1 = NOT MEASURED, and /v1/locate refuses such a model outright.
+    // The defaults of this struct ARE the Qwen 3.6 calibration, so the values
+    // below are the 35B's measured pair; every OTHER row must set -1 explicitly
+    // until its own sweep runs. Inheriting one model's layer index is exactly
+    // the false-receipt failure this whole table exists to prevent, and layer
+    // geometry visibly does not transfer here — the 35B's citation head is at
+    // L3 of 40, the 9B's at L27 of 33.
+    int         locate_layer = 11;
+    int         locate_head  = 5;
+    const char* locate_provenance =
+        "LOCHEAD 2026-09-18, Leg C messy corpus 15 docs EN+DE, 75 keys: "
+        "L11 h=5 = 82.7% top1 / 89.3% top3; best was L23 h=5 at 100% top3, "
+        "declined on depth (24/40 blocks)";
 };
 
 // ── The calibration table — which models the lens may run on ─────────────────
@@ -149,12 +203,48 @@ struct LensConstants {
 // Qwen3.8-9B at 32, and Qwen3.6-27B with Qwen3.8-27B at 64 — in both pairs a
 // calibrated model and an uncalibrated one. Raw block_count separates every
 // model above, because the trailing MTP head shifts the Qwen 3.8 builds by one.
+//
+// 2026-09-15 — this got sharper, not milder, when Qwen3.8-27B was calibrated.
+// TWO of the five are calibrated now, with DIFFERENT coordinates (L27H13 and
+// L19H20), so an arch-keyed allowlist could not even pick a winner to be wrong
+// with; and the depth collision at 64 now pairs a genuinely calibrated model
+// (Qwen3.8-27B, depth 65-1) with an uncalibrated one (Qwen3.6-27B, raw 64)
+// whose own measured answer is 7.1% under those coordinates.
 // That separation is an accident of these files, not a law; it holds for every
 // model this repo targets, and a future collision must be resolved by adding a
 // field to the key, never by widening an entry to cover a model nobody measured.
+// `file_type` sentinel: this row does not restrict on quantization, which is
+// the behaviour every row had before the field existed.
+inline constexpr uint32_t kLensAnyFileType = 0xFFFFFFFFu;
+
 struct LensCalibration {
     const char*   architecture;   // GGUF general.architecture
     uint32_t      block_count;    // GGUF <arch>.block_count, raw (see the key note)
+    // ── The third key field, added 2026-09-18 because the collision the note
+    // above predicted actually arrived ────────────────────────────────────────
+    // Ternary-Bonsai-27B is `qwen35` with block_count 64. So is Qwen3.6-27B,
+    // which sits in models/ uncalibrated and which
+    // LensCalibrationGuard.RefusesUncalibratedModelsOfACalibratedArchitecture
+    // pins at nullptr. {arch, block_count} cannot separate them, and the note
+    // above says how to resolve exactly this: ADD A FIELD to the key, never
+    // widen an entry over a model nobody measured. GGUF general.file_type is
+    // that field, and it is the right one rather than a convenient one — the
+    // LEGCSEARCH run that admitted Bonsai measured the calibration to BE
+    // quant-sensitive (Qwen3.8-27B's own L19H20 scores EN 92 / DE 90.4 at
+    // Q3_K_M and EN 90.4 / DE 89.8 on ternary, which crosses the 90% bar).
+    //
+    // kLensAnyFileType means "any quantization", which is what the four
+    // pre-existing rows carry so that this field CANNOT refuse a model that
+    // worked before it landed. That is deliberately a preserved looseness, not
+    // an endorsement: models/ holds Qwen3.8-9B at BOTH Q8_0 and Q4_K_M, both
+    // key {qwen35, 33}, and only the Q8_0 was ever measured. Pinning the
+    // existing rows would be correct and would also refuse a model that runs
+    // today, so it is a separate decision, not a side effect of this one.
+    //
+    // A row that names a concrete file_type wins over one that does not, so a
+    // pinned row and an unrestricted row can share {arch, block_count} without
+    // either shadowing the other. NEW rows should pin.
+    uint32_t      file_type;      // GGUF general.file_type, or kLensAnyFileType
     const char*   model;          // the exact model the numbers were measured on
     const char*   provenance;     // the probe note that measured them
     LensConstants constants;
@@ -168,9 +258,9 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
         // same 40 layers in both and the lens never touches the draft head, so
         // both are the SAME calibration — listed twice rather than keyed on a
         // depth that would collide with uncalibrated models elsewhere.
-        {"qwen35moe", 41, "Qwen3.6-35B-A3B (MTP build)",
+        {"qwen35moe", 41, kLensAnyFileType, "Qwen3.6-35B-A3B (MTP build)",
          "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
-        {"qwen35moe", 40, "Qwen3.6-35B-A3B (plain build, same 40-layer stack)",
+        {"qwen35moe", 40, kLensAnyFileType, "Qwen3.6-35B-A3B (plain build, same 40-layer stack)",
          "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
         // Qwen 3.8-9B. Its own head is L27H13, not L3H13 — 98% top-3 vs 84% on
         // the same messy corpus, and 0% vs 7% ungrounded false alarm
@@ -179,45 +269,192 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
         // validated on this entry at 4774–6200 tokens with no degradation
         // (note-ss2-thread-alarm.md Gate 0: 89% top-1 / 98% top-3).
         //
-        // coverage_used_peak stays 0.705 deliberately. It is the weak arm on
-        // BOTH models (87% / 84% used-clear against a ≥90% bar) and was never
-        // searched — it was frozen from COV1 on one model. A recalibration on
-        // 12+11 spans scored ~4 points better (note-lens-norm-weighted-metric.md);
-        // "recalibration is worth ~4 points" is the finding, the value it
-        // produced is fitted on 23 spans and is not shippable. Decided
-        // 2026-09-05: carry 0.705 here until a real coverage-layer search runs.
-        {"qwen35", 33, "Qwen3.8-9B",
+        // coverage_used_peak stays 0.705 — and as of 2026-09-15 that is a
+        // MEASURED choice, not the inherited one this comment used to describe.
+        //
+        // It read "the weak arm on both models, 87%/84% used-clear, never
+        // searched". Both halves of that are now superseded. The layer WAS
+        // searched (COVSEARCH: KEEP L11 on both), and the "weak arm" verdict
+        // came from a control group that turned out to be broken — OMISSION1
+        // ablated all 133 leg C spans per model and found that 53% (9B) / 38%
+        // (27B) of the spans labelled "filler" are CAUSALLY USED. Scored
+        // against causal labels instead, coverage separates used from unused at
+        // AUC 0.912 / 0.955, which is a strong signal, not a weak one.
+        //
+        // Why 0.705 and not the accuracy-optimal ~0.30: `skipped[]` is a
+        // RECALL-first screen ("anything ignored is in this list",
+        // docs/lens-format.md), and accuracy weights a missed omission the same
+        // as a spurious entry. Dropping to 0.31 takes the 9B from 97% recall to
+        // 83%. 0.705 is the right operating point for the claim we make.
+        //
+        // COVCAUSAL found L7 (9B) and L15 (27B) hold recall EXACTLY equal to
+        // L11 and buy ~7 points of precision — a shorter list, not a better
+        // claim, and two different layers, so there is no shared default to
+        // move to. Not moved. See docs/plan-lens-only-engine.md §4.
+        {"qwen35", 33, kLensAnyFileType, "Qwen3.8-9B",
          "docs/note-lens-qwen38-probe.md §5.3; docs/note-ss2-thread-alarm.md",
          LensConstants{/*citation_head*/ 13, /*citation_layer*/ 27, /*coverage_layer*/ 11,
                        /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
-                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8 (attention lens)",
+                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8-9B (attention lens)",
+                       /*citation_probe*/ "note-lens-qwen38-probe.md \u00a75.3",
+                       /*coverage_probe*/ "COVSEARCH",
                        /*flash_prefill_ok*/ true,
                        /*flash_prefill_provenance*/
                        "drift gate 2026-09-13 (BANDDRIFT DRIFT_ARM=flash DRIFT_LANG=all): "
                        "15/15 token-identical, 0/98 decisions crossed, max |dpeak| 0.000835 "
-                       "vs line-level margin 0.001259"}},
+                       "vs line-level margin 0.001259",
+                       // LOCHEAD has not run on this model. -1 ⇒ /v1/locate
+                       // refuses it rather than borrowing the 35B's L11 h=5.
+                       /*locate_layer*/ -1, /*locate_head*/ -1,
+                       /*locate_provenance*/ "not swept by LOCHEAD"}},
+        // Qwen 3.8-27B. Its own head is L19H20 — and the method that found the
+        // 9B's head would have picked the WRONG one here: the N3 leg selects on
+        // three synthetic prompts, chose L11H22, and that head then scored 84.6%
+        // on the messy corpus, rank 14 of 384. L19H20 was selected on the corpus
+        // that judges it (LEGCSEARCH) and confirmed on the N3 prompts it had not
+        // seen. See docs/note-lens-qwen38-27b-probe.md §3.
+        //
+        // The first model to clear EVERY arm of leg C: citation 91% top3
+        // (EN 92 / DE 90), coverage 97% used-clear (EN 98 / DE 97), 0/75
+        // ungrounded false alarms. The 9B, which ships, has never passed it —
+        // its coverage arm is 87% and 83% on German.
+        //
+        // Two caveats that belong next to the numbers, not only in the note.
+        // DE citation is 90.4% against a 90% bar: four tokens the other way and
+        // this arm fails. And every measurement here is Q3_K_M, where the 9B's
+        // are Q8_0 — greedy agreement slipped to 27/28 and 28/29, which is the
+        // quantization talking. `config.weights` on the report is what records
+        // which one a given receipt actually ran under.
+        {"qwen35", 65, kLensAnyFileType, "Qwen3.8-27B",
+         "docs/note-lens-qwen38-27b-probe.md (LEGCSEARCH §3, held-out §4, COVSEARCH §5)",
+         LensConstants{/*citation_head*/ 20, /*citation_layer*/ 19, /*coverage_layer*/ 11,
+                       /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
+                       /*citation_topk*/ 8, /*model_label*/ "Qwen3.8-27B (attention lens)",
+                       /*citation_probe*/ "LEGCSEARCH",
+                       /*coverage_probe*/ "COVSEARCH",
+                       /*flash_prefill_ok*/ true,
+                       /*flash_prefill_provenance*/
+                       "drift gate 2026-09-15 (BANDDRIFT DRIFT_ARM=flash DRIFT_LANG=all): "
+                       "15/15 token-identical, 0/98 decisions crossed, max |dpeak| 0.000544 "
+                       "vs line-level margin 0.000991 — 1.8x, and the binding language here "
+                       "is ENGLISH (EN 0.000991 vs DE 0.020000), the reverse of the 9B",
+                       // LOCHEAD has not run on this model either.
+                       /*locate_layer*/ -1, /*locate_head*/ -1,
+                       /*locate_provenance*/ "not swept by LOCHEAD"}},
+        // ── Ternary-Bonsai-27B (prism-ml), Q2_0 group-64 ────────────────────
+        // The first NON-Qwen-published model in this table, and the first row
+        // that pins a file_type. It is `qwen35`/64, which is ALSO Qwen3.6-27B's
+        // key — ftype 41 (ternary Q2_0) vs 15 is the only thing separating a
+        // measured model from an unmeasured one here, which is why the third
+        // key field exists at all.
+        //
+        // Admitted 2026-09-18 by the user on a LEGCSEARCH run over the Leg C
+        // messy corpus, 15 documents EN+DE, 404 scored value tokens:
+        //
+        //   rank  head     top3    EN     DE    verify blocks
+        //     1   L59 H21  94.8%  95.0%  94.6%    60/64   <- this entry
+        //     2   L51 H18  92.6%  92.2%  93.0%    52/64
+        //     5   L19 H20  90.1%  90.4%  89.8%    20/64
+        //
+        // VERDICT PASS, and cross-language selection HOLDS in both directions:
+        // selecting on EN picks L59 H21 and it scores 94.6% on German;
+        // selecting on German picks the same head. That two-way hold is the
+        // strongest form this result takes and is why the entry is not an
+        // English-only hypothesis.
+        //
+        // WHY NOT L19 H20, which is Qwen3.8-27B's own calibrated coordinate and
+        // costs 20 blocks instead of 60: it SURVIVES ternary quantization —
+        // rank 5 of 384, still a real citation head — but lands at DE 89.8%
+        // against a 90% bar and does not clear the gate. The {qwen35, 65}
+        // comment above had already warned that arm was four tokens from
+        // failing at Q3_K_M; 2.25-bit ternary is what spent them. A head that
+        // misses the bar must not be shipped as a calibration, so the depth
+        // went instead.
+        //
+        // WHAT THAT DEPTH COSTS, stated plainly: verify truncates after
+        // max(citation_layer, coverage_layer) + 1 = 60 of 64 blocks. A
+        // `--lens-verify-only` server on this model loads 94% of the weights,
+        // so the "the auditor is a slice of the model" property of
+        // docs/plan-lens-only-engine.md §5 DOES NOT HOLD HERE. L51 H18 (52/64)
+        // is the cheaper passer if 94% ever needs to come down.
+        //
+        // NOT MEASURED ON THIS MODEL — coverage_layer, coverage_used_peak and
+        // ungrounded_body_mass are the values the other two qwen35 rows carry.
+        // COVSEARCH, COVCAUSAL, OMISSION1 and the N3b ungrounded leg have NOT
+        // run on ternary weights. Citations on this entry rest on a measurement;
+        // the `skipped[]` list and the grounded badge DO NOT. locate refuses
+        // outright (-1), and flash prefill is refused by the struct default.
+        {"qwen35", 64, /*file_type*/ 41, "Ternary-Bonsai-27B (Q2_0 g64, ternary)",
+         "LEGCSEARCH 2026-09-18, Leg C corpus 15 docs EN+DE, 404 scored tokens: "
+         "L59 h=21 = 84.9% top1 / 94.8% top3 (EN 95.0 / DE 94.6), PASS on both "
+         "halves, cross-language selection holds both directions. "
+         "COVERAGE AND UNGROUNDED ARE NOT MEASURED ON THIS MODEL — those three "
+         "constants are inherited from the Qwen 3.8 rows and only the citation "
+         "arm has a receipt here.",
+         LensConstants{/*citation_head*/ 21, /*citation_layer*/ 59, /*coverage_layer*/ 11,
+                       /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
+                       /*citation_topk*/ 8,
+                       /*model_label*/ "Ternary-Bonsai-27B (attention lens, citation arm only)",
+                       /*citation_probe*/ "LEGCSEARCH 2026-09-18 (94.8% top3, EN 95.0 / DE 94.6)",
+                       /*coverage_probe*/ "INHERITED from the Qwen 3.8 rows \u2014 NOT measured on this model",
+                       /*flash_prefill_ok*/ false,
+                       /*flash_prefill_provenance*/ "not scored by the drift gate",
+                       // LOCHEAD 2026-09-18, same corpus, 75 keys EN+DE. L35 h=6
+                       // is rank 1 of 384 AND free: verify already cuts at
+                       // max(citation 59, coverage 11) + 1 = 60 blocks, so any
+                       // locate layer <= 59 costs this server nothing. That is
+                       // why there is no depth tradeoff to decide here, unlike
+                       // the 35B where L11 (82.7%) was taken over L23 (100%)
+                       // precisely because locate drove the cut there. If a
+                       // locate-ONLY server is ever built on this model, L23
+                       // h=23 (93.3% top3, 24/64) is the shallow row.
+                       /*locate_layer*/ 35, /*locate_head*/ 6,
+                       /*locate_provenance*/
+                       "LOCHEAD 2026-09-18, Leg C messy corpus 15 docs EN+DE, 75 keys: "
+                       "L35 h=6 = 88.0% top1 / 100.0% top3 (EN 100.0 / DE 100.0), rank 1 "
+                       "of 384, and free at 36/64 because citation already cuts at 60"}},
     };
     return kLensCalibrations;
 }
 
 // The calibration for one loaded model, or nullptr if it has none.
-inline const LensCalibration* lens_calibration_for(const std::string& arch, uint32_t block_count) {
+inline const LensCalibration* lens_calibration_for(const std::string& arch,
+                                                  uint32_t block_count,
+                                                  uint32_t file_type) {
+    // Two passes, not one, and the order is the contract: a row that pins a
+    // quantization beats a row that accepts any. One pass with `||` would let
+    // table ORDER decide which of the two answers a caller gets.
     for (const LensCalibration& c : lens_calibrations())
-        if (arch == c.architecture && block_count == c.block_count) return &c;
+        if (arch == c.architecture && block_count == c.block_count &&
+            c.file_type == file_type) return &c;
+    for (const LensCalibration& c : lens_calibrations())
+        if (arch == c.architecture && block_count == c.block_count &&
+            c.file_type == kLensAnyFileType) return &c;
     return nullptr;
 }
 
 // The refusal text. Fail-loud contract order: parameter, expected, actual.
-inline std::string lens_calibration_refusal(const std::string& arch, uint32_t block_count) {
-    std::string expected;
+// The calibrated set rendered as one string, "arch/block (model)" separated by
+// commas. ONE builder, because the startup banner and the refusal below are two
+// views of the same table: an operator who reads one and later hits the other
+// must not be given two different answers to "which models have a lens?".
+inline std::string lens_calibration_list() {
+    std::string list;
     for (const LensCalibration& c : lens_calibrations()) {
-        if (!expected.empty()) expected += ", ";
-        expected += std::string(c.architecture) + "/" + std::to_string(c.block_count) +
-                    " (" + c.model + ")";
+        if (!list.empty()) list += ", ";
+        list += std::string(c.architecture) + "/" + std::to_string(c.block_count) + "/" +
+                (c.file_type == kLensAnyFileType ? std::string("any-quant")
+                                                 : std::string("ftype ") + std::to_string(c.file_type)) +
+                " (" + c.model + ")";
     }
+    return list;
+}
+
+inline std::string lens_calibration_refusal(const std::string& arch, uint32_t block_count,
+                                            uint32_t file_type) {
     return "--attention-lens: expected a model with a calibrated lens entry, one of {" +
-           expected + "}, actual architecture '" + arch + "' with block_count " +
-           std::to_string(block_count) +
+           lens_calibration_list() + "}, actual architecture '" + arch + "' with block_count " +
+           std::to_string(block_count) + " and file_type " + std::to_string(file_type) +
            " — the lens constants are coordinates measured on one model and do not "
            "transfer to another model of the same architecture";
 }
@@ -413,6 +650,77 @@ struct LensReport {
     };
     RuntimeConfig config;
 
+    // ── Routing digest (MoE only; docs/plan-lens-only-engine.md §3) ──────────
+    //
+    // WHICH EXPERTS RAN, as a fingerprint rather than a payload. A MoE router's
+    // top-k is an argmax with no margin, so the same document routed on a
+    // different build, driver or prefill shape selects different experts —
+    // measured 1-6% of selections, changing 1 extraction in 15. Dense models
+    // have none of this and emit nothing here.
+    //
+    // WHAT IT IS FOR. Same configuration, comparing two reports' `digest` is an
+    // exact, nearly free regression detector: did this refactor or ggml bump
+    // change which experts run? That is the question it answers well.
+    //
+    // WHAT IT IS NOT. A cross-configuration pass/fail gate. Because 1-6% of
+    // selections flip under any perturbation, the whole-trace digest differs on
+    // essentially EVERY cross-config comparison while the extraction changes
+    // about 1 time in 15 — a gate on equality would cry wolf ~14 times out of
+    // 15. `per_layer` exists so a comparison can report HOW MANY layers
+    // diverged and WHERE, which is a magnitude a reader can weigh, instead of a
+    // boolean that is almost always "differs". Carrying the selections
+    // themselves (~1.3 MB) would permit exact replay; that is a later slice and
+    // deliberately not this one.
+    //
+    // ADDITIVE, absent on dense models and on any server too old to stamp it —
+    // same reversible reasoning as RuntimeConfig above, and no version bump.
+    struct RoutingDigest {
+        // The result of comparing THIS pass's routing against one the caller
+        // supplied (normally `routing` lifted straight out of an earlier
+        // report). Absent unless the caller supplied one.
+        //
+        // READ `identical` CAREFULLY — it answers a narrower question than it
+        // looks. It is meaningful only between LIKE passes: verify vs verify
+        // across two machines or builds, or extract vs extract. An EXTRACT
+        // digest compared against a VERIFY digest differs by CONSTRUCTION and
+        // not because anything is wrong: extract decodes the JSON one token at
+        // a time while verify teacher-forces the same tokens as one prefill, so
+        // the same positions are computed at different batch shapes — which is
+        // precisely the perturbation a top-k argmax turns into a different
+        // expert. Expect `identical: false` on every honest extract→verify
+        // pair; `layers_diverged` is the number to read there, not the flag.
+        struct Expected {
+            std::string digest;                  // what the caller supplied
+            bool identical             = false;
+            int  layers_diverged       = 0;
+            int  layers_compared       = 0;
+            // Index into per_layer, NOT a block index: per_layer is ordered by
+            // ascending MoE layer, and a recipe whose MoE sits on alternate
+            // blocks has index != block.
+            int  first_diverged_index  = -1;
+            bool empty() const { return digest.empty(); }
+        };
+
+        std::string              digest;      // FNV-1a over the whole trace, hex
+        std::vector<std::string> per_layer;   // one hex digest per MoE layer
+        // The selections themselves, base64, carried ONLY when the caller asks
+        // (`include_routing_trace`) because it is ~100s of KB. Truncated to the
+        // layers a verify pass can reach — deeper ones are unreachable there by
+        // construction, so shipping them would be shipping what nobody can use.
+        // Bound to the token ids it was captured over; replaying it onto
+        // different tokens is refused rather than guessed.
+        std::string              trace;
+        // True when THIS report's routing was replayed from a supplied trace
+        // rather than chosen by the router. The receipt should say which.
+        bool                     replayed = false;
+        int    layers    = 0;
+        int    top_k     = 0;
+        size_t positions = 0;
+        Expected expected;
+        bool empty() const { return digest.empty(); }
+    };
+    RoutingDigest routing;
+
     std::string model;
     bool        validated_envelope = true;
     LensConstants k;
@@ -584,6 +892,11 @@ struct LensWarmDocument {
 // ── Driver ───────────────────────────────────────────────────────────────────
 struct LensExtractOptions {
     int  max_new_tokens = 512;   // hard cap on the emitted JSON length
+    // Carry the expert SELECTIONS, not just their fingerprint, so a later
+    // /v1/verify can replay them and reproduce this pass's routing exactly.
+    // Off by default: the payload is ~100s of KB, and most callers want the
+    // digest only.
+    bool include_routing_trace = false;
     // Opt-in warm handle (docs/plan-lens-warm-document.md §2.2). Empty ⇒ today's
     // behaviour exactly: cold prefill, nothing stored. Non-empty ⇒ the caller
     // asserts this is the same document it named last time, and the server
@@ -701,7 +1014,141 @@ LensReport run_lens_verify(ForwardPassBase* fp, ggml_backend_sched_t sched,
                            const std::string& extraction,
                            const std::vector<LensConcept>& concepts,
                            const std::vector<size_t>& message_offsets,
-                           const LensConstants& k);
+                           const LensConstants& k,
+                           // Optional: a routing fingerprint from an earlier
+                           // report, to compare this pass against. Null (the
+                           // default) skips the comparison entirely and keeps
+                           // every existing caller byte-identical.
+                           const LensReport::RoutingDigest* expected = nullptr);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOCATE — where do these keys look? No generation, no audit.
+// (../qemmi-lens/docs/plan-locate-and-cut.md §3; plan-lens-only-engine.md §5)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The third verb, and the WEAKEST of the three claims. Extract says where the
+// model looked while WRITING values; verify says where it attends while READING
+// values it was handed; locate says only **where these key tokens look**. No
+// value is produced, none is audited, and `extraction_origin` is deliberately
+// ABSENT from the response rather than set to either of the other two — a
+// locate report is not an extraction of any origin, and a consumer that reads
+// it as one is reading a claim that was never made.
+//
+// Mechanism: one head-less TAPPED prefill over the ordinary lens prompt
+// (document + instruction). The instruction names every key, so each key OWNS a
+// token span inside the prompt, and the citation head's rows at those positions
+// are a retrieval signal over the document — causally available because the
+// document precedes the instruction, so every document position is visible to
+// every key token. Nothing is generated, so this is cheaper than verify: it
+// truncates after `citation_layer` ALONE (coverage is not read), which is 4
+// blocks of 40 on Qwen 3.6-35B against verify's 12.
+//
+// ── WHAT THIS IS NOT CALIBRATED FOR ─────────────────────────────────────────
+// The citation head was selected and validated for key→VALUE extraction: rows
+// of GENERATED tokens attending back to their source. Key-as-QUERY retrieval is
+// the same head read in a regime no probe has scored. `LensLocateReport::
+// uncalibrated` is therefore hardcoded true, and it is not a placeholder to be
+// flipped when someone feels confident — it comes off when a probe measures
+// this regime, and not before.
+//
+// Two further properties a consumer must carry rather than smooth over:
+//
+//   * **Attention sums to 1, so absence does not look like absence.** A key
+//     whose answer is not in the document still returns a ranked list. There is
+//     no abstention signal here and none may be synthesized from `mass` — that
+//     is scalar confidence, which has been refuted three times on this codebase
+//     (SCORE2 BAR2, the presence gate, the margin-measures-difficulty finding).
+//   * **`mass` is comparable within one hit list only.** Not across keys, not
+//     across documents, and never against a report's `body_mass`, which is a
+//     different head's mean over different rows.
+struct LensLocateHit {
+    // DOCUMENT-relative byte span, exactly like LensCitation's — the caller
+    // slices its own document with these, never the rendered prompt.
+    size_t byte_lo = 0, byte_hi = 0;
+    // Two different questions about the same span, both published because a
+    // caller cutting a document needs both and they can disagree:
+    //   `peak` — the single largest citation-head mass in the span. THIS IS THE
+    //            ORDERING KEY: hits come back peak-descending, because that is
+    //            what the span finder selects on.
+    //   `mass` — the SUM over the span's positions. Emphatically not the
+    //            ordering key: a wide flat span routinely outsums a sharp one,
+    //            and ranking by it would reorder the list away from the signal
+    //            the spans were chosen by. (The smoke gate caught exactly this
+    //            disagreement on a real document the first time it ran.)
+    double mass = 0.0;
+    double peak = 0.0;
+    // Prompt token positions, for a caller correlating against `prompt_len` /
+    // `doc_lo` / `doc_hi`. Absolute, not document-relative.
+    int tok_lo = 0, tok_hi = 0;
+};
+
+struct LensLocateReport {
+    std::string model;
+    LensReport::RuntimeConfig config;
+    bool validated_envelope = true;
+    // TRUE iff this particular request sits outside what LOCHEAD measured.
+    //
+    // It is no longer "always true": the sweep scored the key-as-query regime on
+    // this model and the pair in LensConstants came out of it, so an ordinary
+    // key-mode locate is as calibrated as any other lens number here — same
+    // corpus, same bar, same standard as the citation and coverage constants.
+    //
+    // What LOCHEAD did NOT sweep is the QUESTION form. It ran key mode
+    // (lens_build_instruction), so a question vocabulary is a different prompt
+    // regime with no measurement behind it, exactly as question mode is already
+    // partly uncalibrated on the extract path. That, and only that, sets this
+    // now. `locate_provenance` travels beside it so a reader sees the rate
+    // rather than a bare boolean.
+    bool uncalibrated = false;
+    std::string locate_provenance;
+    bool question_vocabulary = false;
+    int prompt_len = 0, doc_lo = 0, doc_hi = 0;
+    // The pair actually read — the LOCATE pair, not the citation pair. Named
+    // for what it is: after LOCHEAD these are different heads doing different
+    // jobs, and calling this "citation" on the wire would invite a reader to
+    // compare it against a citation from a report.
+    int locate_layer = 0, locate_head = 0;
+    int top_k = 0;
+    // Ordered by the caller's key_vocabulary, not by score: the request's order
+    // is the one the caller can correlate against, and a key with NO hits keeps
+    // its slot with an empty list rather than vanishing. Within one key, hits are
+    // ordered by `peak` descending — see LensLocateHit.
+    std::vector<std::pair<std::string, std::vector<LensLocateHit>>> hits;
+};
+
+std::string lens_locate_to_json(const LensLocateReport& r);
+
+// Single-slot, exclusive — same discipline as run_lens_extract and
+// run_lens_verify (slot 0, model lock held by the caller). Fails loud on an
+// empty document or vocabulary, a mixed key/question vocabulary, an oversized
+// prompt, or a key that cannot be found in the rendered instruction.
+//
+// `top_k` is the number of SPANS returned per key, not positions. Default 3 in
+// the route, because the measured weakness of this signal is twins — adjacent
+// near-identical lines — and a caller handed one span cannot see that it was
+// contested (RETRIEVE2B: every error was right-family-wrong-variant).
+LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                 ::Tokenizer* tok, const ModelMetadata& meta,
+                                 uint32_t n_ctx_max,
+                                 const std::string& document,
+                                 const std::vector<LensConcept>& concepts,
+                                 const LensConstants& k,
+                                 int top_k);
+
+// Pure span-finder, exposed for tests: turn a per-position mass vector into at
+// most `top_k` disjoint token spans, highest peak first.
+//
+// Greedy by peak: take the largest untaken position, then grow left and right
+// while the neighbour holds at least `tail_frac` of that peak, stopping at
+// `max_width` positions or at an already-taken one. Growing from the peak
+// rather than thresholding globally is what keeps two adjacent values from
+// merging into one span that spells neither — the twins case again.
+//
+// Returns [lo, hi) index pairs into `mass`. A position with mass <= 0 is never
+// taken, so a shorter list than `top_k` is a real answer, not a truncation.
+std::vector<std::pair<int, int>>
+lens_locate_spans(const std::vector<float>& mass, int top_k,
+                  double tail_frac, int max_width);
 
 // Pure: order `report.fields` by `concepts` and mark absent-by-omission — a
 // hinted concept the model did not emit (or emitted empty) becomes a value-null,

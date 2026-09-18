@@ -55,7 +55,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-SERVER="${SERVER:-build-metal/bin/http_server}"
+SERVER="${SERVER:-build-metal/bin/qwenium-server}"
 MODEL="${MODEL:-models/Qwen3.6-35B-A3B-MTP-UD-Q2_K_XL.gguf}"
 PORT="${PORT:-18099}"
 CTX="${CTX:-4096}"

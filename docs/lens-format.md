@@ -75,6 +75,12 @@ claims the model *chose* correctly. Conflicts ship as coexisting keys with
 separate citations — resolution belongs to the importer/human. Every consumer of
 this format inherits that contract.
 
+**The omission audit points one way.** `skipped[]` is a recall instrument: what
+is missing from the document's read surface lands in it, but so does a lot that
+was read. Treat it as *where to look*, never as *what was ignored* — the
+direction is measured (above), and the reverse reading is wrong more often than
+right.
+
 **Product invariant: the lens never lies about where the model looked.** "The
 model is right" was never the claim; "the record is faithful" is. The lens earns
 its keep *most* when the model is wrong — a wrong value carrying a citation is
@@ -245,10 +251,10 @@ Done in that repo's working tree as of 2026-09-06 (uncommitted there).
 | `format_version` | string | `"qemmi-lens/v4"`. Gate before reading anything else. |
 | `model` | string | The pinned model that produced this (Qwen3.6). |
 | `validated_envelope` | bool | `true` iff the prompt was ≤ 4K tokens — the measured envelope (plan §1.5). `false` is a **disclosure, not a rejection**: the extraction ran, but beyond where the signals were validated. |
-| `citation_source` | string | Human label for the citation head (L3H13, N3). |
+| `citation_source` | string | Human label for the citation head, e.g. `layer 59, head 21 (L59H21) \u2014 LEGCSEARCH 2026-09-18 (94.8% top3...)`. Both the coordinate **and the probe name** come from the calibration entry; the probe name was the literal `N3` on every report until 2026-09-18, which was true only of the 35B. |
 | `config` | object, **optional** | **The numerical configuration that produced this report** (2026-09-13): `weights` (16-hex-digit content hash of the tensor inventory — arch + shape + **quantization** + layout), `attention` (`"materialized"` \| `"flash-prefill"` \| `"flash"`), `kv_type` (`"f32"`, `"f16"`, …). `model` names the *calibration entry*, which is coarser than it looks — it says "Qwen3.8-9B", not which quantization — and all three of these move decisions. **Two reports are only comparable when this matches.** A diff that ignores it can show a config artifact as a change, which is the one way the `verify` re-audit flow could mislead. Absent ⇒ the server did not stamp it (too old, or the lens was driven in-process); additive, **not** a version bump, same reasoning as `extraction_origin`. |
 | `extraction_origin` | `"generated"` \| `"supplied"` | **Who produced the values.** `generated` = this model emitted the JSON (`POST /v1/extract`); the report says where the producing model looked while writing it. `supplied` = the caller handed the JSON in and this model only read it (`POST /v1/verify`, teacher-forced); the report says where **this** model attends to **someone else's** answer. Additive, **not** a version bump: absence is unambiguous — a payload without this member came from a server with no `/v1/verify`, so its values are necessarily `generated`. |
-| `coverage_source` | string | Human label for the coverage source (layer-11 max-heads, COV1). |
+| `coverage_source` | string | Human label for the coverage source, e.g. `layer 11, max over heads \u2014 COVSEARCH`. **A model whose coverage layer was inherited rather than measured says so here** — Ternary-Bonsai-27B reports `INHERITED from the Qwen 3.8 rows \u2014 NOT measured on this model`. This is the only place a caller reading one report can see that the `skipped[]` list rests on an unmeasured threshold. |
 | `used_threshold` | number | Coverage span-peak ≥ this ⇒ a span was "consulted" (0.705). |
 | `ungrounded_threshold` | number | `body_mass` ≥ this ⇒ `grounded` (0.538, N3b). |
 | `prompt_len` | int | Total prompt tokens (ChatML-wrapped). |
@@ -422,6 +428,37 @@ Consumed by the Attention Lens viewer; an importer can ignore these.
   incorporated." `lo/hi` are token indices; `byte_lo/byte_hi` document-relative
   bytes. This is the **omission audit** (COV1) — the backstop for the weak
   citation classes.
+
+  **Read it in the recall direction, and only that direction** (measured
+  2026-09-15, `OMISSION1`, 133 spans over the full 15-document EN+DE corpus on
+  each model; `plan-lens-only-engine.md` §4). The list is a **screen, not a
+  verdict**, and `used_threshold = 0.705` is deliberately a **recall-first**
+  operating point:
+
+  | model | recall | precision |
+  |---|---|---|
+  | Qwen3.8-9B | **97%** | 53% |
+  | Qwen3.8-27B | **90%** | 78% |
+
+  So `skipped[]` supports *"anything ignored is in here"*. It does **not**
+  support *"everything in here was ignored"* — on the 9B, roughly half of a
+  typical list is load-bearing text the model did read. The "possibly" in
+  "possibly not incorporated" is load-bearing and must not be dropped by a
+  consumer.
+
+  *Why the threshold is not lower.* Fitted against these causal labels the
+  **accuracy**-optimal cut is ~0.30 on both models (88% / 92% vs 80% / 90% at
+  0.705). It is not adopted, because accuracy weights a missed omission and a
+  spurious entry equally and this list does not: dropping to 0.31 takes the 9B
+  from 97% recall to 83%, trading the flag's whole purpose for a shorter list.
+  0.705 is the right operating point for the claim above, and that is now a
+  measured statement rather than an inherited one.
+
+  The measurement is causal, not another attention number: each span was
+  **ablated** from the document and the extraction re-run. Greedy B=1 decode is
+  byte-reproducible here, so the noise floor is exactly zero and every diff is
+  attributable. The converse claim is much stronger — of spans the report calls
+  *consulted*, **41 of 42** moved a value when ablated.
 
 ## Honest limits (shipped verbatim, plan §4)
 

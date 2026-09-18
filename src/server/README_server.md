@@ -75,7 +75,7 @@ std::vector<int> run_batched_decode(const std::vector<int32_t>& tokens,
 Add to your CMakeLists.txt:
 ```cmake
 add_executable(http_server src/server/http_server.cpp)
-target_link_libraries(http_server PRIVATE
+target_link_libraries(qwenium-server PRIVATE
     your_qwen_lib
     httplib::httplib  # or just include the header
     nlohmann_json::nlohmann_json
@@ -88,7 +88,7 @@ target_link_libraries(http_server PRIVATE
 ### Start Server
 
 ```bash
-./http_server --port 8080 --model ./qwen2.5-coder-14b-instruct-q4_0.gguf
+./qwenium-server --port 8080 --model ./qwen2.5-coder-14b-instruct-q4_0.gguf
 ```
 
 ### API Endpoints
