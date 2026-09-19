@@ -752,9 +752,8 @@ TEST(LensCalibrationGuard, RefusesUncalibratedModelsOfACalibratedArchitecture) {
     // under Qwen 3.8-9B's coordinates.
     EXPECT_EQ(lens_calibration_for("qwen35", 24, kLensAnyFileType), nullptr);   // Qwen3.5-0.8B
     EXPECT_EQ(lens_calibration_for("qwen35", 32, kLensAnyFileType), nullptr);   // Qwen3.5-9B
-    // Qwen3.6-27B is `qwen35`/64/ftype 15. Ternary-Bonsai-27B is `qwen35`/64 too
-    // and IS calibrated (ftype 41), so block_count 64 alone no longer decides —
-    // the quantization separates them, which is why file_type joined the key.
+    // Qwen3.6-27B is `qwen35`/64/ftype 15 and must stay refused at EVERY
+    // file_type, including the sentinel — no row claims {qwen35, 64} today.
     EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q4_K_M*/ 15), nullptr);  // Qwen3.6-27B
     EXPECT_EQ(lens_calibration_for("qwen35", 64, kLensAnyFileType), nullptr);
 
@@ -771,39 +770,23 @@ TEST(LensCalibrationGuard, RefusesUncalibratedModelsOfACalibratedArchitecture) {
 }
 
 // ── The quantization key field ───────────────────────────────────────────────
-// Ternary-Bonsai-27B and Qwen3.6-27B are BOTH `qwen35` with block_count 64.
-// One is calibrated and one must stay refused, so this pair is the whole
-// reason general.file_type is part of the key. If this test ever passes with
-// the third argument removed, the key has silently widened again.
-TEST(LensCalibrationGuard, FileTypeSeparatesTwoModelsThatShareArchAndBlockCount) {
-    const LensCalibration* bonsai = lens_calibration_for("qwen35", 64, /*ternary Q2_0*/ 41);
-    ASSERT_NE(bonsai, nullptr);
-    EXPECT_EQ(bonsai->constants.citation_layer, 59);   // L59H21, LEGCSEARCH 94.8%
-    EXPECT_EQ(bonsai->constants.citation_head,  21);
-
-    // The SAME arch and block_count at a different quantization is still refused.
-    EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q4_K_M*/ 15), nullptr);
-    EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q8_0*/    7), nullptr);
-
-    // Bonsai must not have borrowed Qwen3.8-27B's coordinates: its own L19H20
-    // survives ternary at rank 5 but lands at DE 89.8% against a 90% bar.
-    const LensCalibration* q38_27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
-    ASSERT_NE(q38_27, nullptr);
-    EXPECT_NE(bonsai->constants.citation_layer, q38_27->constants.citation_layer);
-
-    // Locate WAS swept on this model (LOCHEAD 2026-09-18, L35 h=6, 100% top3
-    // in both languages) and is free: verify already cuts at 60 blocks for the
-    // citation layer, so a locate layer <= 59 costs this server nothing.
-    EXPECT_EQ(bonsai->constants.locate_layer, 35);
-    EXPECT_EQ(bonsai->constants.locate_head,   6);
-    // It must stay SHALLOWER than the citation layer, because that is the whole
-    // reason it is free. If a future sweep moves it deeper than citation, the
-    // --lens-verify-only cut in http_server.cpp must grow to cover it — that
-    // max() folds locate in, and this is the assertion that says why.
-    EXPECT_LT(bonsai->constants.locate_layer, bonsai->constants.citation_layer);
-
-    // Still unmeasured, still refused: the drift gate never ran on ternary.
-    EXPECT_FALSE(bonsai->constants.flash_prefill_ok);
+// No row pins a file_type today (the Ternary-Bonsai-27B row that motivated the
+// field was reverted 2026-09-19 with the model). The field stays because the
+// collision is not Bonsai-specific — a plain non-MTP Qwen3.8-27B build also
+// keys as {qwen35, 64}. This test holds the invariant that matters while no
+// row pins: a file_type that no row claims must RESOLVE THE SAME as any other,
+// so the extra key component cannot change an answer it was never meant to.
+TEST(LensCalibrationGuard, AnUnpinnedTableIgnoresTheFileType) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.file_type != kLensAnyFileType) continue;   // pinned rows: other test
+        for (uint32_t ft : {0u, 7u, 15u, 41u, 143u, kLensAnyFileType}) {
+            const LensCalibration* got =
+                lens_calibration_for(c.architecture, c.block_count, ft);
+            ASSERT_NE(got, nullptr) << c.architecture << "/" << c.block_count
+                                    << " must resolve at file_type " << ft;
+            EXPECT_EQ(got, &c) << "file_type " << ft << " changed which row won";
+        }
+    }
 }
 
 // A row that PINS a quantization must beat a row that accepts any, otherwise
@@ -2162,4 +2145,88 @@ TEST(LensLocateJson, CarriesUncalibratedAndOmitsExtractionOrigin) {
     ASSERT_TRUE(j["hits"].contains("nothing_here"));
     EXPECT_TRUE(j["hits"]["nothing_here"].empty())
         << "a key with no hits keeps its slot rather than vanishing";
+}
+
+// The 9B's locate pair (LOCHEAD 2026-09-19). Pins the coordinates AND the two
+// properties that make them safe to ship: locate does not move the cut, and it
+// is not the citation coordinate.
+TEST(LensCalibrationGuard, NineBLocatePairIsSweptAndFree) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+
+    EXPECT_EQ(q9->constants.locate_layer, 11);
+    EXPECT_EQ(q9->constants.locate_head,   6);
+
+    // FREE. The --lens-verify-only cut is max(citation, coverage, locate) + 1.
+    // locate == coverage here, so folding it in changes nothing. If a future
+    // sweep moves locate past citation, this fails and the server pays for it.
+    EXPECT_LE(q9->constants.locate_layer, q9->constants.coverage_layer);
+    EXPECT_LE(q9->constants.locate_layer, q9->constants.citation_layer);
+    const int cut = std::max({q9->constants.citation_layer,
+                              q9->constants.coverage_layer,
+                              q9->constants.locate_layer}) + 1;
+    EXPECT_EQ(cut, 28) << "the 9B verify-only cut must stay 28 of 33 blocks";
+
+    // Locate is NOT the citation coordinate. Measured on the same corpus:
+    // reading locate off the citation layer scores 49.3%, rank 107 of 128.
+    EXPECT_NE(q9->constants.locate_layer, q9->constants.citation_layer);
+
+    // /v1/locate is no longer refused on this model.
+    EXPECT_GE(q9->constants.locate_layer, 0);
+    EXPECT_GE(q9->constants.locate_head,  0);
+    EXPECT_STRNE(q9->constants.locate_provenance, "not swept by LOCHEAD");
+}
+
+// The 27B's locate pair is the mirror image of the 9B's: DELIBERATELY NOT FREE.
+// It is the only row where locate sets the cut, so it is the only row that can
+// catch a regression in `max(citation, coverage, locate)` — if someone drops
+// locate from that max in http_server.cpp, the 9B keeps working and this model
+// silently taps a block the verify-only server never loaded.
+TEST(LensCalibrationGuard, TwentySevenBLocatePairIsSweptAndSetsTheCut) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+
+    EXPECT_EQ(q27->constants.locate_layer, 27);
+    EXPECT_EQ(q27->constants.locate_head,  10);
+
+    // NOT free, and that is the point: locate is deeper than BOTH other
+    // constants, so it alone decides the cut.
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.citation_layer);
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.coverage_layer);
+
+    const int cut = std::max({q27->constants.citation_layer,
+                              q27->constants.coverage_layer,
+                              q27->constants.locate_layer}) + 1;
+    EXPECT_EQ(cut, 28) << "the 27B verify-only cut is 28 of 65 — locate sets it";
+
+    // The cost this row accepted, stated as an assertion so it cannot drift
+    // unnoticed: without locate the cut would have been 20.
+    const int cut_without_locate = std::max(q27->constants.citation_layer,
+                                            q27->constants.coverage_layer) + 1;
+    EXPECT_EQ(cut_without_locate, 20)
+        << "landing locate cost this model 8 blocks; if this number moves, the "
+           "trade recorded in note-lens-qwen38-27b-probe.md §8 no longer holds";
+
+    // Direction of the depth profile is the OPPOSITE of the 9B's. Asserted
+    // because the 9B write-up originally generalized the wrong way round.
+    EXPECT_NE(q27->constants.locate_layer, q27->constants.citation_layer);
+
+    EXPECT_GE(q27->constants.locate_layer, 0);
+    EXPECT_GE(q27->constants.locate_head,  0);
+    EXPECT_STRNE(q27->constants.locate_provenance, "not swept by LOCHEAD");
+}
+
+// Cross-model: the two calibrated Qwen3.8 rows disagree about WHERE locate
+// lives, and that disagreement is load-bearing — it is why locate_layer is a
+// per-row constant and not a rule of thumb.
+TEST(LensCalibrationGuard, LocateDepthDirectionIsNotAFamilyConstant) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9,  nullptr);
+    ASSERT_NE(q27, nullptr);
+
+    // 9B: locate SHALLOWER than citation. 27B: locate DEEPER than citation.
+    // Same architecture string, opposite answers.
+    EXPECT_LT(q9->constants.locate_layer,  q9->constants.citation_layer);
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.citation_layer);
 }

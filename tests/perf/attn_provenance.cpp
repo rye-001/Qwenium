@@ -3747,10 +3747,18 @@ static int run_locate_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
                     pct(t1_en[c] + t1_de[c], n_all), pct(bt3, n_all), mean / H);
     }
 
-    std::printf("\n  === RANKED, top 15 of %d ===\n", C);
+    // How many ranks to print. Default 15 — but the per-half split is the only
+    // place EN and DE are visible, and the candidate a DEPTH decision turns on
+    // is routinely below rank 15 (on Qwen3.8-27B the best head inside the free
+    // zone sits at rank ~30). Printing more costs nothing and re-running a
+    // 6-minute sweep to see one row costs a lot.
+    int topn = 15;
+    if (const char* tn = std::getenv("LOCHEAD_TOPN")) topn = std::atoi(tn);
+    if (topn < 1) topn = 1;
+    std::printf("\n  === RANKED, top %d of %d ===\n", std::min(topn, C), C);
     std::printf("  rank | layer head |  top1    top3  |  EN top3   DE top3\n");
     std::printf("  -----+------------+----------------+-------------------\n");
-    for (int i = 0; i < std::min(15, C); ++i) {
+    for (int i = 0; i < std::min(topn, C); ++i) {
         const int c = order[i];
         std::printf("  %4d | L%-4d h=%-3d| %6.1f%% %6.1f%% | %7.1f%% %8.1f%%\n", i + 1,
                     attn_layers[c / H], c % H,

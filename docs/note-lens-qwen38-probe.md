@@ -233,3 +233,78 @@ None of these were acted on. Each is an architecture decision.
 - **`LensConstants` was not changed**, and the architecture refusal added in the
   same change was not relaxed. Making the constants per-model is an architecture
   decision, not a probe outcome.
+
+## LEGCSEARCH on the messy bilingual corpus (2026-09-19) — L3H13 does NOT hold
+
+§3's table above is Prompt A, **N = 28 English value tokens, 128 candidates**.
+It ranked `L3 H13` second at 92.9% top1 / 96.4% top3, one place behind
+`L27 H13`. Because `L3` sits below the coverage layer (`L11`), shipping it
+would have cut `--lens-verify-only` from 28 of 33 blocks to 12 — **48% of the
+stack** — so it was worth scoring properly.
+
+Scored on the Leg C corpus (15 docs EN+DE, the same corpus that judges every
+other model's citation head), the shallow head collapses:
+
+| rank | layer head | top1 | top3 | EN | DE | bar | verify blocks |
+|---|---|---|---|---|---|---|---|
+| 1 | **L27 H13** | 88.6% | **97.8%** | 97.7% | 97.9% | PASS | 28/33 |
+| 2 | L31 H3 | 78.2% | 93.0% | 92.7% | 93.3% | PASS | 32/33 |
+| 3 | L31 H0 | 67.8% | 91.0% | 90.4% | 91.8% | PASS | 32/33 |
+| 4 | L31 H1 | 69.2% | 90.8% | 90.4% | 91.2% | PASS | 32/33 |
+| 7 | **L3 H13** | 74.8% | **83.8%** | 84.5% | 83.0% | **fail** | 12/33 |
+
+`L3 H13` misses the 90% bar by **6.2 points pooled, and on BOTH halves** — so
+this is not the German-weakness failure mode that disqualified `L19 H20` on
+Bonsai. The shallow head simply does not carry the citation signal once the
+corpus is messy. The N=28 English probe overestimated it by ~13 points.
+
+Per-layer best head, top3 — the signal has a sharp onset at L27, not a gradient:
+
+| layer | 3 | 7 | 11 | 15 | 19 | 23 | 27 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| best top3 | 83.8 | 75.3 | 70.2 | 82.3 | 82.8 | 79.2 | **97.8** | 93.0 |
+
+**No head at or below L23 clears the bar.** The sweep's own summary line reads
+"shallowest passer: the same candidate — no depth/quality trade here".
+Cross-language selection holds both directions (EN→L27H13→DE 97.9%,
+DE→L27H13→EN 97.7%).
+
+`L27 H13` is confirmed: best AND shallowest passer. The row is unchanged, and
+the 48% cut does not exist on this model.
+
+## LOCHEAD (2026-09-19) — the 9B has a locate head, at L11, and it costs nothing
+
+`/v1/locate` was refused on this model: the row carried `locate_layer = -1`.
+Swept all 128 (layer, head) pairs on the Leg C messy corpus, 75 scored keys
+(EN 40 / DE 35).
+
+| rank | layer head | top1 | top3 | EN | DE |
+|---|---|---|---|---|---|
+| 1 | **L11 h=6** | 88.0% | **96.0%** | 95.0% | 97.1% |
+| 2 | L15 h=11 | 88.0% | 96.0% | 95.0% | 97.1% |
+| 3 | L15 h=1 | 81.3% | 94.7% | 97.5% | 91.4% |
+| 13 | L7 h=3 | 68.0% | 92.0% | 92.5% | 91.4% |
+| 107 | L3 h=13 (the citation coordinate) | 33.3% | 49.3% | — | — |
+
+Ranks 1 and 2 tie exactly. **L11 wins on depth** — the same tiebreak the 35B's
+row already documents ("L11 was chosen over the higher-scoring L23" because it
+equals `max(citation_layer, coverage_layer)`).
+
+**It is free.** `max(citation 27, coverage 11, locate 11) + 1 = 28` — the
+`--lens-verify-only` cut is unchanged at 28/33. A hypothetical locate-only
+server would need 12/33, i.e. 64% of the stack skipped.
+
+### Locate and citation run in OPPOSITE directions on the same model
+
+Per-layer best head, top3, both swept on the same corpus:
+
+| layer | 3 | 7 | 11 | 15 | 19 | 23 | 27 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| **locate** (key→source) | 50.7 | 92.0 | **96.0** | 96.0 | 93.3 | 88.0 | 86.7 | 84.0 |
+| **citation** (generated→source) | 83.8 | 75.3 | 70.2 | 82.3 | 82.8 | 79.2 | **97.8** | 93.0 |
+
+Locate peaks early and decays with depth; citation is near-flat until a sharp
+onset at L27. This is the fourth model on which the generated→source head is
+not the key→source head, and the cleanest demonstration of why: they are not
+merely different coordinates, they have inverted depth profiles. Reading
+locate off the citation layer scores 49.3% here (rank 107 of 128).

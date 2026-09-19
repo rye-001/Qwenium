@@ -99,7 +99,7 @@ struct LensConstants {
     // These were the LITERALS "N3" and "COV1" in the report builder until
     // 2026-09-18 — correct for the 35B whose defaults these are, and a false
     // receipt for every row added since: the 9B's head comes from
-    // note-lens-qwen38-probe.md, the 27B's and Bonsai's from LEGCSEARCH, and
+    // note-lens-qwen38-probe.md, the 27B's from LEGCSEARCH, and
     // their coverage layers from COVSEARCH. Exactly the defect class the
     // `citation_source` comment in server_lens.cpp already describes for the
     // layer/head numbers themselves. A row whose constant is INHERITED rather
@@ -222,16 +222,26 @@ struct LensCalibration {
     uint32_t      block_count;    // GGUF <arch>.block_count, raw (see the key note)
     // ── The third key field, added 2026-09-18 because the collision the note
     // above predicted actually arrived ────────────────────────────────────────
-    // Ternary-Bonsai-27B is `qwen35` with block_count 64. So is Qwen3.6-27B,
-    // which sits in models/ uncalibrated and which
+    // NO ROW PINS A FILE TYPE TODAY. The field stays anyway, and this comment
+    // is the reason — read it before deleting an "unused" key component.
+    //
+    // It was added for Ternary-Bonsai-27B (prism-ml), which is `qwen35` with
+    // block_count 64 — and so is Qwen3.6-27B, which sits in models/
+    // uncalibrated and which
     // LensCalibrationGuard.RefusesUncalibratedModelsOfACalibratedArchitecture
-    // pins at nullptr. {arch, block_count} cannot separate them, and the note
-    // above says how to resolve exactly this: ADD A FIELD to the key, never
-    // widen an entry over a model nobody measured. GGUF general.file_type is
-    // that field, and it is the right one rather than a convenient one — the
-    // LEGCSEARCH run that admitted Bonsai measured the calibration to BE
-    // quant-sensitive (Qwen3.8-27B's own L19H20 scores EN 92 / DE 90.4 at
-    // Q3_K_M and EN 90.4 / DE 89.8 on ternary, which crosses the 90% bar).
+    // pins at nullptr. {arch, block_count} could not separate them, and the
+    // note above says how to resolve exactly this: ADD A FIELD to the key,
+    // never widen an entry over a model nobody measured. That Bonsai row was
+    // reverted on 2026-09-19 when the model was de-scoped
+    // (docs/note-lens-bonsai-27b-probe.md keeps the measurements), but the
+    // collision it exposed is NOT Bonsai-specific: a plain non-MTP build of
+    // Qwen3.8-27B also keys as {qwen35, 64} — 65 = 64 decode + 1 NextN — and
+    // would silently inherit the MTP row's calibration without this field.
+    //
+    // general.file_type is the right field rather than a convenient one,
+    // because the calibration measured quant-SENSITIVE: Qwen3.8-27B's own
+    // L19H20 scores EN 92 / DE 90.4 at Q3_K_M and EN 90.4 / DE 89.8 on ternary
+    // weights, which crosses the 90% bar.
     //
     // kLensAnyFileType means "any quantization", which is what the four
     // pre-existing rows carry so that this field CANNOT refuse a model that
@@ -303,10 +313,24 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "drift gate 2026-09-13 (BANDDRIFT DRIFT_ARM=flash DRIFT_LANG=all): "
                        "15/15 token-identical, 0/98 decisions crossed, max |dpeak| 0.000835 "
                        "vs line-level margin 0.001259",
-                       // LOCHEAD has not run on this model. -1 ⇒ /v1/locate
-                       // refuses it rather than borrowing the 35B's L11 h=5.
-                       /*locate_layer*/ -1, /*locate_head*/ -1,
-                       /*locate_provenance*/ "not swept by LOCHEAD"}},
+                       // LOCHEAD 2026-09-19. Ranks 1 and 2 tie exactly (L11 h=6
+                       // and L15 h=11, both 88.0/96.0, both EN 95.0 / DE 97.1);
+                       // L11 wins on DEPTH, the same tiebreak the 35B row
+                       // documents. It is free here: max(citation 27, coverage
+                       // 11, locate 11) + 1 = 28, unchanged.
+                       //
+                       // Locate and citation run in OPPOSITE directions on this
+                       // model — locate peaks at L11 (96.0%) and decays to 84.0%
+                       // at L31; citation is flat until a sharp onset at L27.
+                       // Reading locate off the citation layer scores 49.3%,
+                       // rank 107 of 128. They are not interchangeable.
+                       /*locate_layer*/ 11, /*locate_head*/ 6,
+                       /*locate_provenance*/
+                       "LOCHEAD 2026-09-19, Leg C messy corpus 15 docs EN+DE, 75 keys: "
+                       "L11 h=6 = 88.0% top1 / 96.0% top3 (EN 95.0 / DE 97.1), rank 1 "
+                       "of 128, tied with L15 h=11 and taken on depth. TOP-1 IS 88.0% "
+                       "— a caller that acts on a single span is acting on that "
+                       "rate, not on 96.0%"}},
         // Qwen 3.8-27B. Its own head is L19H20 — and the method that found the
         // 9B's head would have picked the WRONG one here: the N3 leg selects on
         // three synthetic prompts, chose L11H22, and that head then scored 84.6%
@@ -338,81 +362,29 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "15/15 token-identical, 0/98 decisions crossed, max |dpeak| 0.000544 "
                        "vs line-level margin 0.000991 — 1.8x, and the binding language here "
                        "is ENGLISH (EN 0.000991 vs DE 0.020000), the reverse of the 9B",
-                       // LOCHEAD has not run on this model either.
-                       /*locate_layer*/ -1, /*locate_head*/ -1,
-                       /*locate_provenance*/ "not swept by LOCHEAD"}},
-        // ── Ternary-Bonsai-27B (prism-ml), Q2_0 group-64 ────────────────────
-        // The first NON-Qwen-published model in this table, and the first row
-        // that pins a file_type. It is `qwen35`/64, which is ALSO Qwen3.6-27B's
-        // key — ftype 41 (ternary Q2_0) vs 15 is the only thing separating a
-        // measured model from an unmeasured one here, which is why the third
-        // key field exists at all.
-        //
-        // Admitted 2026-09-18 by the user on a LEGCSEARCH run over the Leg C
-        // messy corpus, 15 documents EN+DE, 404 scored value tokens:
-        //
-        //   rank  head     top3    EN     DE    verify blocks
-        //     1   L59 H21  94.8%  95.0%  94.6%    60/64   <- this entry
-        //     2   L51 H18  92.6%  92.2%  93.0%    52/64
-        //     5   L19 H20  90.1%  90.4%  89.8%    20/64
-        //
-        // VERDICT PASS, and cross-language selection HOLDS in both directions:
-        // selecting on EN picks L59 H21 and it scores 94.6% on German;
-        // selecting on German picks the same head. That two-way hold is the
-        // strongest form this result takes and is why the entry is not an
-        // English-only hypothesis.
-        //
-        // WHY NOT L19 H20, which is Qwen3.8-27B's own calibrated coordinate and
-        // costs 20 blocks instead of 60: it SURVIVES ternary quantization —
-        // rank 5 of 384, still a real citation head — but lands at DE 89.8%
-        // against a 90% bar and does not clear the gate. The {qwen35, 65}
-        // comment above had already warned that arm was four tokens from
-        // failing at Q3_K_M; 2.25-bit ternary is what spent them. A head that
-        // misses the bar must not be shipped as a calibration, so the depth
-        // went instead.
-        //
-        // WHAT THAT DEPTH COSTS, stated plainly: verify truncates after
-        // max(citation_layer, coverage_layer) + 1 = 60 of 64 blocks. A
-        // `--lens-verify-only` server on this model loads 94% of the weights,
-        // so the "the auditor is a slice of the model" property of
-        // docs/plan-lens-only-engine.md §5 DOES NOT HOLD HERE. L51 H18 (52/64)
-        // is the cheaper passer if 94% ever needs to come down.
-        //
-        // NOT MEASURED ON THIS MODEL — coverage_layer, coverage_used_peak and
-        // ungrounded_body_mass are the values the other two qwen35 rows carry.
-        // COVSEARCH, COVCAUSAL, OMISSION1 and the N3b ungrounded leg have NOT
-        // run on ternary weights. Citations on this entry rest on a measurement;
-        // the `skipped[]` list and the grounded badge DO NOT. locate refuses
-        // outright (-1), and flash prefill is refused by the struct default.
-        {"qwen35", 64, /*file_type*/ 41, "Ternary-Bonsai-27B (Q2_0 g64, ternary)",
-         "LEGCSEARCH 2026-09-18, Leg C corpus 15 docs EN+DE, 404 scored tokens: "
-         "L59 h=21 = 84.9% top1 / 94.8% top3 (EN 95.0 / DE 94.6), PASS on both "
-         "halves, cross-language selection holds both directions. "
-         "COVERAGE AND UNGROUNDED ARE NOT MEASURED ON THIS MODEL — those three "
-         "constants are inherited from the Qwen 3.8 rows and only the citation "
-         "arm has a receipt here.",
-         LensConstants{/*citation_head*/ 21, /*citation_layer*/ 59, /*coverage_layer*/ 11,
-                       /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
-                       /*citation_topk*/ 8,
-                       /*model_label*/ "Ternary-Bonsai-27B (attention lens, citation arm only)",
-                       /*citation_probe*/ "LEGCSEARCH 2026-09-18 (94.8% top3, EN 95.0 / DE 94.6)",
-                       /*coverage_probe*/ "INHERITED from the Qwen 3.8 rows \u2014 NOT measured on this model",
-                       /*flash_prefill_ok*/ false,
-                       /*flash_prefill_provenance*/ "not scored by the drift gate",
-                       // LOCHEAD 2026-09-18, same corpus, 75 keys EN+DE. L35 h=6
-                       // is rank 1 of 384 AND free: verify already cuts at
-                       // max(citation 59, coverage 11) + 1 = 60 blocks, so any
-                       // locate layer <= 59 costs this server nothing. That is
-                       // why there is no depth tradeoff to decide here, unlike
-                       // the 35B where L11 (82.7%) was taken over L23 (100%)
-                       // precisely because locate drove the cut there. If a
-                       // locate-ONLY server is ever built on this model, L23
-                       // h=23 (93.3% top3, 24/64) is the shallow row.
-                       /*locate_layer*/ 35, /*locate_head*/ 6,
+                       // LOCHEAD 2026-09-19. THIS IS THE FIRST ROW WHERE LOCATE
+                       // MOVES THE CUT: max(citation 19, coverage 11, locate 27)
+                       // + 1 = 28 of 65, where citation+coverage alone gave 20.
+                       // That cost was accepted deliberately, because the free
+                       // zone is empty — the best candidate at or below L19 is
+                       // L15 h=17 at 90.7% pooled, and it FAILS German at 88.6%.
+                       // An EN-only reading (92.5%) would have shipped it free.
+                       //
+                       // L27 h=10 is the SHALLOWEST candidate clearing 90% top3
+                       // on both halves, chosen over the best one: L35 h=16
+                       // scores a perfect 100.0/100.0/100.0 but cuts 36 of 65,
+                       // +16 blocks against L27's +8. Six other heads also hit
+                       // 100/100/100 (L39 h=7, L43 h=22, L47 h=17/h=2, L39 h=12,
+                       // L47 h=1), so depth buys a plateau here, not a peak.
+                       /*locate_layer*/ 27, /*locate_head*/ 10,
                        /*locate_provenance*/
-                       "LOCHEAD 2026-09-18, Leg C messy corpus 15 docs EN+DE, 75 keys: "
-                       "L35 h=6 = 88.0% top1 / 100.0% top3 (EN 100.0 / DE 100.0), rank 1 "
-                       "of 384, and free at 36/64 because citation already cuts at 60"}},
+                       "LOCHEAD 2026-09-19, Leg C messy corpus 15 docs EN+DE, 75 keys: "
+                       "L27 h=10 = 81.3% top1 / 94.7% top3 (EN 97.5 / DE 91.4), rank 40 "
+                       "of 384, the shallowest head clearing 90% top3 on BOTH halves. "
+                       "Best available was L35 h=16 at 100% top3, declined on depth "
+                       "(36/65 blocks vs 28/65). TOP-1 IS 81.3% \u2014 a caller that acts "
+                       "on a single span is acting on that rate, not on 94.7%. Measured "
+                       "at Q3_K_M, where the 9B's pair is Q8_0"}},
     };
     return kLensCalibrations;
 }

@@ -225,9 +225,17 @@ public:
             // LOCATE BELONGS IN THIS MAX. This process serves /v1/locate too, and
             // locate taps its OWN layer — a calibration whose locate_layer sits
             // deeper than both of the others would tap a block this cut never
-            // loaded. It does not bite today (the 35B's locate is 11 vs a cut of
-            // 11; Bonsai's is 35 vs a cut of 59), which is exactly why it had to
-            // be written down before it does. -1 means "not swept" and must not
+            // loaded.
+            //
+            // THIS NOW BITES. It was written when it did not: the 35B and the 9B
+            // both sit at L11, equal to coverage, so the max was inert and the
+            // line was pure anticipation. Qwen3.8-27B (2026-09-19) is the case it
+            // was waiting for — locate 27 against citation 19 and coverage 11, so
+            // this max is what makes the cut 28 of 65 instead of 20, and deleting
+            // it would serve /v1/locate a layer that was never loaded. Do not
+            // "simplify" it back to two terms.
+            //
+            // -1 means "not swept" and must not
             // drag the max down, so it is only folded in when it is real.
             int cutoff =
                 std::max(cal->constants.citation_layer, cal->constants.coverage_layer);
@@ -2948,9 +2956,20 @@ int main(int argc, char* argv[]) {
         if (integration.lens_verify_only()) {
             // A truncated model cannot generate — see the constructor banner
             // for which blocks are loaded and why. Everything else 404/400s.
+            //
+            // /v1/locate is listed because this process SERVES it. Leaving it
+            // out was the same defect the constructor banner carries a
+            // two-reading split to avoid: an operator reading the startup
+            // top-down was told about a route in prose and then handed a
+            // four-line list that did not have it, so the list read as
+            // exhaustive and was not.
             std::cout << "  POST /v1/verify            (lens-verify-only: "
                       << integration.lens_verify_only_blocks_needed() << "/"
                       << integration.lens_verify_only_total_blocks() << " blocks loaded)"
+                      << std::endl;
+            std::cout << "  POST /v1/locate            (lens-verify-only; per-model — "
+                         "refused on a model whose calibration row carries no measured "
+                         "locate head)"
                       << std::endl;
             std::cout << "  POST /v1/completions       refused (--lens-verify-only)"
                       << std::endl;
@@ -2965,6 +2984,16 @@ int main(int argc, char* argv[]) {
                               ? "  (text + image_url image input)"
                               : "  (text-only; start with --mmproj for images)")
                       << std::endl;
+            // The full server serves the lens routes too, and listed none of
+            // them. Same omission as above, other branch.
+            if (integration.attention_lens_enabled()) {
+                std::cout << "  POST /v1/extract           (--attention-lens)" << std::endl;
+                std::cout << "  POST /v1/verify            (--attention-lens)" << std::endl;
+                std::cout << "  POST /v1/locate            (--attention-lens; per-model — "
+                             "refused on a model whose calibration row carries no measured "
+                             "locate head)"
+                          << std::endl;
+            }
         }
         std::cout << "  GET  /v1/models" << std::endl;
         std::cout << "Press Ctrl+C to stop" << std::endl;

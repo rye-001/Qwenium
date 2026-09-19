@@ -22,9 +22,12 @@
 #                  not), and `locate_provenance` names the run either way.
 #   3b. FLOOR     — the labelled values must actually be found. A FLOOR that
 #                  catches breakage, NOT a calibration: the real rate is
-#                  LOCHEAD's per-model top3 rate (35B L11h5 89.3%, Bonsai-27B
-#                  L35h6 100%) over 75 keys, and four keys on one
-#                  document cannot re-measure it.
+#                  LOCHEAD's per-model top3 rate (9B L11h6 96.0%, 35B L11h5
+#                  89.3%, 27B L27h10 94.7%) over 75 keys, and four keys on one
+#                  document cannot
+#                  re-measure it. Note top3 is not top1 —
+#                  the 9B is 88.0% top1, which is the rate a caller acting on a
+#                  SINGLE span is actually running on.
 #   4. VERBATIM  — every returned range slices real document bytes, and the
 #                  ranges for one key are disjoint and ordered by PEAK (not by
 #                  `mass`, which is the span SUM and can rank differently — this
@@ -172,7 +175,8 @@ for key, want in TRUTH.items():
 check(len(found) >= 2, "floor",
       f"{len(found)} of 4 labelled values inside a returned span ({', '.join(found)}) "
       f"— floor is 2; the per-model rate is in this report's locate_provenance, "
-      f"not a constant (35B L11h5 = 89.3% top3, Bonsai-27B L35h6 = 100%)")
+      f"not a constant (9B L11h6 = 96.0% top3 / 88.0% top1, 35B L11h5 = 89.3%, "
+      f"27B L27h10 = 94.7% top3 / 81.3% top1)")
 
 # ── Gate 4: VERBATIM ─────────────────────────────────────────────────────────
 bad = []

@@ -233,7 +233,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD) + `suffix_decoding` (SuffixDecoding: session-scoped, adaptive-length lookup, §5), `sampling_snapshot` |
-| `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the fail-loud architecture/tensor-inventory validators), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
+| `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the three fail-loud gates: tensor **type** — is every ggml type id one this build knows, checked at parse because `ggml_type_size`'s own bounds check is a plain `assert` that Release removes; **architecture** — is `general.architecture` in the registry allow-list; **inventory** — does the file carry every tensor the recipe needs, correctly shaped), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
@@ -823,25 +823,31 @@ coordinates). Three models are calibrated today, all Qwen: **Qwen 3.6-35B-A3B**
 citation **L27H13** — 98% vs 84% top-3 and 0% vs 7% ungrounded false alarm on
 the same messy corpus, `note-lens-qwen38-probe.md` §5.3) and **Qwen 3.8-27B**
 (`qwen35`/65, citation **L19H20**, coverage **L11 @ 0.705** — added 2026-09-15,
-`note-lens-qwen38-27b-probe.md`). A fourth was added 2026-09-18 and is the
-first non-Qwen-published one: **Ternary-Bonsai-27B** (prism-ml, `qwen35`/64 at
-`file_type` 41, ternary Q2_0 group-64, citation **L59H21** — 94.8% top-3,
-EN 95.0 / DE 94.6, `note-lens-bonsai-27b-probe.md`). Locate was swept the same day
-(`LOCHEAD`): **L35 h=6, 100% top-3 in BOTH languages**, and *free* — verify
-already cuts at `max(citation 59, coverage 11) + 1 = 60`, so any locate layer
-≤ 59 costs this server nothing, which is the opposite of the 35B where locate
-drove the cut. Its entry is still deliberately **partial**: coverage, the
-ungrounded threshold and flash prefill were not measured on ternary weights, so
-flash prefill is refused by the struct default and `coverage_source` says so
-**in the report itself** rather than only in a code comment.
+`note-lens-qwen38-27b-probe.md`). A fourth entry, **Ternary-Bonsai-27B** (prism-ml, ternary Q2_0
+group-64), was added 2026-09-18 and **reverted 2026-09-19** when the model was
+de-scoped; its measurements are kept in `note-lens-bonsai-27b-probe.md` and the
+`file_type` key field it motivated stayed (see below). The 9B's locate pair
+(**L11 h=6**, 96.0% top-3 / 88.0% top-1 EN 95.0 / DE 97.1) was added
+2026-09-19 and is *free*: it equals the coverage layer, so the cut stays 28 of
+33 blocks. The 27B's locate pair (**L27 h=10**, 94.7% top-3 / 81.3% top-1,
+EN 97.5 / DE 91.4) was added the same day and is **not** free — it is deeper
+than both other constants and moves that model's cut from 20 to **28 of 65**.
+The +8 blocks were accepted because the free zone is empty: the best candidate
+at or below the citation layer, L15 h=17, reads 90.7% pooled and **fails German
+at 88.6%**. The best head overall, L35 h=16, scores a perfect 100.0/100.0/100.0
+and was declined on depth (36 of 65). `note-lens-qwen38-27b-probe.md` §8.
 
 The `--lens-verify-only` cut is `max(citation_layer, coverage_layer,
-locate_layer) + 1`. **Locate joined that max on 2026-09-18**, when Bonsai became
-the first entry with both a locate pair and a citation layer deeper than it: the
+locate_layer) + 1`. **Locate joined that max on 2026-09-18**, when an entry
+first carried both a locate pair and a citation layer deeper than it: the
 process serves `/v1/locate`, locate taps its own layer, and a calibration whose
 locate layer sat deeper than the other two would tap a block the cut never
-loaded. It does not bite on any entry today, which is precisely why it was
-written down rather than left to the first sweep that lands deep.
+loaded. It was written down before it could bite, while both calibrated locate
+pairs still sat at L11 equal to coverage. **It bites as of 2026-09-19**:
+Qwen3.8-27B's locate 27 against citation 19 and coverage 11 is what makes that
+model's cut 28 of 65 rather than 20, and it is the only entry where removing
+locate from the max would still leave every other model working while silently
+serving `/v1/locate` a block this mode never loaded.
 
 *Three constants, three different provenances.* The 27B is the first model to
 clear **every** arm of leg C (citation 91% top-3, coverage 97% used-clear, 0/75
@@ -870,16 +876,18 @@ calibrated model (Qwen3.8-27B) with an uncalibrated one (Qwen3.6-27B), whose
 coordinates score 7.1% on the model that owns them. A future collision is
 resolved by **adding a field to the key, never by widening an entry to a model
 nobody measured** — and on 2026-09-18 that future arrived. Ternary-Bonsai-27B
-is `qwen35` with `block_count` 64, the *same key* as the uncalibrated
+was `qwen35` with `block_count` 64, the *same key* as the uncalibrated
 Qwen3.6-27B, so admitting one would have admitted both. The added field is GGUF
-`general.file_type` (ternary Q2_0 = 41, Qwen3.6-27B's Q4_K_M = 15), and it is
-the principled field rather than a convenient one: the run that admitted Bonsai
-measured the calibration to **be** quant-sensitive — Qwen3.8-27B's own L19H20
-survives ternary at rank 5 of 384 but falls from DE 90.4% to **89.8%**, crossing
-the 90% bar, which is why Bonsai carries a different head rather than borrowing
-one. A row may set `kLensAnyFileType` to accept any quantization, which is what
-the four pre-existing rows carry so the new field cannot refuse a model that
-worked before it landed; a row that **pins** a quantization beats one that does
+`general.file_type`, and it is the principled field rather than a convenient
+one: that run measured the calibration to **be** quant-sensitive —
+Qwen3.8-27B's own L19H20 survives ternary at rank 5 of 384 but falls from
+DE 90.4% to **89.8%**, crossing the 90% bar. **The field outlived the row that
+motivated it**, deliberately: the Bonsai entry was reverted on 2026-09-19, but
+a plain non-MTP build of Qwen3.8-27B also keys as `{qwen35, 64}` (65 = 64
+decode + 1 NextN) and would silently inherit the MTP row's coordinates without
+it. No row pins a quantization today; a row may set `kLensAnyFileType` to
+accept any, which is what all four carry so the field cannot refuse a model
+that worked before it landed, and a row that **pins** one beats a row that does
 not. That "any" is a preserved looseness, not an endorsement: `models/` holds
 Qwen3.8-9B at both Q8_0 and Q4_K_M under the one `{qwen35, 33}` entry, and only
 the Q8_0 was ever measured. Tightening that is a separate decision. `coverage_used_peak`
@@ -1026,13 +1034,15 @@ this process will ever serve, so there is no reason to load its weights either.
 **It also serves `/v1/locate`** (2026-09-18), on its own scheduler (§6 — sharing
 this mode's scheduler corrupted every later `/v1/verify`, and this mode is where
 that defect reproduces, because `reserve_max_batch` is skipped here). The block
-count is safe by arithmetic rather than by intent: locate truncates after `locate_layer`, which on the one
-model swept so far is 11 — exactly the `max(citation_layer, coverage_layer)`
-cutoff this mode already loads to. A model whose LOCHEAD sweep ever lands
-DEEPER than that cutoff would need `needed` to become
-`max(citation_layer, coverage_layer, locate_layer) + 1`, or `/v1/locate` would
-have to be refused here the way `/v1/extract` is. Neither has been needed yet;
-this paragraph is the place to come back to when it is.
+count is safe **by intent, not by arithmetic** — and that changed. It was once
+safe by coincidence: locate truncates after `locate_layer`, which on every model
+swept up to 2026-09-18 was 11, exactly the `max(citation_layer, coverage_layer)`
+cutoff this mode already loaded to. Qwen3.8-27B's sweep (2026-09-19) landed
+locate at **27**, deeper than that cutoff, which is the case this paragraph was
+written to anticipate. The resolution was the first of the two options it named:
+`needed` is `max(citation_layer, coverage_layer, locate_layer) + 1`, so the 27B
+loads 28 of 65 instead of 20. `/v1/locate` was **not** refused here. Any future
+row is covered by the same arithmetic; no third option is needed.
 
 `--lens-verify-only` (requires `--attention-lens`; refused fail-loud alone)
 resolves the calibration entry from GGUF **metadata** (`{architecture,

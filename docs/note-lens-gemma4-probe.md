@@ -304,3 +304,100 @@ does not, and it remains untested.
 **Caveat**: the Qwen arm sampled 8 attention layers (3,7,11,15,19,23,27,31)
 against Gemma's full 48. L27, the known-good layer, is in the set, so the control
 is sound — and a higher unsampled Qwen ceiling would only widen the gap.
+
+## Addendum 2026-09-19 — LOCHEAD: no locate head on Gemma 4 either
+
+**Verdict: NO-GO. The best key-as-query candidate on Gemma 4 is 68.0% top-3
+against a 90% bar. `/v1/locate` stays Qwen-only, and the span-only mode with it.**
+
+This closes the one item the span-only work left open. The reason to run it was
+that **citation and locate are different circuits** — on Qwen 3.8-9B they have
+*inverted* depth profiles (locate peaks at L11 where citation is worst, 96.0% vs
+70.2%), so Gemma's citation null (0/768 clears 70%) did not logically imply a
+locate null. It was upside, never a gate on anything. The upside did not appear:
+locate on Gemma lands at essentially the same place citation did.
+
+### Provenance
+
+| | |
+|---|---|
+| Model | `models/gemma-4-12B-it-Q8_0.gguf`, arch `gemma4`, 48 blocks, Q8_0 dense |
+| Attention layers | all 48 materialize `kq_soft` (graph-scan discovered) |
+| Candidates | **48 x 16 = 768**, identical space to the citation sweep above |
+| Corpus | Leg C messy corpus, 15 docs EN+DE, **75 scored keys (EN 40, DE 35)** |
+| Driver | `build-metal/bin/attn-provenance`, env `LOCHEAD=1` |
+| Raw log | `.session-results/gemma4_lochead.log` |
+| BOS | `add_bos_token=true` id 2 `"<bos>"` — applied and confirmed in the log |
+| Chat template | `Gemma4ChatTemplate`, selected by `g_arch` in `qdocs_chat_prompt` |
+| Process hygiene | exit 0; `ps aux` shows no surviving `attn-provenance` |
+
+**Nothing arch-specific had to be written for this.** LOCHEAD reads raw attention
+rows only (Metric A), so it never touches Gemma 4's two-KV-cache split — the trap
+`note-lens-gemma-norm-weighted.md` §2 had to work around for Metric B simply does
+not arise. The log prints `n_head_kv=0` for the same reason (the generic accessor
+does not model gemma4's dual caches); it is cosmetic here, not a defect, because
+no leg of this probe reads a KV cache.
+
+### Result
+
+    rank | layer head |  top1    top3  |  EN top3   DE top3
+       1 | L19   h=2  |   41.3%   68.0% |    72.5%     62.9%
+       2 | L22   h=4  |   41.3%   66.7% |    67.5%     65.7%
+       3 | L24   h=0  |   46.7%   65.3% |    72.5%     57.1%
+       4 | L19   h=9  |   37.3%   64.0% |    65.0%     62.9%
+       5 | L22   h=10 |   36.0%   64.0% |    65.0%     62.9%
+
+Best is **L19 h=2, 41.3% top-1 / 68.0% top-3**. The bar (top-3 >= 90% pooled *and*
+on both halves) is missed by 22 points pooled; the best EN figure anywhere in the
+768 is 75.0% and the best DE is 65.7%, so no candidate clears it on either half
+alone either. For scale, Qwen 3.8-9B's landed pair is **88.0% top-1 / 96.0% top-3**
+on this same corpus and the same 75 keys.
+
+Ignore the harness's `incumbent L0 h=13 ... rank 497` line: `FROZEN_SLOT`/
+`FROZEN_HEAD` default to a **Qwen** citation pair, and there has never been a
+calibrated Gemma locate head for it to name. It is not a Gemma baseline.
+
+### Two things this measurement says beyond the headline
+
+**1. Locate is not an easier circuit on Gemma — it is the same diffuse regime.**
+Citation topped out at 63% top-3 mass (L7H13, after the search defect was fixed);
+locate tops out at 68.0%. Those are the same answer within corpus noise. The
+"different circuit" argument was correct as a reason to *look*, and it is exactly
+what makes the null informative rather than redundant: two independent probes of
+two different circuits both land ~65% on Gemma and both land >=96% on Qwen. That
+is a property of the model family, not of one signal.
+
+**2. Gemma's locate depth profile is NOT inverted, so there was no cheap cut here
+even hypothetically.** The per-layer curve rises from the bottom and plateaus in
+the L19-L24 band (L0-L11 are all <=46.7% top-3); the head-MEAN column rises with
+it, 0.15 shallow to ~0.40 mid. Qwen's 9B wins at L11 of 33 — 12 blocks computed.
+Gemma's best sits at L19 of 48, and it does not work. Both halves of the
+proposition fail: no accuracy, and no depth saving if there had been.
+
+### The one thing this run did not test
+
+**The sliding window never bound, so this is not a windowing artifact — but it
+also was not tested.** 40 of Gemma 4's 48 blocks are sliding-attention, and I
+expected the ranked list to be dominated by the 8 global layers, with local layers
+flooring out because a key in the instruction cannot reach a distant document span.
+That did not happen: the top 15 are overwhelmingly sliding layers (L19, L21, L22,
+L24, L20, L15...). The reason is in the log — **prompt lengths are 168-284 tokens**,
+far inside the window, so local and global layers see the identical span and the
+distinction is inert on this corpus. The hypothesis is therefore neither confirmed
+nor refuted; it is untested, and it would only become testable on documents long
+enough to exceed the window. That matters if Gemma is ever revisited at
+workload-envelope scale (10K ctx), where the 40 sliding layers would be
+structurally unable to host a locate head for a distant span. It does not rescue
+the present null: at these lengths every one of the 768 candidates had full reach
+and none of them clears the bar.
+
+### Consequence
+
+- `LensConstants` unchanged. No Gemma row, no constant moved — and per standing
+  practice, moving one would be the user's decision, not this probe's.
+- The **cross-family rule is satisfied for the tap interface, not violated by
+  this null**: the interface was already validated on Gemma (all 768 heads
+  scored, twice now, on two different signals). What Gemma lacks is a usable
+  *head*, which is a model property. The rule governs interfaces and forward-pass
+  changes; it does not require that every family have a shippable calibration.
+- Span-only mode is Qwen-only, for the same reason `/v1/locate` is.

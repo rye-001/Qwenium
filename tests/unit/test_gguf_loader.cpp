@@ -418,3 +418,50 @@ TEST_F(GGUFKVBagLoaderTest, WrongTypeAccessOnBagKeyThrows) {
         EXPECT_NE(msg.find("uint32"), std::string::npos) << msg;
     }
 }
+
+// ── Unknown tensor type is refused, fail-loud ────────────────────────────────
+//
+// Regression: Ternary-Bonsai-2-27B-PTQ1_0.gguf declares ggml type 143. Before
+// this gate existed, calculate_tensor_bytes() called ggml_type_size(143), whose
+// bounds asserts NDEBUG removes, read type_traits[] out of bounds, and reported
+// "567 MB" for a 5.9 GB file. ggml aborted later in ggml_new_tensor_impl, but
+// only after we had sized memory off that number.
+
+TEST(GGUFTensorTypeGuard, KnownTypesAreAccepted) {
+    for (uint32_t t = 0; t < static_cast<uint32_t>(GGML_TYPE_COUNT); ++t) {
+        EXPECT_NO_THROW(validate_tensor_type("blk.0.ffn_down.weight", t))
+            << "type id " << t << " is inside GGML_TYPE_COUNT and must be accepted";
+    }
+}
+
+TEST(GGUFTensorTypeGuard, TypeIdAtOrAboveCountIsRefused) {
+    EXPECT_THROW(validate_tensor_type("blk.0.ffn_down.weight",
+                                      static_cast<uint32_t>(GGML_TYPE_COUNT)),
+                 GGUFLoadError);
+    EXPECT_THROW(validate_tensor_type("blk.0.ffn_down.weight", 142u), GGUFLoadError);
+    EXPECT_THROW(validate_tensor_type("blk.0.ffn_down.weight", 143u), GGUFLoadError);
+    EXPECT_THROW(validate_tensor_type("blk.0.ffn_down.weight", 0xFFFFFFFFu),
+                 GGUFLoadError);
+}
+
+// The message names the slot, the expected range, then the actual value —
+// the order the fail-loud contract fixes (CLAUDE.md).
+TEST(GGUFTensorTypeGuard, RefusalNamesSlotExpectedActualInThatOrder) {
+    try {
+        validate_tensor_type("blk.7.attn_qkv.weight", 143u);
+        FAIL() << "expected GGUFLoadError";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        const size_t slot     = msg.find("blk.7.attn_qkv.weight");
+        const size_t expected = msg.find("expected");
+        const size_t actual   = msg.find("actual");
+        ASSERT_NE(slot,     std::string::npos) << msg;
+        ASSERT_NE(expected, std::string::npos) << msg;
+        ASSERT_NE(actual,   std::string::npos) << msg;
+        EXPECT_LT(slot, expected) << msg;
+        EXPECT_LT(expected, actual) << msg;
+        // Says what it found, not only that it refused.
+        EXPECT_NE(msg.find("143"),     std::string::npos) << msg;
+        EXPECT_NE(msg.find("PTQ1_0"),  std::string::npos) << msg;
+    }
+}
