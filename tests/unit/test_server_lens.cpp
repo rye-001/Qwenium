@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <cctype>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -2229,4 +2230,195 @@ TEST(LensCalibrationGuard, LocateDepthDirectionIsNotAFamilyConstant) {
     // Same architecture string, opposite answers.
     EXPECT_LT(q9->constants.locate_layer,  q9->constants.citation_layer);
     EXPECT_GT(q27->constants.locate_layer, q27->constants.citation_layer);
+}
+
+// ── config.attention must describe the pass that RAN, not the server's flags ──
+//
+// lens-format.md's contract for `config` is "the numerical configuration that
+// produced THIS report" plus "two reports are only comparable when this
+// matches". Both halves broke on /v1/locate: its only pass is the tapped
+// prefill, which run_lens_locate forces materialized, so a locate report from
+// a --flash-attn server IS byte-comparable with one from a plain server — and
+// the old label told readers it was not.
+TEST(LensAttentionLabel, LocateIsMaterializedWhateverTheServerFlagsSay) {
+    using RP = LensReport::RoutePrefill;
+    // Every flag combination, including ones the server cannot currently
+    // produce: the route property must not depend on any of them.
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, false, false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, false, true),  "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, true,  false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, true,  true),  "materialized");
+}
+
+// The regression, stated as the comparison it protects: a locate report from a
+// flash server and one from a plain server must carry the SAME stamp, because
+// the pass that produced them is the same pass.
+TEST(LensAttentionLabel, TwoLocateReportsAcrossFlashSettingsStayComparable) {
+    using RP = LensReport::RoutePrefill;
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, /*decode*/ false, /*prefill*/ true),
+                 lens_attention_label(RP::AlwaysMaterialized, false, false))
+        << "a locate report must not claim a configuration its pass never ran under";
+}
+
+// extract and verify are NOT the same case — each has an untapped prompt
+// prefill that really does run under the flag, so the fix must not flatten
+// them to "materialized" and lose a real numerical difference.
+TEST(LensAttentionLabel, ExtractAndVerifyStillReportTheServerConfiguration) {
+    using RP = LensReport::RoutePrefill;
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, false, false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, false, true),  "flash-prefill");
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, true,  false), "flash");
+    // Decode-flash wins over prefill-flash: "flash" is the stronger statement
+    // and the one a reader must not under-read.
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, true,  true),   "flash");
+}
+
+// The label set is closed — lens-format.md documents exactly three values and
+// an importer switches on them.
+TEST(LensAttentionLabel, EmitsOnlyTheThreeDocumentedValues) {
+    using RP = LensReport::RoutePrefill;
+    const std::set<std::string> allowed = {"materialized", "flash-prefill", "flash"};
+    for (RP r : {RP::HonoursServerFlag, RP::AlwaysMaterialized})
+        for (bool d : {false, true})
+            for (bool pf : {false, true})
+                EXPECT_TRUE(allowed.count(lens_attention_label(r, d, pf)) == 1)
+                    << "undocumented label: " << lens_attention_label(r, d, pf);
+}
+
+// ── LensKeyAggregation — the opt-in reduction over a key's query rows ────────
+//
+// MAX is what LOCHEAD measured and must stay the default, byte-identical to the
+// behaviour that predates the enum. MEAN exists for SENTENCE-length keys, where
+// max inverts into a defect: one filler token spikes and the wordiest key wins
+// regardless of content (DECIDE1 2026-09-20 — a 4-way routing task collapsed
+// into a single category until the filler was removed, +25 points).
+TEST(LensKeyAggregationContract, MaxIsTheDefaultAndIsNamedOnTheWire) {
+    EXPECT_STREQ(lens_key_aggregation_name(LensKeyAggregation::Max),  "max");
+    EXPECT_STREQ(lens_key_aggregation_name(LensKeyAggregation::Mean), "mean");
+    LensLocateReport r;
+    EXPECT_EQ(r.key_aggregation, LensKeyAggregation::Max)
+        << "the default must remain MAX: it is the reduction LOCHEAD measured, "
+           "and every shipped locate_provenance rate is quoted under it";
+}
+
+// A report scored under MEAN sits outside LOCHEAD's measurement, exactly as a
+// question vocabulary does. If this ever stops being disclosed, a caller reads
+// a 96.0% provenance rate for a request that was never measured at 96.0%.
+TEST(LensKeyAggregationContract, MeanIsSerializedSoAReportCannotHideIt) {
+    LensLocateReport r;
+    r.model = "m"; r.locate_layer = 11; r.locate_head = 6; r.top_k = 3;
+    r.locate_provenance = "LOCHEAD 2026-09-19";
+    r.key_aggregation = LensKeyAggregation::Mean;
+    r.uncalibrated = true;                      // what run_lens_locate sets
+    const std::string js = lens_locate_to_json(r);
+    EXPECT_NE(js.find("\"key_aggregation\":\"mean\""), std::string::npos)
+        << "the reduction must travel with the report";
+    EXPECT_NE(js.find("\"uncalibrated\":true"), std::string::npos)
+        << "MEAN is off-calibration and must say so, like question mode";
+
+    r.key_aggregation = LensKeyAggregation::Max;
+    r.uncalibrated = false;
+    EXPECT_NE(lens_locate_to_json(r).find("\"key_aggregation\":\"max\""),
+              std::string::npos)
+        << "emitted unconditionally: an absent member would make a reader guess "
+           "whether it meant max or an old server";
+}
+
+// The two reductions must actually differ on a multi-row key, or the parameter
+// is decorative. Mirrors the shape of the real loop: rows x document positions,
+// one row carrying a lone spike.
+TEST(LensKeyAggregationContract, MaxAndMeanDisagreeOnASpikyKey) {
+    // 3 query rows over 2 document positions.
+    //   row0: [0.90, 0.10]   <- the filler token's spurious spike on position 0
+    //   row1: [0.02, 0.50]
+    //   row2: [0.02, 0.50]   <- two rows agree on position 1
+    // The spike must be big enough to win MAX and still lose MEAN; a first
+    // draft of this fixture used 0.05/0.40 and the mean came out 0.333 vs
+    // 0.300, i.e. the spike won both and the test proved nothing.
+    const std::vector<std::vector<float>> rows = {{0.90f, 0.10f},
+                                                  {0.02f, 0.50f},
+                                                  {0.02f, 0.50f}};
+    std::vector<float> mx(2, 0.0f), mn(2, 0.0f);
+    for (const auto& r : rows)
+        for (size_t d = 0; d < 2; ++d) {
+            if (r[d] > mx[d]) mx[d] = r[d];
+            mn[d] += r[d];
+        }
+    for (float& v : mn) v /= (float)rows.size();
+
+    // MAX hands the spike the win; MEAN hands it to the position two rows agree on.
+    EXPECT_GT(mx[0], mx[1]) << "max follows the lone spike";
+    EXPECT_LT(mn[0], mn[1]) << "mean follows the agreement — this is the +25 points";
+}
+
+// ── The CHOICE pair — a third job on the same layer ─────────────────────────
+TEST(LensChoiceHead, NineBCarriesASweptChoicePairOnTheLocateLayer) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.choice_layer, 11);
+    EXPECT_EQ(q9->constants.choice_head,   3);
+
+    // THE POINT OF THIS PAIR: same layer as locate, different head, so serving
+    // choice costs a --lens-locate-only server no extra blocks.
+    EXPECT_EQ(q9->constants.choice_layer, q9->constants.locate_layer)
+        << "choice is free on this model precisely because it shares locate's layer";
+    EXPECT_NE(q9->constants.choice_head, q9->constants.locate_head)
+        << "...but it is NOT the locate head: reading choice there scores 87.5% "
+           "against this pair's 92.5%";
+
+    // The rate is conditional on a recipe, so the provenance must carry it.
+    // A bare layer/head pair would be a receipt with its conditions stripped.
+    const std::string prov = q9->constants.choice_provenance;
+    EXPECT_NE(prov.find("DECIDEHEAD"), std::string::npos);
+    EXPECT_NE(prov.find("92.5%"),      std::string::npos);
+    EXPECT_NE(prov.find("question"),   std::string::npos) << "instruction shape";
+    EXPECT_NE(prov.find("mean"),       std::string::npos) << "key aggregation";
+    EXPECT_NE(prov.find("Q4_K_M"),     std::string::npos) << "quant stability";
+}
+
+// Every other row must stay unswept rather than inheriting the 9B's coordinate.
+// Borrowing a head across models is the false-receipt failure this table exists
+// to prevent, and DECIDEHEAD has only run on the 9B.
+TEST(LensChoiceHead, EveryOtherRowIsRefusedRatherThanInheriting) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (std::string(c.model) == "Qwen3.8-9B") continue;
+        EXPECT_LT(c.constants.choice_layer, 0) << c.model << " must not carry a choice pair";
+        EXPECT_LT(c.constants.choice_head,  0) << c.model;
+        EXPECT_STREQ(c.constants.choice_provenance, "not swept by DECIDEHEAD") << c.model;
+    }
+}
+
+TEST(LensChoiceHead, HeadRoleIsNamedOnTheWireAndDefaultsToLocate) {
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Locate), "locate");
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Choice), "choice");
+    LensLocateReport r;
+    EXPECT_EQ(r.head_role, LensHeadRole::Locate)
+        << "default must stay locate: the route predates the choice pair";
+    r.model = "m"; r.locate_layer = 11; r.locate_head = 3; r.top_k = 3;
+    r.head_role = LensHeadRole::Choice;
+    r.locate_provenance = "DECIDEHEAD 2026-09-20";
+    const std::string js = lens_locate_to_json(r);
+    EXPECT_NE(js.find("\"head_role\":\"choice\""), std::string::npos)
+        << "a reader must be able to tell which job's calibration applies";
+    EXPECT_NE(js.find("DECIDEHEAD"), std::string::npos)
+        << "provenance must switch with the pair, not stay locate's";
+}
+
+// The 9B row is kLensAnyFileType, so it serves Q8_0 AND Q4_K_M — and the same
+// pair measures 96.0% top-3 on one and 93.3% on the other. A provenance naming
+// only one of them makes every report on the other file overstate itself, which
+// is the failure this table exists to prevent. Guarded because the temptation
+// to "tidy" a long string back to a single number is real.
+TEST(LensChoiceHead, NineBLocateProvenanceNamesBothQuants) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::string p = q9->constants.locate_provenance;
+    EXPECT_NE(p.find("Q8_0"),   std::string::npos) << "must name the quant it was swept on";
+    EXPECT_NE(p.find("Q4_K_M"), std::string::npos) << "...and the one it also serves";
+    EXPECT_NE(p.find("96.0%"),  std::string::npos) << "Q8_0 top-3";
+    EXPECT_NE(p.find("93.3%"),  std::string::npos) << "Q4_K_M top-3";
+    EXPECT_NE(p.find("88.0%"),  std::string::npos) << "Q8_0 top-1";
+    EXPECT_NE(p.find("84.0%"),  std::string::npos) << "Q4_K_M top-1";
+    // The row is unpinned, which is WHY both rates have to be here.
+    EXPECT_EQ(q9->file_type, kLensAnyFileType);
 }

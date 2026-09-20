@@ -827,7 +827,9 @@ the same messy corpus, `note-lens-qwen38-probe.md` §5.3) and **Qwen 3.8-27B**
 group-64), was added 2026-09-18 and **reverted 2026-09-19** when the model was
 de-scoped; its measurements are kept in `note-lens-bonsai-27b-probe.md` and the
 `file_type` key field it motivated stayed (see below). The 9B's locate pair
-(**L11 h=6**, 96.0% top-3 / 88.0% top-1 EN 95.0 / DE 97.1) was added
+(**L11 h=6**, 96.0% top-3 / 88.0% top-1 EN 95.0 / DE 97.1 **on Q8_0**, and
+93.3 / 84.0 on Q4_K_M — the row is unpinned so it serves both, and its
+provenance names both rates) was added
 2026-09-19 and is *free*: it equals the coverage layer, so the cut stays 28 of
 33 blocks. The 27B's locate pair (**L27 h=10**, 94.7% top-3 / 81.3% top-1,
 EN 97.5 / DE 91.4) was added the same day and is **not** free — it is deeper
@@ -973,15 +975,38 @@ Two facts about it are load-bearing:
   range-checking every tap against `[0, 1]` — a post-softmax weight cannot fall
   outside it, so bytes that do are not this pass's attention, and the lens
   refuses rather than reports. Gate: `tests/smoke/server_locate_smoke.sh`
-  gate 8, `VERIFY_ONLY=1`. Precedents: the MTP head's dedicated scheduler and
-  `server-image-multirequest-bug.md`.
+  gate 8, `VERIFY_ONLY=1` (the gate cannot run under `--lens-locate-only`,
+  which refuses `/v1/verify`; that leg runs gates 1–7 plus an explicit
+  refusal check and says so rather than reporting a full pass). Precedents:
+  the MTP head's dedicated scheduler and `server-image-multirequest-bug.md`.
+- **It takes an optional `key_aggregation`** (`"max"` default, `"mean"` opt-in;
+  2026-09-20). Not a tuning knob — a property of the KEY KIND. `max` is the
+  reduction LOCHEAD measured and is correct for the 1-4 token field names it
+  swept; on SENTENCE-length keys it inverts into a defect, letting one filler
+  token spike so the wordiest key wins (`an` against ` agreement`, 0.507, with
+  the same key's next span at 0.047). `mean` was worth **+17.5 points** on a
+  4-way routing task at identical latency (DECIDE1,
+  `note-lens-qwen38-probe.md`). Default is byte-identical to the behaviour that
+  predates the field, and `mean` sets `uncalibrated` because the shipped
+  provenance rates were all measured under `max`.
+- **It takes an optional `head`** (`"locate"` default, `"choice"` opt-in;
+  2026-09-20), selecting which calibrated job's pair to read. A layer is not a
+  job: on Qwen3.8-9B choice sits at the **same layer** as locate (11) on a
+  different head (3 vs 6), measured 92.5% on 4-way routing — identical on Q8_0
+  and Q4_K_M — so choice is free on a `--lens-locate-only` server. Refused
+  fail-loud where DECIDEHEAD has not run; reading choice off the locate pair
+  measured 87.5%, and off the citation pair far worse. The two jobs have
+  opposite recipes (`max` for locate, `mean` for choice) and `uncalibrated`
+  follows whichever applies.
 - **It truncates after `locate_layer` alone**, so the constant IS the route's
   cost. On Qwen 3.6-35B that layer is 11, which is exactly
   `max(citation_layer, coverage_layer)` — so `/v1/locate` costs a
   `--lens-verify-only` server **not one additional block**, which is why it is
   served there and `/v1/extract` is not. That equality is a property of this
   model's calibration, not a general fact: a model whose sweep lands deeper
-  makes the locate slice bigger than the verify slice.
+  makes the locate slice bigger than the verify slice — which Qwen3.8-27B then
+  did (locate 27 vs citation 19). Because the constant IS the cost, it is also
+  what `--lens-locate-only` loads to (see below): 12 of 33 blocks on the 9B.
 
 Two things had to generalize, both **recipe-agnostic and byte-inert when
 unarmed** — the same discipline the P1 tap seam already keeps:
@@ -1065,6 +1090,40 @@ loaded, so this flag saves weight bytes only; sizing the state to match is a
 further optimization this change does not attempt. This is the smallest
 saving of the three calibrated entries (9B skips 5/33 blocks); the 35B-A3B
 entry (12 of 40) and the 27B entry (20 of 65) skip a much larger fraction.
+
+**Locate-only server mode (`--lens-locate-only`, 2026-09-19).** The same
+argument taken to its floor. `/v1/locate` reads ONE layer and generates
+nothing, so a process that serves locate *alone* needs `locate_layer + 1`
+blocks — citation and coverage are deliberately **not** in this cut, because
+this mode refuses `/v1/verify`, and folding them in would load blocks solely to
+keep a route that is switched off. Requires `--attention-lens`, is **mutually
+exclusive** with `--lens-verify-only` (they set different cuts and serve
+different route sets, so silently preferring one would either waste weights or
+withdraw a route the operator asked for), and is **refused fail-loud on a model
+whose calibration row carries no measured locate head** rather than falling
+back to the verify-only cut.
+
+Measured on Qwen3.8-9B-Q8_0 (`locate_layer` 11 ⇒ **12 of 33 blocks**, 160 of 442
+tensors): Metal weights buffer **3661 MB**, against verify-only's 7168 MB on the
+same model — a **1.96×** reduction. Latency is unchanged by the mode and always
+was: `/v1/locate` sets `truncate_after_layer` per request, so it computed 12
+blocks even on a full server. What the flag buys is **residency, not speed** —
+which is exactly what makes it the replication unit. One process still serves
+one request at a time (every lens route holds `model_mutex_` exclusively, and
+the lens's global engine state — `attention_taps`, `truncate_after_layer`,
+`prefill_attn_impl` — lives on the one shared `ForwardPassBase`), so concurrency
+for span-only comes from running N of these, not from batching. Measured
+locate latency on the 9B: 367 ms at 326 chars, 733 ms at 1430, 1750 ms at 4006,
+4116 ms at 8606 — slightly superlinear, and nearly flat in key count (+6.7%
+from 1 key to 15). Against 1810 ms for `/v1/verify` on the same document,
+locate is 2.59× cheaper.
+
+The three modes are one `LensServerMode` enum (`Full` / `VerifyOnly` /
+`LocateOnly`), not a pair of booleans: the cut, the block counters and the
+refusal text all derive from that single value, so a server cannot disagree
+with itself about which blocks it holds. Route gating reads `lens_truncated()`
+(any cut) except for `/v1/verify`, which is legal under `VerifyOnly` and
+refused under `LocateOnly` — a per-route fact, not a property of being cut.
 
 Three things keep this from becoming a second, cheaper way to lie:
 

@@ -2231,6 +2231,8 @@ std::string lens_locate_to_json(const LensLocateReport& r) {
     // and LensCalibration::provenance already follow.
     o += "\"locate_provenance\":\"" + jesc(r.locate_provenance) + "\",\n";
     o += std::string("\"question_vocabulary\":") + (r.question_vocabulary ? "true" : "false") + ",\n";
+    o += std::string("\"key_aggregation\":\"") + lens_key_aggregation_name(r.key_aggregation) + "\",\n";
+    o += std::string("\"head_role\":\"") + lens_head_role_name(r.head_role) + "\",\n";
     o += "\"locate\":{\"layer\":" + std::to_string(r.locate_layer) +
          ",\"head\":" + std::to_string(r.locate_head) + "},\n";
     o += "\"top_k\":" + std::to_string(r.top_k) + ",\n";
@@ -2266,7 +2268,9 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
                                  const std::string& document,
                                  const std::vector<LensConcept>& concepts,
                                  const LensConstants& k,
-                                 int top_k) {
+                                 int top_k,
+                                 LensKeyAggregation key_agg,
+                                 LensHeadRole head_role) {
     if (document.empty())
         throw std::runtime_error("run_lens_locate: document expected non-empty actual=empty");
     if (concepts.empty())
@@ -2280,12 +2284,23 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     // index. Borrowing coordinates is the false-receipt failure the calibration
     // table exists to prevent, and layer geometry does not transfer inside this
     // family (35B citation L3/40, 9B L27/33).
-    if (k.locate_layer < 0 || k.locate_head < 0)
+    // Checked for the pair this REQUEST reads, not always the locate one: a
+    // model may carry one and not the other, and refusing on the wrong field
+    // would either block a served head or admit an unswept one.
+    if (head_role == LensHeadRole::Locate && (k.locate_layer < 0 || k.locate_head < 0))
         throw std::runtime_error(
             std::string("run_lens_locate: this model has no measured locate head — ") +
             k.model_label + " carries locate_provenance \"" + k.locate_provenance +
             "\". /v1/locate is refused rather than reading another model's coordinates. "
             "Run the LOCHEAD sweep (tests/perf/attn_provenance.cpp, LOCHEAD=1) and add the "
+            "pair to this model's calibration row.");
+    if (head_role == LensHeadRole::Choice && (k.choice_layer < 0 || k.choice_head < 0))
+        throw std::runtime_error(
+            std::string("run_lens_locate: head=\"choice\" — this model has no measured "
+                        "choice head. ") + k.model_label + " carries choice_provenance \"" +
+            k.choice_provenance + "\". Refused rather than reading the LOCATE pair, which "
+            "measured 87.5% against the choice pair's 92.5% on the one model swept. "
+            "Run DECIDEHEAD (tests/perf/attn_provenance.cpp, DECIDEHEAD=1) and add the "
             "pair to this model's calibration row.");
 
     // Same vocabulary validation as the other two drivers, so all three routes
@@ -2347,10 +2362,31 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     rep.question_vocabulary = question_mode;
     // LOCHEAD swept KEY mode. A question vocabulary is an unmeasured prompt
     // regime on this route, the same caveat the extract path already carries.
-    rep.uncalibrated        = question_mode;
-    rep.locate_provenance   = k.locate_provenance;
-    rep.locate_layer        = k.locate_layer;
-    rep.locate_head         = k.locate_head;
+    // MEAN is outside what LOCHEAD swept (it measured MAX), exactly as a
+    // question vocabulary is. Both set this, so a caller who changes either
+    // knob is told the provenance rate no longer describes their request.
+    rep.key_aggregation     = key_agg;
+    rep.head_role           = head_role;
+    // The pair this request reads, and the provenance that describes IT.
+    // Refused fail-loud on a model whose sweep never ran, exactly as an
+    // uncalibrated model is refused at startup: serving choice off the locate
+    // pair is the misuse the table exists to prevent (measured 87.5% vs 92.5%
+    // on the one model swept, and far worse on the citation pair).
+    // Validated at the top of this function, before any work.
+    const bool want_choice = head_role == LensHeadRole::Choice;
+    const int use_layer = want_choice ? k.choice_layer : k.locate_layer;
+    const int use_head  = want_choice ? k.choice_head  : k.locate_head;
+    // MEAN is outside what LOCHEAD swept (it measured MAX); for the CHOICE
+    // pair the reverse holds — DECIDEHEAD measured 92.5% under MEAN, so MAX is
+    // the off-recipe setting there. Either way the report says when the
+    // request sits outside the measurement behind its own provenance.
+    const bool agg_off_recipe = want_choice
+        ? (key_agg != LensKeyAggregation::Mean)
+        : (key_agg != LensKeyAggregation::Max);
+    rep.uncalibrated        = (question_mode && !want_choice) || agg_off_recipe;
+    rep.locate_provenance   = want_choice ? k.choice_provenance : k.locate_provenance;
+    rep.locate_layer        = use_layer;
+    rep.locate_head         = use_head;
     rep.top_k               = top_k;
     rep.prompt_len          = P;
     tokens_covering(doc_pos, doc_end, rep.doc_lo, rep.doc_hi);
@@ -2405,14 +2441,14 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
         }
     } engine_restore{fp, fp->prefill_attn_impl()};
 
-    fp->set_truncate_after_layer(k.locate_layer);
+    fp->set_truncate_after_layer(use_layer);
     fp->clear_slot(0);
     fp->set_cache_pos(0, 0);
     // Flash never writes kq_soft. Belt-and-braces exactly as in run_lens_verify:
     // the server already refuses --attention-lens with --flash-attn, but tapping
     // a prefill is structurally impossible without a materialized one.
     fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
-    fp->set_attention_taps({k.locate_layer});
+    fp->set_attention_taps({use_layer});
 
     std::vector<ForwardPassBase::AttentionTap> taps;
     {
@@ -2426,20 +2462,22 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
         taps = fp->get_attention_taps(gf);
         fp->advance_cache((uint32_t)prompt_tokens.size(), 0);
     }
-    if (taps.size() != 1 || taps[0].layer != k.locate_layer)
+    if (taps.size() != 1 || taps[0].layer != use_layer)
         throw std::runtime_error(
-            "run_lens_locate: attention taps expected {locate_layer " +
-            std::to_string(k.locate_layer) + "}, actual " +
+            std::string("run_lens_locate: attention taps expected {") +
+            lens_head_role_name(head_role) + "_layer " +
+            std::to_string(use_layer) + "}, actual " +
             (taps.size() != 1 ? std::to_string(taps.size()) + " taps"
                               : "{" + std::to_string(taps[0].layer) + "}"));
     if (taps[0].n_q != P)
         throw std::runtime_error(
             "run_lens_locate: tapped prefill query rows expected=" + std::to_string(P) +
             " (one per prompt token) actual=" + std::to_string(taps[0].n_q));
-    if (k.locate_head >= taps[0].n_head)
+    if (use_head >= taps[0].n_head)
         throw std::runtime_error(
-            "run_lens_locate: slot 'locate_head' expected within [0, " +
-            std::to_string(taps[0].n_head) + "), actual " + std::to_string(k.locate_head));
+            std::string("run_lens_locate: slot '") + lens_head_role_name(head_role) +
+            "_head' expected within [0, " +
+            std::to_string(taps[0].n_head) + "), actual " + std::to_string(use_head));
     if (rep.doc_hi > taps[0].n_kv)
         throw std::runtime_error(
             "run_lens_locate: document token range expected within the tapped key "
@@ -2447,23 +2485,37 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             std::to_string(rep.doc_hi));
 
     // ── Aggregate, per key, over the document ────────────────────────────────
-    // MAX over the key's own query rows, not mean: a key is 1-4 tokens and a
-    // mean dilutes the one row that carried the retrieval signal with the ones
-    // that carried punctuation. LOCHEAD compared this against LAST-token-only
-    // (LOCHEAD_AGG=last): +1 to +3 points of top1, same winning head, identical
-    // top3. Second-order, so the simpler aggregate stays.
+    // MAX over the key's own query rows by default: a field name is 1-4 tokens
+    // and a mean dilutes the one row that carried the retrieval signal with the
+    // ones that carried punctuation. LOCHEAD compared this against
+    // LAST-token-only (LOCHEAD_AGG=last): +1 to +3 points of top1, same winning
+    // head, identical top3. Second-order, so the simpler aggregate stays the
+    // DEFAULT.
+    //
+    // MEAN is opt-in for SENTENCE-length keys, where max inverts into a defect —
+    // one filler token spikes and the wordiest key wins regardless of content
+    // (LensKeyAggregation, server_lens.h, has the measurement).
     rep.hits.reserve(concepts.size());
     const ForwardPassBase::AttentionTap& tp = taps[0];
     for (size_t ci = 0; ci < concepts.size(); ++ci) {
         std::vector<float> mass((size_t)n_doc, 0.0f);
+        const int n_q_rows = qspan[ci].second - qspan[ci].first;
         for (int q = qspan[ci].first; q < qspan[ci].second; ++q) {
             const float* row = tp.rows.data() +
-                (size_t)tp.n_kv * ((size_t)q + (size_t)tp.n_q * (size_t)k.locate_head);
+                (size_t)tp.n_kv * ((size_t)q + (size_t)tp.n_q * (size_t)use_head);
             for (int d = 0; d < n_doc; ++d) {
                 const float v = row[rep.doc_lo + d];
-                if (v > mass[(size_t)d]) mass[(size_t)d] = v;
+                if (key_agg == LensKeyAggregation::Mean) mass[(size_t)d] += v;
+                else if (v > mass[(size_t)d])            mass[(size_t)d] = v;
             }
         }
+        // Divide once at the end rather than accumulating a running mean: the
+        // row count is fixed and a single division keeps the two branches
+        // bit-comparable in shape. n_q_rows >= 1 is guaranteed by the qspan
+        // check above, which throws when a key covers no prompt token.
+        if (key_agg == LensKeyAggregation::Mean && n_q_rows > 1)
+            for (int d = 0; d < n_doc; ++d)
+                mass[(size_t)d] /= (float)n_q_rows;
         // Fail loud on a non-finite BEFORE the span finder, which cannot see
         // one: `mass[i] > bv` is false for NaN, so a NaN row would silently read
         // as "the key did not attend here" and the caller would cut it away.

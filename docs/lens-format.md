@@ -252,7 +252,7 @@ Done in that repo's working tree as of 2026-09-06 (uncommitted there).
 | `model` | string | The pinned model that produced this (Qwen3.6). |
 | `validated_envelope` | bool | `true` iff the prompt was ≤ 4K tokens — the measured envelope (plan §1.5). `false` is a **disclosure, not a rejection**: the extraction ran, but beyond where the signals were validated. |
 | `citation_source` | string | Human label for the citation head, e.g. `layer 59, head 21 (L59H21) \u2014 LEGCSEARCH 2026-09-18 (94.8% top3...)`. Both the coordinate **and the probe name** come from the calibration entry; the probe name was the literal `N3` on every report until 2026-09-18, which was true only of the 35B. |
-| `config` | object, **optional** | **The numerical configuration that produced this report** (2026-09-13): `weights` (16-hex-digit content hash of the tensor inventory — arch + shape + **quantization** + layout), `attention` (`"materialized"` \| `"flash-prefill"` \| `"flash"`), `kv_type` (`"f32"`, `"f16"`, …). `model` names the *calibration entry*, which is coarser than it looks — it says "Qwen3.8-9B", not which quantization — and all three of these move decisions. **Two reports are only comparable when this matches.** A diff that ignores it can show a config artifact as a change, which is the one way the `verify` re-audit flow could mislead. Absent ⇒ the server did not stamp it (too old, or the lens was driven in-process); additive, **not** a version bump, same reasoning as `extraction_origin`. |
+| `config` | object, **optional** | **The numerical configuration that produced this report** (2026-09-13): `weights` (16-hex-digit content hash of the tensor inventory — arch + shape + **quantization** + layout), `attention` (`"materialized"` \| `"flash-prefill"` \| `"flash"`), `kv_type` (`"f32"`, `"f16"`, …). `model` names the *calibration entry*, which is coarser than it looks — it says "Qwen3.8-9B", not which quantization — and all three of these move decisions. **Two reports are only comparable when this matches.** A diff that ignores it can show a config artifact as a change, which is the one way the `verify` re-audit flow could mislead. Absent ⇒ the server did not stamp it (too old, or the lens was driven in-process); additive, **not** a version bump, same reasoning as `extraction_origin`. **`attention` describes the pass that produced THIS report, not the server's flags** (fixed 2026-09-19): a `/v1/locate` report is always `"materialized"`, even on a server started with `--flash-attn`, because locate's only pass is its tapped prefill and flash never writes `kq_soft`. So two locate reports from a flash server and a plain server ARE comparable. `/v1/extract` and `/v1/verify` differ — each has an untapped prompt prefill that does run under the flag — and they report it. |
 | `extraction_origin` | `"generated"` \| `"supplied"` | **Who produced the values.** `generated` = this model emitted the JSON (`POST /v1/extract`); the report says where the producing model looked while writing it. `supplied` = the caller handed the JSON in and this model only read it (`POST /v1/verify`, teacher-forced); the report says where **this** model attends to **someone else's** answer. Additive, **not** a version bump: absence is unambiguous — a payload without this member came from a server with no `/v1/verify`, so its values are necessarily `generated`. |
 | `coverage_source` | string | Human label for the coverage source, e.g. `layer 11, max over heads \u2014 COVSEARCH`. **A model whose coverage layer was inherited rather than measured must say so here** — the string comes from the calibration row's `coverage_probe`, not from a literal in the report builder, precisely so an inherited constant cannot be reported as a measured one. Every calibrated model today measured its own; this is the only place a caller reading one report could see otherwise, so the mechanism stays even while nothing uses it. |
 | `used_threshold` | number | Coverage span-peak ≥ this ⇒ a span was "consulted" (0.705). |
@@ -629,6 +629,35 @@ context ⇒ **400** (fail-loud, names the parameter). Output that cannot be pars
 ⇒ **422** `unparseable_extraction` (see the shape contract — this one is *not*
 your fault). The endpoint is single-slot and exclusive; the server 404s it when
 `--attention-lens` is off.
+
+`POST /v1/locate` takes an optional **`key_aggregation`** (2026-09-20),
+`"max"` (default) or `"mean"`: how a key's own query rows are reduced to one
+mass profile. `max` is what LOCHEAD measured and is right for short field-name
+keys. `mean` is for **sentence-length keys** — scoring category descriptions
+under `max` lets one filler token spike, so the wordiest key wins regardless of
+content; `mean` was worth **+17.5 points** on a 4-way routing task at the same
+latency. The value is echoed back in the report, and `mean` sets
+`uncalibrated: true` because the provenance rate was measured under `max`.
+An unknown value is a fail-loud **400**.
+
+`POST /v1/locate` also takes an optional **`head`** (2026-09-20), `"locate"`
+(default) or `"choice"`: which calibrated job to read. Locate answers *where a
+key's answer sits*; choice answers *which of the supplied option descriptions
+fits this document*. They are different heads — on Qwen3.8-9B the **same layer**
+(11) with h=6 for locate and **h=3 for choice**, so choice costs a locate-only
+server no extra blocks. `"choice"` is **refused fail-loud** on a model whose
+DECIDEHEAD sweep has not run, rather than falling back to the locate pair
+(which measured 87.5% against the choice pair's 92.5%). The report echoes
+`head_role`, and `locate_provenance` switches to the pair actually read.
+
+Note the two jobs have **opposite recipes**: locate was measured under
+`key_aggregation: "max"`, choice under `"mean"`. `uncalibrated` tracks whichever
+applies, so `head: "locate"` with `"mean"` is uncalibrated while
+`head: "choice"` with `"mean"` is not. A **truncated** lens server also 404s the routes it
+did not load blocks for, naming the flag and the block count: `--lens-verify-only`
+refuses `/v1/extract`, and `--lens-locate-only` (2026-09-19) refuses `/v1/verify`
+as well, serving `/v1/locate` alone. Every lens route is exclusive within its
+process, so concurrency comes from running several servers, not from batching.
 
 ## Question vocabulary (docs/plan-question-keys.md)
 

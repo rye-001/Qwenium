@@ -37,6 +37,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <functional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <fstream>
@@ -3787,6 +3789,748 @@ static int run_locate_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
     std::printf("  Compare against LEGCSEARCH's generated-token regime on the SAME corpus:\n");
     std::printf("  its incumbent scores ~97%% top3. A key-as-query candidate that cannot\n");
     std::printf("  reach a usable rate here is the refutation, not a tuning opportunity.\n");
+    return 0;
+}
+
+// Defined below (near run_qkey_probe); declared here because LOCABSENT resolves
+// the shipped calibration the same way every other calibrated leg does.
+static uint32_t probe_lens_file_type(const ModelMetadata& meta);
+
+// ── LOCABSENT — can locate tell that a key is NOT in the document? ──────────
+//
+// This is the gap that makes the omission pitch hollow. /v1/locate ALWAYS
+// returns spans: ask for a field the document does not contain and you get
+// three confident byte ranges and no signal that the answer is not there.
+// One live observation (peak 0.044 absent vs 0.379-0.820 present) said a signal
+// exists. This measures it properly and produces a THRESHOLD or refuses to.
+//
+// LABELS. Present = each document's own labelled fields (75 across the corpus).
+// Absent  = {"payment_terms", "warranty_period"}, already VERIFIED absent from
+// all 15 Leg C documents by run_qdocs_s1 (which uses them as fabrication bait),
+// so this leg invents no ground truth of its own. 2 x 15 = 30 absent samples.
+//
+// THE LENGTH CONFOUND, and why a raw peak threshold would not transfer.
+// Attention over a document is a distribution: a key that matches nothing still
+// spreads mass across the body, so its peak falls as the document grows, and so
+// does a PRESENT key's. A threshold fitted on short documents would fire on
+// every long one. Both scores are therefore reported:
+//   raw   = peak attention on the best document position (what the route emits)
+//   conc  = peak x n_doc_tokens — concentration against the uniform baseline
+//           1/n_doc_tokens, which is dimensionless and length-free by
+//           construction.
+// If `conc` separates and `raw` does not, the constant must be a concentration.
+//
+// SELECTION DISCIPLINE (the COVSEARCH lesson, docs/plan-coverage-layer-search.md):
+// a threshold picked and scored on the same data is a fit, not a measurement.
+// Every threshold here is chosen on ONE language at a target false-alarm rate
+// and scored on the OTHER, in both directions, and the cross-scored number is
+// the one that counts.
+//
+//   LOCABSENT=1 QWEN36_MODEL_PATH=models/Qwen3.8-9B-Q8_0.gguf ./bin/attn-provenance
+static int run_locate_absence(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                              Tokenizer* tok, const ModelMetadata& meta,
+                              const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ LOCABSENT — does locate know when the answer is NOT there?    ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    // The SHIPPED pair, from the same table production reads — never the env
+    // overrides, or this would calibrate a head the route does not use.
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count,
+                                   probe_lens_file_type(meta));
+    if (!calib) {
+        std::fprintf(stderr, "LOCABSENT: expected a calibrated lens entry for arch '%s' "
+                             "block_count %u, actual none\n",
+                     meta.architecture.c_str(), meta.block_count);
+        return 1;
+    }
+    const int L = calib->constants.locate_layer;
+    const int H = calib->constants.locate_head;
+    if (L < 0 || H < 0) {
+        std::fprintf(stderr, "LOCABSENT: expected calibration '%s' to carry a measured "
+                             "locate pair, actual locate_layer=%d locate_head=%d — run "
+                             "LOCHEAD on this model first\n", calib->model, L, H);
+        return 1;
+    }
+    int slot = -1;
+    for (size_t i = 0; i < attn_layers.size(); ++i)
+        if (attn_layers[i] == L) { slot = (int)i; break; }
+    if (slot < 0) {
+        std::fprintf(stderr, "LOCABSENT: expected locate_layer %d among the %zu tapped "
+                             "attention layers, actual not present\n", L, attn_layers.size());
+        return 1;
+    }
+    // ── The absent set, widened 2026-09-19, and deliberately SPANNED ────────
+    // The first run used run_qdocs_s1's two (payment_terms, warranty_period)
+    // and they disagreed violently: at one threshold warranty_period was caught
+    // 100% of the time and payment_terms 46.7%. Two concepts cannot tell you
+    // whether that is noise or structure, so the set is widened along the axis
+    // the disagreement suggested: SEMANTIC DISTANCE from what the document
+    // actually contains. All six are verified absent from all 15 documents in
+    // both languages (no occurrence of vat/tax/discount/incoterm/contract/
+    // warranty/payment or their German equivalents anywhere in the corpus).
+    //
+    //   FAR  — nothing in an order email is related at all
+    //   MID  — a plausible business field, no neighbour in the text
+    //   NEAR — a strong neighbour IS present, so the key has somewhere wrong
+    //          to look (payment_terms -> the price; contract_number -> the PO
+    //          number). This is the hard and realistic case, and the one an
+    //          omission claim lives or dies on.
+    const std::vector<std::string> ABSENT = {
+        "warranty_period",   // FAR
+        "incoterms",         // FAR
+        "vat_number",        // MID
+        "discount_rate",     // MID
+        "payment_terms",     // NEAR (price)
+        "contract_number",   // NEAR (order_number / PO)
+    };
+    // LOCABSENT_ABSENT_N=k  — keep only the first k absent concepts (tests COUNT)
+    // LOCABSENT_REVERSE=1    — reverse the absent order (tests POSITION)
+    // Two knobs because run 2 vs run 3 moved payment_terms' median 11.41 -> 2.56
+    // and warranty_period's 5.03 -> 10.14 with present scores UNCHANGED, and
+    // count and position are confounded in that comparison. They need different
+    // fixes (normalize by key count vs make the score order-invariant), so they
+    // have to be separated before any threshold is proposed.
+    std::vector<std::string> absent_set = ABSENT;
+    if (const char* rv = std::getenv("LOCABSENT_REVERSE"))
+        if (std::string(rv) == "1") std::reverse(absent_set.begin(), absent_set.end());
+    if (const char* an = std::getenv("LOCABSENT_ABSENT_N")) {
+        const size_t k = (size_t)std::max(1, std::atoi(an));
+        if (k < absent_set.size()) absent_set.resize(k);
+    }
+    std::printf("locate pair: L%d h=%d (%s)\n", L, H, calib->model);
+    std::printf("absent keys (verified absent from all 15 docs, %zu): ",
+                absent_set.size());
+    for (const auto& a : absent_set) std::printf("%s ", a.c_str());
+    std::printf("\n\n");
+
+    struct Sample { double raw, conc; bool absent, de; std::string tag, key; int doc_toks; };
+    std::vector<Sample> S;
+    std::vector<int> taps = {L};
+
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        // The key list the ENDPOINT would receive: this document's own concepts
+        // PLUS the two absent ones, in one request — which is the realistic
+        // shape (a caller sends one schema to every document) and also the only
+        // shape where present and absent keys compete for the same attention.
+        std::vector<std::string> keys;
+        for (const QLabel& f : d.fields) keys.push_back(f.concept);
+        for (const auto& a : absent_set) keys.push_back(a);
+        // ── THE POSITION CONFOUND, and the only correct way to run this ──────
+        // Appending the absent keys puts every present key at positions 1..N
+        // and every absent key after them — and the score is DOMINATED by
+        // position: reversing the absent list moved contract_number's median
+        // from 8.40 to 28.20 and warranty_period's from 10.14 to 2.17, same
+        // documents, same model. So "absent scores lower" measured that way is
+        // partly "absent was listed later", and the AUC it produces is not a
+        // measurement of absence at all.
+        //
+        // LOCABSENT_SHUFFLE=1 interleaves the two classes with a FIXED seed
+        // (deterministic, so the run is reproducible) and is the only arm whose
+        // AUC means what the column header says. It is not the default purely
+        // so the confounded arm stays runnable for comparison; read the
+        // shuffled numbers.
+        if (std::getenv("LOCABSENT_SHUFFLE")) {
+            std::mt19937 rng(0xA85E27u + (uint32_t)std::hash<std::string>{}(d.tag));
+            std::shuffle(keys.begin(), keys.end(), rng);
+        }
+        std::set<std::string> absent_names(absent_set.begin(), absent_set.end());
+
+        const std::string prompt_text =
+            qdocs_chat_prompt(d.document, qinf::lens_build_instruction(keys));
+        std::vector<int32_t> ptoks = tok->encode(prompt_text);
+        const int P = (int)ptoks.size();
+        const std::vector<size_t> pcum = cum_bytes(tok, ptoks);
+
+        const size_t doc_pos = prompt_text.find(d.document);
+        if (doc_pos == std::string::npos)
+            throw std::runtime_error("LOCABSENT: document not found verbatim in the prompt");
+        const size_t doc_end = doc_pos + d.document.size();
+        auto covering = [&](size_t b0, size_t b1, int& lo, int& hi) {
+            lo = P; hi = 0;
+            for (int i = 0; i < P; ++i)
+                if (pcum[i] < b1 && pcum[i + 1] > b0) { if (i < lo) lo = i; hi = i + 1; }
+            if (lo > hi) { lo = 0; hi = 0; }
+        };
+        int doc_lo = 0, doc_hi = 0;
+        covering(doc_pos, doc_end, doc_lo, doc_hi);
+        const int doc_toks = doc_hi - doc_lo;
+        if (doc_toks <= 0) { std::printf("[%s] SKIPPED — empty document span\n", d.tag.c_str()); continue; }
+
+        // Key query spans, searched from the END of the document forward —
+        // identical rule to run_lens_locate and run_locate_head_search.
+        std::vector<std::pair<int,int>> qspan(keys.size());
+        size_t cursor = doc_end;
+        bool skip = false;
+        for (size_t ci = 0; ci < keys.size(); ++ci) {
+            const size_t at = prompt_text.find(keys[ci], cursor);
+            if (at == std::string::npos) { skip = true; break; }
+            cursor = at + keys[ci].size();
+            int lo = 0, hi = 0;
+            covering(at, at + keys[ci].size(), lo, hi);
+            if (hi <= lo) { skip = true; break; }
+            qspan[ci] = {lo, hi};
+        }
+        if (skip) { std::printf("[%s] SKIPPED — a key is not findable in the instruction\n",
+                                d.tag.c_str()); continue; }
+
+        fp->set_attention_taps(taps);
+        fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        std::vector<ForwardPassBase::AttentionTap> tp;
+        {
+            ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
+            fp->mark_attention_taps(gf);
+            ggml_backend_sched_reset(sched);
+            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->set_prefill_inputs(gf, ptoks, 0);
+            qinf::engine::require_compute_success(
+                ggml_backend_sched_graph_compute(sched, gf), "LOCABSENT");
+            tp = fp->get_attention_taps(gf);
+        }
+        fp->set_attention_taps({});
+        if (tp.size() != 1)
+            throw std::runtime_error("LOCABSENT: expected 1 tap, actual " +
+                                     std::to_string(tp.size()));
+        const ForwardPassBase::AttentionTap& T = tp[0];
+
+        for (size_t ci = 0; ci < keys.size(); ++ci) {
+            double peak = 0.0;
+            for (int p = doc_lo; p < doc_hi && p < T.n_kv; ++p)
+                for (int q = qspan[ci].first; q < qspan[ci].second; ++q) {
+                    const float x = T.rows[(size_t)T.n_kv *
+                        ((size_t)q + (size_t)T.n_q * (size_t)H) + (size_t)p];
+                    if (x > peak) peak = x;
+                }
+            const bool is_absent = absent_names.count(keys[ci]) > 0;
+            S.push_back({peak, peak * (double)doc_toks, is_absent, d.de,
+                         d.tag, keys[ci], doc_toks});
+        }
+        std::printf("[%s%s] P=%d doc_toks=%d keys=%zu (%zu present + %zu absent)\n",
+                    d.tag.c_str(), d.de ? " DE" : "", P, doc_toks, keys.size(),
+                    d.fields.size(), absent_set.size());
+    }
+
+    // ── Distributions ────────────────────────────────────────────────────────
+    auto stat = [&](bool absent, bool use_conc, int lang /*-1 any,0 en,1 de*/) {
+        std::vector<double> v;
+        for (const Sample& x : S) {
+            if (x.absent != absent) continue;
+            if (lang == 0 && x.de) continue;
+            if (lang == 1 && !x.de) continue;
+            v.push_back(use_conc ? x.conc : x.raw);
+        }
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    auto q = [](const std::vector<double>& v, double f) {
+        if (v.empty()) return 0.0;
+        return v[std::min(v.size() - 1, (size_t)(f * (double)v.size()))];
+    };
+    for (int m = 0; m < 2; ++m) {
+        const bool conc = (m == 1);
+        std::printf("\n  === %s ===\n", conc ? "conc = peak x doc_tokens (length-free)"
+                                             : "raw peak (what the route emits)");
+        std::printf("  class    n     min     p10     p50     p90     max\n");
+        for (int a = 0; a < 2; ++a) {
+            std::vector<double> v = stat(a == 1, conc, -1);
+            std::printf("  %-7s %3zu  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f\n",
+                        a ? "ABSENT" : "present", v.size(),
+                        v.empty() ? 0.0 : v.front(), q(v, 0.10), q(v, 0.50),
+                        q(v, 0.90), v.empty() ? 0.0 : v.back());
+        }
+    }
+
+    // ── AUC (rank separation), per score and per language ────────────────────
+    auto auc = [&](bool conc, int lang) {
+        std::vector<double> pos = stat(false, conc, lang);   // present
+        std::vector<double> neg = stat(true,  conc, lang);   // absent
+        if (pos.empty() || neg.empty()) return 0.0;
+        long long win = 0, tot = 0;
+        for (double a : pos) for (double b : neg) { tot++; if (a > b) win += 2; else if (a == b) win += 1; }
+        return (double)win / (2.0 * (double)tot);
+    };
+    std::printf("\n  === AUC (present scores ABOVE absent; 0.5 = no signal) ===\n");
+    std::printf("  score |  pooled     EN       DE\n");
+    std::printf("  raw   |  %.4f  %.4f  %.4f\n", auc(false,-1), auc(false,0), auc(false,1));
+    std::printf("  conc  |  %.4f  %.4f  %.4f\n", auc(true, -1), auc(true, 0), auc(true, 1));
+
+    // ── Thresholds, CHOSEN ON ONE LANGUAGE AND SCORED ON THE OTHER ───────────
+    // Direction: flag ABSENT when score < T. The cost that matters is a
+    // FALSE ABSENT — telling a caller a field is missing when it is on the
+    // page. That is the error the omission claim cannot afford, so T is chosen
+    // at a target false-absent rate on present fields and the absent-detection
+    // rate is whatever it turns out to be.
+    auto pick_T = [&](bool conc, int lang, double target_false_absent) {
+        std::vector<double> pos = stat(false, conc, lang);
+        if (pos.empty()) return 0.0;
+        const size_t k = (size_t)(target_false_absent * (double)pos.size());
+        return k == 0 ? std::nextafter(pos.front(), 0.0) : pos[k - 1];
+    };
+    auto score_T = [&](bool conc, int lang, double T, double& far, double& det) {
+        std::vector<double> pos = stat(false, conc, lang), neg = stat(true, conc, lang);
+        long fa = 0; for (double a : pos) if (a < T) fa++;
+        long dt = 0; for (double b : neg) if (b < T) dt++;
+        far = pos.empty() ? 0.0 : 100.0 * (double)fa / (double)pos.size();
+        det = neg.empty() ? 0.0 : 100.0 * (double)dt / (double)neg.size();
+    };
+    std::printf("\n  === CROSS-LANGUAGE: choose T on one half, score on the OTHER ===\n");
+    std::printf("  (flag ABSENT when score < T; false-alarm = a PRESENT field called missing)\n");
+    for (int m = 0; m < 2; ++m) {
+        const bool conc = (m == 1);
+        std::printf("\n  score=%s\n", conc ? "conc" : "raw");
+        std::printf("    target | chose T on | T        | scored on | false-alarm | absent-detected\n");
+        for (double tgt : {0.02, 0.05, 0.10}) {
+            for (int sel = 0; sel < 2; ++sel) {
+                const int other = 1 - sel;
+                const double T = pick_T(conc, sel, tgt);
+                double far = 0, det = 0;
+                score_T(conc, other, T, far, det);
+                std::printf("    %5.0f%% | %-10s | %8.4f | %-9s |  %8.1f%% |  %8.1f%%\n",
+                            tgt * 100, sel ? "DE" : "EN", T, other ? "DE" : "EN", far, det);
+            }
+        }
+    }
+
+    // ── LEAVE-ONE-ABSENT-CONCEPT-OUT ────────────────────────────────────────
+    // The 30 absent samples are 2 concepts x 15 documents, NOT 30 independent
+    // absences. A threshold fitted to them could be fitted to two key NAMES —
+    // e.g. two rare or multi-token strings that attend weakly for reasons that
+    // have nothing to do with the answer being missing. Same discipline as the
+    // language split: choose on one concept, score on the other.
+    std::printf("\n  === LEAVE-ONE-ABSENT-CONCEPT-OUT (the generalization test) ===\n");
+    std::printf("  per-concept, conc: concept            n   min    p50    max\n");
+    for (const std::string& a : absent_set) {
+        std::vector<double> v;
+        for (const Sample& x : S) if (x.absent && x.key == a) v.push_back(x.conc);
+        std::sort(v.begin(), v.end());
+        std::printf("                     %-18s %2zu  %5.2f  %5.2f  %5.2f\n",
+                    a.c_str(), v.size(), v.empty()?0.0:v.front(), q(v,0.50),
+                    v.empty()?0.0:v.back());
+    }
+    // T is still chosen on PRESENT fields at a false-alarm target (absence
+    // never sets its own threshold), but detection is scored on ONE held-out
+    // absent concept at a time, so a concept that only works because its twin
+    // was in the fit cannot hide.
+    for (int m = 0; m < 2; ++m) {
+        const bool conc = (m == 1);
+        std::printf("\n  score=%s — detection per held-out absent concept\n",
+                    conc ? "conc" : "raw");
+        for (double tgt : {0.05, 0.10}) {
+            const double T = pick_T(conc, -1, tgt);
+            long tot_n = 0, tot_d = 0;
+            std::printf("    target %2.0f%%  T=%8.4f\n", tgt * 100, T);
+            for (size_t ai = 0; ai < absent_set.size(); ++ai) {
+                long n = 0, d = 0;
+                for (const Sample& x : S) {
+                    if (!x.absent || x.key != absent_set[ai]) continue;
+                    n++; if ((conc ? x.conc : x.raw) < T) d++;
+                }
+                tot_n += n; tot_d += d;
+                std::printf("      %-18s detected %5.1f%%  (%ld/%ld)\n",
+                            absent_set[ai].c_str(), n ? 100.0*(double)d/(double)n : 0.0, d, n);
+            }
+            std::printf("      %-18s detected %5.1f%%  (%ld/%ld)  <- pooled\n",
+                        "ALL", tot_n ? 100.0*(double)tot_d/(double)tot_n : 0.0, tot_d, tot_n);
+        }
+    }
+
+    // The worst present field and the best absent one — the overlap, by name,
+    // because a number cannot say WHICH field a threshold would sacrifice.
+    const Sample* worst_present = nullptr; const Sample* best_absent = nullptr;
+    for (const Sample& x : S) {
+        if (!x.absent && (!worst_present || x.conc < worst_present->conc)) worst_present = &x;
+        if ( x.absent && (!best_absent   || x.conc > best_absent->conc))   best_absent  = &x;
+    }
+    if (worst_present && best_absent) {
+        std::printf("\n  OVERLAP (conc): weakest PRESENT %s.%s = %.3f | strongest ABSENT %s.%s = %.3f%s\n",
+                    worst_present->tag.c_str(), worst_present->key.c_str(), worst_present->conc,
+                    best_absent->tag.c_str(), best_absent->key.c_str(), best_absent->conc,
+                    worst_present->conc > best_absent->conc
+                        ? "  — SEPARABLE: no overlap at all" : "  — classes OVERLAP");
+    }
+    std::printf("\n  Probe only: this moves no constant. A threshold ships when the\n");
+    std::printf("  cross-language rows above are acceptable, which is a product call.\n");
+    return 0;
+}
+
+// ── DECIDEHEAD — is the LOCATE head the right head for a DECISION? ──────────
+//
+// Every decision number this repo has (DECIDE1's 80%, the 2/4 ordinal scouting)
+// was read off L11 h=6 — a pair calibrated for a DIFFERENT task: "given a field
+// name, find where its value sits". We have never asked whether some other head
+// is better at "which of these descriptions matches this document".
+//
+// There is strong precedent for it mattering. LOCHEAD found the CITATION head
+// ranks 372 of 384 at locate on the 27B: same model, same corpus, different
+// task, near-worst head. Concluding "span-only cannot rate" from one head
+// chosen for another job would repeat exactly that mistake.
+//
+// Nearly free, for LOCHEAD's reason: one tapped prefill per document yields
+// every tapped layer and every head at once, so the sweep costs one prefill per
+// (document x instruction shape), not one per candidate. No generation.
+//
+// FOUR LEVERS, all in the same pass:
+//   * HEAD          — every (layer, head), the point of the leg
+//   * INSTRUCTION   — extraction shape vs QUESTION shape. Question mode puts
+//                     each option on its OWN LINE, which structurally removes
+//                     the comma-collision defect: an option containing a comma
+//                     ("routine, no impact, can wait") is shredded by the
+//                     extraction instruction's comma-joined key list into three
+//                     keys. The needle is the option text in BOTH shapes
+//                     (server_lens.cpp:2379), so query spans are identical and
+//                     the only difference is the surrounding instruction.
+//   * KEY AGG       — max vs mean over the option's own query rows. DECIDE1
+//                     measured +17.5 points for mean on sentence keys; this
+//                     re-checks it at every head rather than only at L11 h=6.
+//   * DOC SCORE     — peak (one best position) vs mass (total attention).
+//
+// TWO TASKS, same machinery: CHOICE (4-way routing, argmax) and SCORE (4 ordered
+// levels, argmax plus within-1, because an ordinal that is never more than one
+// level out is useful even when it is rarely exact).
+//
+//   DECIDEHEAD=1 QWEN36_MODEL_PATH=models/Qwen3.8-9B-Q8_0.gguf ./bin/attn-provenance
+struct QDecide { std::string tag; bool de; int label; std::string document; };
+
+// Category descriptions and ordinal levels are FROZEN: written once, not tuned
+// against the score. Tuning them here would make every number below a fit.
+static std::vector<std::pair<std::string,std::string>> decide_choice_options() {
+    return {{"finance",     "an invoice a payment a budget or an amount of money owed"},
+            {"legal",       "a contract a clause termination liability or governing law"},
+            {"engineering", "software a server error a deployment or a stack trace"},
+            {"people",      "an employee hiring leave or a staff policy"}};
+}
+// Ordered low -> high. Comma-free so the EXTRACTION arm is not handicapped by
+// the collision the QUESTION arm is immune to; that keeps the arms comparable.
+static std::vector<std::pair<std::string,std::string>> decide_score_options() {
+    return {{"level_1", "routine with no customer impact that can wait"},
+            {"level_2", "minor with a few users affected and a workaround available"},
+            {"level_3", "serious with many users affected and no workaround"},
+            {"level_4", "critical with the service down and revenue lost"}};
+}
+
+// Mirrors py/lens_decide1.py's corpus (keep the two in step if either changes).
+// `lure` documents deliberately carry another category's vocabulary.
+static std::vector<QDecide> decide_choice_corpus() {
+    return {
+     {"f_en1",false,0,"Reminder: invoice 4471 for 1,992.00 GBP fell due on 2025-09-30 and is still unpaid. Please arrange the transfer this week."},
+     {"f_en2",false,0,"Please approve the purchase order for 40 Alu Pro stands at 82.00 each. This comes out of the Q4 equipment budget."},
+     {"f_en3",false,0,"Submitting my expense claim for the Berlin trip: 340.50 in total, receipts attached for the hotel and the train."},
+     {"f_en4",false,0,"Our VAT filing for Q3 is due next month. The regulations changed this year, so confirm the treatment of cross-border sales."},
+     {"f_en5",false,0,"The direct debit failed again on the 15th. Bank says the mandate was cancelled. Re-send the details so we can settle the balance."},
+     {"l_en1",false,1,"We intend to serve notice of termination under clause 11.2, effective in 90 days. Outstanding fees up to that date remain payable."},
+     {"l_en2",false,1,"Please review the attached mutual NDA before Thursday. I am concerned about the definition of confidential information."},
+     {"l_en3",false,1,"The data processing agreement needs updating for the new sub-processor. Personal data now sits in a second region."},
+     {"l_en4",false,1,"The counterparty has rejected mediation and is referring the dispute to arbitration before a single arbitrator."},
+     {"l_en5",false,1,"Question on the employment contract template: the non-compete runs twelve months and may be unenforceable."},
+     {"e_en1",false,2,"Checkout returns HTTP 500 whenever the cart holds more than 50 items. Stack trace points at OrderValidator.java line 212."},
+     {"e_en2",false,2,"Rolling back release 0.9.4. The worker pods restart every four minutes under load and the null pointer is in every log."},
+     {"e_en3",false,2,"The nightly migration takes six hours and the query plan shows a full scan. It is driving up our database bill."},
+     {"e_en4",false,2,"Security advisory for the image library we vendor: a crafted PNG overflows the decoder. Patch upstream and redeploy."},
+     {"e_en5",false,2,"Their API returns 429 after about 300 calls a minute and our retry logic makes it worse. We need backoff."},
+     {"p_en1",false,3,"I would like to request parental leave from 2026-02-01 for twelve weeks and understand the phased return option."},
+     {"p_en2",false,3,"Following the review cycle, please confirm the new salary band for the team member and the effective date."},
+     {"p_en3",false,3,"New starter begins Monday. Make sure the laptop, the accounts and the first-week buddy schedule are arranged."},
+     {"p_en4",false,3,"She has resigned and her notice period is three months. We should agree the handover plan and last working day."},
+     {"p_en5",false,3,"Requesting approval for the team to attend the training course; the cost is 1,200 per head from the development allowance."},
+     {"f_de1",true, 0,"Erinnerung: Rechnung 4471 ueber 1.992,00 EUR war am 30.09.2025 faellig und ist weiterhin offen. Bitte veranlassen Sie die Ueberweisung."},
+     {"f_de2",true, 0,"Bitte genehmigen Sie die Bestellung von 40 Alu Pro Staendern zu je 82,00 EUR zulasten des Sachmittelbudgets."},
+     {"f_de3",true, 0,"Ich reiche die Reisekostenabrechnung fuer Berlin ein: insgesamt 340,50 EUR, Belege fuer Hotel und Bahn liegen bei."},
+     {"f_de4",true, 0,"Die Umsatzsteuervoranmeldung fuer das dritte Quartal steht an. Die Vorschriften haben sich geaendert."},
+     {"f_de5",true, 0,"Der Lastschrifteinzug ist am 15. erneut gescheitert, das Mandat wurde widerrufen. Bitte Daten neu senden."},
+     {"l_de1",true, 1,"Wir werden die Kuendigung nach Ziffer 11.2 mit einer Frist von 90 Tagen aussprechen. Faellige Entgelte bleiben zahlbar."},
+     {"l_de2",true, 1,"Bitte pruefen Sie die beiliegende Geheimhaltungsvereinbarung bis Donnerstag, insbesondere die Nachwirkung."},
+     {"l_de3",true, 1,"Der Auftragsverarbeitungsvertrag muss wegen des neuen Unterauftragnehmers angepasst werden."},
+     {"l_de4",true, 1,"Die Gegenseite lehnt die Mediation ab und ruft das Schiedsgericht an; vorgesehen ist ein Einzelschiedsrichter."},
+     {"l_de5",true, 1,"Frage zum Muster des Arbeitsvertrags: das Wettbewerbsverbot laeuft zwoelf Monate und duerfte unwirksam sein."},
+     {"e_de1",true, 2,"Der Checkout liefert HTTP 500, sobald der Warenkorb mehr als 50 Positionen enthaelt. Der Stacktrace zeigt auf OrderValidator.java."},
+     {"e_de2",true, 2,"Wir rollen Release 0.9.4 zurueck. Die Worker starten unter Last alle vier Minuten neu, die Nullpointer-Ausnahme steht im Log."},
+     {"e_de3",true, 2,"Die naechtliche Migration dauert sechs Stunden und der Abfrageplan zeigt einen vollen Scan. Das treibt die Datenbankkosten."},
+     {"e_de4",true, 2,"Sicherheitshinweis zur Bildbibliothek: ein praepariertes PNG kann den Decoder ueberlaufen lassen. Patch einspielen und neu deployen."},
+     {"e_de5",true, 2,"Deren Schnittstelle antwortet ab 300 Aufrufen pro Minute mit 429 und unsere Wiederholungslogik verschlimmert es."},
+     {"p_de1",true, 3,"Ich moechte Elternzeit ab dem 01.02.2026 fuer zwoelf Wochen beantragen und Informationen zum Wiedereinstieg erhalten."},
+     {"p_de2",true, 3,"Nach dem Beurteilungszyklus bitte ich um Bestaetigung der neuen Gehaltsstufe fuer die Mitarbeiterin."},
+     {"p_de3",true, 3,"Der neue Kollege faengt am Montag an. Bitte Laptop, Zugaenge und den Paten fuer die erste Woche organisieren."},
+     {"p_de4",true, 3,"Sie hat gekuendigt, die Kuendigungsfrist betraegt drei Monate. Wir sollten die Uebergabe festlegen."},
+     {"p_de5",true, 3,"Ich bitte um Freigabe fuer die Weiterbildung des Teams; die Kosten betragen 1.200 EUR pro Person."},
+    };
+}
+static std::vector<QDecide> decide_score_corpus() {
+    return {
+     {"s_en1",false,0,"Ticket 8801: the footer copyright year still says 2025. Cosmetic, nobody has complained, fix whenever convenient."},
+     {"s_en2",false,0,"Ticket 8802: internal admin page loads a little slowly for staff. No customer sees it and nothing is blocked."},
+     {"s_en3",false,0,"Ticket 8803: a tooltip is misaligned on the settings screen in one browser. Purely visual."},
+     {"s_en4",false,1,"Ticket 8811: CSV export drops the last column for a handful of accounts. They can re-run it from the old report meanwhile."},
+     {"s_en5",false,1,"Ticket 8812: two users report the avatar upload failing over 5 MB. Resizing first works around it."},
+     {"s_en6",false,1,"Ticket 8813: search ranking looks off for rare terms for some customers. The filter view still finds everything."},
+     {"s_en7",false,2,"Ticket 8821: invoice PDFs fail to render for most customers since the template change. There is no way to get them out."},
+     {"s_en8",false,2,"Ticket 8822: login is rejecting a large share of users after the token change and no workaround exists."},
+     {"s_en9",false,2,"Ticket 8823: the nightly sync has not run for three days for many tenants and data is now stale everywhere."},
+     {"s_en10",false,3,"Ticket 8831: checkout is down for everyone since 14:10 and no payments are completing. Revenue has stopped."},
+     {"s_en11",false,3,"Ticket 8832: the whole platform is returning 503 and every customer is offline. All orders are failing."},
+     {"s_en12",false,3,"Ticket 8833: the primary database is unreachable, the site is hard down and we are losing every transaction."},
+     {"s_de1",true, 0,"Ticket 8801: die Jahreszahl im Fusszeilenhinweis lautet noch 2025. Rein kosmetisch, niemand hat sich beschwert."},
+     {"s_de2",true, 0,"Ticket 8802: die interne Verwaltungsseite laedt fuer Mitarbeiter etwas langsam. Kein Kunde sieht sie."},
+     {"s_de3",true, 0,"Ticket 8803: ein Hinweisfeld sitzt in einem Browser leicht verschoben. Rein optisch."},
+     {"s_de4",true, 1,"Ticket 8811: der CSV-Export laesst bei wenigen Konten die letzte Spalte weg. Der alte Bericht funktioniert weiterhin."},
+     {"s_de5",true, 1,"Ticket 8812: zwei Nutzer melden Fehler beim Hochladen von Bildern ueber 5 MB. Verkleinern hilft."},
+     {"s_de6",true, 1,"Ticket 8813: die Suchreihenfolge wirkt bei seltenen Begriffen unpassend. Die Filteransicht findet alles."},
+     {"s_de7",true, 2,"Ticket 8821: Rechnungs-PDFs lassen sich seit der Umstellung fuer die meisten Kunden nicht erzeugen. Kein Ausweg."},
+     {"s_de8",true, 2,"Ticket 8822: die Anmeldung weist seit der Umstellung viele Nutzer ab und es gibt keine Umgehung."},
+     {"s_de9",true, 2,"Ticket 8823: der naechtliche Abgleich laeuft seit drei Tagen fuer viele Mandanten nicht, die Daten sind veraltet."},
+     {"s_de10",true, 3,"Ticket 8831: der Checkout ist seit 14:10 fuer alle ausgefallen, es gehen keine Zahlungen mehr ein."},
+     {"s_de11",true, 3,"Ticket 8832: die gesamte Plattform liefert 503, alle Kunden sind offline und saemtliche Bestellungen scheitern."},
+     {"s_de12",true, 3,"Ticket 8833: die Hauptdatenbank ist nicht erreichbar, die Seite ist komplett aus und jede Transaktion geht verloren."},
+    };
+}
+
+// One sweep over both tasks. `label` is the index of the correct option.
+static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                  Tokenizer* tok, const ModelMetadata& meta,
+                                  const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ DECIDEHEAD — every (layer, head) scored as a DECISION head    ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    const int C = S * H;
+    // variant = keyagg(2) x docscore(2); instruction shape is a separate pass.
+    enum { V_MAX_PEAK = 0, V_MAX_MASS, V_MEAN_PEAK, V_MEAN_MASS, N_VAR };
+    static const char* VNAME[N_VAR] = {"max/peak", "max/mass", "mean/peak", "mean/mass"};
+    const int N_SHAPE = 2;
+    static const char* SNAME[N_SHAPE] = {"extract", "question"};
+
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count,
+                                   probe_lens_file_type(meta));
+    if (!calib) {
+        std::fprintf(stderr, "DECIDEHEAD: no calibrated lens entry for arch '%s' bc %u\n",
+                     meta.architecture.c_str(), meta.block_count);
+        return 1;
+    }
+    const int inc_layer = calib->constants.locate_layer;
+    const int inc_head  = calib->constants.locate_head;
+    std::printf("candidates: %d tapped layers x %d heads = %d | shapes %d | variants %d\n",
+                S, H, C, N_SHAPE, N_VAR);
+    std::printf("incumbent (what every decision number so far was read off): L%d h=%d\n\n",
+                inc_layer, inc_head);
+
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+
+    struct Task {
+        const char* name;
+        std::vector<std::pair<std::string,std::string>> options;   // (id, text)
+        std::vector<QDecide> corpus;
+        bool ordinal;
+    };
+    std::vector<Task> tasks = {
+        {"CHOICE (4-way routing)", decide_choice_options(), decide_choice_corpus(), false},
+        {"SCORE  (4 ordered levels)", decide_score_options(), decide_score_corpus(), true},
+    };
+
+    for (const Task& T : tasks) {
+        const int NOPT = (int)T.options.size();
+        // [shape][variant][candidate]
+        std::vector<std::vector<std::vector<long>>> hit(
+            N_SHAPE, std::vector<std::vector<long>>(N_VAR, std::vector<long>(C, 0)));
+        std::vector<std::vector<std::vector<long>>> near = hit, hit_en = hit, hit_de = hit;
+        long n_all = 0, n_en = 0, n_de = 0;
+
+        for (const QDecide& d : T.corpus) {
+            n_all++; (d.de ? n_de : n_en)++;
+            for (int sh = 0; sh < N_SHAPE; ++sh) {
+                std::vector<std::string> ids, texts;
+                for (const auto& o : T.options) { ids.push_back(o.first); texts.push_back(o.second); }
+                const std::string suffix = (sh == 0)
+                    ? qinf::lens_build_instruction(texts)
+                    : qinf::lens_build_question_instruction(ids, texts);
+                const std::string prompt_text = qdocs_chat_prompt(d.document, suffix);
+                std::vector<int32_t> ptoks = tok->encode(prompt_text);
+                const int P = (int)ptoks.size();
+                const std::vector<size_t> pcum = cum_bytes(tok, ptoks);
+
+                const size_t doc_pos = prompt_text.find(d.document);
+                if (doc_pos == std::string::npos)
+                    throw std::runtime_error("DECIDEHEAD: document not verbatim in prompt");
+                auto covering = [&](size_t b0, size_t b1, int& lo, int& hi) {
+                    lo = P; hi = 0;
+                    for (int i = 0; i < P; ++i)
+                        if (pcum[i] < b1 && pcum[i + 1] > b0) { if (i < lo) lo = i; hi = i + 1; }
+                    if (lo > hi) { lo = 0; hi = 0; }
+                };
+                int doc_lo = 0, doc_hi = 0;
+                covering(doc_pos, doc_pos + d.document.size(), doc_lo, doc_hi);
+
+                // Option query spans, searched from the END of the document
+                // forward — the same rule run_lens_locate uses, and for the
+                // same reason: option words can also occur in the body.
+                std::vector<std::pair<int,int>> qspan(NOPT);
+                size_t cursor = doc_pos + d.document.size();
+                bool skip = false;
+                for (int c = 0; c < NOPT; ++c) {
+                    const size_t at = prompt_text.find(texts[c], cursor);
+                    if (at == std::string::npos) { skip = true; break; }
+                    cursor = at + texts[c].size();
+                    int lo = 0, hi = 0;
+                    covering(at, at + texts[c].size(), lo, hi);
+                    if (hi <= lo) { skip = true; break; }
+                    qspan[c] = {lo, hi};
+                }
+                if (skip) { std::printf("[%s/%s] SKIPPED — option not findable\n",
+                                        d.tag.c_str(), SNAME[sh]); continue; }
+
+                fp->set_attention_taps(taps);
+                fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+                fp->clear_slot(0);
+                fp->set_cache_pos(0, 0);
+                std::vector<ForwardPassBase::AttentionTap> tp;
+                {
+                    ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
+                    fp->mark_attention_taps(gf);
+                    ggml_backend_sched_reset(sched);
+                    ggml_backend_sched_alloc_graph(sched, gf);
+                    fp->set_prefill_inputs(gf, ptoks, 0);
+                    qinf::engine::require_compute_success(
+                        ggml_backend_sched_graph_compute(sched, gf), "DECIDEHEAD");
+                    tp = fp->get_attention_taps(gf);
+                }
+                fp->set_attention_taps({});
+
+                for (int slot = 0; slot < S; ++slot) {
+                    const ForwardPassBase::AttentionTap& A = tp[slot];
+                    for (int h = 0; h < H; ++h) {
+                        const int cand = slot * H + h;
+                        double best[N_VAR]; int pick[N_VAR];
+                        for (int v = 0; v < N_VAR; ++v) { best[v] = -1.0; pick[v] = 0; }
+                        for (int c = 0; c < NOPT; ++c) {
+                            const int q0 = qspan[c].first, q1 = qspan[c].second;
+                            const int nq = q1 - q0;
+                            double mx_peak = 0, mx_mass = 0, mn_peak = 0, mn_mass = 0;
+                            for (int p = doc_lo; p < doc_hi && p < A.n_kv; ++p) {
+                                double mx = 0, sm = 0;
+                                for (int q = q0; q < q1; ++q) {
+                                    const float x = A.rows[(size_t)A.n_kv *
+                                        ((size_t)q + (size_t)A.n_q * (size_t)h) + (size_t)p];
+                                    if (x > mx) mx = x;
+                                    sm += x;
+                                }
+                                const double mn = nq > 0 ? sm / (double)nq : 0.0;
+                                if (mx > mx_peak) mx_peak = mx;
+                                if (mn > mn_peak) mn_peak = mn;
+                                mx_mass += mx; mn_mass += mn;
+                            }
+                            const double sc[N_VAR] = {mx_peak, mx_mass, mn_peak, mn_mass};
+                            for (int v = 0; v < N_VAR; ++v)
+                                if (sc[v] > best[v]) { best[v] = sc[v]; pick[v] = c; }
+                        }
+                        for (int v = 0; v < N_VAR; ++v) {
+                            if (pick[v] == d.label) {
+                                hit[sh][v][cand]++;
+                                (d.de ? hit_de : hit_en)[sh][v][cand]++;
+                            }
+                            if (std::abs(pick[v] - d.label) <= 1) near[sh][v][cand]++;
+                        }
+                    }
+                }
+            }
+        }
+
+        auto pct = [](long a, long b) { return b ? 100.0 * (double)a / (double)b : 0.0; };
+        std::printf("\n╔═ %s ═╗  %ld docs (EN %ld / DE %ld), chance %.0f%%\n",
+                    T.name, n_all, n_en, n_de, 100.0 / NOPT);
+
+        // Best candidate per (shape, variant) — the grid that says which lever moved.
+        std::printf("\n  === BEST HEAD PER SHAPE x VARIANT ===\n");
+        std::printf("  shape    variant   | best head |  exact   %s|  EN     DE\n",
+                    T.ordinal ? "within1 " : "        ");
+        for (int sh = 0; sh < N_SHAPE; ++sh)
+            for (int v = 0; v < N_VAR; ++v) {
+                int bc = 0; long bh = -1;
+                for (int c = 0; c < C; ++c) if (hit[sh][v][c] > bh) { bh = hit[sh][v][c]; bc = c; }
+                std::printf("  %-8s %-9s | L%-3d h=%-3d| %6.1f%% %s| %5.1f%% %5.1f%%\n",
+                            SNAME[sh], VNAME[v], attn_layers[bc / H], bc % H,
+                            pct(bh, n_all),
+                            T.ordinal ? (std::to_string((int)pct(near[sh][v][bc], n_all)) + "%      ").substr(0,8).c_str()
+                                      : "        ",
+                            pct(hit_en[sh][v][bc], n_en), pct(hit_de[sh][v][bc], n_de));
+            }
+
+        // The single best configuration, then its depth and the incumbent.
+        int bsh = 0, bv = 0, bc = 0; long bh = -1;
+        for (int sh = 0; sh < N_SHAPE; ++sh)
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c)
+                    if (hit[sh][v][c] > bh) { bh = hit[sh][v][c]; bc = c; bsh = sh; bv = v; }
+        std::printf("\n  === RANKED, best configuration (%s / %s), top 10 of %d ===\n",
+                    SNAME[bsh], VNAME[bv], C);
+        std::vector<int> ord(C);
+        for (int c = 0; c < C; ++c) ord[c] = c;
+        std::stable_sort(ord.begin(), ord.end(),
+                         [&](int a, int b) { return hit[bsh][bv][a] > hit[bsh][bv][b]; });
+        std::printf("  rank | layer head | blocks |  exact  |  EN     DE\n");
+        for (int i = 0; i < std::min(10, C); ++i) {
+            const int c = ord[i];
+            std::printf("  %4d | L%-4d h=%-3d| %3d    | %6.1f%% | %5.1f%% %5.1f%%\n", i + 1,
+                        attn_layers[c / H], c % H, attn_layers[c / H] + 1,
+                        pct(hit[bsh][bv][c], n_all),
+                        pct(hit_en[bsh][bv][c], n_en), pct(hit_de[bsh][bv][c], n_de));
+        }
+        int inc_slot = -1;
+        for (int i = 0; i < S; ++i) if (attn_layers[i] == inc_layer) inc_slot = i;
+        if (inc_slot >= 0 && inc_head >= 0) {
+            const int ic = inc_slot * H + inc_head;
+            int irank = 0;
+            for (int i = 0; i < C; ++i) if (ord[i] == ic) { irank = i + 1; break; }
+            std::printf("\n  INCUMBENT locate pair L%d h=%d: rank %d of %d, exact %.1f%%\n",
+                        inc_layer, inc_head, irank, C, pct(hit[bsh][bv][ic], n_all));
+            std::printf("  (every decision number before this leg was read off that pair)\n");
+        }
+        // ── SELECT ON ONE LANGUAGE, SCORE ON THE OTHER ──────────────────────
+        // The grid above picks the best of C x N_SHAPE x N_VAR candidates on
+        // the SAME data it reports, which for this corpus is 1024 draws against
+        // N=the corpus. The maximum of that many noisy draws is inflated even when the
+        // signal is real, so the pooled winner is an UPPER BOUND, not a rate.
+        // These two rows are the honest number: choose the configuration using
+        // one language only, then report what it scores on the other, which it
+        // never saw. Same discipline as COVSEARCH and the LOCABSENT thresholds.
+        std::printf("\n  === HELD OUT: select on one language, score on the OTHER ===\n");
+        std::printf("  selected on | config                | best head | scored on | exact  %s\n",
+                    T.ordinal ? "within1" : "");
+        for (int sel = 0; sel < 2; ++sel) {
+            const auto& SELH = sel ? hit_de : hit_en;
+            const auto& OTHH = sel ? hit_en : hit_de;
+            const auto& OTHN = sel ? near   : near;
+            const long nsel = sel ? n_de : n_en, noth = sel ? n_en : n_de;
+            int ssh = 0, sv = 0, sc = 0; long sb = -1;
+            for (int sh = 0; sh < N_SHAPE; ++sh)
+                for (int v = 0; v < N_VAR; ++v)
+                    for (int c = 0; c < C; ++c)
+                        if (SELH[sh][v][c] > sb) { sb = SELH[sh][v][c]; sc = c; ssh = sh; sv = v; }
+            // within-1 is tracked pooled only, so report it pooled and say so.
+            std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %5.1f%% %s\n",
+                        sel ? "DE" : "EN", SNAME[ssh], VNAME[sv],
+                        attn_layers[sc / H], sc % H, sel ? "EN" : "DE",
+                        pct(OTHH[ssh][sv][sc], noth),
+                        T.ordinal ? (std::to_string((int)pct(OTHN[ssh][sv][sc], n_all)) + "% pooled").c_str() : "");
+            (void)nsel;
+        }
+
+        std::printf("\n  === PER TAPPED LAYER — best head and its depth cost ===\n");
+        for (int slot = 0; slot < S; ++slot) {
+            int bhh = 0; long bb = -1;
+            for (int h = 0; h < H; ++h) {
+                const long v = hit[bsh][bv][slot * H + h];
+                if (v > bb) { bb = v; bhh = h; }
+            }
+            std::printf("  L%-3d | %2d/%d blocks | h=%-3d %6.1f%%\n", attn_layers[slot],
+                        attn_layers[slot] + 1, (int)meta.block_count, bhh, pct(bb, n_all));
+        }
+    }
+    std::printf("\n  Probe only: moves no constant. A decision head ships when a\n");
+    std::printf("  product decides the rate is worth its depth, which is the user's call.\n");
     return 0;
 }
 
@@ -10608,6 +11352,14 @@ int main() {
     // /v1/locate's regime (../qemmi-lens/docs/plan-locate-and-cut.md §11a).
     if (std::getenv("LOCHEAD"))
         return run_locate_head_search(fp.get(), sched, tok, meta, attn_layers);
+    // LOCABSENT — the absence threshold for span-only: does the calibrated
+    // locate head know when a key is NOT in the document?
+    if (std::getenv("LOCABSENT"))
+        return run_locate_absence(fp.get(), sched, tok, meta, attn_layers);
+    // DECIDEHEAD — is the LOCATE pair the right head for a DECISION? Sweeps
+    // every (layer, head) x instruction shape x score variant on two tasks.
+    if (std::getenv("DECIDEHEAD"))
+        return run_decide_head_search(fp.get(), sched, tok, meta, attn_layers);
     // Leg C's corpus again, asking whether its LABELS are causally true.
     if (std::getenv("OMISSION1"))
         return run_omission1(fp.get(), sched, tok, meta, attn_layers);
