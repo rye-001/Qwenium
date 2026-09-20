@@ -4368,36 +4368,86 @@ static int run_absent_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         return tot > 0 ? win / tot : 0.0;
     };
 
+    // SELECTION IS RESTRICTED TO THE QUESTION SHAPE, and that is a correctness
+    // requirement, not a preference. run_lens_locate treats question mode as
+    // ON-recipe for every decision role — it never sets `uncalibrated` for
+    // them — so a pair measured under the EXTRACTION shape would be served to
+    // a question-vocabulary caller with `uncalibrated:false` while sitting
+    // outside its own provenance: a silent false receipt. Extract is still
+    // measured and printed, with no vote. Found on the 27B, where extract wins
+    // the pooled table and the 9B's question-shape win had hidden it.
+    const int SEL_SHAPE = 1;
+    // d-prime, the tie-break. AUC saturates — the 27B put ten heads inside one
+    // point of each other at 0.99 — and a metric pinned near its ceiling
+    // cannot choose, so "rank 1" becomes whichever tied head the scan reached
+    // first. This is the standardised distance between the present and absent
+    // score distributions: unbounded above, so it keeps discriminating after
+    // AUC has stopped. It is a SEPARATION between two populations, not a
+    // per-request confidence.
+    auto dprime = [&](int sh, int v, int cand, int lang) {
+        const std::vector<float>& x = sc[sh][v][cand];
+        if (x.size() != N) return 0.0;
+        double mp = 0, ma = 0; long np = 0, na = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (lang >= 0 && (samples[i].de ? 1 : 0) != lang) continue;
+            if (samples[i].absent) { ma += x[i]; na++; } else { mp += x[i]; np++; }
+        }
+        if (np < 2 || na < 2) return 0.0;
+        mp /= (double)np; ma /= (double)na;
+        double sp = 0, sa = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (lang >= 0 && (samples[i].de ? 1 : 0) != lang) continue;
+            const double d = x[i] - (samples[i].absent ? ma : mp);
+            (samples[i].absent ? sa : sp) += d * d;
+        }
+        const double sd = std::sqrt((sp + sa) / (double)(np + na - 2));
+        return sd > 0.0 ? (mp - ma) / sd : 0.0;
+    };
+    auto better = [&](int sh, int v, int c, int sh2, int v2, int c2, int lang) {
+        const double a = auc(sh, v, c, lang), b = auc(sh2, v2, c2, lang);
+        if (a != b) return a > b;
+        return dprime(sh, v, c, lang) > dprime(sh2, v2, c2, lang);
+    };
+
     std::printf("\n  === BEST HEAD PER SHAPE x VARIANT (by pooled AUC) ===\n");
-    std::printf("  shape    variant   | best head | AUC pooled   EN      DE\n");
-    int bsh = 0, bv = 0, bc = 0; double bauc = -1.0;
+    std::printf("  shape    variant   | best head | AUC pooled   EN      DE     | d'\n");
+    int bv = 0, bc = 0;
+    const int bsh = SEL_SHAPE;
+    bool seeded = false;
     for (int sh = 0; sh < N_SHAPE; ++sh)
         for (int v = 0; v < N_VAR; ++v) {
-            int cbest = 0; double abest = -1.0;
-            for (int c = 0; c < C; ++c) {
-                const double a = auc(sh, v, c, -1);
-                if (a > abest) { abest = a; cbest = c; }
-            }
-            std::printf("  %-8s %-9s | L%-3d h=%-3d| %.4f   %.4f  %.4f\n",
+            int cbest = 0;
+            for (int c = 1; c < C; ++c) if (better(sh, v, c, sh, v, cbest, -1)) cbest = c;
+            const double abest = auc(sh, v, cbest, -1);
+            std::printf("  %-8s %-9s | L%-3d h=%-3d| %.4f   %.4f  %.4f | %5.2f%s\n",
                         SNAME[sh], VNAME[v], attn_layers[cbest / H], cbest % H,
-                        abest, auc(sh, v, cbest, 0), auc(sh, v, cbest, 1));
-            if (abest > bauc) { bauc = abest; bc = cbest; bsh = sh; bv = v; }
+                        abest, auc(sh, v, cbest, 0), auc(sh, v, cbest, 1),
+                        dprime(sh, v, cbest, -1), sh == SEL_SHAPE ? "" : "   (no vote)");
+            if (sh == SEL_SHAPE && (!seeded || better(sh, v, cbest, bsh, bv, bc, -1)))
+                { bc = cbest; bv = v; seeded = true; }
         }
 
     std::printf("\n  === RANKED, best configuration (%s / %s), top 10 of %d ===\n",
                 SNAME[bsh], VNAME[bv], C);
     std::vector<int> ord(C);
     for (int c = 0; c < C; ++c) ord[c] = c;
-    std::vector<double> pooled(C);
-    for (int c = 0; c < C; ++c) pooled[c] = auc(bsh, bv, c, -1);
-    std::stable_sort(ord.begin(), ord.end(),
-                     [&](int a, int b) { return pooled[a] > pooled[b]; });
-    std::printf("  rank | layer head | blocks |  AUC     EN      DE\n");
+    std::vector<double> pooled(C), pdp(C);
+    for (int c = 0; c < C; ++c) { pooled[c] = auc(bsh, bv, c, -1);
+                                  pdp[c]    = dprime(bsh, bv, c, -1); }
+    std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+        if (pooled[a] != pooled[b]) return pooled[a] > pooled[b];
+        return pdp[a] > pdp[b];
+    });
+    long tied_top = 0;
+    for (int c = 0; c < C; ++c) if (pooled[c] >= pooled[ord[0]]) tied_top++;
+    std::printf("  top AUC %.4f, shared by %ld of %d heads%s\n", pooled[ord[0]], tied_top, C,
+                tied_top > 1 ? "  <-- SATURATED, d' is doing the choosing" : "");
+    std::printf("  rank | layer head | blocks |  AUC     EN      DE     | d'\n");
     for (int i = 0; i < std::min(10, C); ++i) {
         const int c = ord[i];
-        std::printf("  %4d | L%-4d h=%-3d| %3d    | %.4f  %.4f  %.4f\n", i + 1,
+        std::printf("  %4d | L%-4d h=%-3d| %3d    | %.4f  %.4f  %.4f | %5.2f\n", i + 1,
                     attn_layers[c / H], c % H, attn_layers[c / H] + 1,
-                    pooled[c], auc(bsh, bv, c, 0), auc(bsh, bv, c, 1));
+                    pooled[c], auc(bsh, bv, c, 0), auc(bsh, bv, c, 1), pdp[c]);
     }
 
     int inc_slot = -1;
@@ -4417,18 +4467,46 @@ static int run_absent_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
     // upper bound even when the signal is real.
     std::printf("\n  === HELD OUT: select on one language, score on the OTHER ===\n");
     std::printf("  selected on | config                | best head | scored on | AUC\n");
+    int pickc[2] = {0, 0}, pickv[2] = {0, 0};
     for (int sel = 0; sel < 2; ++sel) {
-        int ssh = 0, sv = 0, scd = 0; double sb = -1.0;
-        for (int sh = 0; sh < N_SHAPE; ++sh)
-            for (int v = 0; v < N_VAR; ++v)
-                for (int c = 0; c < C; ++c) {
-                    const double a = auc(sh, v, c, sel);
-                    if (a > sb) { sb = a; scd = c; ssh = sh; sv = v; }
-                }
-        std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %.4f\n",
-                    sel ? "DE" : "EN", SNAME[ssh], VNAME[sv],
+        int sv = 0, scd = 0;
+        for (int v = 0; v < N_VAR; ++v)
+            for (int c = 0; c < C; ++c)
+                if (better(SEL_SHAPE, v, c, SEL_SHAPE, sv, scd, sel)) { scd = c; sv = v; }
+        pickc[sel] = scd; pickv[sel] = sv;
+        const double top = auc(SEL_SHAPE, sv, scd, sel);
+        long tied = 0;
+        for (int v = 0; v < N_VAR; ++v)
+            for (int c = 0; c < C; ++c) if (auc(SEL_SHAPE, v, c, sel) >= top) tied++;
+        std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %.4f | tied at top: %ld\n",
+                    sel ? "DE" : "EN", SNAME[SEL_SHAPE], VNAME[sv],
                     attn_layers[scd / H], scd % H, sel ? "EN" : "DE",
-                    auc(ssh, sv, scd, 1 - sel));
+                    auc(SEL_SHAPE, sv, scd, 1 - sel), tied);
+    }
+    std::printf("  SYMMETRY: the two halves pick %s head, %s variant\n",
+                pickc[0] == pickc[1] ? "the SAME" : "a DIFFERENT",
+                pickv[0] == pickv[1] ? "the same" : "a different");
+    {
+        auto keyed = [&](int lang) {
+            std::vector<int> o(C);
+            for (int c = 0; c < C; ++c) o[c] = c;
+            std::stable_sort(o.begin(), o.end(), [&](int x, int y) {
+                const double a = auc(SEL_SHAPE, bv, x, lang), b = auc(SEL_SHAPE, bv, y, lang);
+                if (a != b) return a > b;
+                return dprime(SEL_SHAPE, bv, x, lang) > dprime(SEL_SHAPE, bv, y, lang);
+            });
+            return o;
+        };
+        const std::vector<int> oe = keyed(0), od = keyed(1);
+        int overlap = 0;
+        for (int i = 0; i < std::min(10, C); ++i)
+            for (int j = 0; j < std::min(10, C); ++j) if (oe[i] == od[j]) overlap++;
+        auto rank_in = [&](const std::vector<int>& o, int cand) {
+            for (int i = 0; i < C; ++i) if (o[i] == cand) return i + 1;
+            return C;
+        };
+        std::printf("  STABILITY: top-10 overlap %d/10 | pooled winner L%d h=%d ranks %d on EN, %d on DE\n",
+                    overlap, attn_layers[bc / H], bc % H, rank_in(oe, bc), rank_in(od, bc));
     }
 
     std::printf("\n  === PER TAPPED LAYER — best head and its depth cost ===\n");
@@ -4675,6 +4753,17 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         std::vector<std::vector<std::vector<long>>> hit(
             N_SHAPE, std::vector<std::vector<long>>(N_VAR, std::vector<long>(C, 0)));
         std::vector<std::vector<std::vector<long>>> near = hit, hit_en = hit, hit_de = hit;
+        // Mean simplex margin, summed here and divided at read time. It exists
+        // ONLY as a tie-break between heads that score identically — accuracy
+        // saturates on a 20-document language half, where 100/95/90% are
+        // one-document steps and a plain argmax reports whichever tied head the
+        // scan reached first as "the pick". That is not a claim that margin
+        // measures confidence: this repo has killed that reading four times.
+        // Ranking heads by how far apart they push the classes is a different
+        // question from telling a caller how sure to be about one answer.
+        std::vector<std::vector<std::vector<double>>> marg(
+            N_SHAPE, std::vector<std::vector<double>>(N_VAR, std::vector<double>(C, 0.0)));
+        std::vector<std::vector<std::vector<double>>> marg_en = marg, marg_de = marg;
         long n_all = 0, n_en = 0, n_de = 0;
 
         for (const QDecide& d : T.corpus) {
@@ -4741,7 +4830,7 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
                     const ForwardPassBase::AttentionTap& A = tp[slot];
                     for (int h = 0; h < H; ++h) {
                         const int cand = slot * H + h;
-                        double best[N_VAR]; int pick[N_VAR];
+                        double best[N_VAR]; int pick[N_VAR]; double allsc[N_VAR][8];
                         for (int v = 0; v < N_VAR; ++v) { best[v] = -1.0; pick[v] = 0; }
                         for (int c = 0; c < NOPT; ++c) {
                             const int q0 = qspan[c].first, q1 = qspan[c].second;
@@ -4761,8 +4850,10 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
                                 mx_mass += mx; mn_mass += mn;
                             }
                             const double sc[N_VAR] = {mx_peak, mx_mass, mn_peak, mn_mass};
-                            for (int v = 0; v < N_VAR; ++v)
+                            for (int v = 0; v < N_VAR; ++v) {
+                                allsc[v][c] = sc[v];
                                 if (sc[v] > best[v]) { best[v] = sc[v]; pick[v] = c; }
+                            }
                         }
                         for (int v = 0; v < N_VAR; ++v) {
                             if (pick[v] == d.label) {
@@ -4770,6 +4861,20 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
                                 (d.de ? hit_de : hit_en)[sh][v][cand]++;
                             }
                             if (std::abs(pick[v] - d.label) <= 1) near[sh][v][cand]++;
+                            // MARGIN, the tie-break — see the note above `pct`.
+                            // Simplex-normalised so it is scale-free and needs
+                            // no fitted temperature: the correct option's share
+                            // minus the best wrong option's share.
+                            double tot = 0.0;
+                            for (int c = 0; c < NOPT; ++c) tot += allsc[v][c];
+                            if (tot > 0.0) {
+                                double wrong = 0.0;
+                                for (int c = 0; c < NOPT; ++c)
+                                    if (c != d.label && allsc[v][c] > wrong) wrong = allsc[v][c];
+                                const double m = (allsc[v][d.label] - wrong) / tot;
+                                marg[sh][v][cand] += m;
+                                (d.de ? marg_de : marg_en)[sh][v][cand] += m;
+                            }
                         }
                     }
                 }
@@ -4777,44 +4882,83 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         }
 
         auto pct = [](long a, long b) { return b ? 100.0 * (double)a / (double)b : 0.0; };
+        // SELECTION IS RESTRICTED TO THE QUESTION SHAPE, and that is a
+        // correctness requirement, not a preference. run_lens_locate treats
+        // question mode as ON-recipe for every decision role — it never sets
+        // `uncalibrated` for them — so a pair measured under the EXTRACTION
+        // shape would be served to a question-vocabulary caller with
+        // `uncalibrated:false` while sitting outside its own provenance. That
+        // is a silent false receipt, which is the one thing the calibration
+        // table exists to prevent. Extract is still measured and printed, as a
+        // cross-check with no vote. Found on the 27B, where extract wins and
+        // the 9B's question-shape win had hidden the problem.
+        const int SEL_SHAPE = 1;
+        auto mean_marg = [&](int sh, int v, int c, int lang) {
+            const double sum = lang == 0 ? marg_en[sh][v][c]
+                             : lang == 1 ? marg_de[sh][v][c] : marg[sh][v][c];
+            const long n = lang == 0 ? n_en : lang == 1 ? n_de : n_all;
+            return n ? sum / (double)n : 0.0;
+        };
+        // Lexicographic (accuracy, margin) over one language subset.
+        auto hits_of = [&](int sh, int v, int c, int lang) {
+            return lang == 0 ? hit_en[sh][v][c] : lang == 1 ? hit_de[sh][v][c] : hit[sh][v][c];
+        };
+        auto better = [&](int sh, int v, int c, int sh2, int v2, int c2, int lang) {
+            const long a = hits_of(sh, v, c, lang), b = hits_of(sh2, v2, c2, lang);
+            if (a != b) return a > b;
+            return mean_marg(sh, v, c, lang) > mean_marg(sh2, v2, c2, lang);
+        };
         std::printf("\n╔═ %s ═╗  %ld docs (EN %ld / DE %ld), chance %.0f%%\n",
                     T.name, n_all, n_en, n_de, 100.0 / NOPT);
 
         // Best candidate per (shape, variant) — the grid that says which lever moved.
         std::printf("\n  === BEST HEAD PER SHAPE x VARIANT ===\n");
-        std::printf("  shape    variant   | best head |  exact   %s|  EN     DE\n",
+        std::printf("  shape    variant   | best head |  exact   %s|  EN     DE    | margin\n",
                     T.ordinal ? "within1 " : "        ");
         for (int sh = 0; sh < N_SHAPE; ++sh)
             for (int v = 0; v < N_VAR; ++v) {
-                int bc = 0; long bh = -1;
-                for (int c = 0; c < C; ++c) if (hit[sh][v][c] > bh) { bh = hit[sh][v][c]; bc = c; }
-                std::printf("  %-8s %-9s | L%-3d h=%-3d| %6.1f%% %s| %5.1f%% %5.1f%%\n",
+                int bc = 0;
+                for (int c = 1; c < C; ++c) if (better(sh, v, c, sh, v, bc, -1)) bc = c;
+                const long bh = hit[sh][v][bc];
+                std::printf("  %-8s %-9s | L%-3d h=%-3d| %6.1f%% %s| %5.1f%% %5.1f%% | %+.3f%s\n",
                             SNAME[sh], VNAME[v], attn_layers[bc / H], bc % H,
                             pct(bh, n_all),
                             T.ordinal ? (std::to_string((int)pct(near[sh][v][bc], n_all)) + "%      ").substr(0,8).c_str()
                                       : "        ",
-                            pct(hit_en[sh][v][bc], n_en), pct(hit_de[sh][v][bc], n_de));
+                            pct(hit_en[sh][v][bc], n_en), pct(hit_de[sh][v][bc], n_de),
+                            mean_marg(sh, v, bc, -1), sh == SEL_SHAPE ? "" : "  (no vote)");
             }
 
         // The single best configuration, then its depth and the incumbent.
-        int bsh = 0, bv = 0, bc = 0; long bh = -1;
-        for (int sh = 0; sh < N_SHAPE; ++sh)
-            for (int v = 0; v < N_VAR; ++v)
-                for (int c = 0; c < C; ++c)
-                    if (hit[sh][v][c] > bh) { bh = hit[sh][v][c]; bc = c; bsh = sh; bv = v; }
+        const int bsh = SEL_SHAPE;
+        int bv = 0, bc = 0;
+        for (int v = 0; v < N_VAR; ++v)
+            for (int c = 0; c < C; ++c)
+                if (better(bsh, v, c, bsh, bv, bc, -1)) { bc = c; bv = v; }
         std::printf("\n  === RANKED, best configuration (%s / %s), top 10 of %d ===\n",
                     SNAME[bsh], VNAME[bv], C);
         std::vector<int> ord(C);
         for (int c = 0; c < C; ++c) ord[c] = c;
-        std::stable_sort(ord.begin(), ord.end(),
-                         [&](int a, int b) { return hit[bsh][bv][a] > hit[bsh][bv][b]; });
-        std::printf("  rank | layer head | blocks |  exact  |  EN     DE\n");
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+            if (hit[bsh][bv][a] != hit[bsh][bv][b]) return hit[bsh][bv][a] > hit[bsh][bv][b];
+            return mean_marg(bsh, bv, a, -1) > mean_marg(bsh, bv, b, -1);
+        });
+        // How many heads share the leading accuracy. A large count means the
+        // ranking did not choose between them and every rank below is the
+        // margin talking.
+        long tied_top = 0;
+        for (int c = 0; c < C; ++c) if (hit[bsh][bv][c] >= hit[bsh][bv][ord[0]]) tied_top++;
+        std::printf("  top accuracy %.1f%%, shared by %ld of %d heads%s\n",
+                    pct(hit[bsh][bv][ord[0]], n_all), tied_top, C,
+                    tied_top > 1 ? "  <-- SATURATED, margin is doing the choosing" : "");
+        std::printf("  rank | layer head | blocks |  exact  |  EN     DE    | margin\n");
         for (int i = 0; i < std::min(10, C); ++i) {
             const int c = ord[i];
-            std::printf("  %4d | L%-4d h=%-3d| %3d    | %6.1f%% | %5.1f%% %5.1f%%\n", i + 1,
+            std::printf("  %4d | L%-4d h=%-3d| %3d    | %6.1f%% | %5.1f%% %5.1f%% | %+.3f\n", i + 1,
                         attn_layers[c / H], c % H, attn_layers[c / H] + 1,
                         pct(hit[bsh][bv][c], n_all),
-                        pct(hit_en[bsh][bv][c], n_en), pct(hit_de[bsh][bv][c], n_de));
+                        pct(hit_en[bsh][bv][c], n_en), pct(hit_de[bsh][bv][c], n_de),
+                        mean_marg(bsh, bv, c, -1));
         }
         int inc_slot = -1;
         for (int i = 0; i < S; ++i) if (attn_layers[i] == inc_layer) inc_slot = i;
@@ -4837,34 +4981,94 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         std::printf("\n  === HELD OUT: select on one language, score on the OTHER ===\n");
         std::printf("  selected on | config                | best head | scored on | exact  %s\n",
                     T.ordinal ? "within1" : "");
+        int pickc[2] = {0, 0}, pickv[2] = {0, 0};
         for (int sel = 0; sel < 2; ++sel) {
-            const auto& SELH = sel ? hit_de : hit_en;
             const auto& OTHH = sel ? hit_en : hit_de;
-            const auto& OTHN = sel ? near   : near;
-            const long nsel = sel ? n_de : n_en, noth = sel ? n_en : n_de;
-            int ssh = 0, sv = 0, sc = 0; long sb = -1;
-            for (int sh = 0; sh < N_SHAPE; ++sh)
-                for (int v = 0; v < N_VAR; ++v)
-                    for (int c = 0; c < C; ++c)
-                        if (SELH[sh][v][c] > sb) { sb = SELH[sh][v][c]; sc = c; ssh = sh; sv = v; }
-            // within-1 is tracked pooled only, so report it pooled and say so.
-            std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %5.1f%% %s\n",
-                        sel ? "DE" : "EN", SNAME[ssh], VNAME[sv],
+            const auto& OTHN = near;
+            const long noth = sel ? n_en : n_de;
+            int sv = 0, sc = 0;
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c)
+                    if (better(SEL_SHAPE, v, c, SEL_SHAPE, sv, sc, sel)) { sc = c; sv = v; }
+            pickc[sel] = sc; pickv[sel] = sv;
+            const long top = hits_of(SEL_SHAPE, sv, sc, sel);
+            long tied = 0;
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c)
+                    if (hits_of(SEL_SHAPE, v, c, sel) >= top) tied++;
+            std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %5.1f%% %s | tied at top: %ld\n",
+                        sel ? "DE" : "EN", SNAME[SEL_SHAPE], VNAME[sv],
                         attn_layers[sc / H], sc % H, sel ? "EN" : "DE",
-                        pct(OTHH[ssh][sv][sc], noth),
-                        T.ordinal ? (std::to_string((int)pct(OTHN[ssh][sv][sc], n_all)) + "% pooled").c_str() : "");
-            (void)nsel;
+                        pct(OTHH[SEL_SHAPE][sv][sc], noth),
+                        T.ordinal ? (std::to_string((int)pct(OTHN[SEL_SHAPE][sv][sc], n_all)) + "% pooled").c_str() : "",
+                        tied);
+        }
+        std::printf("  SYMMETRY: the two halves pick %s head, %s variant\n",
+                    pickc[0] == pickc[1] ? "the SAME" : "a DIFFERENT",
+                    pickv[0] == pickv[1] ? "the same" : "a different");
+        {
+            // Rank agreement under the SAME lexicographic key the selection
+            // uses, so a saturated accuracy cannot hand out a free rank 1.
+            auto keyed = [&](int lang) {
+                std::vector<int> o(C);
+                for (int c = 0; c < C; ++c) o[c] = c;
+                std::stable_sort(o.begin(), o.end(), [&](int x, int y) {
+                    const long a = hits_of(SEL_SHAPE, bv, x, lang), b = hits_of(SEL_SHAPE, bv, y, lang);
+                    if (a != b) return a > b;
+                    return mean_marg(SEL_SHAPE, bv, x, lang) > mean_marg(SEL_SHAPE, bv, y, lang);
+                });
+                return o;
+            };
+            const std::vector<int> oe = keyed(0), od = keyed(1);
+            int overlap = 0;
+            for (int i = 0; i < std::min(10, C); ++i)
+                for (int j = 0; j < std::min(10, C); ++j) if (oe[i] == od[j]) overlap++;
+            auto rank_in = [&](const std::vector<int>& o, int cand) {
+                for (int i = 0; i < C; ++i) if (o[i] == cand) return i + 1;
+                return C;
+            };
+            std::printf("  STABILITY: top-10 overlap %d/10 | pooled winner L%d h=%d ranks %d on EN, %d on DE\n",
+                        overlap, attn_layers[bc / H], bc % H, rank_in(oe, bc), rank_in(od, bc));
         }
 
-        std::printf("\n  === PER TAPPED LAYER — best head and its depth cost ===\n");
+        // ── DEPTH BUDGET, HELD OUT ──────────────────────────────────────
+        // The pooled winner gets a held-out check above, but a product rarely
+        // lands the pooled winner — it lands the best head it can reach inside
+        // the depth it is already paying for. That candidate has to earn the
+        // same check, and nothing above reports it: a cheap head with a good
+        // pooled rate and an unstable selection is exactly the trap this leg
+        // fell into on the 27B before it was corrected.
+        //
+        // Budget is CUMULATIVE: a server loaded to layer L may read any head at
+        // or below L. So each row selects within layers <= L, on one language,
+        // and reports what that pick scores on the other.
+        std::printf("\n  === PER TAPPED LAYER — best head within the budget, held out ===\n");
+        std::printf("  budget | blocks | best head | pooled | EN-pick ->DE | DE-pick ->EN | agree\n");
         for (int slot = 0; slot < S; ++slot) {
-            int bhh = 0; long bb = -1;
-            for (int h = 0; h < H; ++h) {
-                const long v = hit[bsh][bv][slot * H + h];
-                if (v > bb) { bb = v; bhh = h; }
-            }
-            std::printf("  L%-3d | %2d/%d blocks | h=%-3d %6.1f%%\n", attn_layers[slot],
-                        attn_layers[slot] + 1, (int)meta.block_count, bhh, pct(bb, n_all));
+            auto best_within = [&](int lang) {
+                int bh2 = 0, bv2 = bv;
+                bool seeded = false;
+                for (int v = 0; v < N_VAR; ++v)
+                    for (int sl = 0; sl <= slot; ++sl)
+                        for (int h = 0; h < H; ++h) {
+                            const int c = sl * H + h;
+                            if (!seeded) { bh2 = c; bv2 = v; seeded = true; continue; }
+                            if (better(bsh, v, c, bsh, bv2, bh2, lang)) { bh2 = c; bv2 = v; }
+                        }
+                return std::make_pair(bh2, bv2);
+            };
+            const auto pooled_pick = best_within(-1);
+            const auto en_pick = best_within(0);
+            const auto de_pick = best_within(1);
+            std::printf("  L%-5d | %2d/%-3d | L%-3d h=%-3d| %5.1f%% | L%-3d h=%-3d %5.1f%% | L%-3d h=%-3d %5.1f%% | %s\n",
+                        attn_layers[slot], attn_layers[slot] + 1, (int)meta.block_count,
+                        attn_layers[pooled_pick.first / H], pooled_pick.first % H,
+                        pct(hit[bsh][pooled_pick.second][pooled_pick.first], n_all),
+                        attn_layers[en_pick.first / H], en_pick.first % H,
+                        pct(hit_de[bsh][en_pick.second][en_pick.first], n_de),
+                        attn_layers[de_pick.first / H], de_pick.first % H,
+                        pct(hit_en[bsh][de_pick.second][de_pick.first], n_en),
+                        en_pick.first == de_pick.first ? "YES" : "no");
         }
     }
     std::printf("\n  Probe only: moves no constant. A decision head ships when a\n");

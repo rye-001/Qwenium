@@ -484,12 +484,19 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        /*choice_layer*/ 11, /*choice_head*/ 3,
                        /*choice_provenance*/
                        "DECIDEHEAD 2026-09-20, 40 docs EN+DE, 4-way routing, chance 25%: "
-                       "L11 h=3 = 92.5% (EN 95.0 / DE 90.0), rank 5 of 128, IDENTICAL on "
+                       "L11 h=3 = 92.5% (EN 95.0 / DE 90.0), rank 7 of 128, IDENTICAL on "
                        "Q8_0 and Q4_K_M. Measured ONLY under: question instruction shape, "
                        "mean key aggregation, document score summed over the body (not "
                        "peak) — change any of the three and this rate does not apply. "
                        "Corpus is synthetic and self-authored; held-out cross-language "
-                       "selection on the same sweep ran 85-95%",
+                       "selection on the same sweep ran 85-95% and is NOT symmetric "
+                       "(EN selects L15 h=9 and reads 85.0% on DE; DE selects L19 h=2 and "
+                       "reads 95.0% on EN) \u2014 this pair was landed for cross-QUANT "
+                       "stability and for being free, never for held-out symmetry. Rank "
+                       "restated 2026-09-20 when DECIDEHEAD was corrected to select under "
+                       "the question shape only and to tie-break a saturated accuracy on "
+                       "margin; the RATE and the EN/DE split are unchanged, only the "
+                       "ordering around it moved",
                        // ABSENTHEAD 2026-09-20. RANK 1 OF 128 ON BOTH QUANTS
                        // (0.9948 on Q4_K_M, 0.9953 on Q8_0), and the held-out
                        // selection picks the SAME configuration on both files.
@@ -605,7 +612,77 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "Best available was L35 h=16 at 100% top3, declined on depth "
                        "(36/65 blocks vs 28/65). TOP-1 IS 81.3% \u2014 a caller that acts "
                        "on a single span is acting on that rate, not on 94.7%. Measured "
-                       "at Q3_K_M, where the 9B's pair is Q8_0"}},
+                       "at Q3_K_M, where the 9B's pair is Q8_0",
+                       // DECIDEHEAD 2026-09-20 RAN HERE AND IS NOT LANDED. The
+                       // pair is left unmeasured-by-declaration rather than
+                       // filled in, because every candidate cheap enough to be
+                       // worth taking FAILED its held-out check and the one
+                       // that passed costs 8 blocks more than absence.
+                       //
+                       // Read the provenance for the numbers before proposing
+                       // any of them again — in particular L31 h=10, whose
+                       // 95.0% is a POOLED rate that German does not reproduce.
+                       /*choice_layer*/ -1, /*choice_head*/ -1,
+                       /*choice_provenance*/
+                       "SWEPT AND DECLINED, not unmeasured. DECIDEHEAD 2026-09-20 on "
+                       "Q3_K_M, 40 docs EN+DE, 4-way routing, chance 25%, question shape "
+                       "and mean key aggregation. The signal is strong: L47 h=13 = 100.0% "
+                       "pooled, unique of 384, and BOTH held-out halves select it "
+                       "(90.0% EN->DE, 100.0% DE->EN). It costs 48 of 65 blocks. The "
+                       "cheapest STABLE head is L39 h=7 at 40 blocks: 97.5% pooled, both "
+                       "halves select it, and its worst held-out direction (95.0%) beats "
+                       "L47's (90.0%). NOTHING CHEAPER SURVIVES A HELD-OUT CHECK within "
+                       "its own depth budget: at 32 blocks L31 h=10 reads 95.0% pooled but "
+                       "German selects L15 h=17 and scores 75.0% on English; at 28 blocks "
+                       "(locate's own layer, i.e. free) L27 h=6 reads 92.5% pooled and "
+                       "fails the same way. So choice is NOT free on this model, unlike "
+                       "the 9B where it shares locate's layer \u2014 landing it means "
+                       "paying 40 blocks, which is a product decision nobody has made. "
+                       "Q3_K_M ONLY: no second 27B file exists, so the cross-quant "
+                       "agreement that qualified every 9B pair was not available here",
+                       // ABSENTHEAD 2026-09-20, corrected leg. Rank 1 of 384 and
+                       // UNIQUE at the top; both held-out halves select this
+                       // same head AND the same variant, each with exactly one
+                       // candidate at its top.
+                       //
+                       // Costs 4 blocks over locate (28 -> 32) and is worth
+                       // them: the free head at L27 h=22 catches 79-88% of
+                       // absences where this one catches 93-94%, at the same
+                       // near-zero false-accusation rate.
+                       /*absent_layer*/ 31, /*absent_head*/ 23,
+                       /*absent_provenance*/
+                       "ABSENTHEAD 2026-09-20 on Q3_K_M, Leg C corpus, present vs absent "
+                       "over 6 verified-absent concepts, position-balanced: L31 h=23 = AUC "
+                       "0.9956 (EN 0.9953 / DE 0.9966), rank 1 of 384 and the ONLY head at "
+                       "that AUC. d-prime 4.17. Held out (select on one language, score on "
+                       "the other) picks THE SAME head and THE SAME variant both ways, one "
+                       "candidate at the top of each half: 0.9966 and 0.9953. OPERATING "
+                       "POINT at a 2% false-alarm target: 92.9% / 93.8% of absences caught "
+                       "at 0.0% / 2.5% actual false accusations; the free head at L27 h=22 "
+                       "reaches only 79.2-88.1% there. Measured ONLY under: question "
+                       "instruction shape, mean key aggregation, document score summed "
+                       "over the body. AUC IS A SEPARATION, NOT A RATE \u2014 the "
+                       "threshold is a product choice, see LOCABSENT. The incumbent locate "
+                       "pair reads 0.9600 here, rank 41 of 384. Q3_K_M ONLY: no second 27B "
+                       "file exists, so cross-quant agreement was not measurable",
+                       // SCOREHEAD 2026-09-20: swept, NO-GO. Not a weak result
+                       // that might be worth taking — an unreproducible one.
+                       /*score_layer*/ -1, /*score_head*/ -1,
+                       /*score_provenance*/
+                       "SWEPT AND REFUSED. SCOREHEAD 2026-09-20 on Q3_K_M, 48 docs EN+DE, "
+                       "4 ordered levels. The pooled winner L43 h=13 reaches ordinal "
+                       "concordance 0.9965, which looks landable and is not: ZERO of the "
+                       "three held-out axes agree on a head. Language picks L43 h=15 vs "
+                       "L39 h=12; bilingual halves pick L43 h=6 vs L31 h=19 and one "
+                       "direction COLLAPSES to 0.7548; corpus origin picks L35 h=2 vs L43 "
+                       "h=13. Top-10 overlap falls to 2 of 10. The level profile is also "
+                       "squashed (0.97 / 1.13 / 1.27 / 1.62 against the 9B's 0.62 / 1.02 / "
+                       "1.49 / 2.13). The 9B's bar \u2014 both held-out axes agree \u2014 "
+                       "rejects this, so no pair is landed. UNTESTED HYPOTHESIS: the only "
+                       "27B file is Q3_K_M and the 9B showed ordinal separation is "
+                       "quant-sensitive in the same direction (Q4_K_M 3.48 vs Q8_0 2.70), "
+                       "so a gentler quant may carry the signal. Not a claim \u2014 there "
+                       "is no second file to test it on"}},
     };
     return kLensCalibrations;
 }

@@ -2379,12 +2379,22 @@ TEST(LensChoiceHead, NineBCarriesASweptChoicePairOnTheLocateLayer) {
 // Every other row must stay unswept rather than inheriting the 9B's coordinate.
 // Borrowing a head across models is the false-receipt failure this table exists
 // to prevent, and DECIDEHEAD has only run on the 9B.
-TEST(LensChoiceHead, EveryOtherRowIsRefusedRatherThanInheriting) {
+// Was "every row but the 9B is empty", which stopped being the invariant the
+// moment a second model was swept. The invariant was never the model list — it
+// is that a row NEVER inherits another model's coordinates. So: layer and head
+// are set together or not at all, and a row carrying a pair must carry its own
+// provenance rather than the default (the default is what an inherited pair
+// would still be wearing).
+TEST(LensChoiceHead, ARowCarriesItsOwnPairOrRefuses) {
     for (const LensCalibration& c : lens_calibrations()) {
-        if (std::string(c.model) == "Qwen3.8-9B") continue;
-        EXPECT_LT(c.constants.choice_layer, 0) << c.model << " must not carry a choice pair";
-        EXPECT_LT(c.constants.choice_head,  0) << c.model;
-        EXPECT_STREQ(c.constants.choice_provenance, "not swept by DECIDEHEAD") << c.model;
+        const bool has = c.constants.choice_layer >= 0;
+        EXPECT_EQ(has, c.constants.choice_head >= 0)
+            << c.model << ": layer and head must be set together or not at all";
+        EXPECT_FALSE(std::string(c.constants.choice_provenance).empty()) << c.model;
+        if (has)
+            EXPECT_STRNE(c.constants.choice_provenance, "not swept by DECIDEHEAD")
+                << c.model << " carries a pair under the default provenance, which is "
+                              "what an inherited coordinate looks like";
     }
 }
 
@@ -2460,16 +2470,32 @@ TEST(LensAbsentHead, NineBCarriesASweptAbsencePairThatCostsDepth) {
     EXPECT_NE(p.find("SEPARATION"), std::string::npos) << "AUC must not read as a rate";
 }
 
-TEST(LensAbsentHead, EveryOtherRowIsRefusedRatherThanInheriting) {
+TEST(LensAbsentHead, ARowCarriesItsOwnPairOrRefuses) {
     for (const LensCalibration& c : lens_calibrations()) {
-        if (std::string(c.model) == "Qwen3.8-9B") continue;
-        EXPECT_LT(c.constants.absent_layer, 0) << c.model;
-        EXPECT_LT(c.constants.absent_head,  0) << c.model;
-        EXPECT_STREQ(c.constants.absent_provenance, "not swept by ABSENTHEAD") << c.model;
+        const bool has = c.constants.absent_layer >= 0;
+        EXPECT_EQ(has, c.constants.absent_head >= 0)
+            << c.model << ": layer and head must be set together or not at all";
+        EXPECT_FALSE(std::string(c.constants.absent_provenance).empty()) << c.model;
+        if (has)
+            EXPECT_STRNE(c.constants.absent_provenance, "not swept by ABSENTHEAD") << c.model;
     }
 }
 
-// Three jobs, three pairs, all distinct — the per-action design in one assert.
+// Two models now carry an absence pair, and geometry does not transfer between
+// them — the 9B's sits at L19 of 33 and the 27B's at L31 of 65. If these ever
+// coincide, suspect a copy rather than a coincidence.
+TEST(LensAbsentHead, TheTwoSweptModelsLandOnDifferentCoordinates) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    ASSERT_NE(q27, nullptr);
+    ASSERT_GE(q9->constants.absent_layer, 0);
+    ASSERT_GE(q27->constants.absent_layer, 0);
+    EXPECT_NE(std::make_pair(q9->constants.absent_layer, q9->constants.absent_head),
+              std::make_pair(q27->constants.absent_layer, q27->constants.absent_head));
+}
+
+// Four jobs, four pairs, all distinct — the per-action design in one assert.
 TEST(LensAbsentHead, TheThreeJobsReadThreeDifferentHeads) {
     const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
     ASSERT_NE(q9, nullptr);
@@ -2540,10 +2566,53 @@ TEST(LensScoreHead, ProvenanceWarnsThatExactMatchIsNotTheNumber) {
 }
 
 // An unswept model must be refused, not served off a neighbour's coordinates.
+// "Unswept" and "swept and declined" are BOTH -1 and both refused — the pair
+// is absent either way — but they are different facts and the provenance is
+// where the difference lives, so a row may carry -1 with a non-default string.
 TEST(LensScoreHead, ModelsWithoutASweptOrdinalPairDeclareItUnmeasured) {
     for (const LensCalibration& c : lens_calibrations()) {
         if (c.constants.score_layer >= 0) continue;
         EXPECT_EQ(c.constants.score_head, -1) << c.model;
-        EXPECT_STREQ(c.constants.score_provenance, "not swept by SCOREHEAD") << c.model;
+        EXPECT_FALSE(std::string(c.constants.score_provenance).empty()) << c.model;
     }
+}
+
+// ── The 27B: absence landed, choice and score swept and DECLINED ────────────
+TEST(LensTwentySevenB, CarriesTheSweptAbsencePair) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.absent_layer, 31);
+    EXPECT_EQ(q27->constants.absent_head, 23);
+    // Absence sets this model's locate-only cut: 4 blocks deeper than locate.
+    EXPECT_GT(q27->constants.absent_layer, q27->constants.locate_layer);
+}
+
+// A -1 that means "we measured it and said no" must never read as "we never
+// looked". Both rows below were swept on 2026-09-20; a future reader who sees
+// the default string would re-run a sweep that has already answered.
+TEST(LensTwentySevenB, DeclinedPairsDoNotClaimToBeUnswept) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.choice_layer, -1);
+    EXPECT_EQ(q27->constants.score_layer, -1);
+    const std::string ch = q27->constants.choice_provenance;
+    const std::string sc = q27->constants.score_provenance;
+    EXPECT_STRNE(q27->constants.choice_provenance, "not swept by DECIDEHEAD");
+    EXPECT_STRNE(q27->constants.score_provenance, "not swept by SCOREHEAD");
+    EXPECT_NE(ch.find("DECLINED"), std::string::npos);
+    EXPECT_NE(sc.find("REFUSED"), std::string::npos);
+    // The reason each was declined has to survive, not just the verdict.
+    EXPECT_NE(ch.find("NOTHING CHEAPER SURVIVES"), std::string::npos);
+    EXPECT_NE(sc.find("ZERO of the"), std::string::npos);
+}
+
+// Only one 27B file exists, so the cross-quant agreement that qualified every
+// 9B pair was unavailable. That limit belongs in the receipt, not in a doc.
+TEST(LensTwentySevenB, EveryDecisionProvenanceNamesTheSingleQuantLimit) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    for (const char* prov : {q27->constants.choice_provenance,
+                             q27->constants.absent_provenance,
+                             q27->constants.score_provenance})
+        EXPECT_NE(std::string(prov).find("Q3_K_M"), std::string::npos) << prov;
 }

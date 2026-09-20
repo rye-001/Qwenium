@@ -294,3 +294,151 @@ was a happy coincidence of that model, not a law.
 configurable. The decision above turns on rows at rank 67–79, which the fixed
 top-15 print could not show; re-running a 6-minute sweep to see one row is the
 alternative it removes. Additive and arch-agnostic.
+
+## 9. Addendum 2026-09-20 — the other three jobs: one landed, two refused
+
+The 9B now carries four calibrated heads (locate, choice, absent, score). This
+addendum sweeps the same three follow-on jobs here. **One landed. Two were
+measured and declined** — and the declines are the useful part, because a `-1`
+that means *we looked and said no* is a different fact from a `-1` that means
+*nobody looked*, and only the provenance can tell them apart.
+
+Everything below is **Q3_K_M only**. It is the sole Qwen3.8-27B file on disk,
+and it is a more aggressive quantization than the Q4_K_M the 9B standardised
+on. Every 9B pair earned its landing partly by agreeing across two files;
+nothing here could. That limit is written into all three provenance strings
+rather than into this doc alone.
+
+### 9.1 The corrective pass that had to come first
+
+The first pass over all three jobs produced an answer that was **wrong**, and
+it was wrong because of two defects in the probes, not in the model. Both were
+found here and both had been invisible on the 9B.
+
+**DECIDEHEAD and ABSENTHEAD were selecting across both instruction shapes.**
+`run_lens_locate` treats question mode as on-recipe for every decision role —
+it never sets `uncalibrated` for them — so a pair measured under the
+*extraction* shape would be served to a question-vocabulary caller claiming to
+be on-recipe. A silent false receipt, which is the single thing the
+calibration table exists to prevent. On the 9B the question shape won anyway,
+so the bug never surfaced; on the 27B the extract shape tops the absence table
+(L31 h=1, AUC 0.9967) and the question-shape winner is a different head.
+
+**Neither leg counted ties or carried a tie-break.** Accuracy and AUC both
+saturate — the 27B put ten absence heads inside one point of each other, and
+choice ties four-deep at the top on a 20-document language half where one
+document is 5 points. A plain argmax over a saturated metric reports whichever
+tied head the scan reached first, which then *reads as held-out disagreement*.
+This is the COVSEARCH G3 failure again: a gate that cannot fail, and its
+mirror image, a gate that fails for no reason.
+
+The corrected legs select question-only (extract still printed, marked
+`(no vote)`), print how many candidates tie at each half's top, and break ties
+on a ceiling-free quantity: **margin** for choice (the correct option's share
+minus the best wrong option's, simplex-normalised, no fitted temperature) and
+**d′** for absence (standardised distance between the present and absent score
+distributions). Neither is a confidence signal — this repo has killed that
+reading four times. Ranking heads by how far apart they push two populations
+is a different question from telling a caller how sure to be about one answer.
+
+**The fix was validated against the 9B's landed pairs before being trusted
+here.** Absence reproduces exactly: L19 h=10, AUC 0.9948 to four decimals,
+now unique at the top, with both held-out halves selecting the same head *and*
+variant and a top-10 overlap of 9/10 — a stronger receipt than the one
+originally landed. Choice reproduces its rate exactly (92.5%, EN 95.0 /
+DE 90.0) and remains the best head at or below locate's layer. Only its
+*rank* moved, 5 → 7 of 128, because the ranking rule changed; that number has
+been restated in `choice_provenance`, along with the fact — previously
+unstated — that its held-out selection is **not** symmetric.
+
+Before the fix, choice here looked like "EN picks L31 h=9, DE picks L11 h=3,
+no agreement". After it, **both halves pick L47 h=13**. There was never a
+disagreement.
+
+### 9.2 Absence — LANDED at L31 h=23
+
+| | value |
+|---|---|
+| pair | **L31 h=23**, 32 of 65 blocks |
+| AUC | **0.9956** (EN 0.9953 / DE 0.9966), rank 1 of 384 and the only head at that AUC |
+| d′ | 4.17 |
+| held out | **same head and same variant both directions**, one candidate at the top of each half: 0.9966 and 0.9953 |
+| operating point (2% FA target) | **92.9% / 93.8%** of absences caught at **0.0% / 2.5%** actual false accusations |
+| incumbent locate pair | 0.9600, rank 41 of 384 |
+
+It costs **4 blocks** over locate (28 → 32) and earns them: the free head at
+L27 h=22 reaches only 79.2–88.1% detection at the same target. That is a far
+better trade than the 9B's absence pair, which had to buy 8.
+
+Verified live on a `--lens-locate-only` server: the cut prints as
+`max(locate_layer=27, choice_layer=-1, absent_layer=31, score_layer=-1) + 1` =
+**32/65**, and a genuinely absent key (`tracking_number`) reads 0.138 against a
+present one's 0.593.
+
+### 9.3 Choice — SWEPT AND DECLINED
+
+The signal is strong and it is **not free on this model**, which is the whole
+finding. On the 9B choice shares locate's layer and costs nothing; here the
+depth curve climbs almost monotonically and every cheap candidate fails its
+held-out check.
+
+| budget | blocks | best head | pooled | EN-pick → DE | DE-pick → EN | agree |
+|---|---|---|---|---|---|---|
+| L11 | 12/65 | L11 h=3 | 85.0% | L11 h=3 90.0% | L11 h=3 80.0% | **yes** |
+| L27 | 28/65 | L27 h=6 | 92.5% | L27 h=6 85.0% | L15 h=17 75.0% | no |
+| L31 | 32/65 | L31 h=10 | 95.0% | L31 h=10 95.0% | L15 h=17 75.0% | no |
+| L39 | 40/65 | L39 h=7 | 97.5% | L39 h=7 **100.0%** | L39 h=7 **95.0%** | **yes** |
+| L47 | 48/65 | L47 h=13 | **100.0%** | L47 h=13 90.0% | L47 h=13 100.0% | **yes** |
+
+The budget is cumulative — a server loaded to layer L may read any head at or
+below L — and that column is the one that mattered. **L31 h=10's 95.0% is a
+pooled rate German does not reproduce**: inside the same budget it selects
+L15 h=17 and scores 75.0% on English. The "choice rides free once absence pays
+for L31" plan died there, and it would have shipped as a 95% claim.
+
+The cheapest *stable* head is **L39 h=7** at 40 blocks, and it is arguably
+better than the pooled winner: 97.5% against L47 h=13's 100%, but a worst-case
+held-out direction of 95.0% against L47's 90.0%, for 8 fewer blocks.
+
+Landing choice here therefore means moving the locate-only cut 32 → 40. That is
+a product decision, not a probe result, so nothing is landed and the numbers
+live in `choice_provenance`.
+
+### 9.4 Score — SWEPT AND REFUSED
+
+SCOREHEAD already selected question-only, so the corrective pass does not touch
+this verdict. The pooled winner L43 h=13 reaches ordinal concordance 0.9965,
+which looks landable and is not: **zero of the three held-out axes agree on a
+head.**
+
+| axis | one half picks | the other picks | worst transfer |
+|---|---|---|---|
+| language | L43 h=15 | L39 h=12 | 0.9630 |
+| bilingual halves | L43 h=6 | L31 h=19 | **0.7548** |
+| corpus origin | L35 h=2 | L43 h=13 | 0.8932 |
+
+Top-10 overlap falls to 2 of 10, and the level profile is squashed —
+0.97 / 1.13 / 1.27 / 1.62 against the 9B's 0.62 / 1.02 / 1.49 / 2.13. The bar
+set when the 9B's score head landed was *both held-out axes must agree*; here
+none do, so the bar rejects it. That is the bar working.
+
+One **untested hypothesis**, recorded as a hypothesis: the 9B showed ordinal
+separation is quant-sensitive in this direction (Q4_K_M 3.48 vs Q8_0 2.70), so
+Q3_K_M may simply not carry the signal. There is no second 27B file to test it
+on, and it is not a claim.
+
+### 9.5 State
+
+| job | 9B (Q4_K_M) | 27B (Q3_K_M) |
+|---|---|---|
+| locate | L11 h=6, 12/33 | L27 h=10, 28/65 |
+| choice | L11 h=3, free | swept, declined (40 blocks for a stable head) |
+| absent | L19 h=10, 20/33 | **L31 h=23, 32/65** |
+| score | L19 h=11, free | swept, refused (no held-out agreement) |
+
+996/996 unit tests. Two pre-existing tests were rewritten rather than relaxed:
+they asserted "every row but the 9B is empty", which was never the invariant —
+the invariant is that a row never inherits another model's coordinates, so they
+now check that layer and head are set together and that a row carrying a pair
+does not also carry the default provenance, which is what an inherited
+coordinate would still be wearing.

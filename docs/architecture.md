@@ -1017,6 +1017,13 @@ Two facts about it are load-bearing:
   masses; an affine correction would be the first *fitted* constant in the
   table and none is landed. Adjacency is not interchangeability: h=10 reads
   the ordinal job at 0.9861 and separates at 1.97 SD against h=11's 3.48.
+  **The 27B carries only locate and absent** (L27 h=10, L31 h=23 — absence
+  costs it 4 blocks, 28 → 32 of 65). Its choice and score pairs were swept and
+  **declined**, not skipped: every choice head cheap enough to be free fails a
+  held-out check inside its own depth budget, and score agrees on no head
+  across three axes. A `-1` therefore means one of two different things, and
+  the provenance string is what distinguishes "measured and refused" from
+  "never measured" — both are refused at the route either way.
 - **It truncates after `locate_layer` alone**, so the constant IS the route's
   cost. On Qwen 3.6-35B that layer is 11, which is exactly
   `max(citation_layer, coverage_layer)` — so `/v1/locate` costs a
