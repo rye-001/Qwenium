@@ -295,7 +295,7 @@ configurable. The decision above turns on rows at rank 67–79, which the fixed
 top-15 print could not show; re-running a 6-minute sweep to see one row is the
 alternative it removes. Additive and arch-agnostic.
 
-## 9. Addendum 2026-09-20 — the other three jobs: one landed, two refused
+## 9. Addendum 2026-09-20 — the other three jobs: two landed, one refused
 
 The 9B now carries four calibrated heads (locate, choice, absent, score). This
 addendum sweeps the same three follow-on jobs here. **One landed. Two were
@@ -375,7 +375,7 @@ Verified live on a `--lens-locate-only` server: the cut prints as
 **32/65**, and a genuinely absent key (`tracking_number`) reads 0.138 against a
 present one's 0.593.
 
-### 9.3 Choice — SWEPT AND DECLINED
+### 9.3 Choice — LANDED at L39 h=7, over a better pooled head
 
 The signal is strong and it is **not free on this model**, which is the whole
 finding. On the 9B choice shares locate's layer and costs nothing; here the
@@ -396,13 +396,26 @@ pooled rate German does not reproduce**: inside the same budget it selects
 L15 h=17 and scores 75.0% on English. The "choice rides free once absence pays
 for L31" plan died there, and it would have shipped as a 95% claim.
 
-The cheapest *stable* head is **L39 h=7** at 40 blocks, and it is arguably
-better than the pooled winner: 97.5% against L47 h=13's 100%, but a worst-case
-held-out direction of 95.0% against L47's 90.0%, for 8 fewer blocks.
+**Landed: `L39 h=7`, 97.5% pooled (EN 95.0 / DE 100.0), rank 2 of 384.**
 
-Landing choice here therefore means moving the locate-only cut 32 → 40. That is
-a product decision, not a probe result, so nothing is landed and the numbers
-live in `choice_provenance`.
+It was chosen over a head with a strictly better pooled rate, and that is the
+interesting part. L47 h=13 scores a perfect 100.0% — but held out its worst
+direction is 90.0%, where L39 h=7's is **95.0%**, and it costs 8 more blocks.
+A pooled maximum is not a rate; the worst held-out direction is closer to one.
+This is the first pair in the table landed *against* the pooled winner, and
+`choice_provenance` names L47 h=13 explicitly so a later reader does not
+"upgrade" to it without re-deciding.
+
+**Choice is not free on this model**, and that is a property of the model, not
+of the job: on the 9B it shares locate's layer and costs nothing, here it sets
+the cut at **40 of 65** (32 → 40). The cut is computed from the constants
+rather than written down per mode, which is exactly why the same flag produces
+20/33 on one model and 40/65 on the other.
+
+Verified live: the banner prints
+`max(locate_layer=27, choice_layer=39, absent_layer=31, score_layer=-1) + 1` =
+40/65, and three routing documents come back correct through the shipped route
+with the winner at 0.65–0.71 of the mass against ~0.1 for each loser.
 
 ### 9.4 Score — SWEPT AND REFUSED
 
@@ -432,11 +445,13 @@ on, and it is not a claim.
 | job | 9B (Q4_K_M) | 27B (Q3_K_M) |
 |---|---|---|
 | locate | L11 h=6, 12/33 | L27 h=10, 28/65 |
-| choice | L11 h=3, free | swept, declined (40 blocks for a stable head) |
-| absent | L19 h=10, 20/33 | **L31 h=23, 32/65** |
+| choice | L11 h=3, free | **L39 h=7, sets the cut at 40/65** |
+| absent | L19 h=10, 20/33 | **L31 h=23** |
 | score | L19 h=11, free | swept, refused (no held-out agreement) |
 
-996/996 unit tests. Two pre-existing tests were rewritten rather than relaxed:
+Locate-only cut: **20/33** on the 9B, **40/65** on the 27B.
+
+998/998 unit tests. Two pre-existing tests were rewritten rather than relaxed:
 they asserted "every row but the 9B is empty", which was never the invariant —
 the invariant is that a row never inherits another model's coordinates, so they
 now check that layer and head are set together and that a row carrying a pair

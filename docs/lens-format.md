@@ -643,10 +643,12 @@ An unknown value is a fail-loud **400**.
 `POST /v1/locate` also takes an optional **`head`** (2026-09-20) — `"locate"`
 (default), `"choice"`, `"absent"` or `"score"`: which calibrated job to read.
 **Four jobs, four different heads** on Qwen3.8-9B: locate L11 h=6, choice
-L11 h=3, absent L19 h=10, score L19 h=11. Qwen3.8-27B carries **two**, locate
-L27 h=10 and absent L31 h=23; its choice and score heads were measured and
-declined, so those two `head` values are refused there with a provenance that
-says so. Which pairs a model carries is per-model and never inherited. Two share layer 11 and two share
+L11 h=3, absent L19 h=10, score L19 h=11. Qwen3.8-27B carries **three**, locate
+L27 h=10, absent L31 h=23 and choice L39 h=7; its score head was measured and
+refused, so that `head` value is refused there with a provenance saying so.
+Which pairs a model carries — and what they cost — is per-model and never
+inherited: choice is free on the 9B and sets the cut on the 27B (40 of 65
+blocks against the 9B's 20 of 33). Two share layer 11 and two share
 layer 19, and none of them is a substitute for another — every sweep so far
 has found the incumbent pair a poor reader of the new job. Locate answers *where a
 key's answer sits*; choice answers *which of the supplied option descriptions

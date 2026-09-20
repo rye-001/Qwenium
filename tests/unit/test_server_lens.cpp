@@ -2588,22 +2588,56 @@ TEST(LensTwentySevenB, CarriesTheSweptAbsencePair) {
 }
 
 // A -1 that means "we measured it and said no" must never read as "we never
-// looked". Both rows below were swept on 2026-09-20; a future reader who sees
+// looked". Score was swept on 2026-09-20 and refused; a future reader who saw
 // the default string would re-run a sweep that has already answered.
-TEST(LensTwentySevenB, DeclinedPairsDoNotClaimToBeUnswept) {
+TEST(LensTwentySevenB, RefusedPairsDoNotClaimToBeUnswept) {
     const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
     ASSERT_NE(q27, nullptr);
-    EXPECT_EQ(q27->constants.choice_layer, -1);
     EXPECT_EQ(q27->constants.score_layer, -1);
-    const std::string ch = q27->constants.choice_provenance;
     const std::string sc = q27->constants.score_provenance;
-    EXPECT_STRNE(q27->constants.choice_provenance, "not swept by DECIDEHEAD");
     EXPECT_STRNE(q27->constants.score_provenance, "not swept by SCOREHEAD");
-    EXPECT_NE(ch.find("DECLINED"), std::string::npos);
     EXPECT_NE(sc.find("REFUSED"), std::string::npos);
-    // The reason each was declined has to survive, not just the verdict.
-    EXPECT_NE(ch.find("NOTHING CHEAPER SURVIVES"), std::string::npos);
+    // The reason has to survive, not just the verdict.
     EXPECT_NE(sc.find("ZERO of the"), std::string::npos);
+}
+
+// The 27B choice pair is the one place in this table where a head was landed
+// over a STRICTLY BETTER pooled rate. If a future edit "upgrades" it to the
+// 100% head, these asserts are what should stop it: the reason lives in the
+// provenance, and the depth it costs is real.
+TEST(LensTwentySevenB, ChoiceIsTheHeldOutWinnerNotThePooledWinner) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.choice_layer, 39);
+    EXPECT_EQ(q27->constants.choice_head, 7);
+    const std::string ch = q27->constants.choice_provenance;
+    EXPECT_NE(ch.find("HELD-OUT SYMMETRY, NOT FOR THE POOLED RATE"), std::string::npos);
+    EXPECT_NE(ch.find("L47 h=13"), std::string::npos)
+        << "the better pooled head that was declined must stay named";
+    // Choice is NOT free here, unlike the 9B — it sets the cut.
+    EXPECT_GT(q27->constants.choice_layer, q27->constants.absent_layer);
+    EXPECT_GT(q27->constants.choice_layer, q27->constants.locate_layer);
+}
+
+// Choice is free on the 9B and costs depth on the 27B. Neither is a property
+// of "choice"; both are properties of a model, which is why the cut is
+// computed from the constants instead of being written down per mode.
+TEST(LensTwentySevenB, ChoiceIsFreeOnOneModelAndNotTheOther) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    ASSERT_NE(q27, nullptr);
+    auto cut = [](const LensConstants& k, bool with_choice) {
+        int c = k.locate_layer;
+        if (with_choice) c = std::max(c, k.choice_layer);
+        c = std::max(c, k.absent_layer);
+        c = std::max(c, k.score_layer);
+        return c + 1;
+    };
+    EXPECT_EQ(cut(q9->constants, true), cut(q9->constants, false)) << "9B: choice is free";
+    EXPECT_EQ(cut(q9->constants, true), 20);
+    EXPECT_GT(cut(q27->constants, true), cut(q27->constants, false)) << "27B: choice pays";
+    EXPECT_EQ(cut(q27->constants, true), 40);
 }
 
 // Only one 27B file exists, so the cross-quant agreement that qualified every

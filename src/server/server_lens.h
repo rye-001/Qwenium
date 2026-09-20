@@ -613,33 +613,41 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "(36/65 blocks vs 28/65). TOP-1 IS 81.3% \u2014 a caller that acts "
                        "on a single span is acting on that rate, not on 94.7%. Measured "
                        "at Q3_K_M, where the 9B's pair is Q8_0",
-                       // DECIDEHEAD 2026-09-20 RAN HERE AND IS NOT LANDED. The
-                       // pair is left unmeasured-by-declaration rather than
-                       // filled in, because every candidate cheap enough to be
-                       // worth taking FAILED its held-out check and the one
-                       // that passed costs 8 blocks more than absence.
+                       // DECIDEHEAD 2026-09-20. NOT THE BEST HEAD, AND THAT IS
+                       // THE POINT: L47 h=13 scores a perfect 100.0% and was
+                       // declined. This pair is 2.5 points behind it pooled and
+                       // AHEAD of it where it matters — held out, L39 h=7's
+                       // worst direction is 95.0% against L47's 90.0% — for 8
+                       // fewer blocks. A pooled maximum is not a rate; the
+                       // worst held-out direction is closer to one.
                        //
-                       // Read the provenance for the numbers before proposing
-                       // any of them again — in particular L31 h=10, whose
-                       // 95.0% is a POOLED rate that German does not reproduce.
-                       /*choice_layer*/ -1, /*choice_head*/ -1,
+                       // CHOICE IS NOT FREE ON THIS MODEL. On the 9B it shares
+                       // locate's layer and costs nothing. Here the depth curve
+                       // climbs almost monotonically and EVERY cheap candidate
+                       // fails a held-out check inside its own budget — most
+                       // dangerously L31 h=10, which would have ridden along
+                       // free once absence paid for L31 and whose 95.0% is a
+                       // POOLED rate German does not reproduce (it selects
+                       // L15 h=17 in that budget and reads 75.0% on English).
+                       // This pair sets the locate-only cut: 32 -> 40 of 65.
+                       /*choice_layer*/ 39, /*choice_head*/ 7,
                        /*choice_provenance*/
-                       "SWEPT AND DECLINED, not unmeasured. DECIDEHEAD 2026-09-20 on "
-                       "Q3_K_M, 40 docs EN+DE, 4-way routing, chance 25%, question shape "
-                       "and mean key aggregation. The signal is strong: L47 h=13 = 100.0% "
-                       "pooled, unique of 384, and BOTH held-out halves select it "
-                       "(90.0% EN->DE, 100.0% DE->EN). It costs 48 of 65 blocks. The "
-                       "cheapest STABLE head is L39 h=7 at 40 blocks: 97.5% pooled, both "
-                       "halves select it, and its worst held-out direction (95.0%) beats "
-                       "L47's (90.0%). NOTHING CHEAPER SURVIVES A HELD-OUT CHECK within "
-                       "its own depth budget: at 32 blocks L31 h=10 reads 95.0% pooled but "
-                       "German selects L15 h=17 and scores 75.0% on English; at 28 blocks "
-                       "(locate's own layer, i.e. free) L27 h=6 reads 92.5% pooled and "
-                       "fails the same way. So choice is NOT free on this model, unlike "
-                       "the 9B where it shares locate's layer \u2014 landing it means "
-                       "paying 40 blocks, which is a product decision nobody has made. "
-                       "Q3_K_M ONLY: no second 27B file exists, so the cross-quant "
-                       "agreement that qualified every 9B pair was not available here",
+                       "DECIDEHEAD 2026-09-20 on Q3_K_M, 40 docs EN+DE, 4-way routing, "
+                       "chance 25%: L39 h=7 = 97.5% pooled (EN 95.0 / DE 100.0), rank 2 of "
+                       "384. CHOSEN FOR HELD-OUT SYMMETRY, NOT FOR THE POOLED RATE: both "
+                       "language halves select this same head, and its worst direction "
+                       "(95.0%) beats the pooled winner L47 h=13, which reaches 100.0% but "
+                       "falls to 90.0% held out and costs 48 blocks. NOTHING CHEAPER "
+                       "SURVIVES a held-out check within its own depth budget \u2014 at 32 "
+                       "blocks L31 h=10 reads 95.0% pooled but German selects L15 h=17 and "
+                       "scores 75.0% on English; at 28 blocks (locate's layer, i.e. free) "
+                       "L27 h=6 reads 92.5% and fails the same way \u2014 so this pair "
+                       "COSTS 8 BLOCKS over absence, 40 of 65. Measured ONLY under: "
+                       "question instruction shape, mean key aggregation, document score "
+                       "summed over the body. The incumbent locate pair reads 72.5% here, "
+                       "rank 176 of 384. Q3_K_M ONLY: no second 27B file exists, so the "
+                       "cross-quant agreement that qualified every 9B pair was not "
+                       "available here. Corpus synthetic and self-authored",
                        // ABSENTHEAD 2026-09-20, corrected leg. Rank 1 of 384 and
                        // UNIQUE at the top; both held-out halves select this
                        // same head AND the same variant, each with exactly one
