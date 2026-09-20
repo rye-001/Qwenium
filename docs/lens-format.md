@@ -640,8 +640,12 @@ latency. The value is echoed back in the report, and `mean` sets
 `uncalibrated: true` because the provenance rate was measured under `max`.
 An unknown value is a fail-loud **400**.
 
-`POST /v1/locate` also takes an optional **`head`** (2026-09-20), `"locate"`
-(default) or `"choice"`: which calibrated job to read. Locate answers *where a
+`POST /v1/locate` also takes an optional **`head`** (2026-09-20) — `"locate"`
+(default), `"choice"`, `"absent"` or `"score"`: which calibrated job to read.
+**Four jobs, four different heads** on Qwen3.8-9B: locate L11 h=6, choice
+L11 h=3, absent L19 h=10, score L19 h=11. Two share layer 11 and two share
+layer 19, and none of them is a substitute for another — every sweep so far
+has found the incumbent pair a poor reader of the new job. Locate answers *where a
 key's answer sits*; choice answers *which of the supplied option descriptions
 fits this document*. They are different heads — on Qwen3.8-9B the **same layer**
 (11) with h=6 for locate and **h=3 for choice**, so choice costs a locate-only
@@ -650,10 +654,49 @@ DECIDEHEAD sweep has not run, rather than falling back to the locate pair
 (which measured 87.5% against the choice pair's 92.5%). The report echoes
 `head_role`, and `locate_provenance` switches to the pair actually read.
 
-Note the two jobs have **opposite recipes**: locate was measured under
-`key_aggregation: "max"`, choice under `"mean"`. `uncalibrated` tracks whichever
-applies, so `head: "locate"` with `"mean"` is uncalibrated while
-`head: "choice"` with `"mean"` is not. A **truncated** lens server also 404s the routes it
+Note that **locate is the odd one out on recipe**: it was measured under
+`key_aggregation: "max"` and the extraction instruction shape, while choice,
+absent and score were all measured under `"mean"` and the question shape.
+`uncalibrated` tracks whichever recipe belongs to the pair actually read, so
+`head: "locate"` with `"mean"` is uncalibrated while `head: "choice"` with
+`"mean"` is not — never against a single house recipe, which would mislabel
+three jobs out of four.
+
+**`head: "absent"`** (2026-09-20) reads a third pair — on Qwen3.8-9B **L19 h=10**
+— and answers *is this key's evidence in the document at all*, the `noul` job.
+Unlike choice it is **not free**: L19 is 20 of 33 blocks against locate's 12,
+because there is no shallow absence head that survives a change of quantization.
+A `--lens-locate-only` server therefore loads
+`max(locate, choice, absent, score) + 1` blocks. Its provenance reports an **AUC, not a
+rate** — 0.9948 / 0.9953 across the two quants — with the operating point
+(89.6% of absences caught at zero false accusations) stated alongside, because
+the threshold itself is a product choice.
+
+**`head: "score"`** (2026-09-20) reads a fourth pair — on Qwen3.8-9B **L19 h=11**
+— and answers *where does this document sit on an ordered scale*, the `score`
+job. Levels are supplied as an ordinary question vocabulary, **ordered
+low-to-high**; nothing in the request marks them as ordered, so that ordering is
+the caller's contract to keep. It is **free**: h=11 is the neighbour of
+absence's h=10 on a layer absence already pays for, and the ordinal signal peaks
+at L19 (L23, L27 and L31 all read worse), so there is no deeper pair to decline.
+
+Two things make this route's output different from the other three, and a
+client that ignores either will misreport it:
+
+* **Read the fraction, not the top level.** An ordinal has no meaningful
+  argmax — the mass sits between the two adjacent levels a document falls
+  between and the winner flips on noise, which is why the pair was selected by
+  *ordinal concordance* (1.0000, rank 1 of 128 and unique on both quants) and
+  not by exact match. Normalise the four levels' summed `mass` to a
+  distribution and report the probability-weighted level.
+* **The scale is uncalibrated, only the order is.** Four true levels come out
+  at 0.62 / 1.02 / 1.49 / 2.13 — monotone and well separated, but visibly not
+  on a 0..3 scale, so rounding to an integer reads **low**. Mapping the
+  fraction onto a rubric belongs to whoever owns the rubric; an affine
+  correction would be the first *fitted* constant in the calibration table, and
+  none is landed.
+
+A **truncated** lens server also 404s the routes it
 did not load blocks for, naming the flag and the block count: `--lens-verify-only`
 refuses `/v1/extract`, and `--lens-locate-only` (2026-09-19) refuses `/v1/verify`
 as well, serving `/v1/locate` alone. Every lens route is exclusive within its

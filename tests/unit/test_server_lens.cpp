@@ -2422,3 +2422,128 @@ TEST(LensChoiceHead, NineBLocateProvenanceNamesBothQuants) {
     // The row is unpinned, which is WHY both rates have to be here.
     EXPECT_EQ(q9->file_type, kLensAnyFileType);
 }
+
+// ── The ABSENT pair — the fourth job, and the first that is NOT free ────────
+TEST(LensAbsentHead, NineBCarriesASweptAbsencePairThatCostsDepth) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.absent_layer, 19);
+    EXPECT_EQ(q9->constants.absent_head,  10);
+
+    // Unlike choice, absence does NOT share locate's layer. That is the whole
+    // cost of this pair and the reason the locate-only cut moved 12 -> 20:
+    // there is no stable shallow absence head (L11 is h=8 on Q4_K_M and h=6 on
+    // Q8_0), so depth was paid for a coordinate that survives a file swap.
+    EXPECT_GT(q9->constants.absent_layer, q9->constants.locate_layer);
+    EXPECT_GT(q9->constants.absent_layer, q9->constants.choice_layer);
+
+    // The locate-only server must load every head it can serve.
+    const int locate_only_cut = std::max({q9->constants.locate_layer,
+                                          q9->constants.choice_layer,
+                                          q9->constants.absent_layer}) + 1;
+    EXPECT_EQ(locate_only_cut, 20) << "absence sets the locate-only cut on this model";
+    // Verify-only is unaffected: citation is deeper still.
+    const int verify_only_cut = std::max({q9->constants.citation_layer,
+                                          q9->constants.coverage_layer,
+                                          q9->constants.locate_layer,
+                                          q9->constants.choice_layer,
+                                          q9->constants.absent_layer}) + 1;
+    EXPECT_EQ(verify_only_cut, 28) << "citation still dominates the verify-only cut";
+
+    // AUC is a separation, not a rate — the provenance must not let a reader
+    // mistake 0.9948 for an accuracy, and must carry both quants.
+    const std::string p = q9->constants.absent_provenance;
+    EXPECT_NE(p.find("ABSENTHEAD"), std::string::npos);
+    EXPECT_NE(p.find("0.9948"),     std::string::npos) << "Q4_K_M AUC";
+    EXPECT_NE(p.find("0.9953"),     std::string::npos) << "Q8_0 AUC";
+    EXPECT_NE(p.find("89.6%"),      std::string::npos) << "the operating point a buyer hears";
+    EXPECT_NE(p.find("SEPARATION"), std::string::npos) << "AUC must not read as a rate";
+}
+
+TEST(LensAbsentHead, EveryOtherRowIsRefusedRatherThanInheriting) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (std::string(c.model) == "Qwen3.8-9B") continue;
+        EXPECT_LT(c.constants.absent_layer, 0) << c.model;
+        EXPECT_LT(c.constants.absent_head,  0) << c.model;
+        EXPECT_STREQ(c.constants.absent_provenance, "not swept by ABSENTHEAD") << c.model;
+    }
+}
+
+// Three jobs, three pairs, all distinct — the per-action design in one assert.
+TEST(LensAbsentHead, TheThreeJobsReadThreeDifferentHeads) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::set<std::pair<int,int>> pairs = {
+        {q9->constants.locate_layer, q9->constants.locate_head},
+        {q9->constants.choice_layer, q9->constants.choice_head},
+        {q9->constants.absent_layer, q9->constants.absent_head},
+        {q9->constants.score_layer,  q9->constants.score_head}};
+    EXPECT_EQ(pairs.size(), 4u) << "locate, choice, absence and score must not collapse "
+                                   "onto one coordinate — reuse has measured badly every "
+                                   "time";
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Absent), "absent");
+}
+
+// ── SCOREHEAD: the ordinal pair ─────────────────────────────────────────────
+TEST(LensScoreHead, NineBCarriesTheSweptOrdinalPair) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.score_layer, 19);
+    EXPECT_EQ(q9->constants.score_head, 11);
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Score), "score");
+}
+
+// The trap this file exists to catch. `kLensCalibrations` uses POSITIONAL
+// aggregate initialisation — the /*field*/ markers are comments — so appending
+// the score triple anywhere but last silently shifts every pair after it and
+// still compiles. Score sits beside absence on the same layer, which makes a
+// swap between exactly those two invisible to a layer check; pin the HEADS.
+TEST(LensScoreHead, ScoreAndAbsentShareALayerButNotAHead) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.score_layer, q9->constants.absent_layer)
+        << "score is free precisely because it shares absence's layer";
+    EXPECT_NE(q9->constants.score_head, q9->constants.absent_head)
+        << "adjacent heads, measured differently: h=10 won absence, h=11 the ordinal";
+}
+
+// The score pair moves no cut. Absence already pays for layer 19, so a server
+// that serves absence serves score for nothing — if this ever fails, the score
+// head has drifted off absence's layer and someone is paying depth for it.
+TEST(LensScoreHead, ScoreIsFreeOnALocateOnlyServer) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const int without = std::max({q9->constants.locate_layer,
+                                  q9->constants.choice_layer,
+                                  q9->constants.absent_layer}) + 1;
+    const int with    = std::max({q9->constants.locate_layer,
+                                  q9->constants.choice_layer,
+                                  q9->constants.absent_layer,
+                                  q9->constants.score_layer}) + 1;
+    EXPECT_EQ(with, without);
+    EXPECT_EQ(with, 20);
+}
+
+// An ordinal head is not selected by accuracy and its provenance has to say so
+// out loud, because 66.7% sitting alone in a table reads like a bad head rather
+// than a number the sweep deliberately did not optimise.
+TEST(LensScoreHead, ProvenanceWarnsThatExactMatchIsNotTheNumber) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::string prov = q9->constants.score_provenance;
+    EXPECT_NE(prov.find("NOT THE PRODUCT NUMBER"), std::string::npos);
+    EXPECT_NE(prov.find("UNCALIBRATED"), std::string::npos)
+        << "a caller that rounds the fraction to an integer level reads low";
+    EXPECT_NE(prov.find("Q8_0"), std::string::npos);
+    EXPECT_NE(prov.find("Q4_K_M"), std::string::npos)
+        << "quant stability was measured for this pair; the receipt must name both";
+}
+
+// An unswept model must be refused, not served off a neighbour's coordinates.
+TEST(LensScoreHead, ModelsWithoutASweptOrdinalPairDeclareItUnmeasured) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.constants.score_layer >= 0) continue;
+        EXPECT_EQ(c.constants.score_head, -1) << c.model;
+        EXPECT_STREQ(c.constants.score_provenance, "not swept by SCOREHEAD") << c.model;
+    }
+}

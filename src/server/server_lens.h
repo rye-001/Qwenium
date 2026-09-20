@@ -195,15 +195,21 @@ struct LensConstants {
     // The best routing head overall (L19 h=10, 97.5%) buys ~5 points for 8 more
     // blocks, which is a trade, not an upgrade.
     //
-    // NOTHING BELOW IS A DECISION HEAD. No routing or ordinal pair is landed:
-    // choice held out at 85-95% across languages, but the ordinal exact rate
-    // did not transfer (50% one direction, 83.3% the other, selecting different
-    // heads AND different score variants) — the same instability that killed
-    // L3H13. Its within-1 rate, 91-95%, is the part that held. Landing any of
-    // these is a calibration change and therefore a user decision; the point of
-    // this comment is only that WHEN one lands it will be its own pair, read
-    // with its own score variant (`mass` beat `peak` for decisions, the reverse
-    // of what locate wants), and not a second use of the fields below.
+    // FOUR JOBS NOW READ FOUR DIFFERENT HEADS on this model, and the spread is
+    // the argument: locate L11 h=6, choice L11 h=3, absent L19 h=10, score
+    // L19 h=11. Two pairs share a layer and do unrelated work; two heads are
+    // ADJACENT on layer 19 and are not interchangeable — h=10 won absence while
+    // h=11 wins the ordinal, and on the ordinal job h=10 separates the levels
+    // at 1.97 standard deviations against h=11's 3.48. So L19 is where this
+    // model finishes semantic matching; it is not a head that does everything.
+    // Every one of these was landed only after a sweep, and every sweep so far
+    // has found the incumbent pair to be a poor reader of the new job.
+    //
+    // Each pair is read with its OWN recipe, which is why they cannot be
+    // swapped even when they share coordinates: locate wants `max` key
+    // aggregation and a peak score, while all three decision pairs want `mean`
+    // and a score summed over the body. Landing or moving any of them is a
+    // calibration change and therefore a user decision.
     //
     // Quantization DOES move head rankings — the L11 h=6 / L15 h=11 tie for
     // LOCATE on Q8_0 breaks at Q4_K_M — so any pair must name the file type it
@@ -237,6 +243,61 @@ struct LensConstants {
     int         choice_layer = -1;
     int         choice_head  = -1;
     const char* choice_provenance = "not swept by DECIDEHEAD";
+
+    // ── The ABSENT pair: is this key's evidence in the document at all? ────
+    //
+    // The FOURTH job. Unlike locate and choice it produces no argmax — it is a
+    // SEPARATION between "present" and "absent", so it was selected by AUC and
+    // its threshold is a product choice, not a constant. `LOCABSENT` is where
+    // the threshold work lives; this pair is only the coordinate it reads.
+    //
+    // THIS ONE IS NOT FREE, and that is the difference from choice. Choice sits
+    // on locate's own layer (11), so it costs a truncated server nothing.
+    // Absence does not: its best head is at 19, and there is NO stable shallow
+    // alternative — the best head at layer 11 is h=8 on Q4_K_M but h=6 on Q8_0,
+    // so a "free" absence pair would be a coordinate that changes meaning when
+    // the file changes. Paying 8 blocks for a stable one is the trade taken.
+    //
+    // DEFAULT -1 = NOT MEASURED, refused rather than borrowed, as above.
+    int         absent_layer = -1;
+    int         absent_head  = -1;
+    const char* absent_provenance = "not swept by ABSENTHEAD";
+
+    // ── The SCORE pair: place a document on an ordered scale of N levels ───
+    //
+    // The FIFTH job, and the one whose number means the least at face value.
+    // Read the provenance before quoting anything from it.
+    //
+    // IT WAS NOT SELECTED BY ACCURACY, and it must not be judged by it. An
+    // ordinal has no meaningful argmax: SCOREHEAD found the readout flips
+    // between the two ADJACENT levels a document sits between while the
+    // ordering stays perfect, so ranking heads by exact-match was ranking them
+    // on a coin flip — which is precisely how DECIDEHEAD ended up with a pair
+    // that could not be reproduced by selecting twice. This pair was chosen by
+    // ORDINAL CONCORDANCE (over every pair of documents on different levels,
+    // is the higher one scored higher), tie-broken by how far apart it pushes
+    // adjacent levels. Both are scale-free, so neither is flattered by the
+    // compressed range described below.
+    //
+    // THE SCALE IS NOT CALIBRATED, ONLY THE ORDER IS. On the sweep corpus the
+    // four true levels come out at 0.62 / 1.02 / 1.49 / 2.13 — monotone, well
+    // separated, and visibly NOT on a 0..3 scale. A caller that rounds this to
+    // an integer level will read low. The honest output is the fractional
+    // score and the per-level masses, with the mapping owned by whoever owns
+    // the rubric; an affine correction would be two FITTED numbers, of a kind
+    // no other constant in this table is, fitted to one rubric and with no
+    // evidence it transfers to a customer's own levels. None is landed here.
+    //
+    // FREE, and the first pair that is free without a compromise. It shares
+    // layer 19 with the absent pair, so a server already serving absence pays
+    // nothing for it, and layer 19 is also where the ordinal signal PEAKS —
+    // L23, L27 and L31 all score worse. Choice was free by luck and absence
+    // bought its depth; this one needed neither.
+    //
+    // DEFAULT -1 = NOT MEASURED, refused rather than borrowed, as above.
+    int         score_layer = -1;
+    int         score_head  = -1;
+    const char* score_provenance = "not swept by SCOREHEAD";
 };
 
 // ── The calibration table — which models the lens may run on ─────────────────
@@ -428,7 +489,69 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "mean key aggregation, document score summed over the body (not "
                        "peak) — change any of the three and this rate does not apply. "
                        "Corpus is synthetic and self-authored; held-out cross-language "
-                       "selection on the same sweep ran 85-95%"}},
+                       "selection on the same sweep ran 85-95%",
+                       // ABSENTHEAD 2026-09-20. RANK 1 OF 128 ON BOTH QUANTS
+                       // (0.9948 on Q4_K_M, 0.9953 on Q8_0), and the held-out
+                       // selection picks the SAME configuration on both files.
+                       // The incumbent locate pair reads 0.9612 / 0.9713 here.
+                       //
+                       // NOT free: L19 is 20 of 33 blocks against locate's 12,
+                       // and unlike choice there is no stable shallow
+                       // alternative — the best head at L11 is h=8 on Q4_K_M
+                       // and h=6 on Q8_0. A cheaper pair would change meaning
+                       // with the file, so depth was paid for stability.
+                       /*absent_layer*/ 19, /*absent_head*/ 10,
+                       /*absent_provenance*/
+                       "ABSENTHEAD 2026-09-20, Leg C corpus, 75 present vs 90 absent over "
+                       "6 verified-absent concepts, position-balanced: L19 h=10 = AUC "
+                       "0.9948 (Q4_K_M) / 0.9953 (Q8_0), rank 1 of 128 on BOTH. Held out "
+                       "(select on one language, score on the other) 0.9905 on both files. "
+                       "OPERATING POINT at zero false accusations: 89.6% of absences caught "
+                       "on Q4_K_M, 79.2% on Q8_0; at a 10% false-alarm target both reach "
+                       "100%. Measured ONLY under: question instruction shape, mean key "
+                       "aggregation, document score summed over the body. AUC IS A "
+                       "SEPARATION, NOT A RATE \u2014 the threshold is a product choice, see "
+                       "LOCABSENT. Corpus synthetic and self-authored",
+                       // SCOREHEAD 2026-09-20. RANK 1 OF 128 ON BOTH QUANTS
+                       // and UNIQUE at the top on both — concordance 1.0000 is
+                       // reached by exactly one head of 128, not shared.
+                       //
+                       // ADJACENT TO THE ABSENT HEAD AND NOT THE SAME HEAD:
+                       // h=10 (absence) reads this job at concordance 0.9861
+                       // and separates adjacent levels at 1.97 SD against
+                       // h=11's 3.48. The two neighbours order almost equally
+                       // well and pull the levels apart very differently, which
+                       // is the whole reason separation and not concordance
+                       // picked this pair.
+                       //
+                       // FREE: layer 19 is already loaded for absence, and the
+                       // ordinal signal PEAKS there (L23 0.9722, L27 0.9803,
+                       // L31 0.9444), so there is no depth trade to decline.
+                       //
+                       // Q4_K_M is the STRONGER file here — 3.48 separation
+                       // against Q8_0's 2.70 — the third signal running in
+                       // which the higher quant is the wrong direction.
+                       /*score_layer*/ 19, /*score_head*/ 11,
+                       /*score_provenance*/
+                       "SCOREHEAD 2026-09-20, 48 docs EN+DE, 4 ordered levels: L19 h=11 = "
+                       "ordinal concordance 1.0000 on Q4_K_M AND Q8_0, rank 1 of 128 on "
+                       "both and the ONLY head at 1.0000 on either. Adjacent-level "
+                       "separation 3.48 SD (Q4_K_M) / 2.70 (Q8_0). Held out on THREE axes, "
+                       "all selecting this same pair: language (EN and DE each pick it and "
+                       "each score 66.7% exact / 87.5% within-1 on the other), corpus "
+                       "origin (the 24 documents added for this sweep pick it too, and are "
+                       "HARDER than the 24 they extend), and bilingual halves (swaps to the "
+                       "neighbouring h=10, which still reads 0.9904 on the half it did not "
+                       "see). THE EXACT-MATCH RATE IS NOT THE PRODUCT NUMBER: 66.7% "
+                       "(Q4_K_M) / 58.3% (Q8_0) measures an argmax this pair was "
+                       "deliberately NOT selected by; within-1 is 89.6% / 83.3% and the "
+                       "ORDERING is perfect. THE SCALE IS UNCALIBRATED \u2014 four true "
+                       "levels read 0.62 / 1.02 / 1.49 / 2.13, so rounding to an integer "
+                       "reads low; emit the fraction and the masses. Measured ONLY under: "
+                       "question instruction shape, mean key aggregation, document score "
+                       "summed over the body. Supersedes DECIDEHEAD's 87.5% for L15 h=11, "
+                       "which was selection inflation on 24 documents and reads 64.6% here. "
+                       "Corpus synthetic and self-authored"}},
         // Qwen 3.8-27B. Its own head is L19H20 — and the method that found the
         // 9B's head would have picked the WRONG one here: the N3 leg selects on
         // three synthetic prompts, chose L11H22, and that head then scored 84.6%
@@ -1223,10 +1346,16 @@ enum class LensKeyAggregation { Max, Mean };
 // heads — see the note above LensConstants::locate_layer. The route reads one
 // pair per request and says which on the wire, because the two carry different
 // provenance and therefore different rates.
-enum class LensHeadRole { Locate, Choice };
+enum class LensHeadRole { Locate, Choice, Absent, Score };
 
 inline const char* lens_head_role_name(LensHeadRole r) {
-    return r == LensHeadRole::Choice ? "choice" : "locate";
+    switch (r) {
+        case LensHeadRole::Choice: return "choice";
+        case LensHeadRole::Absent: return "absent";
+        case LensHeadRole::Score:  return "score";
+        case LensHeadRole::Locate: break;
+    }
+    return "locate";
 }
 
 inline const char* lens_key_aggregation_name(LensKeyAggregation a) {

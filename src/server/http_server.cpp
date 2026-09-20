@@ -282,6 +282,10 @@ public:
             //
             // -1 means "not swept" and must not
             // drag the max down, so it is only folded in when it is real.
+            // Every head this process can SERVE must be inside the cut, or a
+            // request for it taps a block that was never loaded. Folded in
+            // here rather than at each route because the load happens once.
+            auto fold = [](int c, int layer) { return layer >= 0 ? std::max(c, layer) : c; };
             int cutoff;
             if (lens_mode_ == LensServerMode::LocateOnly) {
                 // LOCATE-ONLY cuts at locate ALONE. citation and coverage are
@@ -302,12 +306,25 @@ public:
                         std::string(cal->constants.locate_provenance) +
                         ". Use --lens-verify-only for /v1/verify on this model.");
                 }
+                // LOCATE-ONLY serves /v1/locate, and that route can read the
+                // choice and absence pairs too (head=choice|absent), so they
+                // are part of this mode's surface and part of its cut. On the
+                // 9B that is what takes it from 12 blocks to 20: absence sits
+                // at L19 and, unlike choice, has no stable shallow head. The
+                // SCORE pair rides along free — it is the neighbouring head on
+                // absence's own layer, so it widens the surface without moving
+                // the cut.
                 cutoff = cal->constants.locate_layer;
+                cutoff = fold(cutoff, cal->constants.choice_layer);
+                cutoff = fold(cutoff, cal->constants.absent_layer);
+                cutoff = fold(cutoff, cal->constants.score_layer);
             } else {
                 cutoff =
                     std::max(cal->constants.citation_layer, cal->constants.coverage_layer);
-                if (cal->constants.locate_layer >= 0)
-                    cutoff = std::max(cutoff, cal->constants.locate_layer);
+                cutoff = fold(cutoff, cal->constants.locate_layer);
+                cutoff = fold(cutoff, cal->constants.choice_layer);
+                cutoff = fold(cutoff, cal->constants.absent_layer);
+                cutoff = fold(cutoff, cal->constants.score_layer);
             }
             lens_blocks_needed_ = static_cast<uint32_t>(cutoff) + 1;
             lens_total_blocks_  = meta_for_cut.block_count;
@@ -320,7 +337,10 @@ public:
             // the banner and reproduce the block count by hand.
             const std::string cut_expr =
                 lens_mode_ == LensServerMode::LocateOnly
-                    ? "locate_layer=" + std::to_string(cal->constants.locate_layer)
+                    ? "max(locate_layer=" + std::to_string(cal->constants.locate_layer) +
+                      ", choice_layer=" + std::to_string(cal->constants.choice_layer) +
+                      ", absent_layer=" + std::to_string(cal->constants.absent_layer) +
+                      ", score_layer=" + std::to_string(cal->constants.score_layer) + ")"
                     : "max(citation_layer=" + std::to_string(cal->constants.citation_layer) +
                       ", coverage_layer=" + std::to_string(cal->constants.coverage_layer) +
                       (cal->constants.locate_layer >= 0
@@ -2630,10 +2650,17 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 const std::string hv = body.at("head").get<std::string>();
                 if      (hv == "locate") head_role = qinf::LensHeadRole::Locate;
                 else if (hv == "choice") head_role = qinf::LensHeadRole::Choice;
+                else if (hv == "absent") head_role = qinf::LensHeadRole::Absent;
+                else if (hv == "score")  head_role = qinf::LensHeadRole::Score;
                 else throw std::runtime_error(
-                        "\"head\": expected \"locate\" or \"choice\", actual \"" + hv +
-                        "\" (locate = where a key's answer sits; choice = which of the "
-                        "supplied option descriptions fits the document)");
+                        "\"head\": expected \"locate\", \"choice\", \"absent\" or "
+                        "\"score\", actual \"" +
+                        hv + "\" (locate = where a key's answer sits; choice = which of "
+                        "the supplied option descriptions fits the document; absent = "
+                        "whether the key's evidence is in the document at all; score = "
+                        "where the document sits on an ORDERED scale, whose levels are "
+                        "supplied low-to-high and whose masses are meant to be read as a "
+                        "fraction, not rounded to the top one)");
             }
             if (body.contains("key_aggregation")) {
                 if (!body.at("key_aggregation").is_string())
@@ -2654,7 +2681,7 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 "{\"document\": string, "
                 "\"key_vocabulary\": [{\"key\",\"gloss\"}|{\"id\",\"question\"}|string,...], "
                 "\"top_k\"?: int, \"key_aggregation\"?: \"max\"|\"mean\", "
-                "\"head\"?: \"locate\"|\"choice\"}: ") + e.what()},
+                "\"head\"?: \"locate\"|\"choice\"|\"absent\"|\"score\"}: ") + e.what()},
                 {"code", "bad_request"}}).dump(), "application/json");
             return;
         }

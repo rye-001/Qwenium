@@ -989,15 +989,34 @@ Two facts about it are load-bearing:
   `note-lens-qwen38-probe.md`). Default is byte-identical to the behaviour that
   predates the field, and `mean` sets `uncalibrated` because the shipped
   provenance rates were all measured under `max`.
-- **It takes an optional `head`** (`"locate"` default, `"choice"` opt-in;
-  2026-09-20), selecting which calibrated job's pair to read. A layer is not a
-  job: on Qwen3.8-9B choice sits at the **same layer** as locate (11) on a
+- **It takes an optional `head`** (`"locate"` default, plus `"choice"`,
+  `"absent"` and `"score"` opt-in; 2026-09-20), selecting which calibrated
+  job's pair to read. **Four jobs now read four different heads** on the 9B —
+  locate L11 h=6, choice L11 h=3, absent L19 h=10, score L19 h=11 — two pairs
+  sharing layer 11 and two sharing layer 19. A layer is not a job: on Qwen3.8-9B choice sits at the **same layer** as locate (11) on a
   different head (3 vs 6), measured 92.5% on 4-way routing — identical on Q8_0
   and Q4_K_M — so choice is free on a `--lens-locate-only` server. Refused
   fail-loud where DECIDEHEAD has not run; reading choice off the locate pair
   measured 87.5%, and off the citation pair far worse. The two jobs have
   opposite recipes (`max` for locate, `mean` for choice) and `uncalibrated`
-  follows whichever applies.
+  follows whichever applies. A third value, `"absent"` (2026-09-20), reads the
+  `noul` pair — **L19 h=10** on the 9B, AUC 0.9948/0.9953 across quants, rank 1
+  of 128 on both. It is the first head that is **not** free: absence has no
+  quant-stable shallow alternative, so a `--lens-locate-only` server's cut
+  became `max(locate, choice, absent) + 1` and moved from 12 to **20 of 33
+  blocks** (2055 MB → 3038 MB on Q4_K_M). Verify-only is unchanged at 28, where
+  citation still dominates. A fourth value, `"score"` (2026-09-20), reads the
+  ordinal pair — **L19 h=11**, the head *next to* absence's h=10 on the layer
+  absence already paid for, so the cut is unmoved at 20 and score is free. It
+  is also the first pair not selected by accuracy: an ordinal's argmax flips
+  between the two adjacent levels a document sits between, so the sweep ranked
+  heads by ordinal concordance (1.0000, rank 1 of 128 and unique on **both**
+  quants) and tie-broke on how far apart adjacent levels are pushed. Its
+  fractional output is deliberately **uncalibrated in scale** — four true
+  levels read 0.62/1.02/1.49/2.13 — so callers read the fraction and the
+  masses; an affine correction would be the first *fitted* constant in the
+  table and none is landed. Adjacency is not interchangeability: h=10 reads
+  the ordinal job at 0.9861 and separates at 1.97 SD against h=11's 3.48.
 - **It truncates after `locate_layer` alone**, so the constant IS the route's
   cost. On Qwen 3.6-35B that layer is 11, which is exactly
   `max(citation_layer, coverage_layer)` — so `/v1/locate` costs a

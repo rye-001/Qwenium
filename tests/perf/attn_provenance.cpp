@@ -3796,6 +3796,25 @@ static int run_locate_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
 // the shipped calibration the same way every other calibrated leg does.
 static uint32_t probe_lens_file_type(const ModelMetadata& meta);
 
+// ── The six concepts VERIFIED ABSENT from all 15 Leg C documents ────────────
+// Shared by LOCABSENT (threshold) and ABSENTHEAD (head sweep) so the two legs
+// cannot drift apart and report rates over different ground truth. Two of
+// these (payment_terms, warranty_period) come from run_qdocs_s1, which already
+// used them as fabrication bait; the other four were added 2026-09-19 after
+// two concepts proved too few to tell noise from structure, and verified by
+// scanning the corpus for vat/tax/discount/incoterm/contract/warranty/payment
+// and their German equivalents (zero occurrences of each).
+//
+// The set deliberately SPANS semantic distance from what the documents contain:
+//   FAR  warranty_period, incoterms      — nothing in an order email is related
+//   MID  vat_number, discount_rate       — plausible field, no neighbour present
+//   NEAR payment_terms, contract_number  — a strong neighbour IS present (the
+//        price; the PO number), so the key has somewhere wrong to look
+static std::vector<std::string> lens_absent_concepts() {
+    return {"warranty_period", "incoterms", "vat_number",
+            "discount_rate", "payment_terms", "contract_number"};
+}
+
 // ── LOCABSENT — can locate tell that a key is NOT in the document? ──────────
 //
 // This is the gap that makes the omission pitch hollow. /v1/locate ALWAYS
@@ -3877,14 +3896,7 @@ static int run_locate_absence(ForwardPassBase* fp, ggml_backend_sched_t sched,
     //          to look (payment_terms -> the price; contract_number -> the PO
     //          number). This is the hard and realistic case, and the one an
     //          omission claim lives or dies on.
-    const std::vector<std::string> ABSENT = {
-        "warranty_period",   // FAR
-        "incoterms",         // FAR
-        "vat_number",        // MID
-        "discount_rate",     // MID
-        "payment_terms",     // NEAR (price)
-        "contract_number",   // NEAR (order_number / PO)
-    };
+    const std::vector<std::string> ABSENT = lens_absent_concepts();
     // LOCABSENT_ABSENT_N=k  — keep only the first k absent concepts (tests COUNT)
     // LOCABSENT_REVERSE=1    — reverse the absent order (tests POSITION)
     // Two knobs because run 2 vs run 3 moved payment_terms' median 11.41 -> 2.56
@@ -4153,6 +4165,332 @@ static int run_locate_absence(ForwardPassBase* fp, ggml_backend_sched_t sched,
     }
     std::printf("\n  Probe only: this moves no constant. A threshold ships when the\n");
     std::printf("  cross-language rows above are acceptable, which is a product call.\n");
+    return 0;
+}
+
+// ── ABSENTHEAD — is the LOCATE head the right head for ABSENCE? ─────────────
+//
+// LOCABSENT measured absence at AUC 0.927 — but it read the SHIPPED locate pair
+// (L11 h=6), which was calibrated for "given a field name, find its value's
+// span". That is the same assumption DECIDEHEAD had just falsified for the
+// other two jobs: sweeping heads moved choice +10 points and score +41.7. So
+// 0.927 is a rate for one head, not a ceiling for the model.
+//
+// This leg sweeps every (layer, head) for the yes/no job, with the same four
+// levers DECIDEHEAD used. It is the `noul` half of the Jev mapping.
+//
+// OBJECTIVE IS AUC, NOT ACCURACY. Absence has no argmax — it is a separation
+// between "this key's evidence is in the document" and "it is not", and the
+// threshold is a product choice made afterwards. Ranking heads by accuracy at
+// some threshold would bake that choice into the head selection. AUC ranks the
+// separation itself and is threshold-free.
+//
+// POSITION BALANCING IS NOT OPTIONAL HERE. LOCABSENT found, the hard way, that
+// appending absent keys after present ones makes the score track LIST POSITION
+// rather than absence — its first AUC of 0.9615 measured exactly that. Every
+// request below interleaves the two classes with a fixed seed.
+//
+//   ABSENTHEAD=1 QWEN36_MODEL_PATH=models/Qwen3.8-9B-Q4_K_M.gguf ./bin/attn-provenance
+static int run_absent_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                  Tokenizer* tok, const ModelMetadata& meta,
+                                  const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ ABSENTHEAD — every (layer, head) scored as an ABSENCE head    ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    const int C = S * H;
+    enum { V_MAX_PEAK = 0, V_MAX_MASS, V_MAX_CONC,
+           V_MEAN_PEAK, V_MEAN_MASS, V_MEAN_CONC, N_VAR };
+    static const char* VNAME[N_VAR] = {"max/peak", "max/mass", "max/conc",
+                                       "mean/peak", "mean/mass", "mean/conc"};
+    const int N_SHAPE = 2;
+    static const char* SNAME[N_SHAPE] = {"extract", "question"};
+
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count,
+                                   probe_lens_file_type(meta));
+    if (!calib) {
+        std::fprintf(stderr, "ABSENTHEAD: no calibrated lens entry for '%s' bc %u\n",
+                     meta.architecture.c_str(), meta.block_count);
+        return 1;
+    }
+    const std::vector<std::string> ABSENT = lens_absent_concepts();
+    std::printf("candidates: %d layers x %d heads = %d | shapes %d | variants %d\n",
+                S, H, C, N_SHAPE, N_VAR);
+    std::printf("incumbent (what LOCABSENT's 0.927 was read off): L%d h=%d\n",
+                calib->constants.locate_layer, calib->constants.locate_head);
+    std::printf("absent concepts (%zu, verified absent from all 15 docs)\n\n", ABSENT.size());
+
+    struct Sample { bool absent, de; };
+    std::vector<Sample> samples;
+    // scores[shape][variant][candidate][sample]
+    std::vector<std::vector<std::vector<std::vector<float>>>> sc(
+        N_SHAPE, std::vector<std::vector<std::vector<float>>>(
+            N_VAR, std::vector<std::vector<float>>(C)));
+
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    bool first_doc = true;
+
+    for (const QMessy& d : qdocs_messy_corpus()) {
+        std::vector<std::string> keys;
+        for (const QLabel& f : d.fields) keys.push_back(f.concept);
+        for (const auto& a : ABSENT) keys.push_back(a);
+        std::set<std::string> absent_names(ABSENT.begin(), ABSENT.end());
+        // Interleave: see the header note. Fixed seed => reproducible run.
+        {
+            std::mt19937 rng(0xA85E27u + (uint32_t)std::hash<std::string>{}(d.tag));
+            std::shuffle(keys.begin(), keys.end(), rng);
+        }
+
+        for (int sh = 0; sh < N_SHAPE; ++sh) {
+            std::vector<std::string> ids = keys;   // question mode: id == key here
+            const std::string suffix = (sh == 0)
+                ? qinf::lens_build_instruction(keys)
+                : qinf::lens_build_question_instruction(ids, keys);
+            const std::string prompt_text = qdocs_chat_prompt(d.document, suffix);
+            std::vector<int32_t> ptoks = tok->encode(prompt_text);
+            const int P = (int)ptoks.size();
+            const std::vector<size_t> pcum = cum_bytes(tok, ptoks);
+            const size_t doc_pos = prompt_text.find(d.document);
+            if (doc_pos == std::string::npos)
+                throw std::runtime_error("ABSENTHEAD: document not verbatim in prompt");
+            auto covering = [&](size_t b0, size_t b1, int& lo, int& hi) {
+                lo = P; hi = 0;
+                for (int i = 0; i < P; ++i)
+                    if (pcum[i] < b1 && pcum[i + 1] > b0) { if (i < lo) lo = i; hi = i + 1; }
+                if (lo > hi) { lo = 0; hi = 0; }
+            };
+            int doc_lo = 0, doc_hi = 0;
+            covering(doc_pos, doc_pos + d.document.size(), doc_lo, doc_hi);
+            const int n_doc = doc_hi - doc_lo;
+            if (n_doc <= 0) continue;
+
+            std::vector<std::pair<int,int>> qspan(keys.size());
+            size_t cursor = doc_pos + d.document.size();
+            bool skip = false;
+            for (size_t ci = 0; ci < keys.size(); ++ci) {
+                const size_t at = prompt_text.find(keys[ci], cursor);
+                if (at == std::string::npos) { skip = true; break; }
+                cursor = at + keys[ci].size();
+                int lo = 0, hi = 0;
+                covering(at, at + keys[ci].size(), lo, hi);
+                if (hi <= lo) { skip = true; break; }
+                qspan[ci] = {lo, hi};
+            }
+            if (skip) { std::printf("[%s/%s] SKIPPED — key not findable\n",
+                                    d.tag.c_str(), SNAME[sh]); continue; }
+
+            fp->set_attention_taps(taps);
+            fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+            fp->clear_slot(0);
+            fp->set_cache_pos(0, 0);
+            std::vector<ForwardPassBase::AttentionTap> tp;
+            {
+                ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
+                fp->mark_attention_taps(gf);
+                ggml_backend_sched_reset(sched);
+                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->set_prefill_inputs(gf, ptoks, 0);
+                qinf::engine::require_compute_success(
+                    ggml_backend_sched_graph_compute(sched, gf), "ABSENTHEAD");
+                tp = fp->get_attention_taps(gf);
+            }
+            fp->set_attention_taps({});
+
+            for (size_t ci = 0; ci < keys.size(); ++ci) {
+                const bool is_absent = absent_names.count(keys[ci]) > 0;
+                // One sample row per (document, key), recorded once — the two
+                // shapes score the SAME sample, so the class vector must not
+                // be appended twice.
+                if (sh == 0) samples.push_back({is_absent, d.de});
+                const int q0 = qspan[ci].first, q1 = qspan[ci].second;
+                const int nq = q1 - q0;
+                for (int slot = 0; slot < S; ++slot) {
+                    const ForwardPassBase::AttentionTap& A = tp[slot];
+                    for (int h = 0; h < H; ++h) {
+                        double mx_peak = 0, mx_mass = 0, mn_peak = 0, mn_mass = 0;
+                        for (int p = doc_lo; p < doc_hi && p < A.n_kv; ++p) {
+                            double mx = 0, sm = 0;
+                            for (int q = q0; q < q1; ++q) {
+                                const float x = A.rows[(size_t)A.n_kv *
+                                    ((size_t)q + (size_t)A.n_q * (size_t)h) + (size_t)p];
+                                if (x > mx) mx = x;
+                                sm += x;
+                            }
+                            const double mn = nq > 0 ? sm / (double)nq : 0.0;
+                            if (mx > mx_peak) mx_peak = mx;
+                            if (mn > mn_peak) mn_peak = mn;
+                            mx_mass += mx; mn_mass += mn;
+                        }
+                        const int cand = slot * H + h;
+                        const double v[N_VAR] = {
+                            mx_peak, mx_mass, mx_peak * (double)n_doc,
+                            mn_peak, mn_mass, mn_peak * (double)n_doc};
+                        for (int vi = 0; vi < N_VAR; ++vi)
+                            sc[sh][vi][cand].push_back((float)v[vi]);
+                    }
+                }
+            }
+            if (first_doc && sh == 1) {
+                std::printf("[%s%s] P=%d doc_toks=%d keys=%zu (%zu present + %zu absent)\n",
+                            d.tag.c_str(), d.de ? " DE" : "", P, n_doc, keys.size(),
+                            keys.size() - ABSENT.size(), ABSENT.size());
+                first_doc = false;
+            }
+        }
+    }
+
+    const size_t N = samples.size();
+    if (N == 0) throw std::runtime_error("ABSENTHEAD: no scorable samples");
+    long n_pos = 0, n_neg = 0;
+    for (const Sample& s : samples) (s.absent ? n_neg : n_pos)++;
+    std::printf("\nsamples: %zu  (present %ld / absent %ld)\n", N, n_pos, n_neg);
+
+    // AUC over a language subset. -1 = pooled. PRESENT should score ABOVE absent.
+    auto auc = [&](int sh, int v, int cand, int lang) {
+        const std::vector<float>& x = sc[sh][v][cand];
+        if (x.size() != N) return 0.0;
+        double win = 0, tot = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (samples[i].absent) continue;
+            if (lang == 0 && samples[i].de) continue;
+            if (lang == 1 && !samples[i].de) continue;
+            for (size_t j = 0; j < N; ++j) {
+                if (!samples[j].absent) continue;
+                if (lang == 0 && samples[j].de) continue;
+                if (lang == 1 && !samples[j].de) continue;
+                tot += 1.0;
+                if (x[i] > x[j]) win += 1.0; else if (x[i] == x[j]) win += 0.5;
+            }
+        }
+        return tot > 0 ? win / tot : 0.0;
+    };
+
+    std::printf("\n  === BEST HEAD PER SHAPE x VARIANT (by pooled AUC) ===\n");
+    std::printf("  shape    variant   | best head | AUC pooled   EN      DE\n");
+    int bsh = 0, bv = 0, bc = 0; double bauc = -1.0;
+    for (int sh = 0; sh < N_SHAPE; ++sh)
+        for (int v = 0; v < N_VAR; ++v) {
+            int cbest = 0; double abest = -1.0;
+            for (int c = 0; c < C; ++c) {
+                const double a = auc(sh, v, c, -1);
+                if (a > abest) { abest = a; cbest = c; }
+            }
+            std::printf("  %-8s %-9s | L%-3d h=%-3d| %.4f   %.4f  %.4f\n",
+                        SNAME[sh], VNAME[v], attn_layers[cbest / H], cbest % H,
+                        abest, auc(sh, v, cbest, 0), auc(sh, v, cbest, 1));
+            if (abest > bauc) { bauc = abest; bc = cbest; bsh = sh; bv = v; }
+        }
+
+    std::printf("\n  === RANKED, best configuration (%s / %s), top 10 of %d ===\n",
+                SNAME[bsh], VNAME[bv], C);
+    std::vector<int> ord(C);
+    for (int c = 0; c < C; ++c) ord[c] = c;
+    std::vector<double> pooled(C);
+    for (int c = 0; c < C; ++c) pooled[c] = auc(bsh, bv, c, -1);
+    std::stable_sort(ord.begin(), ord.end(),
+                     [&](int a, int b) { return pooled[a] > pooled[b]; });
+    std::printf("  rank | layer head | blocks |  AUC     EN      DE\n");
+    for (int i = 0; i < std::min(10, C); ++i) {
+        const int c = ord[i];
+        std::printf("  %4d | L%-4d h=%-3d| %3d    | %.4f  %.4f  %.4f\n", i + 1,
+                    attn_layers[c / H], c % H, attn_layers[c / H] + 1,
+                    pooled[c], auc(bsh, bv, c, 0), auc(bsh, bv, c, 1));
+    }
+
+    int inc_slot = -1;
+    for (int i = 0; i < S; ++i) if (attn_layers[i] == calib->constants.locate_layer) inc_slot = i;
+    if (inc_slot >= 0 && calib->constants.locate_head >= 0) {
+        const int ic = inc_slot * H + calib->constants.locate_head;
+        int irank = 0;
+        for (int i = 0; i < C; ++i) if (ord[i] == ic) { irank = i + 1; break; }
+        std::printf("\n  INCUMBENT locate pair L%d h=%d: rank %d of %d, AUC %.4f\n",
+                    calib->constants.locate_layer, calib->constants.locate_head,
+                    irank, C, pooled[ic]);
+        std::printf("  (LOCABSENT's 0.927 was this pair under raw peak, extract shape)\n");
+    }
+
+    // Held out: choose the configuration on ONE language, report the OTHER.
+    // 128 x 12 = 1536 candidates against this N — the pooled maximum is an
+    // upper bound even when the signal is real.
+    std::printf("\n  === HELD OUT: select on one language, score on the OTHER ===\n");
+    std::printf("  selected on | config                | best head | scored on | AUC\n");
+    for (int sel = 0; sel < 2; ++sel) {
+        int ssh = 0, sv = 0, scd = 0; double sb = -1.0;
+        for (int sh = 0; sh < N_SHAPE; ++sh)
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c) {
+                    const double a = auc(sh, v, c, sel);
+                    if (a > sb) { sb = a; scd = c; ssh = sh; sv = v; }
+                }
+        std::printf("  %-11s | %-8s %-13s | L%-3d h=%-3d| %-9s | %.4f\n",
+                    sel ? "DE" : "EN", SNAME[ssh], VNAME[sv],
+                    attn_layers[scd / H], scd % H, sel ? "EN" : "DE",
+                    auc(ssh, sv, scd, 1 - sel));
+    }
+
+    std::printf("\n  === PER TAPPED LAYER — best head and its depth cost ===\n");
+    for (int slot = 0; slot < S; ++slot) {
+        int bhh = 0; double bb = -1.0;
+        for (int h = 0; h < H; ++h) {
+            const double a = pooled[slot * H + h];
+            if (a > bb) { bb = a; bhh = h; }
+        }
+        std::printf("  L%-3d | %2d/%d blocks | h=%-3d AUC %.4f\n", attn_layers[slot],
+                    attn_layers[slot] + 1, (int)meta.block_count, bhh, bb);
+    }
+    // ── OPERATING POINTS, because AUC is not a product claim ────────────────
+    // A buyer hears "we flag missing fields", not "0.99 separation". Reported
+    // for TWO candidates: the best head, and the best head at or below the
+    // locate layer — the second is what a --lens-locate-only server can serve
+    // for free, and the gap between them is the price of the deeper one.
+    //
+    // The budgeted error is a FALSE ABSENT (calling a present field missing),
+    // so T is chosen at a false-alarm target on PRESENT fields and detection is
+    // whatever follows. Chosen on one language, scored on the other.
+    auto operating = [&](int sh, int v, int cand, const char* label) {
+        const std::vector<float>& x = sc[sh][v][cand];
+        std::printf("\n  %s  (L%d h=%d, %s / %s)\n", label,
+                    attn_layers[cand / H], cand % H, SNAME[sh], VNAME[v]);
+        std::printf("    target | chose T on | scored on | false-alarm | absent-detected\n");
+        for (double tgt : {0.02, 0.05, 0.10}) {
+            for (int sel = 0; sel < 2; ++sel) {
+                std::vector<float> pos;
+                for (size_t i = 0; i < N; ++i)
+                    if (!samples[i].absent && (samples[i].de ? 1 : 0) == sel) pos.push_back(x[i]);
+                if (pos.empty()) continue;
+                std::sort(pos.begin(), pos.end());
+                const size_t k = (size_t)(tgt * (double)pos.size());
+                const float T = k == 0 ? std::nextafter(pos.front(), 0.0f) : pos[k - 1];
+                long fa = 0, np = 0, det = 0, na = 0;
+                for (size_t i = 0; i < N; ++i) {
+                    if ((samples[i].de ? 1 : 0) == sel) continue;   // the OTHER half
+                    if (samples[i].absent) { na++; if (x[i] < T) det++; }
+                    else                   { np++; if (x[i] < T) fa++; }
+                }
+                std::printf("    %5.0f%% | %-10s | %-9s |  %8.1f%% |  %8.1f%%\n",
+                            tgt * 100, sel ? "DE" : "EN", sel ? "EN" : "DE",
+                            np ? 100.0 * (double)fa / (double)np : 0.0,
+                            na ? 100.0 * (double)det / (double)na : 0.0);
+            }
+        }
+    };
+    operating(bsh, bv, bc, "BEST HEAD");
+    {
+        int freec = -1; double freeb = -1.0;
+        for (int slot = 0; slot < S; ++slot) {
+            if (attn_layers[slot] > calib->constants.locate_layer) break;
+            for (int h = 0; h < H; ++h)
+                if (pooled[slot * H + h] > freeb) { freeb = pooled[slot * H + h]; freec = slot * H + h; }
+        }
+        if (freec >= 0 && freec != bc)
+            operating(bsh, bv, freec, "FREE HEAD (at or below the locate layer)");
+    }
+
+    std::printf("\n  Probe only: moves no constant. AUC is separation, not a rate —\n");
+    std::printf("  the THRESHOLD is a product choice and LOCABSENT is where it lives.\n");
     return 0;
 }
 
@@ -4531,6 +4869,595 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
     }
     std::printf("\n  Probe only: moves no constant. A decision head ships when a\n");
     std::printf("  product decides the rate is worth its depth, which is the user's call.\n");
+    return 0;
+}
+
+// ── SCOREHEAD — a stable head for the ORDINAL job ───────────────────────────
+//
+// DECIDEHEAD already proved the signal is there: sweeping heads moved the
+// ordinal task from 45.8% (the locate pair) to 87.5% (L15 h=11, top-ranked on
+// both quants). It also proved we cannot LAND that number — held out, the
+// selection is asymmetric: EN picks a config that scores 83.3% on DE, DE picks
+// a DIFFERENT config that scores 50-67% on EN. A pair we cannot reproduce by
+// choosing it twice is not a pair we can ship.
+//
+// So this leg does NOT chase a bigger number. It chases a pair whose held-out
+// behaviour is symmetric, and it changes three things to get there.
+//
+// 1. THE OBJECTIVE STOPS BEING ARGMAX.
+//    DECIDEHEAD's own numbers contain the diagnosis: exact swung 50-87.5%
+//    while within-1 sat at 91-95%. A model that is almost never more than one
+//    level out, but flips which of two adjacent levels it names, has a stable
+//    SIGNAL and an unstable READOUT. Selecting a head by argmax accuracy is
+//    then selecting on the coin flip, which is exactly the shape of failure we
+//    saw. Here every document gets a FRACTIONAL score — the option masses are
+//    non-negative, so dividing by their sum is a probability with NO FREE
+//    PARAMETER (no temperature to tune), and the expected level is the
+//    probability-weighted index. Heads are ranked by ORDINAL CONCORDANCE: over
+//    every pair of documents on different levels, how often is the
+//    higher-level one scored higher. Threshold-free, the same reason ABSENTHEAD
+//    ranks by AUC, and a direct generalisation of it.
+//    Exact and within-1 are still reported so the numbers stay comparable to
+//    DECIDEHEAD — they are just not what chooses.
+//
+// 2. THE CORPUS DOUBLES, AND THE GRID DOES NOT GROW.
+//    DECIDEHEAD searched 1024 configurations against 24 documents, i.e. 12 per
+//    language on the held-out legs, where one document is 8.3 points. When the
+//    failure mode IS selection-on-noise, widening the search is the wrong move
+//    and narrowing it is the fix. So: 48 documents, and the grid stays at four
+//    variants with selection fixed to the QUESTION shape, which DECIDEHEAD
+//    already established beats the extraction shape. Extract is still measured
+//    and printed as a cross-check; it just does not get a vote.
+//    Note the `conc` variant ABSENTHEAD needed is absent here BY PROOF, not by
+//    omission: it rescales a document's score by that document's length, and
+//    every reduction below is within one document and then sum-normalised, so
+//    conc is identically peak for this task.
+//
+// 3. THE HELD-OUT SPLIT IS RUN TWICE, ON TWO DIFFERENT AXES.
+//    EN-vs-DE alone cannot tell "this head does not generalise" apart from
+//    "German wants a different head" — and the whole open question is which of
+//    those we hit. So the same selection is also run on a BILINGUAL odd/even
+//    split of the corpus. The two answers are diagnostic:
+//      * odd/even unstable too  => the problem is N and noise. No pair to land.
+//      * odd/even stable, EN/DE not => German really is a different regime,
+//                                      and a bilingual-selected pair is the
+//                                      honest landing candidate.
+//    The EN-vs-DE arm is a clean LANGUAGE test only because the corpus is
+//    parallel — every DE document is the same ticket as its EN twin, so the
+//    split varies language and holds content fixed. Keep it that way.
+//
+// Selection stability is reported as a first-class number (top-10 overlap
+// between the two halves, and the pooled winner's rank inside each half),
+// because that — not the pooled maximum — is the thing that has to be true
+// before a constant can move.
+//
+//   SCOREHEAD=1 QWEN36_MODEL_PATH=models/Qwen3.8-9B-Q4_K_M.gguf ./bin/attn-provenance
+
+// The 24 documents DECIDEHEAD measured, plus 24 more in the same register and
+// the same parallel EN/DE construction. FROZEN: written once, never tuned
+// against a score. decide_score_corpus() itself is deliberately left untouched
+// so every DECIDEHEAD number already in the provenance strings stays
+// reproducible — this leg extends the corpus, it does not redefine it.
+static std::vector<QDecide> score_corpus_extended() {
+    std::vector<QDecide> v = decide_score_corpus();
+    const std::vector<QDecide> more = {
+     {"s_en13",false,0,"Ticket 8804: the help centre article about password resets still shows an old screenshot. Not urgent, the next content sweep can pick it up."},
+     {"s_en14",false,0,"Ticket 8805: scheduler log lines appear twice in our own dashboard. Noisy for us, invisible to anyone outside."},
+     {"s_en15",false,0,"Ticket 8806: a staff-only report lists its columns in a different order since the upgrade. Nobody has asked for the old order back."},
+     {"s_en16",false,1,"Ticket 8814: notification emails arrive about an hour late for three accounts on the legacy plan. The in-app alert still fires on time."},
+     {"s_en17",false,1,"Ticket 8815: one team cannot reorder items by dragging them in Safari. The arrow buttons do the same job."},
+     {"s_en18",false,1,"Ticket 8816: a couple of tenants see the wrong timezone in the audit log. The raw export carries the correct stamp."},
+     {"s_en19",false,2,"Ticket 8824: attachments over 2 MB are rejected across most workspaces since the storage move and nothing else will take them."},
+     {"s_en20",false,2,"Ticket 8825: the permissions screen is blank for every administrator, so no access can be granted at all today."},
+     {"s_en21",false,2,"Ticket 8826: scheduled reports have stopped reaching a large part of the customer base and re-sending them does not help."},
+     {"s_en22",false,3,"Ticket 8834: every request is timing out at the gateway, the product is unusable and orders are being lost by the minute."},
+     {"s_en23",false,3,"Ticket 8835: we are serving an expired certificate, browsers refuse the site outright and trading has halted."},
+     {"s_en24",false,3,"Ticket 8836: the storage cluster failed over badly, the entire estate is offline and we are bleeding money."},
+     {"s_de13",true, 0,"Ticket 8804: der Hilfeartikel zum Zuruecksetzen des Passworts zeigt noch einen alten Screenshot. Nicht dringend, der naechste Durchgang genuegt."},
+     {"s_de14",true, 0,"Ticket 8805: Protokollzeilen des Planers erscheinen in unserem eigenen Dashboard doppelt. Fuer uns laestig, nach aussen unsichtbar."},
+     {"s_de15",true, 0,"Ticket 8806: ein interner Bericht zeigt die Spalten seit dem Upgrade in anderer Reihenfolge. Niemand hat die alte Reihenfolge zurueckverlangt."},
+     {"s_de16",true, 1,"Ticket 8814: Benachrichtigungen kommen bei drei Konten im Alttarif etwa eine Stunde zu spaet an. Der Hinweis in der App erscheint puenktlich."},
+     {"s_de17",true, 1,"Ticket 8815: ein Team kann Eintraege in Safari nicht per Ziehen umsortieren. Mit den Pfeiltasten geht es genauso."},
+     {"s_de18",true, 1,"Ticket 8816: einige Mandanten sehen im Pruefprotokoll die falsche Zeitzone. Der Rohexport traegt den richtigen Zeitstempel."},
+     {"s_de19",true, 2,"Ticket 8824: Anhaenge ueber 2 MB werden seit der Umstellung in den meisten Arbeitsbereichen abgelehnt und nichts anderes nimmt sie an."},
+     {"s_de20",true, 2,"Ticket 8825: die Rechteverwaltung bleibt fuer alle Administratoren leer, es lassen sich heute keinerlei Zugaenge vergeben."},
+     {"s_de21",true, 2,"Ticket 8826: geplante Berichte erreichen einen grossen Teil der Kunden nicht mehr und erneutes Senden hilft nicht."},
+     {"s_de22",true, 3,"Ticket 8834: saemtliche Anfragen laufen am Gateway in eine Zeitueberschreitung, das Produkt ist unbenutzbar und Auftraege gehen laufend verloren."},
+     {"s_de23",true, 3,"Ticket 8835: wir liefern ein abgelaufenes Zertifikat aus, Browser verweigern die Seite vollstaendig und der Handel steht still."},
+     {"s_de24",true, 3,"Ticket 8836: der Speicherverbund ist fehlerhaft umgeschaltet, der gesamte Bestand ist offline und es entstehen laufend Verluste."},
+    };
+    v.insert(v.end(), more.begin(), more.end());
+    return v;
+}
+
+static int run_score_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                 Tokenizer* tok, const ModelMetadata& meta,
+                                 const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ SCOREHEAD — the ORDINAL job, ranked by concordance not argmax ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    const int S = (int)attn_layers.size();
+    const int H = (int)meta.attention_head_count;
+    const int C = S * H;
+    enum { V_MAX_PEAK = 0, V_MAX_MASS, V_MEAN_PEAK, V_MEAN_MASS, N_VAR };
+    static const char* VNAME[N_VAR] = {"max/peak", "max/mass", "mean/peak", "mean/mass"};
+    const int N_SHAPE = 2;
+    static const char* SNAME[N_SHAPE] = {"extract", "question"};
+    const int SEL_SHAPE = 1;   // question — see header point 2.
+
+    const qinf::LensCalibration* calib =
+        qinf::lens_calibration_for(meta.architecture, meta.block_count,
+                                   probe_lens_file_type(meta));
+    if (!calib) {
+        std::fprintf(stderr, "SCOREHEAD: no calibrated lens entry for arch '%s' bc %u\n",
+                     meta.architecture.c_str(), meta.block_count);
+        return 1;
+    }
+
+    const auto options = decide_score_options();
+    const int NOPT = (int)options.size();
+    const std::vector<QDecide> corpus = score_corpus_extended();
+
+    std::printf("candidates: %d tapped layers x %d heads = %d | variants %d\n", S, H, C, N_VAR);
+    std::printf("selection shape: %s only (extract measured as a cross-check)\n", SNAME[SEL_SHAPE]);
+    std::printf("incumbent locate pair L%d h=%d | choice L%d h=%d | absent L%d h=%d\n",
+                calib->constants.locate_layer, calib->constants.locate_head,
+                calib->constants.choice_layer, calib->constants.choice_head,
+                calib->constants.absent_layer, calib->constants.absent_head);
+    std::printf("corpus: %zu documents, %d ordered levels\n\n", corpus.size(), NOPT);
+
+    struct SDoc { std::string tag; bool de; int label; bool novel; };
+    // Which half of the corpus a document came from. The 24 originals are the
+    // ones DECIDEHEAD measured; the 24 novel ones were written for THIS leg by
+    // the same hand that reports the result, which is a conflict of interest
+    // unless it is measured. The third held-out axis below measures it.
+    const size_t n_original = decide_score_corpus().size();
+    size_t corpus_ix = 0;
+    std::vector<SDoc> docs;
+    // ev[shape][variant][candidate][doc] = expected level in [0, NOPT-1]
+    std::vector<std::vector<std::vector<std::vector<float>>>> ev(
+        N_SHAPE, std::vector<std::vector<std::vector<float>>>(
+            N_VAR, std::vector<std::vector<float>>(C)));
+    // am[...] = argmax level, kept only so exact / within-1 stay comparable
+    // to DECIDEHEAD. It selects nothing.
+    std::vector<std::vector<std::vector<std::vector<int8_t>>>> am(
+        N_SHAPE, std::vector<std::vector<std::vector<int8_t>>>(
+            N_VAR, std::vector<std::vector<int8_t>>(C)));
+
+    std::vector<int> taps(attn_layers.begin(), attn_layers.end());
+    bool first_doc = true;
+
+    for (const QDecide& d : corpus) {
+        const size_t this_ix = corpus_ix++;
+        (void)this_ix;
+        bool recorded = false;
+        for (int sh = 0; sh < N_SHAPE; ++sh) {
+            std::vector<std::string> ids, texts;
+            for (const auto& o : options) { ids.push_back(o.first); texts.push_back(o.second); }
+            const std::string suffix = (sh == 0)
+                ? qinf::lens_build_instruction(texts)
+                : qinf::lens_build_question_instruction(ids, texts);
+            const std::string prompt_text = qdocs_chat_prompt(d.document, suffix);
+            std::vector<int32_t> ptoks = tok->encode(prompt_text);
+            const int P = (int)ptoks.size();
+            const std::vector<size_t> pcum = cum_bytes(tok, ptoks);
+
+            const size_t doc_pos = prompt_text.find(d.document);
+            if (doc_pos == std::string::npos)
+                throw std::runtime_error("SCOREHEAD: document not verbatim in prompt");
+            auto covering = [&](size_t b0, size_t b1, int& lo, int& hi) {
+                lo = P; hi = 0;
+                for (int i = 0; i < P; ++i)
+                    if (pcum[i] < b1 && pcum[i + 1] > b0) { if (i < lo) lo = i; hi = i + 1; }
+                if (lo > hi) { lo = 0; hi = 0; }
+            };
+            int doc_lo = 0, doc_hi = 0;
+            covering(doc_pos, doc_pos + d.document.size(), doc_lo, doc_hi);
+            if (doc_hi <= doc_lo) continue;
+
+            // Option query spans, searched from the END of the document forward
+            // — the rule run_lens_locate uses, for the same reason.
+            std::vector<std::pair<int,int>> qspan(NOPT);
+            size_t cursor = doc_pos + d.document.size();
+            bool skip = false;
+            for (int c = 0; c < NOPT; ++c) {
+                const size_t at = prompt_text.find(texts[c], cursor);
+                if (at == std::string::npos) { skip = true; break; }
+                cursor = at + texts[c].size();
+                int lo = 0, hi = 0;
+                covering(at, at + texts[c].size(), lo, hi);
+                if (hi <= lo) { skip = true; break; }
+                qspan[c] = {lo, hi};
+            }
+            if (skip) { std::printf("[%s/%s] SKIPPED — option not findable\n",
+                                    d.tag.c_str(), SNAME[sh]); continue; }
+
+            fp->set_attention_taps(taps);
+            fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+            fp->clear_slot(0);
+            fp->set_cache_pos(0, 0);
+            std::vector<ForwardPassBase::AttentionTap> tp;
+            {
+                ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
+                fp->mark_attention_taps(gf);
+                ggml_backend_sched_reset(sched);
+                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->set_prefill_inputs(gf, ptoks, 0);
+                qinf::engine::require_compute_success(
+                    ggml_backend_sched_graph_compute(sched, gf), "SCOREHEAD");
+                tp = fp->get_attention_taps(gf);
+            }
+            fp->set_attention_taps({});
+
+            // One document row per (document, shape) — the two shapes score the
+            // SAME document, so the label vector must not be appended twice.
+            if (!recorded) { docs.push_back({d.tag, d.de, d.label, corpus_ix >= n_original});
+                             recorded = true; }
+
+            for (int slot = 0; slot < S; ++slot) {
+                const ForwardPassBase::AttentionTap& A = tp[slot];
+                for (int h = 0; h < H; ++h) {
+                    const int cand = slot * H + h;
+                    double raw[N_VAR][8];
+                    for (int v = 0; v < N_VAR; ++v)
+                        for (int c = 0; c < NOPT; ++c) raw[v][c] = 0.0;
+                    for (int c = 0; c < NOPT; ++c) {
+                        const int q0 = qspan[c].first, q1 = qspan[c].second;
+                        const int nq = q1 - q0;
+                        double mx_peak = 0, mx_mass = 0, mn_peak = 0, mn_mass = 0;
+                        for (int p = doc_lo; p < doc_hi && p < A.n_kv; ++p) {
+                            double mx = 0, sm = 0;
+                            for (int q = q0; q < q1; ++q) {
+                                const float x = A.rows[(size_t)A.n_kv *
+                                    ((size_t)q + (size_t)A.n_q * (size_t)h) + (size_t)p];
+                                if (x > mx) mx = x;
+                                sm += x;
+                            }
+                            const double mn = nq > 0 ? sm / (double)nq : 0.0;
+                            if (mx > mx_peak) mx_peak = mx;
+                            if (mn > mn_peak) mn_peak = mn;
+                            mx_mass += mx; mn_mass += mn;
+                        }
+                        raw[V_MAX_PEAK][c]  = mx_peak;
+                        raw[V_MAX_MASS][c]  = mx_mass;
+                        raw[V_MEAN_PEAK][c] = mn_peak;
+                        raw[V_MEAN_MASS][c] = mn_mass;
+                    }
+                    for (int v = 0; v < N_VAR; ++v) {
+                        // Simplex projection: the masses are non-negative, so
+                        // dividing by their sum is already a distribution.
+                        // NO temperature, nothing fitted. A degenerate row
+                        // (all zero) falls back to the middle of the scale,
+                        // which is the only non-committal answer available.
+                        double tot = 0.0; int arg = 0; double best = -1.0;
+                        for (int c = 0; c < NOPT; ++c) {
+                            tot += raw[v][c];
+                            if (raw[v][c] > best) { best = raw[v][c]; arg = c; }
+                        }
+                        double e = 0.5 * (double)(NOPT - 1);
+                        if (tot > 0.0) {
+                            e = 0.0;
+                            for (int c = 0; c < NOPT; ++c) e += (double)c * raw[v][c] / tot;
+                        }
+                        ev[sh][v][cand].push_back((float)e);
+                        am[sh][v][cand].push_back((int8_t)arg);
+                    }
+                }
+            }
+            if (first_doc && sh == SEL_SHAPE) {
+                std::printf("[%s%s] P=%d doc_toks=%d options=%d\n", d.tag.c_str(),
+                            d.de ? " DE" : "", P, doc_hi - doc_lo, NOPT);
+                first_doc = false;
+            }
+        }
+    }
+
+    const size_t N = docs.size();
+    if (N == 0) throw std::runtime_error("SCOREHEAD: no scorable documents");
+    long n_en = 0, n_de = 0;
+    for (const SDoc& s : docs) (s.de ? n_de : n_en)++;
+    std::printf("\ndocuments scored: %zu  (EN %ld / DE %ld)\n", N, n_en, n_de);
+
+    // ── MASKS ──────────────────────────────────────────────────────────────
+    // ALL, the language split, and a BILINGUAL odd/even split. The second axis
+    // is what tells noise apart from a language effect (header point 3).
+    std::vector<char> m_all(N, 1), m_en(N, 0), m_de(N, 0), m_h0(N, 0), m_h1(N, 0),
+                      m_old(N, 0), m_new(N, 0);
+    { long ie = 0, id = 0;
+      for (size_t i = 0; i < N; ++i) {
+          if (docs[i].de) { m_de[i] = 1; (id++ % 2 ? m_h1 : m_h0)[i] = 1; }
+          else            { m_en[i] = 1; (ie++ % 2 ? m_h1 : m_h0)[i] = 1; }
+          (docs[i].novel ? m_new : m_old)[i] = 1;
+      } }
+    { long no = 0, nn = 0;
+      for (size_t i = 0; i < N; ++i) (docs[i].novel ? nn : no)++;
+      std::printf("corpus split: %ld original (DECIDEHEAD's) / %ld written for this leg\n", no, nn); }
+
+    // Ordinal concordance: over every pair of documents on DIFFERENT levels,
+    // how often the higher level is scored higher. Ties count a half, exactly
+    // as ABSENTHEAD's AUC does. Chance is 0.5; 1.0 is a perfect ordering.
+    auto conc = [&](int sh, int v, int cand, const std::vector<char>& m) {
+        const std::vector<float>& x = ev[sh][v][cand];
+        if (x.size() != N) return 0.0;
+        double win = 0, tot = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (!m[i]) continue;
+            for (size_t j = 0; j < N; ++j) {
+                if (!m[j] || docs[j].label >= docs[i].label) continue;
+                tot += 1.0;
+                if (x[i] > x[j]) win += 1.0; else if (x[i] == x[j]) win += 0.5;
+            }
+        }
+        return tot > 0 ? win / tot : 0.0;
+    };
+    auto exact = [&](int sh, int v, int cand, const std::vector<char>& m) {
+        long hit = 0, tot = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (m[i]) { tot++; if (am[sh][v][cand][i] == docs[i].label) hit++; }
+        return tot ? 100.0 * (double)hit / (double)tot : 0.0;
+    };
+    auto within1 = [&](int sh, int v, int cand, const std::vector<char>& m) {
+        long hit = 0, tot = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (m[i]) { tot++; if (std::abs((int)am[sh][v][cand][i] - docs[i].label) <= 1) hit++; }
+        return tot ? 100.0 * (double)hit / (double)tot : 0.0;
+    };
+    // Mean absolute error of the FRACTIONAL score against the true level. This
+    // is the number a product prints; concordance is the number that selects.
+    auto mae = [&](int sh, int v, int cand, const std::vector<char>& m) {
+        double s = 0; long tot = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (m[i]) { s += std::fabs((double)ev[sh][v][cand][i] - (double)docs[i].label); tot++; }
+        return tot ? s / (double)tot : 0.0;
+    };
+
+    // ── SEPARATION, because concordance SATURATES on this corpus ──────────
+    // The first Q4 run put ten heads inside a 3-point band at the top and the
+    // winner at exactly 1.0000. A metric pinned at its ceiling cannot choose,
+    // and "rank 1" then means "tied with everyone else at 1.0" — the same way
+    // COVSEARCH's G3 gate could not fail once its held AUC saturated.
+    // So concordance keeps its job (it says the ORDER is right) and gets a
+    // tie-break that has no ceiling: the smallest gap between two adjacent
+    // levels, in pooled within-level standard deviations. That is the quantity
+    // a fractional score actually needs — levels that are ordered AND apart —
+    // and it is scale-free, so the squashed range does not flatter it.
+    auto separation = [&](int sh, int v, int cand, const std::vector<char>& m) {
+        const std::vector<float>& x = ev[sh][v][cand];
+        double mu[8] = {0}, ss[8] = {0}; long cnt[8] = {0};
+        for (size_t i = 0; i < N; ++i)
+            if (m[i]) { mu[docs[i].label] += x[i]; cnt[docs[i].label]++; }
+        for (int L = 0; L < NOPT; ++L) if (cnt[L]) mu[L] /= (double)cnt[L];
+        long dof = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (m[i]) { const double dd = x[i] - mu[docs[i].label]; ss[docs[i].label] += dd * dd; }
+        double pooled_ss = 0;
+        for (int L = 0; L < NOPT; ++L) { pooled_ss += ss[L]; if (cnt[L]) dof += cnt[L] - 1; }
+        const double sd = dof > 0 ? std::sqrt(pooled_ss / (double)dof) : 0.0;
+        if (sd <= 0.0) return 0.0;
+        double worst = 1e9;
+        for (int L = 0; L + 1 < NOPT; ++L) {
+            if (!cnt[L] || !cnt[L + 1]) continue;
+            worst = std::min(worst, (mu[L + 1] - mu[L]) / sd);
+        }
+        return worst > 1e8 ? 0.0 : worst;
+    };
+    // Lexicographic (concordance, separation): order first, spacing second.
+    auto better = [&](int sh, int v, int c, int sh2, int v2, int c2,
+                      const std::vector<char>& m) {
+        const double a = conc(sh, v, c, m), b = conc(sh2, v2, c2, m);
+        if (a != b) return a > b;
+        return separation(sh, v, c, m) > separation(sh2, v2, c2, m);
+    };
+
+    std::printf("\n  === BEST HEAD PER SHAPE x VARIANT (by pooled concordance) ===\n");
+    std::printf("  shape    variant   | best head | conc    EN     DE    | exact within1  MAE   sep\n");
+    int bv = 0, bc = 0; double bconc = -1.0;
+    for (int sh = 0; sh < N_SHAPE; ++sh)
+        for (int v = 0; v < N_VAR; ++v) {
+            int cbest = 0;
+            for (int c = 1; c < C; ++c)
+                if (better(sh, v, c, sh, v, cbest, m_all)) cbest = c;
+            const double abest = conc(sh, v, cbest, m_all);
+            std::printf("  %-8s %-9s | L%-3d h=%-3d| %.4f %.4f %.4f | %5.1f%% %5.1f%% %5.2f  %5.2f%s\n",
+                        SNAME[sh], VNAME[v], attn_layers[cbest / H], cbest % H,
+                        abest, conc(sh, v, cbest, m_en), conc(sh, v, cbest, m_de),
+                        exact(sh, v, cbest, m_all), within1(sh, v, cbest, m_all),
+                        mae(sh, v, cbest, m_all), separation(sh, v, cbest, m_all),
+                        sh == SEL_SHAPE ? "" : "   (no vote)");
+            if (sh == SEL_SHAPE && (bconc < 0.0 || better(sh, v, cbest, sh, bv, bc, m_all)))
+                { bconc = abest; bc = cbest; bv = v; }
+        }
+
+    const int bsh = SEL_SHAPE;
+    std::printf("\n  === RANKED, best configuration (%s / %s), top 10 of %d ===\n",
+                SNAME[bsh], VNAME[bv], C);
+    std::vector<double> pooled(C), psep(C);
+    for (int c = 0; c < C; ++c) { pooled[c] = conc(bsh, bv, c, m_all);
+                                  psep[c]   = separation(bsh, bv, c, m_all); }
+    std::vector<int> ord(C);
+    for (int c = 0; c < C; ++c) ord[c] = c;
+    std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+        if (pooled[a] != pooled[b]) return pooled[a] > pooled[b];
+        return psep[a] > psep[b];
+    });
+    // How compressed is the top? If many heads share the leading concordance
+    // the ranking is not choosing between them and every "rank 1" below has to
+    // be read with that number next to it.
+    long tied_top = 0;
+    for (int c = 0; c < C; ++c) if (pooled[c] >= pooled[ord[0]]) tied_top++;
+    std::printf("  concordance at the top: %.4f, shared by %ld of %d heads%s\n",
+                pooled[ord[0]], tied_top, C,
+                tied_top > 1 ? "  <-- SATURATED, separation is doing the choosing" : "");
+    std::printf("  rank | layer head | blocks |  conc     EN      DE   | exact within1  MAE   sep\n");
+    for (int i = 0; i < std::min(10, C); ++i) {
+        const int c = ord[i];
+        std::printf("  %4d | L%-4d h=%-3d| %3d    | %.4f  %.4f  %.4f | %5.1f%% %5.1f%% %5.2f  %5.2f\n",
+                    i + 1, attn_layers[c / H], c % H, attn_layers[c / H] + 1, pooled[c],
+                    conc(bsh, bv, c, m_en), conc(bsh, bv, c, m_de),
+                    exact(bsh, bv, c, m_all), within1(bsh, bv, c, m_all),
+                    mae(bsh, bv, c, m_all), psep[c]);
+    }
+    // The three landed pairs, measured on THIS job — the "a layer is not a job"
+    // line, restated every time a new job is swept.
+    struct Ref { const char* name; int layer, head; };
+    const Ref refs[] = {{"locate", calib->constants.locate_layer, calib->constants.locate_head},
+                        {"choice", calib->constants.choice_layer, calib->constants.choice_head},
+                        {"absent", calib->constants.absent_layer, calib->constants.absent_head}};
+    std::printf("\n  INCUMBENTS on the ordinal job (each calibrated for another job)\n");
+    for (const Ref& r : refs) {
+        int slot = -1;
+        for (int i = 0; i < S; ++i) if (attn_layers[i] == r.layer) slot = i;
+        if (slot < 0 || r.head < 0) continue;
+        const int ic = slot * H + r.head;
+        int rank = 0;
+        for (int i = 0; i < C; ++i) if (ord[i] == ic) { rank = i + 1; break; }
+        std::printf("    %-7s L%-3d h=%-3d | rank %4d of %d | conc %.4f | exact %5.1f%% | within1 %5.1f%% | sep %.2f\n",
+                    r.name, r.layer, r.head, rank, C, pooled[ic],
+                    exact(bsh, bv, ic, m_all), within1(bsh, bv, ic, m_all), psep[ic]);
+    }
+
+    // ── HELD OUT, ON TWO AXES ──────────────────────────────────────────────
+    // Select the (variant, head) on one half, report what it scores on the
+    // other, and say how much the two halves AGREE about which heads are good.
+    // The agreement row is the point of the leg: a pooled maximum we cannot
+    // reproduce by choosing twice is not a landing candidate.
+    auto holdout = [&](const char* axis, const char* na, const std::vector<char>& A,
+                       const char* nb, const std::vector<char>& B) {
+        std::printf("\n  === HELD OUT on %s ===\n", axis);
+        std::printf("  selected on | variant   | best head | scored on | conc    exact  within1\n");
+        int pickc[2] = {0, 0}, pickv[2] = {0, 0};
+        for (int sel = 0; sel < 2; ++sel) {
+            const std::vector<char>& SEL = sel ? B : A;
+            const std::vector<char>& OTH = sel ? A : B;
+            // Lexicographic (concordance, separation) — plain argmax over a
+            // saturated metric picks whichever head the scan reaches first,
+            // which reads as disagreement when the halves in fact agree.
+            int sv = 0, sc = 0;
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c)
+                    if (better(SEL_SHAPE, v, c, SEL_SHAPE, sv, sc, SEL)) { sc = c; sv = v; }
+            pickc[sel] = sc; pickv[sel] = sv;
+            // How many heads tie this half's winning concordance: if that count
+            // is large the half did not really choose, and the row above is a
+            // tie-break, not a verdict.
+            const double top = conc(SEL_SHAPE, sv, sc, SEL);
+            long tied = 0;
+            for (int v = 0; v < N_VAR; ++v)
+                for (int c = 0; c < C; ++c) if (conc(SEL_SHAPE, v, c, SEL) >= top) tied++;
+            std::printf("  %-11s | %-9s | L%-3d h=%-3d| %-9s | %.4f  %5.1f%% %5.1f%% | tied at top: %ld\n",
+                        sel ? nb : na, VNAME[sv], attn_layers[sc / H], sc % H,
+                        sel ? na : nb, conc(SEL_SHAPE, sv, sc, OTH),
+                        exact(SEL_SHAPE, sv, sc, OTH), within1(SEL_SHAPE, sv, sc, OTH), tied);
+        }
+        const bool same_head = pickc[0] == pickc[1];
+        const bool same_var  = pickv[0] == pickv[1];
+        std::printf("  SYMMETRY: the two halves pick %s head, %s variant\n",
+                    same_head ? "the SAME" : "a DIFFERENT",
+                    same_var  ? "the same" : "a different");
+        // Rank agreement over the whole grid, which does not depend on the
+        // winner being identical: how many of one half's top 10 the other half
+        // also puts in its top 10, and where each half ranks the pooled winner.
+        auto keyed = [&](const std::vector<char>& m) {
+            std::vector<int> o(C);
+            for (int c = 0; c < C; ++c) o[c] = c;
+            std::vector<double> sc1(C), sc2(C);
+            for (int c = 0; c < C; ++c) { sc1[c] = conc(SEL_SHAPE, bv, c, m);
+                                          sc2[c] = separation(SEL_SHAPE, bv, c, m); }
+            std::stable_sort(o.begin(), o.end(), [&](int x, int y) {
+                if (sc1[x] != sc1[y]) return sc1[x] > sc1[y];
+                return sc2[x] > sc2[y];
+            });
+            return o;
+        };
+        const std::vector<int> oa = keyed(A), ob = keyed(B);
+        std::vector<int> ta(oa.begin(), oa.begin() + std::min(10, C));
+        std::vector<int> tb(ob.begin(), ob.begin() + std::min(10, C));
+        int overlap = 0;
+        for (int x : ta) for (int y : tb) if (x == y) overlap++;
+        // Rank under the SAME lexicographic key the selection uses, so a
+        // saturated concordance cannot hand out a free rank 1.
+        auto rank_in = [&](const std::vector<int>& o, int cand) {
+            for (int i = 0; i < C; ++i) if (o[i] == cand) return i + 1;
+            return C;
+        };
+        std::printf("  STABILITY: top-10 overlap %d/10 | pooled winner L%d h=%d ranks %d on %s, %d on %s\n",
+                    overlap, attn_layers[bc / H], bc % H,
+                    rank_in(oa, bc), na, rank_in(ob, bc), nb);
+    };
+    holdout("LANGUAGE (content held fixed — the corpus is parallel)", "EN", m_en, "DE", m_de);
+    holdout("BILINGUAL HALVES (language held fixed — noise only)", "half A", m_h0, "half B", m_h1);
+    // The conflict-of-interest axis. If the head selected on DECIDEHEAD's
+    // untouched 24 documents also wins on the 24 written for this leg, the new
+    // documents did not decide the answer. If the two disagree, or the novel
+    // half scores conspicuously higher, then the corpus extension is doing the
+    // work and this leg's headline is an artefact of its own author.
+    holdout("CORPUS ORIGIN (did the documents I wrote decide this?)",
+            "original", m_old, "novel", m_new);
+
+    // ── IS THE SCALE MONOTONE? ─────────────────────────────────────────────
+    // Concordance can be high while two adjacent levels sit on top of each
+    // other. A product that prints a fractional severity needs the four levels
+    // to come out in order and separated, so print the profile and let it be
+    // read rather than asserting it.
+    auto profile = [&](int v, int cand, const char* label) {
+        std::printf("\n  MEAN FRACTIONAL SCORE PER TRUE LEVEL — %s (L%d h=%d, %s)\n",
+                    label, attn_layers[cand / H], cand % H, VNAME[v]);
+        std::printf("    true level | n  | mean score | EN     DE\n");
+        for (int L = 0; L < NOPT; ++L) {
+            double s = 0, se = 0, sd = 0; long n = 0, ne = 0, nd = 0;
+            for (size_t i = 0; i < N; ++i) {
+                if (docs[i].label != L) continue;
+                const double e = ev[SEL_SHAPE][v][cand][i];
+                s += e; n++;
+                if (docs[i].de) { sd += e; nd++; } else { se += e; ne++; }
+            }
+            std::printf("    %-10d | %2ld | %10.3f | %.3f  %.3f\n", L, n,
+                        n ? s / (double)n : 0.0, ne ? se / (double)ne : 0.0,
+                        nd ? sd / (double)nd : 0.0);
+        }
+    };
+    profile(bv, bc, "POOLED BEST");
+
+    // ── WHAT IS FREE ───────────────────────────────────────────────────────
+    // The locate-only server already loads through the ABSENT layer, so any
+    // score head at or below it costs this product nothing. That is a much
+    // wider free zone than the one choice had to fit into, and it is the first
+    // question to ask of any candidate before its rate.
+    const int cut = std::max(calib->constants.absent_layer,
+                    std::max(calib->constants.locate_layer, calib->constants.choice_layer));
+    std::printf("\n  === FREE ZONE — the locate-only cut already loads L0..L%d ===\n", cut);
+    int freec = -1; double freeb = -1.0;
+    for (int slot = 0; slot < S; ++slot) {
+        if (attn_layers[slot] > cut) break;
+        for (int h = 0; h < H; ++h)
+            if (pooled[slot * H + h] > freeb) { freeb = pooled[slot * H + h]; freec = slot * H + h; }
+    }
+    if (freec >= 0) {
+        int rank = 0;
+        for (int i = 0; i < C; ++i) if (ord[i] == freec) { rank = i + 1; break; }
+        std::printf("  best head at or below L%d: L%d h=%d | rank %d of %d | conc %.4f | exact %5.1f%% | within1 %5.1f%%\n",
+                    cut, attn_layers[freec / H], freec % H, rank, C, freeb,
+                    exact(bsh, bv, freec, m_all), within1(bsh, bv, freec, m_all));
+        if (freec != bc)
+            std::printf("  the pooled best costs %d extra blocks for %+.4f concordance\n",
+                        attn_layers[bc / H] - cut, pooled[bc] - freeb);
+        profile(bv, freec, "FREE BEST");
+    }
+
+    std::printf("\n  === PER TAPPED LAYER — best head and its depth cost ===\n");
+    for (int slot = 0; slot < S; ++slot) {
+        int bhh = 0; double bb = -1.0;
+        for (int h = 0; h < H; ++h) {
+            const double a = pooled[slot * H + h];
+            if (a > bb) { bb = a; bhh = h; }
+        }
+        std::printf("  L%-3d | %2d/%d blocks | h=%-3d conc %.4f\n", attn_layers[slot],
+                    attn_layers[slot] + 1, (int)meta.block_count, bhh, bb);
+    }
+
+    std::printf("\n  Probe only: moves no constant. A score head ships when BOTH\n");
+    std::printf("  held-out axes agree on it — a pooled maximum alone is not a rate.\n");
     return 0;
 }
 
@@ -11360,6 +12287,16 @@ int main() {
     // every (layer, head) x instruction shape x score variant on two tasks.
     if (std::getenv("DECIDEHEAD"))
         return run_decide_head_search(fp.get(), sched, tok, meta, attn_layers);
+    // ABSENTHEAD — the same question for the yes/no job: is the LOCATE pair the
+    // right head for ABSENCE? LOCABSENT's 0.927 was read off it.
+    if (std::getenv("ABSENTHEAD"))
+        return run_absent_head_search(fp.get(), sched, tok, meta, attn_layers);
+    // SCOREHEAD — the ordinal job. Unlike its two siblings this leg is not
+    // looking for a bigger number: DECIDEHEAD already found 87.5% and could
+    // not reproduce it by selecting twice. It ranks heads by ordinal
+    // concordance over a fractional score and holds out on TWO axes.
+    if (std::getenv("SCOREHEAD"))
+        return run_score_head_search(fp.get(), sched, tok, meta, attn_layers);
     // Leg C's corpus again, asking whether its LABELS are causally true.
     if (std::getenv("OMISSION1"))
         return run_omission1(fp.get(), sched, tok, meta, attn_layers);

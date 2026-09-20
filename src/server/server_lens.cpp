@@ -2294,6 +2294,24 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             "\". /v1/locate is refused rather than reading another model's coordinates. "
             "Run the LOCHEAD sweep (tests/perf/attn_provenance.cpp, LOCHEAD=1) and add the "
             "pair to this model's calibration row.");
+    if (head_role == LensHeadRole::Absent && (k.absent_layer < 0 || k.absent_head < 0))
+        throw std::runtime_error(
+            std::string("run_lens_locate: head=\"absent\" — this model has no measured "
+                        "absence head. ") + k.model_label + " carries absent_provenance \"" +
+            k.absent_provenance + "\". Refused rather than reading the LOCATE pair, which "
+            "measured AUC 0.961 against the absence pair's 0.995 on the one model swept. "
+            "Run ABSENTHEAD (tests/perf/attn_provenance.cpp, ABSENTHEAD=1) and add the "
+            "pair to this model's calibration row.");
+    if (head_role == LensHeadRole::Score && (k.score_layer < 0 || k.score_head < 0))
+        throw std::runtime_error(
+            std::string("run_lens_locate: head=\"score\" — this model has no measured "
+                        "ordinal head. ") + k.model_label + " carries score_provenance \"" +
+            k.score_provenance + "\". Refused rather than reading the LOCATE pair, which "
+            "measured ordinal concordance 0.837 against the score pair's 1.000 on the one "
+            "model swept — and refused rather than reading the ABSENT pair beside it on "
+            "the same layer, which reads 0.9861 and separates adjacent levels at 1.97 SD "
+            "against 3.48. Run SCOREHEAD (tests/perf/attn_provenance.cpp, SCOREHEAD=1) and "
+            "add the pair to this model's calibration row.");
     if (head_role == LensHeadRole::Choice && (k.choice_layer < 0 || k.choice_head < 0))
         throw std::runtime_error(
             std::string("run_lens_locate: head=\"choice\" — this model has no measured "
@@ -2373,18 +2391,40 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     // pair is the misuse the table exists to prevent (measured 87.5% vs 92.5%
     // on the one model swept, and far worse on the citation pair).
     // Validated at the top of this function, before any work.
-    const bool want_choice = head_role == LensHeadRole::Choice;
-    const int use_layer = want_choice ? k.choice_layer : k.locate_layer;
-    const int use_head  = want_choice ? k.choice_head  : k.locate_head;
-    // MEAN is outside what LOCHEAD swept (it measured MAX); for the CHOICE
-    // pair the reverse holds — DECIDEHEAD measured 92.5% under MEAN, so MAX is
-    // the off-recipe setting there. Either way the report says when the
-    // request sits outside the measurement behind its own provenance.
-    const bool agg_off_recipe = want_choice
+    // One switch rather than a chain of ternaries: with four roles the chain
+    // stopped being readable, and a switch with no default is the version the
+    // compiler checks when a fifth role is added.
+    int use_layer = k.locate_layer, use_head = k.locate_head;
+    const char* use_provenance = k.locate_provenance;
+    // Locate is the odd one out. It was swept under MAX key aggregation and
+    // the extraction instruction shape; CHOICE, ABSENT and SCORE were all
+    // swept under MEAN and the question shape. So "off recipe" inverts with
+    // the job, and a request is disclosed as uncalibrated whenever it sits
+    // outside the measurement behind ITS OWN provenance — never against some
+    // single house recipe, which would mislabel three jobs out of four.
+    bool decision_recipe = true;
+    switch (head_role) {
+        case LensHeadRole::Locate:
+            decision_recipe = false;
+            break;
+        case LensHeadRole::Choice:
+            use_layer = k.choice_layer; use_head = k.choice_head;
+            use_provenance = k.choice_provenance;
+            break;
+        case LensHeadRole::Absent:
+            use_layer = k.absent_layer; use_head = k.absent_head;
+            use_provenance = k.absent_provenance;
+            break;
+        case LensHeadRole::Score:
+            use_layer = k.score_layer; use_head = k.score_head;
+            use_provenance = k.score_provenance;
+            break;
+    }
+    const bool agg_off_recipe = decision_recipe
         ? (key_agg != LensKeyAggregation::Mean)
         : (key_agg != LensKeyAggregation::Max);
-    rep.uncalibrated        = (question_mode && !want_choice) || agg_off_recipe;
-    rep.locate_provenance   = want_choice ? k.choice_provenance : k.locate_provenance;
+    rep.uncalibrated        = (question_mode && !decision_recipe) || agg_off_recipe;
+    rep.locate_provenance   = use_provenance;
     rep.locate_layer        = use_layer;
     rep.locate_head         = use_head;
     rep.top_k               = top_k;
