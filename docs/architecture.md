@@ -237,7 +237,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; `/v1/locate` — document + keys → byte ranges, nothing generated and nothing audited, on its own calibrated head; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; `/v1/locate` — document + keys → byte ranges, nothing generated and nothing audited, on its own calibrated head; `/v1/verdict` — document + yes/no questions → yes / no / unclear read off the prefill's last row, full lens server only; `/v1/compare` — an original's units + a second version → which units are missing, every lens server; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -990,7 +990,7 @@ Two facts about it are load-bearing:
   predates the field, and `mean` sets `uncalibrated` because the shipped
   provenance rates were all measured under `max`.
 - **It takes an optional `head`** (`"locate"` default, plus `"choice"`,
-  `"absent"` and `"score"` opt-in; 2026-09-20), selecting which calibrated
+  `"absent"` and `"score"` opt-in; 2026-09-20; `"inject"` 2026-09-24), selecting which calibrated
   job's pair to read. **Four jobs now read four different heads** on the 9B —
   locate L11 h=6, choice L11 h=3, absent L19 h=10, score L19 h=11 — two pairs
   sharing layer 11 and two sharing layer 19. A layer is not a job: on Qwen3.8-9B choice sits at the **same layer** as locate (11) on a
@@ -1028,6 +1028,17 @@ Two facts about it are load-bearing:
   agreement on any of three axes. A `-1` therefore means one of two different
   things, and the provenance string is what distinguishes "measured and
   refused" from "never measured" — both are refused at the route either way.
+  A fifth value, `"inject"` (2026-09-24, `note-lens-injection-probe.md`), is
+  the first role that **reads no key**: it averages the *template-tail* rows
+  (everything after the instruction) of **L11 h=0** over the document, after
+  Attention Tracker's "distraction effect", and returns ONE `hits` entry named
+  `instruction_like` instead of one per key; `key_aggregation` does not apply
+  and only a key-mode prompt sets `uncalibrated`. It is a **highlighter, not a
+  detector**: the injected sentence is the top segment 90.3% of the time
+  (chance 1.8%), but a single threshold across documents reads only
+  0.83–0.90 AUC. It always points somewhere, so a clean document still gets
+  a span. Free on the 9B (locate's layer; the cut stays 20) and folded into
+  both cut expressions so a model where it sits deeper pays honestly.
 - **It truncates after `locate_layer` alone**, so the constant IS the route's
   cost. On Qwen 3.6-35B that layer is 11, which is exactly
   `max(citation_layer, coverage_layer)` — so `/v1/locate` costs a
@@ -1120,6 +1131,89 @@ loaded, so this flag saves weight bytes only; sizing the state to match is a
 further optimization this change does not attempt. This is the smallest
 saving of the three calibrated entries (9B skips 5/33 blocks); the 35B-A3B
 entry (12 of 40) and the 27B entry (20 of 65) skip a much larger fraction.
+
+**Split locate prefill — a per-model licence (2026-09-25).** `run_lens_locate`
+takes a `LensPrefillShape`: `OneShot` (the pass every constant was measured
+on), `Split` (the document prefilled untapped, then the instruction + keys +
+template tail tapped at their real positions) or `SplitFlash` (the same with
+flash on the document pass). Every row a mode reads sits after the document
+and attention is causal, so only chunk-boundary and flash rounding differ;
+the route fails loud if a read row would fall inside the document pass.
+**Which shape a model uses is a field of its calibration row**
+(`LensConstants::locate_prefill_shape` + `locate_prefill_provenance`, default
+`OneShot`), the same pattern as `flash_prefill_ok`: licensed per model by the
+LOCSPLIT drift gate (`tests/perf/attn_provenance.cpp`), never inherited — and
+per QUANTIZATION: Qwen3.8-9B at Q4_K_M passed and Q8_0 failed (absent on long
+documents changed 2 of 12 top-1 spans), so the licence lives on the table's
+first `file_type`-pinned row (`kGgufFileTypeQ4_K_M`, 15). Both 9B rows are built
+by one function (`qwen38_9b_constants()`), so the pinned row cannot drift from
+the any-quant row in anything but the licence; the any-quant row, and so Q8_0,
+stays `OneShot`. The report names the shape (`prefill`)
+and a split+flash locate is stamped `config.attention = "flash-prefill"` by
+route (`RoutePrefill::DocumentPassFlash`), because its document pass ran flash
+by licence rather than by server flag. Measured at a 10K prompt: locate
+27.5 → 23.4 s, absent 45.5 → 37.4 s, GPU compute buffer 8.2 → 2.9 GB; split
+without flash is slightly slower and exists as the base for keeping a
+document between requests ([`note-lens-prefill-only-engine.md`](note-lens-prefill-only-engine.md)).
+
+**The kept document (`document_id` on `/v1/locate`, 2026-09-26).** Built on the
+split: pass 1 depends on the document alone, so `run_lens_locate` can store slot
+0 right after it (`qinf::snapshot::capture_slot` — KV **and** DeltaNet state,
+which a position rewind cannot restore) and later restore it and run pass 2
+only. The store is `LensDocumentStore` (`server_lens.h`), owned by the server
+beside the slot it restores into and guarded by `model_mutex_`; `qinf-server`
+now links `qinf-snapshot` for it. The only hit test is exact equality of pass
+1's tokens; the document hash only turns an id reused for other text into a
+400. A pass 1 serves any read at or below the layer it was computed to
+(truncation is causal in depth). One-shot rows refuse an id. RAM only: 4
+documents, LRU, 15-minute idle TTL checked on every `/v1/locate` — fixed
+defaults, not flags (`kLensDocumentStoreMax`, `kLensDocumentStoreTtl`). Gated
+by LOCWARM: warm bit-identical to cold on 115/115 reports; 10K locate 22.4 s →
+0.30 s. **`/v1/extract` uses the same store** (2026-09-26): its older warm path
+(`LensWarmDocument` — keep slot 0, rewind the position) is deleted, because a
+position rewind restores KV but not DeltaNet state, and EXTWARM measured it
+NOT warm == cold on the hybrid 9B (edit loop 0/6; with a locate in between the
+output changed 6/6). Extract's document pass is now kept and restored as a
+snapshot (`LensDocPass`), and the candidates pass resumes from the same
+snapshot instead of rewinding. Entries are keyed per route
+(`LensKeptRoute`), because the two routes compute the document pass
+differently (truncated tapped graph vs full `run_prefill`); one store of 4
+serves both. EXTWARM: 15/15 identical to cold, both sequences, candidates on.
+
+**The verdict (`POST /v1/verdict`, 2026-09-26, docs/plan-lens-verdict.md).** A
+new lens route that reads **logits**, not attention: per question, one answer
+(yes / no / unclear) off the prefill's last row, after `verdict_layer` (logit
+lens; 27 → 28 of 33 blocks on the 9B), plus a receipt from the locate head. A
+new driver, `run_lens_verdict` — locate, extract and verify are untouched
+(gate G1: 90 reports byte-identical before and after). One document pass per
+request, truncated at the verdict layer and computed as locate's pass 1 (the
+row's `locate_prefill_shape`); each question resumes from its snapshot. With a
+`document_id` that pass is kept under `LensKeptRoute::Locate`, so it serves a
+later locate too. Served on the full lens server only: truncated servers load
+`token_embd` and the blocks but not the output head, which on the 9B is untied
+(`output.weight` 4096 × 248320 Q6_K, ~834 MB). Licensed per model and quant by
+`LensConstants::verdict_layer` / `verdict_provenance` / `verdict_envelope_tokens`
+(appended last; −1 = refused) — set only on the 9B Q4_K_M row. Uses
+`locate_scheduler()`: every pass is a truncated prefill.
+
+**Compare (`POST /v1/compare`, 2026-09-26, docs/plan-lens-compare.md).** The
+seventh mode, the first read ACROSS two documents: the original (the caller's
+units, one per line) and a second version (free text — a translation, a
+rewrite); per unit, the compare head's attention from the second version's
+rows (max over rows, mean over the unit's tokens, relative to the median unit),
+and `missing` below the row's `compare_threshold`. A new driver,
+`run_lens_compare`; split prefill (pass 1 = instruction + original, pass 2 =
+the second version, compare head tapped), truncated after `compare_layer` (15
+→ 16 of 33 blocks). The compare layer is folded into every lens server's cut
+(it changes no cut on the 9B), and the readout is attention, not logits, so
+**every** lens server serves it — locate-only included. With a `document_id`
+the original's pass is kept under `LensKeptRoute::Compare`, so many revisions
+resume from one original. Licensed by `compare_layer` / `compare_head` /
+`compare_threshold` / `compare_provenance` / `compare_min_units` /
+`compare_envelope_tokens`, appended last, set only on the 9B Q4_K_M row.
+The original's pass is always materialized: unlike locate and verdict it does
+not follow the row's split+flash licence (flash changed 6 of 31,807 flags at
+COMPAREGATE G3).
 
 **Locate-only server mode (`--lens-locate-only`, 2026-09-19).** The same
 argument taken to its floor. `/v1/locate` reads ONE layer and generates
@@ -1793,6 +1887,24 @@ Current, verified against the tree at time of writing:
   (`DecodePolicy::truncate_after_layer`), also opt-in and byte-inert (default
   `-1` = full stack) and honored by every recipe (Qwen and Gemma alike) as a
   plain layer-loop bound, not a per-recipe kernel capability.
+  **Head-selected tap (2026-09-25).** `set_attention_taps(layers, heads)` —
+  one call, so arming taps without heads resets the list rather than
+  inheriting it (`DecodePolicy::attention_tap_heads`, default empty = every
+  head, today's tap). With a list, `mark_attention_taps` leaves `kq_soft.<il>`
+  an ordinary intermediate and copies each selected head's contiguous
+  `[n_kv, n_q]` block into its own output `kq_tap.<il>.<h>`
+  (`ggml_view_3d` + `ggml_cont`); `get_attention_taps` returns them as
+  consecutive blocks with `AttentionTap::heads` (and `block_of(h)`) saying
+  which model head each block is. Why: a lens job reads one head, and the full
+  tap is `16 x P x P` floats — 6.2 GB of host copy and 5.8 s of readback at a
+  10K prompt ([`note-lens-locate-baseline.md`](note-lens-locate-baseline.md)).
+  The copies are the same softmax, so values are byte-identical to the full
+  tap's (`HeadSelectedTapEqualsFullTap{Decode,Prefill}`, run per recipe, Qwen
+  and Gemma); `/v1/locate` is the one caller that sets it (`{use_head}`);
+  extract, verify and the probes keep the full tap. It does NOT remove the
+  materialized `kq_soft` itself — that transient still costs the GPU compute
+  buffer (8–9 GB at 10K); only a split pass with flash on the document does
+  (note-lens-prefill-only-engine.md).
 
 - **Qwen 3.5-family vision is gated end-to-end by coherence smokes, not by an
   automated test** — but the two links most likely to fail quietly are now

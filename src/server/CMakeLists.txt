@@ -64,6 +64,7 @@ target_include_directories(qinf-server PUBLIC
 
 target_link_libraries(qinf-server PUBLIC
     qinf-models
+    qinf-snapshot   # /v1/locate's kept document (LensDocumentStore): capture/restore of slot 0
     sampling
     nlohmann_json::nlohmann_json
     ggml

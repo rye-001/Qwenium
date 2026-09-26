@@ -266,6 +266,7 @@ std::vector<float> ForwardPassBase::get_output_hidden(ggml_cgraph* gf) {
 // recipe; marking an existing node as an output adds no compute, so the tap-off
 // path (empty layer set → this is a no-op) is byte-identical to today.
 void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
+    const std::vector<int>& heads = policy_.attention_tap_heads;
     for (int il : policy_.attention_taps) {
         std::string nm = "kq_soft." + std::to_string(il);
         ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
@@ -275,8 +276,40 @@ void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
                 "' expected in graph, actual absent — layer " +
                 std::to_string(il) + " is not an attention layer of this "
                 "recipe (or the graph has no such block).");
-        ggml_set_output(ts);
-        ggml_build_forward_expand(gf, ts);
+        if (heads.empty()) {
+            ggml_set_output(ts);
+            ggml_build_forward_expand(gf, ts);
+            continue;
+        }
+        // Head-selected tap. kq_soft is [n_kv, n_q, n_head, 1] and contiguous,
+        // so one head is the contiguous block at offset h * nb[2]; ggml_cont
+        // copies it into a tensor of its own. kq_soft stays an ordinary
+        // intermediate, free for galloc to reuse once the copies are made.
+        if (ts->ne[3] != 1 || !ggml_is_contiguous(ts))
+            throw std::runtime_error(
+                "mark_attention_taps: '" + nm + "' expected contiguous with ne[3] == 1 "
+                "for a head-selected tap, actual ne[3]=" + std::to_string(ts->ne[3]) +
+                (ggml_is_contiguous(ts) ? "" : " and non-contiguous"));
+        for (size_t a = 0; a < heads.size(); ++a) {
+            const int h = heads[a];
+            if (h < 0 || h >= (int)ts->ne[2])
+                throw std::runtime_error(
+                    "mark_attention_taps: tap head expected within [0, " +
+                    std::to_string(ts->ne[2]) + ") on layer " + std::to_string(il) +
+                    ", actual " + std::to_string(h));
+            for (size_t b = 0; b < a; ++b)
+                if (heads[b] == h)
+                    throw std::runtime_error(
+                        "mark_attention_taps: tap heads expected distinct, actual head " +
+                        std::to_string(h) + " listed twice");
+            ggml_tensor* one = ggml_view_3d(arena_.ctx(), ts, ts->ne[0], ts->ne[1], 1,
+                                            ts->nb[1], ts->nb[2], (size_t)h * ts->nb[2]);
+            ggml_tensor* sel = ggml_cont(arena_.ctx(), one);
+            const std::string sn = "kq_tap." + std::to_string(il) + "." + std::to_string(h);
+            ggml_set_name(sel, sn.c_str());
+            ggml_set_output(sel);
+            ggml_build_forward_expand(gf, sel);
+        }
     }
 }
 
@@ -330,22 +363,54 @@ std::vector<ForwardPassBase::AttentionTap>
 ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
     std::vector<AttentionTap> out;
     out.reserve(policy_.attention_taps.size());
+    const std::vector<int>& heads = policy_.attention_tap_heads;
     for (int il : policy_.attention_taps) {
         std::string nm = "kq_soft." + std::to_string(il);
-        ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
-        if (!ts)
-            throw std::runtime_error(
-                "get_attention_taps: attention-tap tensor '" + nm +
-                "' expected in graph, actual absent — call "
-                "mark_attention_taps(gf) after build_decoding_graph and before "
-                "graph alloc.");
         AttentionTap tap;
-        tap.layer  = il;
-        tap.n_kv   = (int)ts->ne[0];
-        tap.n_q    = (int)ts->ne[1];   // 1 at decode; >1 at a tapped prefill block
-        tap.n_head = (int)ts->ne[2];   // shape [n_kv, n_q, n_head, 1]
-        tap.rows.resize((size_t)tap.n_kv * tap.n_q * tap.n_head);
-        ggml_backend_tensor_get(ts, tap.rows.data(), 0, ggml_nbytes(ts));
+        tap.layer = il;
+        if (heads.empty()) {
+            ggml_tensor* ts = ggml_graph_get_tensor(gf, nm.c_str());
+            if (!ts)
+                throw std::runtime_error(
+                    "get_attention_taps: attention-tap tensor '" + nm +
+                    "' expected in graph, actual absent — call "
+                    "mark_attention_taps(gf) after build_decoding_graph and before "
+                    "graph alloc.");
+            tap.n_kv   = (int)ts->ne[0];
+            tap.n_q    = (int)ts->ne[1];   // 1 at decode; >1 at a tapped prefill block
+            tap.n_head = (int)ts->ne[2];   // shape [n_kv, n_q, n_head, 1]
+            tap.rows.resize((size_t)tap.n_kv * tap.n_q * tap.n_head);
+            ggml_backend_tensor_get(ts, tap.rows.data(), 0, ggml_nbytes(ts));
+            tap.heads.resize((size_t)tap.n_head);
+            for (int h = 0; h < tap.n_head; ++h) tap.heads[(size_t)h] = h;
+        } else {
+            // Head-selected: one `kq_tap.<il>.<h>` copy per head, laid out as
+            // consecutive blocks — the same [block][q][kv] order as a full tap.
+            tap.heads  = heads;
+            tap.n_head = (int)heads.size();
+            for (size_t b = 0; b < heads.size(); ++b) {
+                const std::string sn = "kq_tap." + std::to_string(il) + "." + std::to_string(heads[b]);
+                ggml_tensor* sel = ggml_graph_get_tensor(gf, sn.c_str());
+                if (!sel)
+                    throw std::runtime_error(
+                        "get_attention_taps: head-selected tap '" + sn +
+                        "' expected in graph, actual absent — call "
+                        "mark_attention_taps(gf) after the graph build and before "
+                        "graph alloc, with the same head list armed.");
+                if (b == 0) {
+                    tap.n_kv = (int)sel->ne[0];
+                    tap.n_q  = (int)sel->ne[1];
+                    tap.rows.resize((size_t)tap.n_kv * tap.n_q * tap.n_head);
+                }
+                const size_t block = (size_t)tap.n_kv * tap.n_q;
+                if (ggml_nbytes(sel) != block * sizeof(float))
+                    throw std::runtime_error(
+                        "get_attention_taps: '" + sn + "' expected " +
+                        std::to_string(block * sizeof(float)) + " bytes, actual " +
+                        std::to_string(ggml_nbytes(sel)));
+                ggml_backend_tensor_get(sel, tap.rows.data() + b * block, 0, ggml_nbytes(sel));
+            }
+        }
         // ── The tap must BE a softmax. Fail loud if it is not. ──────────────
         // Post-softmax attention weights live in [0, 1] — always, with or
         // without sinks. A value outside that range means these bytes are not

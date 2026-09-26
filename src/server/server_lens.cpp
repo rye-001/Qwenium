@@ -24,6 +24,7 @@
 #include "../loader/tokenizer.h"
 #include "../loader/chat_template.h"
 #include "../sampling/grammar_vocab.h"
+#include "session/slot_snapshot.h"   // the kept document: capture/restore of slot 0
 
 namespace qinf {
 
@@ -1234,14 +1235,16 @@ void lens_apply_pass2_candidates(const std::string& document, const std::string&
 }
 
 namespace {
-// cum_bytes: token -> cumulative decoded byte offset, via incremental decode
-// (byte-level BPE; matches attn_provenance.cpp cum_bytes exactly).
+// cum_bytes: token -> cumulative decoded byte offset, cum[k] = bytes of
+// decode(toks[0:k]) (byte-level BPE; matches attn_provenance.cpp cum_bytes
+// exactly). One pass: Tokenizer::decode(vector) IS the concatenation of the
+// per-token decodes, so a running sum of each token's width is the same number.
+// The earlier form re-decoded the whole prefix for every k — quadratic, 5.1 s
+// of a 10K-token /v1/locate (LOCPERF, 2026-09-25).
 std::vector<size_t> cum_bytes(::Tokenizer* tok, const std::vector<int32_t>& toks) {
     std::vector<size_t> cum(toks.size() + 1, 0);
-    for (size_t k = 1; k <= toks.size(); ++k) {
-        std::vector<int32_t> pre(toks.begin(), toks.begin() + k);
-        cum[k] = tok->decode(pre).size();
-    }
+    for (size_t k = 0; k < toks.size(); ++k)
+        cum[k + 1] = cum[k] + tok->decode(toks[k]).size();
     return cum;
 }
 
@@ -1266,6 +1269,19 @@ std::vector<size_t> cum_bytes(::Tokenizer* tok, const std::vector<int32_t>& toks
 // a fence, a preamble, trailing prose — or we would manufacture a parse rate the
 // model has not earned. Shape tolerance belongs in the parser, loudly
 // (lens_find_json_object / LensUnparseableError), not here.
+// Pass 1's document prefill, as run_lens_tapped_decode ran it: restored from the
+// store or computed, the tokens it covered, and the slot snapshot taken right
+// after it — set when the caller keeps the document (a document_id) or will
+// resume from it (the candidates pass). The snapshot is what a later resume
+// restores: KV AND DeltaNet state. A position rewind restores only the KV, and
+// on a hybrid the recurrent state after a decode (or after the slot is cleared)
+// is not the state at the document's end (EXTWARM, 2026-09-26).
+struct LensDocPass {
+    bool warm = false;
+    std::vector<int32_t> prefix_ids;
+    std::shared_ptr<const std::vector<uint8_t>> blob;
+};
+
 LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                ::Tokenizer* tok, const ModelMetadata& meta,
                                GrammarVocab* grammar,
@@ -1274,11 +1290,15 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                const std::string& document,
                                const std::string& instruction_suffix,
                                int max_new_tokens, const LensConstants& k,
-                               bool reuse_prefix, uint32_t* out_prefix_tokens,
-                               std::vector<int32_t>* out_prefix_ids) {
+                               LensDocumentStore* store, const std::string& document_id,
+                               bool keep_snapshot, LensDocPass* out_doc) {
     if (document.empty())
         throw std::runtime_error(
             "run_lens_tapped_decode: document expected non-empty actual=empty");
+    if ((store == nullptr) != document_id.empty())
+        throw std::runtime_error(
+            "run_lens_tapped_decode: a document store and a document_id expected together, actual " +
+            std::string(store ? "a store without an id" : "an id without a store"));
 
     // ChatML, thinking off (the production regime; plan §1.4). The document is
     // embedded verbatim so its byte spans locate value sources.
@@ -1374,26 +1394,56 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             "run_lens_tapped_decode: document token span expected within the prompt "
             "(0 < doc_hi < " + std::to_string(P) + "), actual doc_hi=" +
             std::to_string(split) + " — the chat template moved the document");
-    if (out_prefix_tokens) *out_prefix_tokens = split;
-    if (out_prefix_ids)
-        out_prefix_ids->assign(prompt_tokens.begin(), prompt_tokens.begin() + (long)split);
+    const std::vector<int32_t> pre(prompt_tokens.begin(), prompt_tokens.begin() + (long)split);
+    const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)split, prompt_tokens.end());
+    LensDocPass doc_pass;
+    doc_pass.prefix_ids = pre;
 
+    // ── The document pass: restored from the store, or computed (and kept) ──
+    // A kept pass 1 is used only when it is the identical computation: same
+    // route, same tokens, same attention implementation, full depth
+    // (LensDocumentStore::find). Restoring puts back KV and DeltaNet state.
+    const bool keep = store != nullptr;
+    const bool snap = keep || keep_snapshot;
+    const LensPrefillShape impl_shape =
+        fp->prefill_attn_impl() == ForwardPassBase::AttnImpl::Flash ? LensPrefillShape::SplitFlash
+                                                                    : LensPrefillShape::Split;
+    const int full_depth = (int)meta.block_count;
+    const LensDocumentStore::Clock::time_point now = LensDocumentStore::Clock::now();
+    const uint64_t doc_hash = keep ? lens_document_hash(document) : 0;
+    const qinf::session::CompatHeader header = snap
+        ? qinf::snapshot::make_snapshot_header(meta, fp->snapshot_kv_caches())
+        : qinf::session::CompatHeader{};
+    const LensDocumentStore::Entry* kept =
+        keep ? store->find(LensKeptRoute::Extract, document_id, doc_hash, pre, impl_shape, full_depth, now)
+             : nullptr;
     std::vector<float> logits;
-    if (reuse_prefix) {
-        // Slot 0 still holds this document's KV at [0, split). A decode only
-        // ever wrote at positions >= split, so rewinding is all that is needed.
-        fp->set_cache_pos(split, 0);
-        const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)split,
-                                          prompt_tokens.end());
+    if (kept) {
+        qinf::snapshot::restore_slot(*fp, 0, *kept->blob, header);
+        if (fp->get_cache_pos(0) != split)
+            throw std::runtime_error(
+                "run_lens_tapped_decode: restored document pass expected to end at row " +
+                std::to_string(split) + ", actual " + std::to_string(fp->get_cache_pos(0)));
+        doc_pass.warm = true;
+        doc_pass.blob = kept->blob;
         logits = fp->run_prefill(suffix, split, 0, sched);
     } else {
         fp->clear_slot(0);
         fp->set_cache_pos(0, 0);
-        const std::vector<int32_t> pre(prompt_tokens.begin(),
-                                       prompt_tokens.begin() + (long)split);
-        const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)split,
-                                          prompt_tokens.end());
         fp->run_prefill(pre, 0, 0, sched);
+        if (snap) {
+            doc_pass.blob = std::make_shared<const std::vector<uint8_t>>(
+                qinf::snapshot::capture_slot(*fp, 0, header));
+            if (keep) {
+                LensDocumentStore::Entry e;
+                e.document_hash = doc_hash;
+                e.prefix_tokens = pre;
+                e.shape = impl_shape;
+                e.depth = full_depth;
+                e.blob = doc_pass.blob;
+                store->put(LensKeptRoute::Extract, document_id, std::move(e), now);
+            }
+        }
         logits = fp->run_prefill(suffix, split, 0, sched);
     }
     const int32_t eos = tok->get_eos_token_id();
@@ -1517,6 +1567,7 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     for (size_t i = 0; i < gen_tokens.size(); ++i) run.gen_tok_text[i] = tok->decode(gen_tokens[i]);
     run.gen_text = tok->decode(gen_tokens);
     run.gen_cum  = cum_bytes(tok, gen_tokens);
+    if (out_doc) *out_doc = std::move(doc_pass);
     return run;
 }
 
@@ -1540,7 +1591,8 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
                                   const std::vector<std::string>& keys,
                                   uint32_t vocab_size, uint32_t n_ctx_max,
                                   int max_new_tokens,
-                                  const std::vector<int32_t>* prefix_ids) {
+                                  const ModelMetadata& meta,
+                                  const LensDocPass* doc) {
     QwenChatTemplate ct;
     std::vector<ChatMessage> hist = {{"user", document + lens_cand_pass2_instruction(keys)}};
     const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true,
@@ -1568,15 +1620,25 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
     // diverges even in its last token would attribute pass 2's candidates to
     // text the model never read at those positions. So compare rather than
     // assume, and fall back to a cold prefill on any mismatch.
+    //
+    // Resumed from pass 1's SNAPSHOT (2026-09-26), not by rewinding slot 0's
+    // position: by now pass 1 has decoded and cleared the slot, and on a
+    // DeltaNet hybrid a rewind brought back the KV but not the recurrent state,
+    // so pass 2 read the instruction with no document in its recurrent layers.
     std::vector<float> logits;
-    const uint32_t prefix_tokens = prefix_ids ? (uint32_t)prefix_ids->size() : 0u;
-    bool can_reuse = prefix_ids != nullptr && prefix_tokens > 0 &&
+    const uint32_t prefix_tokens = doc ? (uint32_t)doc->prefix_ids.size() : 0u;
+    bool can_reuse = doc != nullptr && doc->blob && prefix_tokens > 0 &&
                      prefix_tokens < (uint32_t)prompt_tokens.size();
     if (can_reuse)
-        can_reuse = std::equal(prefix_ids->begin(), prefix_ids->end(),
+        can_reuse = std::equal(doc->prefix_ids.begin(), doc->prefix_ids.end(),
                                prompt_tokens.begin());
     if (can_reuse) {
-        fp->set_cache_pos(prefix_tokens, 0);
+        qinf::snapshot::restore_slot(
+            *fp, 0, *doc->blob, qinf::snapshot::make_snapshot_header(meta, fp->snapshot_kv_caches()));
+        if (fp->get_cache_pos(0) != prefix_tokens)
+            throw std::runtime_error(
+                "run_cand_pass2_decode: restored document pass expected to end at row " +
+                std::to_string(prefix_tokens) + ", actual " + std::to_string(fp->get_cache_pos(0)));
         const std::vector<int32_t> suffix(prompt_tokens.begin() + (long)prefix_tokens,
                                           prompt_tokens.end());
         logits = fp->run_prefill(suffix, prefix_tokens, 0, sched);
@@ -1635,14 +1697,14 @@ std::string run_cand_pass2_decode(ForwardPassBase* fp, ggml_backend_sched_t sche
 void run_cand_pass2(ForwardPassBase* fp, ggml_backend_sched_t sched, ::Tokenizer* tok,
                     const std::string& document, const std::vector<std::string>& keys,
                     uint32_t vocab_size, uint32_t n_ctx_max, LensReport& report,
-                    const std::vector<int32_t>* prefix_ids) {
+                    const ModelMetadata& meta, const LensDocPass* doc) {
     // 700, not opts.max_new_tokens: pass 2 must enumerate every span for every
     // key (potentially several per key), a longer output than pass 1's single
     // value per key — matches the budget the CAND=1 probe measured the gate
     // against (docs/plan-candidate-set.md "Viability measured").
     const std::string gen_text =
         run_cand_pass2_decode(fp, sched, tok, document, keys, vocab_size, n_ctx_max, 700,
-                              prefix_ids);
+                              meta, doc);
     lens_apply_pass2_candidates(document, gen_text, keys, report);
 }
 
@@ -1740,18 +1802,16 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
     static const std::vector<std::string> kNoVocab;
     // Request metadata, not decode state — set here rather than inside the
     // decode helper, whose job is the forward pass.
-    // ── Warm document (docs/plan-lens-warm-document.md) ─────────────────────
-    // Reuse only when the caller named an id, the server still holds THAT id,
-    // and the document bytes hash the same. The hash check is the safety
-    // interlock: serving a primed prefix for different text would report
-    // receipts about a document the model never read.
-    const size_t doc_hash = std::hash<std::string>{}(document);
-    const bool reuse = opts.warm != nullptr && !opts.document_id.empty() &&
-                       opts.warm->valid &&
-                       opts.warm->document_id == opts.document_id &&
-                       opts.warm->document_hash == doc_hash;
-    uint32_t prefix_tokens = 0;
-    std::vector<int32_t> prefix_ids;
+    // ── Kept document (LensDocumentStore; docs/plan-lens-warm-document.md) ──
+    // Opt-in by document_id. The store restores pass 1's document prefill as a
+    // snapshot — KV and DeltaNet state — so a warm extract is the same
+    // computation as a cold one (EXTWARM gates it). The candidates pass resumes
+    // from the same snapshot, so it is taken whenever pass 2 will run.
+    if (!opts.document_id.empty() && opts.store == nullptr)
+        throw std::runtime_error(
+            "run_lens_extract: document_id expected a server document store, actual none");
+    LensDocumentStore* store = opts.document_id.empty() ? nullptr : opts.store;
+    LensDocPass doc_pass;
     // WHICH EXPERTS RAN, captured across the whole pass — the document prefill
     // included, which is why capture is a mode on the forward pass rather than
     // a call at the graph sites visible here.
@@ -1763,7 +1823,8 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
         vocab_size, n_ctx_max, document,
         question_mode ? lens_build_question_instruction(keys, questions)
                       : lens_build_instruction(keys),
-        opts.max_new_tokens, k, reuse, &prefix_tokens, &prefix_ids);
+        opts.max_new_tokens, k, store, store ? opts.document_id : std::string(),
+        /*keep_snapshot=*/opts.want_candidates, &doc_pass);
     run.message_offsets = opts.message_offsets;
     if (!run.message_offsets.empty() && run.message_offsets.back() >= document.size())
         throw std::runtime_error(
@@ -1774,7 +1835,7 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
     // Throws LensUnparseableError (⇒ 422) if the output holds no parseable object.
     LensReport report = apply_absent_by_omission(compute_lens_report(run, k), concepts);
     report.question_vocabulary = question_mode;
-    report.prefix_warm = reuse;
+    report.prefix_warm = doc_pass.warm;
     report.routing = routing_digest_of(routing_trace);
     if (opts.include_routing_trace && !report.routing.empty()) {
         // Truncated to max(citation, coverage): a verify pass stops its layer
@@ -1796,26 +1857,12 @@ LensReport run_lens_extract(ForwardPassBase* fp, ggml_backend_sched_t sched,
         // has for "not requested" vs. "ran" (see LensReport::candidates_requested).
         report.candidates_requested = true;
         // Pass 2 shares pass 1's document prefix — same document, same
-        // positions, only the instruction differs. Slot 0 still holds it, so
-        // pass 2 rewinds exactly as pass 1 does. Cleared by measurement
-        // (plan §8.1: 75/75 candidate-set identity, gate 2 and byte-exactness
-        // unchanged), which is why this is option 1 and not option 2.
+        // positions, only the instruction differs — and resumes from pass 1's
+        // snapshot (doc_pass.blob) when the boundary tokens match. Until
+        // 2026-09-26 it rewound slot 0's position instead, which on a hybrid
+        // lost the document's recurrent state (the slot had been cleared).
         run_cand_pass2(fp, sched, tok, document, keys, vocab_size, n_ctx_max,
-                       report, &prefix_ids);
-    }
-
-    // The slot now holds this document's prefix at [0, prefix_tokens). Publish
-    // that so the NEXT request for the same id can rewind to it. Recorded after
-    // both passes precisely because pass 2 leaves the prefix intact too.
-    if (opts.warm != nullptr && !opts.document_id.empty()) {
-        opts.warm->document_id   = opts.document_id;
-        opts.warm->document_hash = doc_hash;
-        opts.warm->prefix_tokens = prefix_tokens;
-        opts.warm->valid         = true;
-    } else if (opts.warm != nullptr) {
-        // No id this time: the slot was clobbered by a cold run, so whatever we
-        // were holding is gone. Say so rather than leaving a stale claim.
-        opts.warm->invalidate();
+                       report, meta, &doc_pass);
     }
 
     return report;
@@ -2221,6 +2268,12 @@ std::string lens_locate_to_json(const LensLocateReport& r) {
     o += "\"model\":\"" + jesc(r.model) + "\",\n";
     o += "\"config\":{\"weights\":\"" + jesc(r.config.weights) + "\",\"attention\":\"" +
          jesc(r.config.attention) + "\",\"kv_type\":\"" + jesc(r.config.kv_type) + "\"},\n";
+    // Additive member, so no format bump: which prefill shape produced the spans.
+    o += std::string("\"prefill\":\"") + lens_prefill_shape_name(r.prefill_shape) + "\",\n";
+    // Additive, and only on a `document_id` request: was the document pass
+    // restored ("warm") or computed and kept ("cold")?
+    if (r.document_prefix != LensDocumentPrefix::None)
+        o += std::string("\"prefix\":\"") + lens_document_prefix_name(r.document_prefix) + "\",\n";
     o += std::string("\"validated_envelope\":") + (r.validated_envelope ? "true" : "false") + ",\n";
     // Emitted unconditionally rather than only when true: a reader must never
     // have to decide whether an absent member means "calibrated" or "old
@@ -2262,6 +2315,74 @@ std::string lens_locate_to_json(const LensLocateReport& r) {
     return o;
 }
 
+uint64_t lens_document_hash(const std::string& document) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : document) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+LensDocumentStore::LensDocumentStore(size_t max_documents, std::chrono::seconds ttl)
+    : max_(max_documents), ttl_(ttl) {
+    if (max_documents == 0)
+        throw std::runtime_error("LensDocumentStore: slot 'max_documents' expected > 0, actual 0");
+    if (ttl.count() <= 0)
+        throw std::runtime_error("LensDocumentStore: slot 'ttl' expected > 0 s, actual " +
+                                 std::to_string(ttl.count()) + " s");
+}
+
+void LensDocumentStore::expire(Clock::time_point now) {
+    for (auto it = entries_.begin(); it != entries_.end();)
+        it = now - it->second.last_used > ttl_ ? entries_.erase(it) : std::next(it);
+}
+
+LensDocumentStore::Entry* LensDocumentStore::find(LensKeptRoute route, const std::string& id,
+                                                  uint64_t document_hash,
+                                                  const std::vector<int32_t>& prefix_tokens,
+                                                  LensPrefillShape shape, int depth,
+                                                  Clock::time_point now) {
+    expire(now);
+    auto it = entries_.find({route, id});
+    if (it == entries_.end()) return nullptr;
+    Entry& e = it->second;
+    // Reusing an id for other text is the caller's bug, and resuming would
+    // report spans in a document the model never read — refused, not missed.
+    if (e.document_hash != document_hash)
+        throw std::runtime_error(
+            "document_id '" + id + "' expected to name the document it was first sent with, "
+            "actual a different document — send a new document_id for new text");
+    if (e.shape != shape || e.depth < depth || e.prefix_tokens != prefix_tokens) return nullptr;
+    e.last_used = now;
+    return &e;
+}
+
+void LensDocumentStore::put(LensKeptRoute route, const std::string& id, Entry entry,
+                            Clock::time_point now) {
+    if (!entry.blob)
+        throw std::runtime_error("LensDocumentStore::put: slot 'blob' expected a captured slot, actual none");
+    expire(now);
+    entries_.erase({route, id});
+    while (entries_.size() >= max_) {
+        auto oldest = entries_.begin();
+        for (auto it = entries_.begin(); it != entries_.end(); ++it)
+            if (it->second.last_used < oldest->second.last_used) oldest = it;
+        entries_.erase(oldest);
+    }
+    entry.last_used = now;
+    entries_.emplace(std::make_pair(route, id), std::move(entry));
+}
+
+bool LensDocumentStore::forget(LensKeptRoute route, const std::string& id) {
+    return entries_.erase({route, id}) > 0;
+}
+
+size_t LensDocumentStore::bytes() const {
+    size_t b = 0;
+    for (const auto& kv : entries_)
+        b += (kv.second.blob ? kv.second.blob->size() : 0) +
+             kv.second.prefix_tokens.size() * sizeof(int32_t);
+    return b;
+}
+
 LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                  ::Tokenizer* tok, const ModelMetadata& meta,
                                  uint32_t n_ctx_max,
@@ -2270,9 +2391,23 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
                                  const LensConstants& k,
                                  int top_k,
                                  LensKeyAggregation key_agg,
-                                 LensHeadRole head_role) {
+                                 LensHeadRole head_role,
+                                 LensPrefillShape shape,
+                                 LensDocumentStore* store,
+                                 const std::string& document_id) {
     if (document.empty())
         throw std::runtime_error("run_lens_locate: document expected non-empty actual=empty");
+    if ((store == nullptr) != document_id.empty())
+        throw std::runtime_error(
+            "run_lens_locate: a document store and a document_id expected together, actual " +
+            std::string(store ? "a store without an id" : "an id without a store"));
+    const bool keep = store != nullptr;
+    if (keep && shape == LensPrefillShape::OneShot)
+        throw std::runtime_error(
+            "run_lens_locate: document_id expected a model row licensed for a split prefill "
+            "(its document pass is what is kept), actual one-shot for " + std::string(k.model_label) +
+            " — a kept one-shot prompt would not reproduce the cold report. Send the request "
+            "without document_id.");
     if (concepts.empty())
         throw std::runtime_error(
             "run_lens_locate: concepts expected non-empty (the complete concept hint) "
@@ -2312,6 +2447,15 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             "the same layer, which reads 0.9861 and separates adjacent levels at 1.97 SD "
             "against 3.48. Run SCOREHEAD (tests/perf/attn_provenance.cpp, SCOREHEAD=1) and "
             "add the pair to this model's calibration row.");
+    if (head_role == LensHeadRole::Inject && (k.inject_layer < 0 || k.inject_head < 0))
+        throw std::runtime_error(
+            std::string("run_lens_locate: head=\"inject\" — this model has no measured "
+                        "injection head. ") + k.model_label + " carries inject_provenance \"" +
+            k.inject_provenance + "\". Refused rather than reading another pair: on the one "
+            "model swept the landed locate and choice heads read AUC 0.97 / 0.96 on short "
+            "documents where the inject pair read 1.000, and the absent and score heads "
+            "0.89. Run INJHEAD and INJHARD (tests/perf/attn_provenance.cpp) and add the "
+            "pair to this model's calibration row.");
     if (head_role == LensHeadRole::Choice && (k.choice_layer < 0 || k.choice_head < 0))
         throw std::runtime_error(
             std::string("run_lens_locate: head=\"choice\" — this model has no measured "
@@ -2385,6 +2529,7 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     // knob is told the provenance rate no longer describes their request.
     rep.key_aggregation     = key_agg;
     rep.head_role           = head_role;
+    rep.prefill_shape       = shape;
     // The pair this request reads, and the provenance that describes IT.
     // Refused fail-loud on a model whose sweep never ran, exactly as an
     // uncalibrated model is refused at startup: serving choice off the locate
@@ -2419,11 +2564,20 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             use_layer = k.score_layer; use_head = k.score_head;
             use_provenance = k.score_provenance;
             break;
+        case LensHeadRole::Inject:
+            use_layer = k.inject_layer; use_head = k.inject_head;
+            use_provenance = k.inject_provenance;
+            break;
     }
     const bool agg_off_recipe = decision_recipe
         ? (key_agg != LensKeyAggregation::Mean)
         : (key_agg != LensKeyAggregation::Max);
-    rep.uncalibrated        = (question_mode && !decision_recipe) || agg_off_recipe;
+    // Inject reads the template tail, not a key, so aggregation is not part of
+    // its recipe — only the instruction shape is: INJHEAD/INJHARD measured the
+    // QUESTION instruction, and a key-mode prompt is a different closing text.
+    rep.uncalibrated        = head_role == LensHeadRole::Inject
+        ? !question_mode
+        : (question_mode && !decision_recipe) || agg_off_recipe;
     rep.locate_provenance   = use_provenance;
     rep.locate_layer        = use_layer;
     rep.locate_head         = use_head;
@@ -2463,6 +2617,26 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
         qspan[ci] = {lo, hi};
     }
 
+    // ── The template-tail rows (inject only) ─────────────────────────────────
+    // Everything after the instruction: the chat template's closing tokens,
+    // ending on the last prompt token. INJHEAD found the distraction effect in
+    // these rows, averaged; a key's own rows do not carry it.
+    int tail_lo = P;
+    if (head_role == LensHeadRole::Inject) {
+        if (prompt_text.compare(doc_end, instruction_suffix.size(), instruction_suffix) != 0)
+            throw std::runtime_error(
+                "run_lens_locate: instruction expected immediately after the document in "
+                "the rendered prompt, actual not found there — the inject readout needs "
+                "the instruction's end");
+        int ilo = 0, ihi = 0;
+        tokens_covering(doc_end, doc_end + instruction_suffix.size(), ilo, ihi);
+        tail_lo = ihi;
+        if (tail_lo <= 0 || tail_lo >= P)
+            throw std::runtime_error(
+                "run_lens_locate: template tail expected non-empty after the instruction, "
+                "actual tail_lo=" + std::to_string(tail_lo) + " P=" + std::to_string(P));
+    }
+
     // ── One head-less TAPPED prefill ─────────────────────────────────────────
     // Truncated after the LOCATE layer alone (causality, plan §1: nothing above
     // it can be reached). On Qwen 3.6-35B that layer is 11, which is exactly
@@ -2484,23 +2658,101 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     fp->set_truncate_after_layer(use_layer);
     fp->clear_slot(0);
     fp->set_cache_pos(0, 0);
+    if (use_head < 0 || use_head >= (int)meta.attention_head_count)
+        throw std::runtime_error(
+            std::string("run_lens_locate: slot '") + lens_head_role_name(head_role) +
+            "_head' expected within [0, " + std::to_string(meta.attention_head_count) +
+            "), actual " + std::to_string(use_head));
+
+    // ── Split prefill (opt-in; see LensPrefillShape) ─────────────────────────
+    // q_off = the first prompt token that STARTS at or after the document's
+    // end: a token straddling the boundary stays in the document pass, so both
+    // passes together are exactly today's token sequence. Every row the modes
+    // read (key rows, the template tail) must sit at or after it.
+    int q_off = 0;
+    if (shape != LensPrefillShape::OneShot) {
+        q_off = P;
+        for (int i = 0; i < P; ++i) if (pcum[(size_t)i] >= doc_end) { q_off = i; break; }
+        int first_read = head_role == LensHeadRole::Inject ? tail_lo : P;
+        if (head_role != LensHeadRole::Inject)
+            for (const std::pair<int, int>& qs : qspan) first_read = std::min(first_read, qs.first);
+        if (q_off <= rep.doc_lo || q_off > first_read)
+            throw std::runtime_error(
+                "run_lens_locate: split point expected within (doc_lo=" + std::to_string(rep.doc_lo) +
+                ", first read row=" + std::to_string(first_read) + "], actual " + std::to_string(q_off));
+        const bool flash = shape == LensPrefillShape::SplitFlash;
+        if (flash && !fp->supports_flash_attn())
+            throw std::runtime_error(
+                "run_lens_locate: shape 'SplitFlash' expected a recipe with flash attention, "
+                "actual arch '" + meta.architecture + "' has none");
+        const std::vector<int32_t> pre(prompt_tokens.begin(), prompt_tokens.begin() + q_off);
+        // A kept document: resume from pass 1's stored slot when this request's
+        // pass 1 would be the identical computation (LensDocumentStore::find).
+        const LensDocumentStore::Clock::time_point now = LensDocumentStore::Clock::now();
+        const uint64_t doc_hash = keep ? lens_document_hash(document) : 0;
+        const qinf::session::CompatHeader header = keep
+            ? qinf::snapshot::make_snapshot_header(meta, fp->snapshot_kv_caches())
+            : qinf::session::CompatHeader{};
+        const LensDocumentStore::Entry* kept =
+            keep ? store->find(LensKeptRoute::Locate, document_id, doc_hash, pre, shape, use_layer, now)
+                 : nullptr;
+        if (kept) {
+            qinf::snapshot::restore_slot(*fp, 0, *kept->blob, header);
+            if (fp->get_cache_pos(0) != (uint32_t)q_off)
+                throw std::runtime_error(
+                    "run_lens_locate: restored document pass expected to end at row " +
+                    std::to_string(q_off) + ", actual " + std::to_string(fp->get_cache_pos(0)));
+        } else {
+            // Pass 1: the document, untapped. Nothing is read from it but its K/V
+            // (and recurrent state), so flash may compute it.
+            fp->set_attention_taps({});
+            fp->set_prefill_attn_impl(flash ? ForwardPassBase::AttnImpl::Flash
+                                            : ForwardPassBase::AttnImpl::Materialized);
+            ggml_cgraph* gf = fp->build_prefill_graph(pre, 0, 0, /*want_logits=*/false);
+            ggml_backend_sched_reset(sched);
+            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->set_prefill_inputs(gf, pre, 0);
+            qinf::engine::require_compute_success(
+                ggml_backend_sched_graph_compute(sched, gf), "run_lens_locate (document pass)");
+            fp->advance_cache((uint32_t)q_off, 0);
+            if (keep) {
+                LensDocumentStore::Entry e;
+                e.document_hash = doc_hash;
+                e.prefix_tokens = pre;
+                e.shape = shape;
+                e.depth = use_layer;
+                e.blob = std::make_shared<const std::vector<uint8_t>>(
+                    qinf::snapshot::capture_slot(*fp, 0, header));
+                store->put(LensKeptRoute::Locate, document_id, std::move(e), now);
+            }
+        }
+        rep.document_prefix = !keep ? LensDocumentPrefix::None
+                            : kept  ? LensDocumentPrefix::Warm : LensDocumentPrefix::Cold;
+    }
+
     // Flash never writes kq_soft. Belt-and-braces exactly as in run_lens_verify:
     // the server already refuses --attention-lens with --flash-attn, but tapping
     // a prefill is structurally impossible without a materialized one.
     fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
-    fp->set_attention_taps({use_layer});
+    // ONE head copied out, not all of them: the route reads use_head alone, and
+    // the full tap is 16 x P x P floats — 6.2 GB and 5.8 s of readback at a 10K
+    // prompt (docs/note-lens-locate-baseline.md). Same softmax, same values.
+    fp->set_attention_taps({use_layer}, {use_head});
 
     std::vector<ForwardPassBase::AttentionTap> taps;
     {
-        ggml_cgraph* gf = fp->build_prefill_graph(prompt_tokens, 0, 0, /*want_logits=*/false);
+        // One-shot: the whole prompt. Split: the rows after the document only,
+        // at their real positions, attending back through the cached document.
+        const std::vector<int32_t> rows(prompt_tokens.begin() + q_off, prompt_tokens.end());
+        ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/false);
         fp->mark_attention_taps(gf);
         ggml_backend_sched_reset(sched);
         ggml_backend_sched_alloc_graph(sched, gf);
-        fp->set_prefill_inputs(gf, prompt_tokens, 0);
+        fp->set_prefill_inputs(gf, rows, q_off);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(sched, gf), "run_lens_locate");
         taps = fp->get_attention_taps(gf);
-        fp->advance_cache((uint32_t)prompt_tokens.size(), 0);
+        fp->advance_cache((uint32_t)rows.size(), 0);
     }
     if (taps.size() != 1 || taps[0].layer != use_layer)
         throw std::runtime_error(
@@ -2509,15 +2761,17 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             std::to_string(use_layer) + "}, actual " +
             (taps.size() != 1 ? std::to_string(taps.size()) + " taps"
                               : "{" + std::to_string(taps[0].layer) + "}"));
-    if (taps[0].n_q != P)
+    if (taps[0].n_q != P - q_off)
         throw std::runtime_error(
-            "run_lens_locate: tapped prefill query rows expected=" + std::to_string(P) +
-            " (one per prompt token) actual=" + std::to_string(taps[0].n_q));
-    if (use_head >= taps[0].n_head)
+            "run_lens_locate: tapped prefill query rows expected=" + std::to_string(P - q_off) +
+            " (one per prompt token after row " + std::to_string(q_off) + ") actual=" +
+            std::to_string(taps[0].n_q));
+    const int use_block = taps[0].block_of(use_head);
+    if (use_block < 0)
         throw std::runtime_error(
-            std::string("run_lens_locate: slot '") + lens_head_role_name(head_role) +
-            "_head' expected within [0, " +
-            std::to_string(taps[0].n_head) + "), actual " + std::to_string(use_head));
+            std::string("run_lens_locate: tap expected to keep ") + lens_head_role_name(head_role) +
+            "_head " + std::to_string(use_head) + ", actual not among its " +
+            std::to_string(taps[0].n_head) + " head block(s)");
     if (rep.doc_hi > taps[0].n_kv)
         throw std::runtime_error(
             "run_lens_locate: document token range expected within the tapped key "
@@ -2535,25 +2789,35 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
     // MEAN is opt-in for SENTENCE-length keys, where max inverts into a defect —
     // one filler token spikes and the wordiest key wins regardless of content
     // (LensKeyAggregation, server_lens.h, has the measurement).
-    rep.hits.reserve(concepts.size());
+    //
+    // INJECT reads no key: ONE entry, `lens_inject_entry`, whose rows are the
+    // template tail averaged — the same span finder, the same hit shape.
+    const bool inject = head_role == LensHeadRole::Inject;
+    const size_t n_entries = inject ? 1 : concepts.size();
+    rep.hits.reserve(n_entries);
     const ForwardPassBase::AttentionTap& tp = taps[0];
-    for (size_t ci = 0; ci < concepts.size(); ++ci) {
+    for (size_t ci = 0; ci < n_entries; ++ci) {
+        const std::string entry = inject ? std::string(lens_inject_entry) : concepts[ci].key;
+        const int q_lo = inject ? tail_lo : qspan[ci].first;
+        const int q_hi = inject ? P : qspan[ci].second;
+        const bool mean_rows = inject || key_agg == LensKeyAggregation::Mean;
         std::vector<float> mass((size_t)n_doc, 0.0f);
-        const int n_q_rows = qspan[ci].second - qspan[ci].first;
-        for (int q = qspan[ci].first; q < qspan[ci].second; ++q) {
+        const int n_q_rows = q_hi - q_lo;
+        for (int q = q_lo; q < q_hi; ++q) {
             const float* row = tp.rows.data() +
-                (size_t)tp.n_kv * ((size_t)q + (size_t)tp.n_q * (size_t)use_head);
+                (size_t)tp.n_kv * ((size_t)(q - q_off) + (size_t)tp.n_q * (size_t)use_block);
             for (int d = 0; d < n_doc; ++d) {
                 const float v = row[rep.doc_lo + d];
-                if (key_agg == LensKeyAggregation::Mean) mass[(size_t)d] += v;
-                else if (v > mass[(size_t)d])            mass[(size_t)d] = v;
+                if (mean_rows)                mass[(size_t)d] += v;
+                else if (v > mass[(size_t)d]) mass[(size_t)d] = v;
             }
         }
         // Divide once at the end rather than accumulating a running mean: the
         // row count is fixed and a single division keeps the two branches
         // bit-comparable in shape. n_q_rows >= 1 is guaranteed by the qspan
-        // check above, which throws when a key covers no prompt token.
-        if (key_agg == LensKeyAggregation::Mean && n_q_rows > 1)
+        // check above (and the tail check for inject), which throw when the
+        // rows are empty.
+        if (mean_rows && n_q_rows > 1)
             for (int d = 0; d < n_doc; ++d)
                 mass[(size_t)d] /= (float)n_q_rows;
         // Fail loud on a non-finite BEFORE the span finder, which cannot see
@@ -2563,7 +2827,7 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             if (!std::isfinite(mass[(size_t)d]))
                 throw std::runtime_error(
                     "run_lens_locate: locate-head mass expected finite for concept '" +
-                    concepts[ci].key + "' at document token " + std::to_string(d) +
+                    entry + "' at document token " + std::to_string(d) +
                     ", actual " + std::to_string(mass[(size_t)d]));
 
         std::vector<LensLocateHit> hits;
@@ -2592,15 +2856,610 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
             if (!hits.empty() && pk > hits.back().peak + 1e-6)
                 throw std::runtime_error(
                     "run_lens_locate: hits expected peak-descending for concept '" +
-                    concepts[ci].key + "', actual " + std::to_string(hits.back().peak) +
+                    entry + "', actual " + std::to_string(hits.back().peak) +
                     " then " + std::to_string(pk));
             hits.push_back(h);
         }
         // A key with no hits keeps its slot with an empty list — see the header.
-        rep.hits.emplace_back(concepts[ci].key, std::move(hits));
+        rep.hits.emplace_back(entry, std::move(hits));
     }
 
-    (void)meta;   // signature parity with the sibling drivers; nothing read yet
+    return rep;
+}
+
+// ── The verdict (POST /v1/verdict; docs/plan-lens-verdict.md) ────────────────
+
+std::string lens_verdict_instruction(const std::string& question, LensVerdictLanguage language) {
+    // VERDICT2's I3, verbatim: its gate numbers were measured on this text.
+    if (language == LensVerdictLanguage::De)
+        return "\n\nFrage: " + question + "\nAntworte mit Ja, wenn das Dokument dies als Tatsache "
+               "angibt, mit Nein, wenn das Dokument das Gegenteil angibt, und mit Unklar, wenn das "
+               "Dokument es nicht sagt. Antworte nur mit Ja, Nein oder Unklar.";
+    return "\n\nQuestion: " + question + "\nAnswer yes if the document states this as a fact, no if "
+           "the document states the opposite, and unclear if the document does not say. Answer with "
+           "yes, no or unclear only.";
+}
+
+std::string lens_verdict_to_json(const LensVerdictReport& r) {
+    std::string o = "{\n";
+    o += "\"format_version\":\"qemmi-lens/v4\",\n";
+    o += "\"model\":\"" + jesc(r.model) + "\",\n";
+    o += "\"config\":{\"weights\":\"" + jesc(r.config.weights) + "\",\"attention\":\"" +
+         jesc(r.config.attention) + "\",\"kv_type\":\"" + jesc(r.config.kv_type) + "\"},\n";
+    o += std::string("\"prefill\":\"") + lens_prefill_shape_name(r.prefill_shape) + "\",\n";
+    if (r.document_prefix != LensDocumentPrefix::None)
+        o += std::string("\"prefix\":\"") + lens_document_prefix_name(r.document_prefix) + "\",\n";
+    o += std::string("\"validated_envelope\":") + (r.validated_envelope ? "true" : "false") + ",\n";
+    o += "\"envelope_tokens\":" + std::to_string(r.envelope_tokens) + ",\n";
+    o += "\"verdict\":{\"blocks\":" + std::to_string(r.verdict_layer + 1) +
+         ",\"provenance\":\"" + jesc(r.verdict_provenance) + "\"},\n";
+    o += std::string("\"language\":\"") + lens_verdict_language_name(r.language) + "\",\n";
+    o += "\"receipt_head\":{\"layer\":" + std::to_string(r.locate_layer) +
+         ",\"head\":" + std::to_string(r.locate_head) + "},\n";
+    o += "\"answers\":[";
+    for (size_t i = 0; i < r.answers.size(); ++i) {
+        const LensVerdictResult& a = r.answers[i];
+        o += std::string(i ? "," : "") + "\n  {\"id\":\"" + jesc(a.id) + "\",\"answer\":\"" +
+             lens_verdict_answer_name(a.answer) + "\",\"p\":{\"yes\":" + fnum(a.p_yes) + ",\"no\":" +
+             fnum(a.p_no) + ",\"unclear\":" + fnum(a.p_unclear) + "},\"prompt_len\":" +
+             std::to_string(a.prompt_len) + ",\"receipt\":[";
+        for (size_t j = 0; j < a.receipt.size(); ++j) {
+            const LensLocateHit& h = a.receipt[j];
+            o += std::string(j ? "," : "") + "{\"byte_lo\":" + std::to_string(h.byte_lo) +
+                 ",\"byte_hi\":" + std::to_string(h.byte_hi) + ",\"mass\":" + fnum(h.mass) +
+                 ",\"peak\":" + fnum(h.peak) + ",\"tok_lo\":" + std::to_string(h.tok_lo) +
+                 ",\"tok_hi\":" + std::to_string(h.tok_hi) + "}";
+        }
+        o += "]}";
+    }
+    o += "\n]\n}\n";
+    return o;
+}
+
+LensVerdictReport run_lens_verdict(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   ::Tokenizer* tok, const ModelMetadata& meta,
+                                   uint32_t n_ctx_max,
+                                   const std::string& document,
+                                   const std::vector<LensVerdictQuestion>& questions,
+                                   const LensConstants& k,
+                                   LensVerdictLanguage language,
+                                   LensPrefillShape shape,
+                                   LensDocumentStore* store,
+                                   const std::string& document_id) {
+    // ── Refusals first, before any engine work ───────────────────────────────
+    if (k.verdict_layer < 0)
+        throw std::runtime_error(
+            std::string("run_lens_verdict: this model has no measured verdict layer — ") + k.model_label +
+            " carries verdict_provenance \"" + k.verdict_provenance + "\". /v1/verdict is refused rather "
+            "than reading another model's depth. Run VERDICT2 (tests/perf/attn_provenance.cpp) on this "
+            "model and quantization and set verdict_layer on its calibration row.");
+    if (k.locate_layer < 0 || k.locate_head < 0 || k.locate_layer > k.verdict_layer)
+        throw std::runtime_error(
+            "run_lens_verdict: the receipt's locate head expected at or below verdict_layer=" +
+            std::to_string(k.verdict_layer) + ", actual locate_layer=" + std::to_string(k.locate_layer));
+    if (document.empty())
+        throw std::runtime_error("run_lens_verdict: document expected non-empty actual=empty");
+    if (questions.empty() || questions.size() > 64)
+        throw std::runtime_error("run_lens_verdict: questions expected 1..64, actual " +
+                                 std::to_string(questions.size()));
+    {
+        std::set<std::string> ids;
+        for (const LensVerdictQuestion& q : questions) {
+            if (q.id.empty() || q.question.empty())
+                throw std::runtime_error("run_lens_verdict: every question expected a non-empty id and "
+                                         "question, actual an empty one");
+            if (!ids.insert(q.id).second)
+                throw std::runtime_error("run_lens_verdict: question ids expected unique, actual '" + q.id +
+                                         "' twice");
+        }
+    }
+    if ((store == nullptr) != document_id.empty())
+        throw std::runtime_error(
+            "run_lens_verdict: a document store and a document_id expected together, actual " +
+            std::string(store ? "a store without an id" : "an id without a store"));
+    const LensPrefillShape doc_shape =
+        shape == LensPrefillShape::SplitFlash ? LensPrefillShape::SplitFlash : LensPrefillShape::Split;
+    if (doc_shape == LensPrefillShape::SplitFlash && !fp->supports_flash_attn())
+        throw std::runtime_error("run_lens_verdict: shape 'SplitFlash' expected a recipe with flash "
+                                 "attention, actual arch '" + meta.architecture + "' has none");
+    if (k.locate_head >= (int)meta.attention_head_count)
+        throw std::runtime_error("run_lens_verdict: locate_head expected within [0, " +
+                                 std::to_string(meta.attention_head_count) + "), actual " +
+                                 std::to_string(k.locate_head));
+
+    // ── Answer tokens: the first token of every spelling, sets disjoint ──────
+    auto first_tokens = [&](std::initializer_list<const char*> words) {
+        std::vector<int32_t> ids;
+        for (const char* w : words)
+            for (const std::string s : {std::string(w), std::string(" ") + w}) {
+                const std::vector<int32_t> t = tok->encode(s);
+                if (!t.empty() && std::find(ids.begin(), ids.end(), t[0]) == ids.end()) ids.push_back(t[0]);
+            }
+        return ids;
+    };
+    const std::vector<int32_t> yes_ids = first_tokens({"Yes", "yes", "YES", "Ja", "ja"});
+    const std::vector<int32_t> no_ids = first_tokens({"No", "no", "NO", "Nein", "nein"});
+    const std::vector<int32_t> unc_ids = first_tokens({"Unclear", "unclear", "Unklar", "unklar"});
+    for (const std::vector<int32_t>* a : {&yes_ids, &no_ids, &unc_ids})
+        for (const std::vector<int32_t>* b : {&yes_ids, &no_ids, &unc_ids})
+            if (a != b)
+                for (int32_t t : *a)
+                    if (std::find(b->begin(), b->end(), t) != b->end())
+                        throw std::runtime_error("run_lens_verdict: answer first tokens expected disjoint, "
+                                                 "actual shared '" + tok->decode(t) + "'");
+
+    LensVerdictReport rep;
+    rep.model = k.model_label;
+    rep.prefill_shape = doc_shape;
+    rep.envelope_tokens = k.verdict_envelope_tokens;
+    rep.verdict_layer = k.verdict_layer;
+    rep.verdict_provenance = k.verdict_provenance;
+    rep.locate_layer = k.locate_layer;
+    rep.locate_head = k.locate_head;
+    rep.language = language;
+
+    struct EngineRestore {
+        ForwardPassBase* fp;
+        ForwardPassBase::AttnImpl prefill_impl;
+        ~EngineRestore() {
+            fp->set_attention_taps({});
+            fp->set_truncate_after_layer(-1);
+            fp->set_prefill_attn_impl(prefill_impl);
+            fp->clear_slot(0);
+        }
+    } engine_restore{fp, fp->prefill_attn_impl()};
+
+    const qinf::session::CompatHeader header =
+        qinf::snapshot::make_snapshot_header(meta, fp->snapshot_kv_caches());
+    const LensDocumentStore::Clock::time_point now = LensDocumentStore::Clock::now();
+    const uint64_t doc_hash = store ? lens_document_hash(document) : 0;
+    std::vector<int32_t> blob_pre;
+    std::shared_ptr<const std::vector<uint8_t>> blob;
+    bool first_doc_pass = true;
+
+    for (const LensVerdictQuestion& q : questions) {
+        QwenChatTemplate ct;
+        const std::string instruction = lens_verdict_instruction(q.question, language);
+        std::vector<ChatMessage> hist = {{"user", document + instruction}};
+        const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true,
+                                                  /*enable_thinking=*/false);
+        const std::vector<int32_t> toks = tok->encode(prompt_text);
+        const int P = (int)toks.size();
+        if ((uint64_t)P >= n_ctx_max)
+            throw std::runtime_error("run_lens_verdict: prompt tokens expected < n_ctx_max=" +
+                                     std::to_string(n_ctx_max) + " actual=" + std::to_string(P));
+        const size_t doc_pos = prompt_text.find(document);
+        if (doc_pos == std::string::npos)
+            throw std::runtime_error("run_lens_verdict: document expected verbatim in the rendered prompt, "
+                                     "actual not found — chat template altered it");
+        const size_t doc_end = doc_pos + document.size();
+        const std::vector<size_t> pcum = cum_bytes(tok, toks);
+        auto covering = [&](size_t b0, size_t b1, int& lo, int& hi) {
+            lo = P; hi = 0;
+            for (int i = 0; i < P; ++i)
+                if (pcum[(size_t)i] < b1 && pcum[(size_t)i + 1] > b0) { lo = std::min(lo, i); hi = i + 1; }
+            if (lo > hi) { lo = 0; hi = 0; }
+        };
+        int doc_lo = 0, doc_hi = 0;
+        covering(doc_pos, doc_end, doc_lo, doc_hi);
+        int q_off = P;
+        for (int i = 0; i < P; ++i) if (pcum[(size_t)i] >= doc_end) { q_off = i; break; }
+        const size_t q_at = prompt_text.find(q.question, doc_end);
+        if (q_at == std::string::npos)
+            throw std::runtime_error("run_lens_verdict: question '" + q.id + "' expected after the document, "
+                                     "actual not found");
+        int q_lo = 0, q_hi = 0;
+        covering(q_at, q_at + q.question.size(), q_lo, q_hi);
+        if (q_off <= doc_lo || q_off > q_lo || q_hi <= q_lo)
+            throw std::runtime_error("run_lens_verdict: split point expected within (doc_lo=" +
+                                     std::to_string(doc_lo) + ", question row " + std::to_string(q_lo) +
+                                     "], actual " + std::to_string(q_off));
+        const std::vector<int32_t> pre(toks.begin(), toks.begin() + q_off);
+
+        // ── The document pass: this request's, the store's, or computed ─────
+        if (!blob || pre != blob_pre) {
+            const LensDocumentStore::Entry* kept =
+                store ? store->find(LensKeptRoute::Locate, document_id, doc_hash, pre, doc_shape,
+                                    k.verdict_layer, now)
+                      : nullptr;
+            if (kept) {
+                blob = kept->blob;
+                if (first_doc_pass) rep.document_prefix = LensDocumentPrefix::Warm;
+            } else {
+                fp->set_attention_taps({});
+                fp->set_truncate_after_layer(k.verdict_layer);
+                fp->set_prefill_attn_impl(doc_shape == LensPrefillShape::SplitFlash
+                                              ? ForwardPassBase::AttnImpl::Flash
+                                              : ForwardPassBase::AttnImpl::Materialized);
+                fp->clear_slot(0);
+                fp->set_cache_pos(0, 0);
+                ggml_cgraph* gf = fp->build_prefill_graph(pre, 0, 0, /*want_logits=*/false);
+                ggml_backend_sched_reset(sched);
+                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->set_prefill_inputs(gf, pre, 0);
+                qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
+                                                      "run_lens_verdict (document pass)");
+                fp->advance_cache((uint32_t)q_off, 0);
+                blob = std::make_shared<const std::vector<uint8_t>>(qinf::snapshot::capture_slot(*fp, 0, header));
+                if (store) {
+                    LensDocumentStore::Entry e;
+                    e.document_hash = doc_hash;
+                    e.prefix_tokens = pre;
+                    e.shape = doc_shape;
+                    e.depth = k.verdict_layer;
+                    e.blob = blob;
+                    store->put(LensKeptRoute::Locate, document_id, std::move(e), now);
+                    if (first_doc_pass) rep.document_prefix = LensDocumentPrefix::Cold;
+                }
+            }
+            blob_pre = pre;
+            first_doc_pass = false;
+        }
+
+        // ── The question pass: resume, read the answer and the receipt ──────
+        qinf::snapshot::restore_slot(*fp, 0, *blob, header);
+        if (fp->get_cache_pos(0) != (uint32_t)q_off)
+            throw std::runtime_error("run_lens_verdict: restored document pass expected to end at row " +
+                                     std::to_string(q_off) + ", actual " + std::to_string(fp->get_cache_pos(0)));
+        fp->set_truncate_after_layer(k.verdict_layer);
+        fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);   // taps need kq_soft
+        fp->set_attention_taps({k.locate_layer}, {k.locate_head});
+        const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
+        ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/true);
+        fp->mark_attention_taps(gf);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, rows, q_off);
+        qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
+                                              "run_lens_verdict (question pass)");
+        const ggml_tensor* lt = ggml_graph_get_tensor(gf, "logits");
+        if (!lt) throw std::runtime_error("run_lens_verdict: logits expected in the question pass, actual none");
+        const std::vector<float> lg = fp->get_output_logits(gf);
+        const size_t V = (size_t)lt->ne[0];
+        if (lg.size() < V) throw std::runtime_error("run_lens_verdict: logits expected >= one row, actual short");
+        const float* row = lg.data() + (lg.size() - V);
+        for (size_t i = 0; i < V; ++i)
+            if (!std::isfinite(row[i]))
+                throw std::runtime_error("run_lens_verdict: logits expected finite for question '" + q.id +
+                                         "', actual non-finite at token " + std::to_string(i));
+        const std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
+        fp->set_attention_taps({});
+
+        LensVerdictResult a;
+        a.id = q.id;
+        a.prompt_len = P;
+        auto lse = [&](const std::vector<int32_t>& ids) {
+            double m = -1e30;
+            for (int32_t t : ids) m = std::max(m, (double)row[t]);
+            double s = 0;
+            for (int32_t t : ids) s += std::exp((double)row[t] - m);
+            return m + std::log(s);
+        };
+        const double ly = lse(yes_ids), ln = lse(no_ids), lu = lse(unc_ids);
+        const double m = std::max({ly, ln, lu});
+        const double ey = std::exp(ly - m), en = std::exp(ln - m), eu = std::exp(lu - m);
+        a.p_yes = ey / (ey + en + eu);
+        a.p_no = en / (ey + en + eu);
+        a.p_unclear = eu / (ey + en + eu);
+        a.answer = a.p_yes >= a.p_no && a.p_yes >= a.p_unclear ? LensVerdictAnswer::Yes
+                 : a.p_no >= a.p_unclear                       ? LensVerdictAnswer::No
+                                                               : LensVerdictAnswer::Unclear;
+
+        // Receipt: the locate head over the question's rows, mean (a question
+        // is sentence-length — the recipe choice/absent use), same span finder.
+        if (taps.size() != 1 || taps[0].layer != k.locate_layer || taps[0].n_q != P - q_off)
+            throw std::runtime_error("run_lens_verdict: tap expected {locate_layer " +
+                                     std::to_string(k.locate_layer) + "} over " + std::to_string(P - q_off) +
+                                     " rows, actual " + std::to_string(taps.size()) + " tap(s)");
+        const int block = taps[0].block_of(k.locate_head);
+        if (block < 0 || doc_hi > taps[0].n_kv)
+            throw std::runtime_error("run_lens_verdict: tap expected to hold locate_head over the document");
+        const int n_doc = doc_hi - doc_lo;
+        std::vector<float> mass((size_t)n_doc, 0.0f);
+        for (int r = q_lo; r < q_hi; ++r) {
+            const float* tr = taps[0].rows.data() +
+                (size_t)taps[0].n_kv * ((size_t)(r - q_off) + (size_t)taps[0].n_q * (size_t)block);
+            for (int d = 0; d < n_doc; ++d) mass[(size_t)d] += tr[doc_lo + d];
+        }
+        for (int d = 0; d < n_doc; ++d) {
+            mass[(size_t)d] /= (float)(q_hi - q_lo);
+            if (!std::isfinite(mass[(size_t)d]))
+                throw std::runtime_error("run_lens_verdict: receipt mass expected finite for question '" +
+                                         q.id + "'");
+        }
+        for (const std::pair<int, int>& sp : lens_locate_spans(mass, 3, /*tail_frac*/ 0.25, /*max_width*/ 64)) {
+            LensLocateHit h;
+            h.tok_lo = doc_lo + sp.first;
+            h.tok_hi = doc_lo + sp.second;
+            const size_t b0 = pcum[(size_t)h.tok_lo], b1 = pcum[(size_t)h.tok_hi];
+            h.byte_lo = b0 > doc_pos ? b0 - doc_pos : 0;
+            h.byte_hi = b1 > doc_pos ? b1 - doc_pos : 0;
+            if (h.byte_hi > document.size()) h.byte_hi = document.size();
+            if (h.byte_lo > h.byte_hi) h.byte_lo = h.byte_hi;
+            for (int d = sp.first; d < sp.second; ++d) {
+                h.mass += (double)mass[(size_t)d];
+                h.peak = std::max(h.peak, (double)mass[(size_t)d]);
+            }
+            a.receipt.push_back(h);
+        }
+        if (k.verdict_envelope_tokens <= 0 || P > k.verdict_envelope_tokens) rep.validated_envelope = false;
+        rep.answers.push_back(std::move(a));
+    }
+    return rep;
+}
+
+// ── Compare (POST /v1/compare; docs/plan-lens-compare.md) ────────────────────
+
+namespace {
+// COMPARE2's generic prompt, verbatim: its gate numbers were measured on it.
+const char* kCompareHead = "Here is the original document, one part per line:\n";
+const char* kCompareMid = "\n\nHere is a second version. It may be translated or reworded, and it may be missing "
+                          "parts of the original:\n";
+const char* kCompareTail = "\n\nWhich parts of the original are missing from the second version?";
+}  // namespace
+
+std::string lens_compare_user_text(const std::vector<std::string>& original_units, const std::string& revised) {
+    std::string a;
+    for (size_t i = 0; i < original_units.size(); ++i) a += (i ? "\n" : "") + original_units[i];
+    return kCompareHead + a + kCompareMid + revised + kCompareTail;
+}
+
+std::string lens_compare_to_json(const LensCompareReport& r) {
+    std::string o = "{\n";
+    o += "\"format_version\":\"qemmi-lens/v4\",\n";
+    o += "\"model\":\"" + jesc(r.model) + "\",\n";
+    o += "\"config\":{\"weights\":\"" + jesc(r.config.weights) + "\",\"attention\":\"" +
+         jesc(r.config.attention) + "\",\"kv_type\":\"" + jesc(r.config.kv_type) + "\"},\n";
+    o += std::string("\"prefill\":\"") + lens_prefill_shape_name(r.prefill_shape) + "\",\n";
+    if (r.document_prefix != LensDocumentPrefix::None)
+        o += std::string("\"prefix\":\"") + lens_document_prefix_name(r.document_prefix) + "\",\n";
+    o += std::string("\"validated_envelope\":") + (r.validated_envelope ? "true" : "false") + ",\n";
+    o += "\"threshold\":" + fnum(r.threshold) + ",\n";
+    o += "\"compare\":{\"layer\":" + std::to_string(r.compare_layer) + ",\"head\":" +
+         std::to_string(r.compare_head) + ",\"provenance\":\"" + jesc(r.compare_provenance) + "\"},\n";
+    o += "\"prompt_len\":" + std::to_string(r.prompt_len) + ",\n";
+    o += "\"units\":[";
+    for (size_t i = 0; i < r.units.size(); ++i) {
+        const LensCompareUnit& u = r.units[i];
+        o += std::string(i ? "," : "") + "\n  {\"index\":" + std::to_string(u.index) + ",\"coverage\":" +
+             fnum(u.coverage) + ",\"missing\":" + (u.missing ? "true" : "false") + ",\"restated_at\":";
+        if (u.restated)
+            o += "{\"byte_lo\":" + std::to_string(u.restated_at.byte_lo) + ",\"byte_hi\":" +
+                 std::to_string(u.restated_at.byte_hi) + ",\"peak\":" + fnum(u.restated_at.peak) + "}";
+        else
+            o += "null";
+        o += "}";
+    }
+    o += "\n]\n}\n";
+    return o;
+}
+
+LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   ::Tokenizer* tok, const ModelMetadata& meta,
+                                   uint32_t n_ctx_max,
+                                   const std::vector<std::string>& original_units,
+                                   const std::string& revised,
+                                   const LensConstants& k,
+                                   LensPrefillShape shape,
+                                   LensDocumentStore* store,
+                                   const std::string& document_id) {
+    // ── Refusals first, before any engine work ───────────────────────────────
+    if (k.compare_layer < 0 || k.compare_head < 0)
+        throw std::runtime_error(
+            std::string("run_lens_compare: this model has no measured compare head — ") + k.model_label +
+            " carries compare_provenance \"" + k.compare_provenance + "\". /v1/compare is refused rather than "
+            "reading another pair. Run COMPARE2 (tests/perf/attn_provenance.cpp) on this model and "
+            "quantization and set compare_layer/compare_head/compare_threshold on its calibration row.");
+    if (original_units.size() < 2)
+        throw std::runtime_error("run_lens_compare: original_units expected at least 2 (coverage is relative to "
+                                 "the document's median unit), actual " + std::to_string(original_units.size()));
+    for (size_t i = 0; i < original_units.size(); ++i)
+        if (original_units[i].find_first_not_of(" \t\r\n") == std::string::npos)
+            throw std::runtime_error("run_lens_compare: original unit " + std::to_string(i) +
+                                     " expected non-empty text, actual empty or whitespace");
+    if (revised.find_first_not_of(" \t\r\n") == std::string::npos)
+        throw std::runtime_error("run_lens_compare: revised expected non-empty text, actual empty");
+    if ((store == nullptr) != document_id.empty())
+        throw std::runtime_error(
+            "run_lens_compare: a document store and a document_id expected together, actual " +
+            std::string(store ? "a store without an id" : "an id without a store"));
+    const LensPrefillShape doc_shape =
+        shape == LensPrefillShape::SplitFlash ? LensPrefillShape::SplitFlash : LensPrefillShape::Split;
+    if (doc_shape == LensPrefillShape::SplitFlash && !fp->supports_flash_attn())
+        throw std::runtime_error("run_lens_compare: shape 'SplitFlash' expected a recipe with flash attention, "
+                                 "actual arch '" + meta.architecture + "' has none");
+    if (k.compare_head >= (int)meta.attention_head_count)
+        throw std::runtime_error("run_lens_compare: compare_head expected within [0, " +
+                                 std::to_string(meta.attention_head_count) + "), actual " +
+                                 std::to_string(k.compare_head));
+
+    // ── The prompt and its spans ─────────────────────────────────────────────
+    const std::string user = lens_compare_user_text(original_units, revised);
+    QwenChatTemplate ct;
+    std::vector<ChatMessage> hist = {{"user", user}};
+    const std::string prompt_text = ct.render(hist, /*add_assistant_prompt=*/true, /*enable_thinking=*/false);
+    const std::vector<int32_t> toks = tok->encode(prompt_text);
+    const int P = (int)toks.size();
+    if ((uint64_t)P >= n_ctx_max)
+        throw std::runtime_error("run_lens_compare: prompt tokens expected < n_ctx_max=" +
+                                 std::to_string(n_ctx_max) + " actual=" + std::to_string(P));
+    const size_t u0 = prompt_text.find(user);
+    if (u0 == std::string::npos)
+        throw std::runtime_error("run_lens_compare: the request expected verbatim in the rendered prompt, "
+                                 "actual not found — chat template altered it");
+    const size_t a0 = u0 + std::string(kCompareHead).size();
+    size_t a_len = 0;
+    for (size_t i = 0; i < original_units.size(); ++i) a_len += (i ? 1 : 0) + original_units[i].size();
+    const size_t a1 = a0 + a_len;
+    const size_t b0 = a1 + std::string(kCompareMid).size(), b1 = b0 + revised.size();
+    const std::vector<size_t> pcum = cum_bytes(tok, toks);
+    auto covering = [&](size_t x0, size_t x1, int& lo, int& hi) {
+        lo = P; hi = 0;
+        for (int i = 0; i < P; ++i)
+            if (pcum[(size_t)i] < x1 && pcum[(size_t)i + 1] > x0) { lo = std::min(lo, i); hi = i + 1; }
+        if (lo > hi) { lo = 0; hi = 0; }
+    };
+    std::vector<std::pair<int, int>> ut;
+    {
+        size_t off = a0;
+        for (const std::string& u : original_units) {
+            int lo, hi;
+            covering(off, off + u.size(), lo, hi);
+            if (hi <= lo) throw std::runtime_error("run_lens_compare: every unit expected to cover a token, actual none");
+            ut.push_back({lo, hi});
+            off += u.size() + 1;
+        }
+    }
+    int blo = 0, bhi = 0;
+    covering(b0, b1, blo, bhi);
+    int q_off = P;
+    for (int i = 0; i < P; ++i) if (pcum[(size_t)i] >= a1) { q_off = i; break; }
+    if (q_off <= ut.front().first || q_off > blo || bhi <= blo)
+        throw std::runtime_error("run_lens_compare: split point expected between the original and the second "
+                                 "version, actual " + std::to_string(q_off));
+
+    LensCompareReport rep;
+    rep.model = k.model_label;
+    rep.prefill_shape = doc_shape;
+    rep.threshold = k.compare_threshold;
+    rep.compare_layer = k.compare_layer;
+    rep.compare_head = k.compare_head;
+    rep.compare_provenance = k.compare_provenance;
+    rep.prompt_len = P;
+    rep.validated_envelope = (int)original_units.size() >= k.compare_min_units && k.compare_envelope_tokens > 0 &&
+                             P <= k.compare_envelope_tokens;
+
+    struct EngineRestore {
+        ForwardPassBase* fp;
+        ForwardPassBase::AttnImpl prefill_impl;
+        ~EngineRestore() {
+            fp->set_attention_taps({});
+            fp->set_truncate_after_layer(-1);
+            fp->set_prefill_attn_impl(prefill_impl);
+            fp->clear_slot(0);
+        }
+    } engine_restore{fp, fp->prefill_attn_impl()};
+
+    // ── Pass 1: the instruction and the original — kept, restored or computed
+    const std::vector<int32_t> pre(toks.begin(), toks.begin() + q_off);
+    fp->set_attention_taps({});
+    fp->set_truncate_after_layer(k.compare_layer);
+    const LensDocumentStore::Clock::time_point now = LensDocumentStore::Clock::now();
+    const uint64_t doc_hash = store ? lens_document_hash(user.substr(0, a1 - u0)) : 0;
+    const qinf::session::CompatHeader header = store
+        ? qinf::snapshot::make_snapshot_header(meta, fp->snapshot_kv_caches())
+        : qinf::session::CompatHeader{};
+    const LensDocumentStore::Entry* kept =
+        store ? store->find(LensKeptRoute::Compare, document_id, doc_hash, pre, doc_shape, k.compare_layer, now)
+              : nullptr;
+    if (kept) {
+        qinf::snapshot::restore_slot(*fp, 0, *kept->blob, header);
+        if (fp->get_cache_pos(0) != (uint32_t)q_off)
+            throw std::runtime_error("run_lens_compare: restored original expected to end at row " +
+                                     std::to_string(q_off) + ", actual " + std::to_string(fp->get_cache_pos(0)));
+        rep.document_prefix = LensDocumentPrefix::Warm;
+    } else {
+        fp->set_prefill_attn_impl(doc_shape == LensPrefillShape::SplitFlash ? ForwardPassBase::AttnImpl::Flash
+                                                                             : ForwardPassBase::AttnImpl::Materialized);
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        ggml_cgraph* gf = fp->build_prefill_graph(pre, 0, 0, /*want_logits=*/false);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, pre, 0);
+        qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
+                                              "run_lens_compare (original pass)");
+        fp->advance_cache((uint32_t)q_off, 0);
+        if (store) {
+            LensDocumentStore::Entry e;
+            e.document_hash = doc_hash;
+            e.prefix_tokens = pre;
+            e.shape = doc_shape;
+            e.depth = k.compare_layer;
+            e.blob = std::make_shared<const std::vector<uint8_t>>(qinf::snapshot::capture_slot(*fp, 0, header));
+            store->put(LensKeptRoute::Compare, document_id, std::move(e), now);
+            rep.document_prefix = LensDocumentPrefix::Cold;
+        }
+    }
+
+    // ── Pass 2: the second version and the question, compare head tapped ────
+    fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);   // taps need kq_soft
+    fp->set_attention_taps({k.compare_layer}, {k.compare_head});
+    std::vector<ForwardPassBase::AttentionTap> taps;
+    {
+        const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
+        ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/false);
+        fp->mark_attention_taps(gf);
+        ggml_backend_sched_reset(sched);
+        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->set_prefill_inputs(gf, rows, q_off);
+        qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
+                                              "run_lens_compare (second-version pass)");
+        taps = fp->get_attention_taps(gf);
+    }
+    fp->set_attention_taps({});
+    if (taps.size() != 1 || taps[0].layer != k.compare_layer || taps[0].n_q != P - q_off)
+        throw std::runtime_error("run_lens_compare: tap expected {compare_layer " + std::to_string(k.compare_layer) +
+                                 "} over " + std::to_string(P - q_off) + " rows, actual " +
+                                 std::to_string(taps.size()) + " tap(s)");
+    const ForwardPassBase::AttentionTap& T = taps[0];
+    const int blk = T.block_of(k.compare_head);
+    if (blk < 0 || ut.back().second > T.n_kv)
+        throw std::runtime_error("run_lens_compare: tap expected to hold compare_head over the original");
+
+    // ── Coverage: per original token, the MAX over the second version's rows;
+    //    per unit, the mean over its tokens; relative to the median unit ─────
+    const int olo = ut.front().first, ohi = ut.back().second;
+    std::vector<float> mx((size_t)(ohi - olo), 0.f);
+    auto row_of = [&](int r) { return T.rows.data() + (size_t)T.n_kv * ((size_t)(r - q_off) + (size_t)T.n_q * (size_t)blk); };
+    for (int r = blo; r < bhi; ++r) {
+        const float* row = row_of(r);
+        for (int t = olo; t < ohi; ++t) mx[(size_t)(t - olo)] = std::max(mx[(size_t)(t - olo)], row[t]);
+    }
+    std::vector<double> raw;
+    for (const auto& u : ut) {
+        double s = 0;
+        for (int t = u.first; t < u.second; ++t) s += mx[(size_t)(t - olo)];
+        raw.push_back(s / (u.second - u.first));
+        if (!std::isfinite(raw.back()))
+            throw std::runtime_error("run_lens_compare: coverage expected finite, actual non-finite");
+    }
+    std::vector<double> srt = raw;
+    std::sort(srt.begin(), srt.end());
+    const double med = std::max(srt[srt.size() / 2], 1e-12);
+    for (size_t i = 0; i < ut.size(); ++i) {
+        LensCompareUnit cu;
+        cu.index = (int)i;
+        cu.coverage = raw[i] / med;
+        cu.missing = cu.coverage < k.compare_threshold;
+        if (!cu.missing) {
+            // Receipt: the span of the second version whose rows attend this unit most.
+            std::vector<float> from((size_t)(bhi - blo), 0.f);
+            for (int r = blo; r < bhi; ++r) {
+                const float* row = row_of(r);
+                double s = 0;
+                for (int t = ut[i].first; t < ut[i].second; ++t) s += row[t];
+                from[(size_t)(r - blo)] = (float)(s / (ut[i].second - ut[i].first));
+            }
+            const std::vector<std::pair<int, int>> sp = lens_locate_spans(from, 1, /*tail_frac*/ 0.25, /*max_width*/ 64);
+            if (!sp.empty()) {
+                LensLocateHit& h = cu.restated_at;
+                h.tok_lo = blo + sp[0].first;
+                h.tok_hi = blo + sp[0].second;
+                const size_t x0 = pcum[(size_t)h.tok_lo], x1 = pcum[(size_t)h.tok_hi];
+                h.byte_lo = x0 > b0 ? x0 - b0 : 0;
+                h.byte_hi = x1 > b0 ? x1 - b0 : 0;
+                if (h.byte_hi > revised.size()) h.byte_hi = revised.size();
+                if (h.byte_lo > h.byte_hi) h.byte_lo = h.byte_hi;
+                for (int r = sp[0].first; r < sp[0].second; ++r) {
+                    h.mass += from[(size_t)r];
+                    h.peak = std::max(h.peak, (double)from[(size_t)r]);
+                }
+                cu.restated = true;
+            }
+        }
+        rep.units.push_back(cu);
+    }
     return rep;
 }
 

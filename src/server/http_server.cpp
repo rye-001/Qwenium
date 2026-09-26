@@ -200,8 +200,8 @@ inline const char* lens_mode_flag(LensServerMode m) {
 // mode cannot advertise one set and enforce another.
 inline const char* lens_mode_serves(LensServerMode m) {
     switch (m) {
-        case LensServerMode::VerifyOnly: return "POST /v1/verify and POST /v1/locate";
-        case LensServerMode::LocateOnly: return "POST /v1/locate only";
+        case LensServerMode::VerifyOnly: return "POST /v1/verify, POST /v1/locate and POST /v1/compare";
+        case LensServerMode::LocateOnly: return "POST /v1/locate and POST /v1/compare only";
         case LensServerMode::Full:       break;
     }
     return "every route";
@@ -313,11 +313,15 @@ public:
                 // at L19 and, unlike choice, has no stable shallow head. The
                 // SCORE pair rides along free — it is the neighbouring head on
                 // absence's own layer, so it widens the surface without moving
-                // the cut.
+                // the cut. INJECT rides free the same way on the 9B (L11 h=0,
+                // locate's layer); folded in so a model where it is deeper
+                // pays honestly rather than refusing at request time.
                 cutoff = cal->constants.locate_layer;
                 cutoff = fold(cutoff, cal->constants.choice_layer);
                 cutoff = fold(cutoff, cal->constants.absent_layer);
                 cutoff = fold(cutoff, cal->constants.score_layer);
+                cutoff = fold(cutoff, cal->constants.inject_layer);
+                cutoff = fold(cutoff, cal->constants.compare_layer);
             } else {
                 cutoff =
                     std::max(cal->constants.citation_layer, cal->constants.coverage_layer);
@@ -325,6 +329,8 @@ public:
                 cutoff = fold(cutoff, cal->constants.choice_layer);
                 cutoff = fold(cutoff, cal->constants.absent_layer);
                 cutoff = fold(cutoff, cal->constants.score_layer);
+                cutoff = fold(cutoff, cal->constants.inject_layer);
+                cutoff = fold(cutoff, cal->constants.compare_layer);
             }
             lens_blocks_needed_ = static_cast<uint32_t>(cutoff) + 1;
             lens_total_blocks_  = meta_for_cut.block_count;
@@ -340,7 +346,9 @@ public:
                     ? "max(locate_layer=" + std::to_string(cal->constants.locate_layer) +
                       ", choice_layer=" + std::to_string(cal->constants.choice_layer) +
                       ", absent_layer=" + std::to_string(cal->constants.absent_layer) +
-                      ", score_layer=" + std::to_string(cal->constants.score_layer) + ")"
+                      ", score_layer=" + std::to_string(cal->constants.score_layer) +
+                      ", inject_layer=" + std::to_string(cal->constants.inject_layer) +
+                      ", compare_layer=" + std::to_string(cal->constants.compare_layer) + ")"
                     : "max(citation_layer=" + std::to_string(cal->constants.citation_layer) +
                       ", coverage_layer=" + std::to_string(cal->constants.coverage_layer) +
                       (cal->constants.locate_layer >= 0
@@ -620,24 +628,29 @@ public:
         // both things about the same route.
         if (lens_mode_ == LensServerMode::LocateOnly) {
             std::cout << "Attention Lens ON (--attention-lens with --lens-locate-only): POST "
-                         "/v1/locate ONLY (single-slot; document + keys \u2192 byte ranges; "
-                         "nothing generated, nothing audited). This process serves no other "
-                         "lens route: it loaded only the blocks locate reads, so /v1/verify "
-                         "is refused here as well as /v1/extract." << std::endl;
+                         "/v1/locate (single-slot; document + keys \u2192 byte ranges; "
+                         "nothing generated, nothing audited) and POST /v1/compare (original "
+                         "units + a second version \u2192 which units are missing). This process "
+                         "serves no other lens route: it loaded only the blocks those read, so "
+                         "/v1/verify and /v1/verdict are refused here as well as /v1/extract." << std::endl;
         } else if (lens_mode_ == LensServerMode::VerifyOnly) {
             std::cout << "Attention Lens ON (--attention-lens with --lens-verify-only): POST "
                          "/v1/verify (single-slot; document + extraction → an audited "
                          "report, teacher-forced, no decode loop) and POST /v1/locate "
-                         "(document + keys → byte ranges; nothing generated, nothing audited). "
-                         "This process does NOT serve POST /v1/extract — it has not loaded "
-                         "the blocks a generating pass would need." << std::endl;
+                         "(document + keys → byte ranges; nothing generated, nothing audited) "
+                         "and POST /v1/compare (original units + a second version → which units "
+                         "are missing). This process does NOT serve POST /v1/extract or "
+                         "POST /v1/verdict — it has not loaded the output head those need." << std::endl;
         } else {
             std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
                          "(single-slot; document → audited key-value JSON; free decode, "
                          "tolerant parse, 422 on unparseable output) and POST /v1/verify "
                          "(single-slot; document + extraction → the same report, teacher-"
                          "forced, no decode loop) and POST /v1/locate (document + keys → "
-                         "byte ranges; nothing generated, nothing audited, uncalibrated)"
+                         "byte ranges; nothing generated, nothing audited, uncalibrated) and "
+                         "POST /v1/verdict (document + yes/no questions → yes / no / unclear "
+                         "read off the prefill; per-model) and POST /v1/compare (original units "
+                         "+ a second version → which units are missing; per-model)"
                       << std::endl;
         }
         std::cout << "  lens calibration: " << cal->model << " [" << cal->architecture << "/"
@@ -884,12 +897,13 @@ public:
         opts.max_new_tokens  = max_new_tokens;
         opts.include_routing_trace = include_routing_trace;
         opts.message_offsets = message_offsets;
-        // Warm document (docs/plan-lens-warm-document.md). Opt-in: an empty id
-        // is today's behaviour exactly. The state lives on the server because
-        // the reusable thing IS slot 0's contents, and --attention-lens owns
-        // slot 0 exclusively; the mutex above is what makes that safe.
+        // Kept document (docs/plan-lens-warm-document.md). Opt-in: an empty id
+        // is today's behaviour exactly. The store holds snapshots, not slot 0
+        // itself, so a locate or verify in between cannot corrupt it; the
+        // mutex above serializes it with the slot it restores into.
+        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
         opts.document_id = document_id;
-        opts.warm        = &warm_document_;
+        opts.store       = &lens_documents_;
         // Opt-in per request. TRUE COSTS A SECOND COLD INFERENCE over the same
         // document (docs/plan-candidate-set.md), so it is never implied by
         // anything else and never defaulted on: the caller pays only when it
@@ -950,20 +964,80 @@ public:
                                  const std::vector<qinf::LensConcept>& concepts,
                                  int top_k,
                                  qinf::LensKeyAggregation key_agg,
-                                 qinf::LensHeadRole head_role) {
+                                 qinf::LensHeadRole head_role,
+                                 const std::string& document_id) {
         std::lock_guard<std::mutex> lock(model_mutex_);
+        // Every locate ages the kept documents out, with or without an id, so a
+        // document idle past the TTL is dropped at the next call of any kind.
+        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
         // locate_scheduler(), NOT scheduler_ — see that function. Sharing the
         // main scheduler silently corrupted every later /v1/verify in this
         // process.
         qinf::LensLocateReport rep = qinf::run_lens_locate(
             forward_pass_.get(), locate_scheduler(), tokenizer_.get(), model_.get_metadata(),
             (uint32_t)max_ctx_per_slot_, document, concepts, lens_constants_, top_k,
-            key_agg, head_role);
-        // locate's ONLY pass is the tapped prefill, which run_lens_locate
-        // forces materialized — so this report is byte-comparable with one
-        // from a server started without --flash-attn, and must say so.
-        rep.config = lens_config_stamp(qinf::LensReport::RoutePrefill::AlwaysMaterialized);
+            key_agg, head_role, lens_constants_.locate_prefill_shape,
+            document_id.empty() ? nullptr : &lens_documents_, document_id);
+        // The prefill shape is the MODEL's licence (its calibration row, gated
+        // by LOCSPLIT), not a server flag. One-shot and split are materialized
+        // throughout — byte-comparable with a server started without
+        // --flash-attn, and stamped so. Split+flash ran its document pass under
+        // flash by licence, and is stamped "flash-prefill" by route.
+        rep.config = lens_config_stamp(
+            lens_constants_.locate_prefill_shape == qinf::LensPrefillShape::SplitFlash
+                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
+                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
         return qinf::lens_locate_to_json(rep);
+    }
+
+    // Run one verdict and return its JSON — the /v1/verdict driver
+    // (docs/plan-lens-verdict.md). Same slot discipline as the other lens
+    // verbs: EXCLUSIVE, model lock held throughout, slot 0. Full lens server
+    // only (the route refuses a truncated one), and on locate_scheduler():
+    // like locate, every pass here is a truncated prefill.
+    std::string verdict_lens_json(const std::string& document,
+                                  const std::vector<qinf::LensVerdictQuestion>& questions,
+                                  qinf::LensVerdictLanguage language,
+                                  const std::string& document_id) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
+        qinf::LensVerdictReport rep = qinf::run_lens_verdict(
+            forward_pass_.get(), locate_scheduler(), tokenizer_.get(), model_.get_metadata(),
+            (uint32_t)max_ctx_per_slot_, document, questions, lens_constants_, language,
+            lens_constants_.locate_prefill_shape,
+            document_id.empty() ? nullptr : &lens_documents_, document_id);
+        // The document pass follows the row's locate licence (it is the pass
+        // locate keeps); the question passes are always materialized.
+        rep.config = lens_config_stamp(
+            rep.prefill_shape == qinf::LensPrefillShape::SplitFlash
+                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
+                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
+        return qinf::lens_verdict_to_json(rep);
+    }
+
+    // Run one compare and return its JSON — the /v1/compare driver
+    // (docs/plan-lens-compare.md). Same slot discipline as every lens verb.
+    // Served on EVERY lens server: the compare head sits inside every cut (it
+    // is folded into the cut above) and the readout is attention — no output
+    // head. locate_scheduler(): every pass is a truncated prefill.
+    std::string compare_lens_json(const std::vector<std::string>& original_units,
+                                  const std::string& revised,
+                                  const std::string& document_id) {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
+        qinf::LensCompareReport rep = qinf::run_lens_compare(
+            forward_pass_.get(), locate_scheduler(), tokenizer_.get(), model_.get_metadata(),
+            (uint32_t)max_ctx_per_slot_, original_units, revised, lens_constants_,
+            // Not the row's locate licence: flash on the original's pass
+            // changed 6 of 31807 flags (COMPAREGATE G3), so it stays
+            // materialized.
+            qinf::LensPrefillShape::Split,
+            document_id.empty() ? nullptr : &lens_documents_, document_id);
+        rep.config = lens_config_stamp(
+            rep.prefill_shape == qinf::LensPrefillShape::SplitFlash
+                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
+                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
+        return qinf::lens_compare_to_json(rep);
     }
 
     void configure_server(qinf::InferenceServer& server) {
@@ -1568,9 +1642,6 @@ private:
     // Resolved once by enable_attention_lens() from the loaded model's
     // calibration entry; only read while attention_lens_enabled_ is true.
     qinf::LensConstants lens_constants_{};
-    // Warm document state for the lens (docs/plan-lens-warm-document.md). Guarded
-    // by model_mutex_, like every other use of slot 0.
-    qinf::LensWarmDocument warm_document_{};
     ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-type / --kv-f16 select otherwise
 
     // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
@@ -1583,6 +1654,12 @@ private:
     // /v1/locate's dedicated scheduler — see locate_scheduler(). Built lazily so
     // a server that never receives a locate pays nothing.
     ggml_backend_sched_t locate_sched_ = nullptr;
+    // The lens's kept documents (`document_id` on /v1/extract and /v1/locate,
+    // one store, entries keyed per route): RAM only, guarded by model_mutex_
+    // like the slot it restores into. Size and idle TTL are fixed defaults,
+    // not flags (kLensDocumentStoreMax / kLensDocumentStoreTtl).
+    qinf::LensDocumentStore lens_documents_{qinf::kLensDocumentStoreMax,
+                                            qinf::kLensDocumentStoreTtl};
 };
 
 // =============================================================================
@@ -2563,10 +2640,9 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
     // verify-only server has always loaded, so the cheap server can do the
     // narrowing pass and the expensive one need never see the whole document.
     //
-    // No `document_id`: warm document reuse is entangled with the extract
-    // path's split prefill and is NOT wired here. Sending one is a 400 rather
-    // than a silent no-op — a caller that asked for prefix reuse and got a cold
-    // pass with no word about it would draw the wrong conclusion about cost.
+    // `document_id` (2026-09-26): keeps the split's document pass in RAM
+    // (LensDocumentStore) and restores it on the next request for the same id —
+    // a snapshot, not /v1/extract's position rewind. Refused on a one-shot row.
     http.Post("/v1/locate", [&integration](const httplib::Request& req, httplib::Response& res) {
         if (!integration.attention_lens_enabled()) {
             res.status = 404;
@@ -2580,6 +2656,7 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         int top_k = 3;   // see run_lens_locate's declaration: twins, not preference
         qinf::LensKeyAggregation key_agg = qinf::LensKeyAggregation::Max;
         qinf::LensHeadRole head_role = qinf::LensHeadRole::Locate;
+        std::string document_id;
         try {
             json body = json::parse(req.body);
             // Locate has no message ATTRIBUTION to report (there are no
@@ -2593,11 +2670,19 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                     "\"messages\" is not accepted here — locate reports byte ranges into "
                     "one document and has no per-message attribution to carry; join the "
                     "thread and send it as \"document\"");
-            if (body.contains("document_id"))
-                throw std::runtime_error(
-                    "\"document_id\" is not accepted here — warm document reuse is not "
-                    "wired on this route, and accepting the member would silently run "
-                    "cold while implying otherwise");
+            // Opt-in: keep this document's pass 1 in RAM for later requests
+            // (LensDocumentStore). Refused on a model row without a split licence.
+            if (body.contains("document_id")) {
+                if (!body.at("document_id").is_string())
+                    throw std::runtime_error(
+                        "\"document_id\": expected a string, actual " +
+                        std::string(body.at("document_id").type_name()));
+                document_id = body.at("document_id").get<std::string>();
+                if (document_id.empty() || document_id.size() > 256)
+                    throw std::runtime_error(
+                        "\"document_id\": expected 1..256 characters, actual " +
+                        std::to_string(document_id.size()));
+            }
             // Same vocabulary shapes as /v1/extract and /v1/verify.
             for (const auto& kv : body.at("key_vocabulary")) {
                 if (kv.is_string()) {
@@ -2652,15 +2737,18 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 else if (hv == "choice") head_role = qinf::LensHeadRole::Choice;
                 else if (hv == "absent") head_role = qinf::LensHeadRole::Absent;
                 else if (hv == "score")  head_role = qinf::LensHeadRole::Score;
+                else if (hv == "inject") head_role = qinf::LensHeadRole::Inject;
                 else throw std::runtime_error(
-                        "\"head\": expected \"locate\", \"choice\", \"absent\" or "
-                        "\"score\", actual \"" +
+                        "\"head\": expected \"locate\", \"choice\", \"absent\", "
+                        "\"score\" or \"inject\", actual \"" +
                         hv + "\" (locate = where a key's answer sits; choice = which of "
                         "the supplied option descriptions fits the document; absent = "
                         "whether the key's evidence is in the document at all; score = "
                         "where the document sits on an ORDERED scale, whose levels are "
                         "supplied low-to-high and whose masses are meant to be read as a "
-                        "fraction, not rounded to the top one)");
+                        "fraction, not rounded to the top one; inject = which sentence "
+                        "of the document addresses the MODEL — a highlighter that always "
+                        "points somewhere, never a yes/no attack detector)");
             }
             if (body.contains("key_aggregation")) {
                 if (!body.at("key_aggregation").is_string())
@@ -2681,12 +2769,14 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 "{\"document\": string, "
                 "\"key_vocabulary\": [{\"key\",\"gloss\"}|{\"id\",\"question\"}|string,...], "
                 "\"top_k\"?: int, \"key_aggregation\"?: \"max\"|\"mean\", "
-                "\"head\"?: \"locate\"|\"choice\"|\"absent\"|\"score\"}: ") + e.what()},
+                "\"head\"?: \"locate\"|\"choice\"|\"absent\"|\"score\"|\"inject\", "
+                "\"document_id\"?: string}: ") + e.what()},
                 {"code", "bad_request"}}).dump(), "application/json");
             return;
         }
         try {
-            res.set_content(integration.locate_lens_json(document, concepts, top_k, key_agg, head_role),
+            res.set_content(integration.locate_lens_json(document, concepts, top_k, key_agg, head_role,
+                                                         document_id),
                             "application/json");
         } catch (const std::exception& e) {
             // No 422 here: locate parses nothing, so there is no shape contract
@@ -2695,6 +2785,119 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             res.status = 400;
             res.set_content(json({{"error", e.what()},
                                   {"code", "bad_request"}}).dump(), "application/json");
+        }
+    });
+
+    // POST /v1/verdict (docs/plan-lens-verdict.md): a document and yes/no
+    // questions → per question yes / no / unclear, read off the prefill's last
+    // row, plus a receipt. Full lens server only: a truncated server has not
+    // loaded the output head (on the 9B an untied 834 MB matrix).
+    http.Post("/v1/verdict", [&integration](const httplib::Request& req, httplib::Response& res) {
+        if (!integration.attention_lens_enabled()) {
+            res.status = 404;
+            res.set_content(json({{"error", "attention lens disabled — start the "
+                                            "server with --attention-lens"}}).dump(),
+                            "application/json");
+            return;
+        }
+        if (integration.lens_truncated()) { refuse_lens_truncated(res, "/v1/verdict", integration); return; }
+        std::string document, document_id;
+        std::vector<qinf::LensVerdictQuestion> questions;
+        qinf::LensVerdictLanguage language = qinf::LensVerdictLanguage::En;
+        try {
+            json body = json::parse(req.body);
+            if (!body.contains("document") || !body.at("document").is_string())
+                throw std::runtime_error("expected a string \"document\" member, actual absent or not a string");
+            document = body.at("document").get<std::string>();
+            if (!body.contains("questions") || !body.at("questions").is_array())
+                throw std::runtime_error("expected a \"questions\" array, actual absent or not an array");
+            for (const auto& q : body.at("questions")) {
+                if (!q.is_object() || !q.contains("id") || !q.contains("question") ||
+                    !q.at("id").is_string() || !q.at("question").is_string())
+                    throw std::runtime_error("questions element expected {\"id\": string, \"question\": string}");
+                questions.push_back({q.at("id").get<std::string>(), q.at("question").get<std::string>()});
+            }
+            if (body.contains("language")) {
+                if (!body.at("language").is_string())
+                    throw std::runtime_error("\"language\": expected a string, actual " +
+                                             std::string(body.at("language").type_name()));
+                const std::string l = body.at("language").get<std::string>();
+                if      (l == "en") language = qinf::LensVerdictLanguage::En;
+                else if (l == "de") language = qinf::LensVerdictLanguage::De;
+                else throw std::runtime_error("\"language\": expected \"en\" or \"de\" (the instruction's "
+                                              "language; both measured), actual \"" + l + "\"");
+            }
+            if (body.contains("document_id")) {
+                if (!body.at("document_id").is_string())
+                    throw std::runtime_error("\"document_id\": expected a string, actual " +
+                                             std::string(body.at("document_id").type_name()));
+                document_id = body.at("document_id").get<std::string>();
+                if (document_id.empty() || document_id.size() > 256)
+                    throw std::runtime_error("\"document_id\": expected 1..256 characters, actual " +
+                                             std::to_string(document_id.size()));
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", std::string("bad request — expected {\"document\": string, "
+                "\"questions\": [{\"id\": string, \"question\": string}, ...], \"language\"?: \"en\"|\"de\", "
+                "\"document_id\"?: string}: ") + e.what()}, {"code", "bad_request"}}).dump(),
+                "application/json");
+            return;
+        }
+        try {
+            res.set_content(integration.verdict_lens_json(document, questions, language, document_id),
+                            "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");
+        }
+    });
+
+    // POST /v1/compare (docs/plan-lens-compare.md): an original as units and a
+    // second version as text → per unit, still covered or missing. Served on
+    // every lens server (the compare head is inside every cut).
+    http.Post("/v1/compare", [&integration](const httplib::Request& req, httplib::Response& res) {
+        if (!integration.attention_lens_enabled()) {
+            res.status = 404;
+            res.set_content(json({{"error", "attention lens disabled — start the "
+                                            "server with --attention-lens"}}).dump(),
+                            "application/json");
+            return;
+        }
+        std::vector<std::string> units;
+        std::string revised, document_id;
+        try {
+            json body = json::parse(req.body);
+            if (!body.contains("original_units") || !body.at("original_units").is_array())
+                throw std::runtime_error("expected an \"original_units\" array of strings, actual absent or not an array");
+            for (const auto& u : body.at("original_units")) {
+                if (!u.is_string()) throw std::runtime_error("original_units element expected a string");
+                units.push_back(u.get<std::string>());
+            }
+            if (!body.contains("revised") || !body.at("revised").is_string())
+                throw std::runtime_error("expected a string \"revised\" member, actual absent or not a string");
+            revised = body.at("revised").get<std::string>();
+            if (body.contains("document_id")) {
+                if (!body.at("document_id").is_string())
+                    throw std::runtime_error("\"document_id\": expected a string, actual " +
+                                             std::string(body.at("document_id").type_name()));
+                document_id = body.at("document_id").get<std::string>();
+                if (document_id.empty() || document_id.size() > 256)
+                    throw std::runtime_error("\"document_id\": expected 1..256 characters, actual " +
+                                             std::to_string(document_id.size()));
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", std::string("bad request — expected {\"original_units\": [string, ...], "
+                "\"revised\": string, \"document_id\"?: string}: ") + e.what()}, {"code", "bad_request"}}).dump(),
+                "application/json");
+            return;
+        }
+        try {
+            res.set_content(integration.compare_lens_json(units, revised, document_id), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");
         }
     });
 
@@ -3184,6 +3387,11 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             std::cout << "  POST /v1/extract           refused (--lens-locate-only)"
                       << std::endl;
+            std::cout << "  POST /v1/verdict           refused (--lens-locate-only; no output head)"
+                      << std::endl;
+            std::cout << "  POST /v1/compare           (lens-locate-only; per-model — refused on a model "
+                         "whose calibration row carries no compare head)"
+                      << std::endl;
         } else if (integration.lens_mode() == LensServerMode::VerifyOnly) {
             // A truncated model cannot generate — see the constructor banner
             // for which blocks are loaded and why. Everything else 404/400s.
@@ -3208,6 +3416,11 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             std::cout << "  POST /v1/extract           refused (--lens-verify-only)"
                       << std::endl;
+            std::cout << "  POST /v1/verdict           refused (--lens-verify-only; no output head)"
+                      << std::endl;
+            std::cout << "  POST /v1/compare           (lens-verify-only; per-model — refused on a model "
+                         "whose calibration row carries no compare head)"
+                      << std::endl;
         } else {
             std::cout << "  POST /v1/completions       (text-only)" << std::endl;
             std::cout << "  POST /v1/chat/completions"
@@ -3223,6 +3436,13 @@ int main(int argc, char* argv[]) {
                 std::cout << "  POST /v1/locate            (--attention-lens; per-model — "
                              "refused on a model whose calibration row carries no measured "
                              "locate head)"
+                          << std::endl;
+                std::cout << "  POST /v1/verdict           (--attention-lens; per-model — "
+                             "refused on a model whose calibration row carries no measured "
+                             "verdict layer)"
+                          << std::endl;
+                std::cout << "  POST /v1/compare           (--attention-lens; per-model — "
+                             "refused on a model whose calibration row carries no compare head)"
                           << std::endl;
             }
         }

@@ -1,0 +1,1131 @@
+{
+ "_source": "extracted from tests/perf/attn_provenance.cpp + py/lens_decide1.py by py/extract_corpora.sh; do not hand-edit",
+ "choice_options": [
+  {
+   "name": "finance",
+   "desc": "an invoice a payment a budget or an amount of money owed"
+  },
+  {
+   "name": "legal",
+   "desc": "a contract a clause termination liability or governing law"
+  },
+  {
+   "name": "engineering",
+   "desc": "software a server error a deployment or a stack trace"
+  },
+  {
+   "name": "people",
+   "desc": "an employee hiring leave or a staff policy"
+  }
+ ],
+ "score_options": [
+  {
+   "name": "level_1",
+   "desc": "routine with no customer impact that can wait"
+  },
+  {
+   "name": "level_2",
+   "desc": "minor with a few users affected and a workaround available"
+  },
+  {
+   "name": "level_3",
+   "desc": "serious with many users affected and no workaround"
+  },
+  {
+   "name": "level_4",
+   "desc": "critical with the service down and revenue lost"
+  }
+ ],
+ "absent_concepts": [
+  "warranty_period",
+  "incoterms",
+  "vat_number",
+  "discount_rate",
+  "payment_terms",
+  "contract_number"
+ ],
+ "choice_cpp": [
+  {
+   "tag": "f_en1",
+   "de": false,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Reminder: invoice 4471 for 1,992.00 GBP fell due on 2025-09-30 and is still unpaid. Please arrange the transfer this week."
+  },
+  {
+   "tag": "f_en2",
+   "de": false,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Please approve the purchase order for 40 Alu Pro stands at 82.00 each. This comes out of the Q4 equipment budget."
+  },
+  {
+   "tag": "f_en3",
+   "de": false,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Submitting my expense claim for the Berlin trip: 340.50 in total, receipts attached for the hotel and the train."
+  },
+  {
+   "tag": "f_en4",
+   "de": false,
+   "label": "finance",
+   "lure_by_tag": true,
+   "document": "Our VAT filing for Q3 is due next month. The regulations changed this year, so confirm the treatment of cross-border sales."
+  },
+  {
+   "tag": "f_en5",
+   "de": false,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "The direct debit failed again on the 15th. Bank says the mandate was cancelled. Re-send the details so we can settle the balance."
+  },
+  {
+   "tag": "l_en1",
+   "de": false,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "We intend to serve notice of termination under clause 11.2, effective in 90 days. Outstanding fees up to that date remain payable."
+  },
+  {
+   "tag": "l_en2",
+   "de": false,
+   "label": "legal",
+   "lure_by_tag": false,
+   "document": "Please review the attached mutual NDA before Thursday. I am concerned about the definition of confidential information."
+  },
+  {
+   "tag": "l_en3",
+   "de": false,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "The data processing agreement needs updating for the new sub-processor. Personal data now sits in a second region."
+  },
+  {
+   "tag": "l_en4",
+   "de": false,
+   "label": "legal",
+   "lure_by_tag": false,
+   "document": "The counterparty has rejected mediation and is referring the dispute to arbitration before a single arbitrator."
+  },
+  {
+   "tag": "l_en5",
+   "de": false,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "Question on the employment contract template: the non-compete runs twelve months and may be unenforceable."
+  },
+  {
+   "tag": "e_en1",
+   "de": false,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Checkout returns HTTP 500 whenever the cart holds more than 50 items. Stack trace points at OrderValidator.java line 212."
+  },
+  {
+   "tag": "e_en2",
+   "de": false,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Rolling back release 0.9.4. The worker pods restart every four minutes under load and the null pointer is in every log."
+  },
+  {
+   "tag": "e_en3",
+   "de": false,
+   "label": "engineering",
+   "lure_by_tag": true,
+   "document": "The nightly migration takes six hours and the query plan shows a full scan. It is driving up our database bill."
+  },
+  {
+   "tag": "e_en4",
+   "de": false,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Security advisory for the image library we vendor: a crafted PNG overflows the decoder. Patch upstream and redeploy."
+  },
+  {
+   "tag": "e_en5",
+   "de": false,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Their API returns 429 after about 300 calls a minute and our retry logic makes it worse. We need backoff."
+  },
+  {
+   "tag": "p_en1",
+   "de": false,
+   "label": "people",
+   "lure_by_tag": false,
+   "document": "I would like to request parental leave from 2026-02-01 for twelve weeks and understand the phased return option."
+  },
+  {
+   "tag": "p_en2",
+   "de": false,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "Following the review cycle, please confirm the new salary band for the team member and the effective date."
+  },
+  {
+   "tag": "p_en3",
+   "de": false,
+   "label": "people",
+   "lure_by_tag": false,
+   "document": "New starter begins Monday. Make sure the laptop, the accounts and the first-week buddy schedule are arranged."
+  },
+  {
+   "tag": "p_en4",
+   "de": false,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "She has resigned and her notice period is three months. We should agree the handover plan and last working day."
+  },
+  {
+   "tag": "p_en5",
+   "de": false,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "Requesting approval for the team to attend the training course; the cost is 1,200 per head from the development allowance."
+  },
+  {
+   "tag": "f_de1",
+   "de": true,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Erinnerung: Rechnung 4471 ueber 1.992,00 EUR war am 30.09.2025 faellig und ist weiterhin offen. Bitte veranlassen Sie die Ueberweisung."
+  },
+  {
+   "tag": "f_de2",
+   "de": true,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Bitte genehmigen Sie die Bestellung von 40 Alu Pro Staendern zu je 82,00 EUR zulasten des Sachmittelbudgets."
+  },
+  {
+   "tag": "f_de3",
+   "de": true,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Ich reiche die Reisekostenabrechnung fuer Berlin ein: insgesamt 340,50 EUR, Belege fuer Hotel und Bahn liegen bei."
+  },
+  {
+   "tag": "f_de4",
+   "de": true,
+   "label": "finance",
+   "lure_by_tag": true,
+   "document": "Die Umsatzsteuervoranmeldung fuer das dritte Quartal steht an. Die Vorschriften haben sich geaendert."
+  },
+  {
+   "tag": "f_de5",
+   "de": true,
+   "label": "finance",
+   "lure_by_tag": false,
+   "document": "Der Lastschrifteinzug ist am 15. erneut gescheitert, das Mandat wurde widerrufen. Bitte Daten neu senden."
+  },
+  {
+   "tag": "l_de1",
+   "de": true,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "Wir werden die Kuendigung nach Ziffer 11.2 mit einer Frist von 90 Tagen aussprechen. Faellige Entgelte bleiben zahlbar."
+  },
+  {
+   "tag": "l_de2",
+   "de": true,
+   "label": "legal",
+   "lure_by_tag": false,
+   "document": "Bitte pruefen Sie die beiliegende Geheimhaltungsvereinbarung bis Donnerstag, insbesondere die Nachwirkung."
+  },
+  {
+   "tag": "l_de3",
+   "de": true,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "Der Auftragsverarbeitungsvertrag muss wegen des neuen Unterauftragnehmers angepasst werden."
+  },
+  {
+   "tag": "l_de4",
+   "de": true,
+   "label": "legal",
+   "lure_by_tag": false,
+   "document": "Die Gegenseite lehnt die Mediation ab und ruft das Schiedsgericht an; vorgesehen ist ein Einzelschiedsrichter."
+  },
+  {
+   "tag": "l_de5",
+   "de": true,
+   "label": "legal",
+   "lure_by_tag": true,
+   "document": "Frage zum Muster des Arbeitsvertrags: das Wettbewerbsverbot laeuft zwoelf Monate und duerfte unwirksam sein."
+  },
+  {
+   "tag": "e_de1",
+   "de": true,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Der Checkout liefert HTTP 500, sobald der Warenkorb mehr als 50 Positionen enthaelt. Der Stacktrace zeigt auf OrderValidator.java."
+  },
+  {
+   "tag": "e_de2",
+   "de": true,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Wir rollen Release 0.9.4 zurueck. Die Worker starten unter Last alle vier Minuten neu, die Nullpointer-Ausnahme steht im Log."
+  },
+  {
+   "tag": "e_de3",
+   "de": true,
+   "label": "engineering",
+   "lure_by_tag": true,
+   "document": "Die naechtliche Migration dauert sechs Stunden und der Abfrageplan zeigt einen vollen Scan. Das treibt die Datenbankkosten."
+  },
+  {
+   "tag": "e_de4",
+   "de": true,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Sicherheitshinweis zur Bildbibliothek: ein praepariertes PNG kann den Decoder ueberlaufen lassen. Patch einspielen und neu deployen."
+  },
+  {
+   "tag": "e_de5",
+   "de": true,
+   "label": "engineering",
+   "lure_by_tag": false,
+   "document": "Deren Schnittstelle antwortet ab 300 Aufrufen pro Minute mit 429 und unsere Wiederholungslogik verschlimmert es."
+  },
+  {
+   "tag": "p_de1",
+   "de": true,
+   "label": "people",
+   "lure_by_tag": false,
+   "document": "Ich moechte Elternzeit ab dem 01.02.2026 fuer zwoelf Wochen beantragen und Informationen zum Wiedereinstieg erhalten."
+  },
+  {
+   "tag": "p_de2",
+   "de": true,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "Nach dem Beurteilungszyklus bitte ich um Bestaetigung der neuen Gehaltsstufe fuer die Mitarbeiterin."
+  },
+  {
+   "tag": "p_de3",
+   "de": true,
+   "label": "people",
+   "lure_by_tag": false,
+   "document": "Der neue Kollege faengt am Montag an. Bitte Laptop, Zugaenge und den Paten fuer die erste Woche organisieren."
+  },
+  {
+   "tag": "p_de4",
+   "de": true,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "Sie hat gekuendigt, die Kuendigungsfrist betraegt drei Monate. Wir sollten die Uebergabe festlegen."
+  },
+  {
+   "tag": "p_de5",
+   "de": true,
+   "label": "people",
+   "lure_by_tag": true,
+   "document": "Ich bitte um Freigabe fuer die Weiterbildung des Teams; die Kosten betragen 1.200 EUR pro Person."
+  }
+ ],
+ "choice_py": [
+  {
+   "tag": "f_en1",
+   "de": false,
+   "label": "finance",
+   "lure": false,
+   "document": "Reminder: invoice 4471 for 1,992.00 GBP fell due on 2025-09-30 and is still unpaid. Please arrange the transfer this week or let us know if it is disputed."
+  },
+  {
+   "tag": "f_en2",
+   "de": false,
+   "label": "finance",
+   "lure": false,
+   "document": "Please approve the purchase order for 40 Alu Pro stands at 82.00 each. This comes out of the Q4 equipment budget and needs sign-off before Friday."
+  },
+  {
+   "tag": "f_en3",
+   "de": false,
+   "label": "finance",
+   "lure": false,
+   "document": "Submitting my expense claim for the Berlin trip: 340.50 in total, receipts attached for the hotel and the train. Reimbursement to the usual account please."
+  },
+  {
+   "tag": "f_en4",
+   "de": false,
+   "label": "finance",
+   "lure": true,
+   "document": "Our VAT filing for Q3 is due next month. The regulations changed this year, so I want to confirm the treatment of the cross-border sales before we submit."
+  },
+  {
+   "tag": "f_en5",
+   "de": false,
+   "label": "finance",
+   "lure": false,
+   "document": "The direct debit failed again on the 15th. Bank says the mandate was cancelled. Can you re-send the details so we can settle the outstanding balance?"
+  },
+  {
+   "tag": "l_en1",
+   "de": false,
+   "label": "legal",
+   "lure": true,
+   "document": "We intend to serve notice of termination under clause 11.2, effective in 90 days. Outstanding fees up to that date remain payable in the usual way."
+  },
+  {
+   "tag": "l_en2",
+   "de": false,
+   "label": "legal",
+   "lure": false,
+   "document": "Please review the attached mutual NDA before Thursday. I am particularly concerned about the definition of confidential information and the survival period."
+  },
+  {
+   "tag": "l_en3",
+   "de": false,
+   "label": "legal",
+   "lure": true,
+   "document": "The data processing agreement needs updating for the new sub-processor. Our systems now store personal data in a second region, so the transfer clauses must change."
+  },
+  {
+   "tag": "l_en4",
+   "de": false,
+   "label": "legal",
+   "lure": false,
+   "document": "The counterparty has rejected mediation and is referring the dispute to arbitration before a single arbitrator seated in London."
+  },
+  {
+   "tag": "l_en5",
+   "de": false,
+   "label": "legal",
+   "lure": true,
+   "document": "Question on the employment contract template: the non-compete runs for twelve months, which may be unenforceable. Can we shorten it for new starters?"
+  },
+  {
+   "tag": "e_en1",
+   "de": false,
+   "label": "engineering",
+   "lure": false,
+   "document": "Checkout returns HTTP 500 whenever the cart holds more than 50 items. Stack trace points at OrderValidator.java line 212. Reproducible on staging every time."
+  },
+  {
+   "tag": "e_en2",
+   "de": false,
+   "label": "engineering",
+   "lure": false,
+   "document": "Rolling back release 0.9.4. The worker pods restart every four minutes under load and the null pointer in SessionCache.evict is in every log."
+  },
+  {
+   "tag": "e_en3",
+   "de": false,
+   "label": "engineering",
+   "lure": true,
+   "document": "The nightly migration now takes six hours and the query plan shows a full scan. It is also driving up our database bill, so I want to add the index this sprint."
+  },
+  {
+   "tag": "e_en4",
+   "de": false,
+   "label": "engineering",
+   "lure": false,
+   "document": "Security advisory for the image library we vendor: a crafted PNG can overflow the decoder. Patch is available upstream; we should bump and redeploy today."
+  },
+  {
+   "tag": "e_en5",
+   "de": false,
+   "label": "engineering",
+   "lure": false,
+   "document": "Their API starts returning 429 after about 300 calls a minute and our retry logic makes it worse. We need backoff before the integration goes live."
+  },
+  {
+   "tag": "p_en1",
+   "de": false,
+   "label": "people",
+   "lure": false,
+   "document": "I would like to request parental leave from 2026-02-01 for twelve weeks, and I would like to understand the phased return-to-work option."
+  },
+  {
+   "tag": "p_en2",
+   "de": false,
+   "label": "people",
+   "lure": true,
+   "document": "Following the review cycle, please confirm the new salary band for the team member and the effective date of the increase."
+  },
+  {
+   "tag": "p_en3",
+   "de": false,
+   "label": "people",
+   "lure": false,
+   "document": "New starter begins on Monday. Could you make sure the laptop, the accounts and the first-week buddy schedule are all arranged before then?"
+  },
+  {
+   "tag": "p_en4",
+   "de": false,
+   "label": "people",
+   "lure": true,
+   "document": "She has resigned and her notice period is three months under her contract. We should agree the handover plan and the last working day."
+  },
+  {
+   "tag": "p_en5",
+   "de": false,
+   "label": "people",
+   "lure": true,
+   "document": "Requesting approval for the team to attend the training course; the cost is 1,200 per head and it would come from the development allowance."
+  },
+  {
+   "tag": "f_de1",
+   "de": true,
+   "label": "finance",
+   "lure": false,
+   "document": "Erinnerung: Rechnung 4471 ueber 1.992,00 EUR war am 30.09.2025 faellig und ist weiterhin offen. Bitte veranlassen Sie die Ueberweisung diese Woche."
+  },
+  {
+   "tag": "f_de2",
+   "de": true,
+   "label": "finance",
+   "lure": false,
+   "document": "Bitte genehmigen Sie die Bestellung von 40 Alu Pro Staendern zu je 82,00 EUR. Der Betrag geht zulasten des Sachmittelbudgets im vierten Quartal."
+  },
+  {
+   "tag": "f_de3",
+   "de": true,
+   "label": "finance",
+   "lure": false,
+   "document": "Ich reiche die Reisekostenabrechnung fuer Berlin ein: insgesamt 340,50 EUR, Belege fuer Hotel und Bahn liegen bei. Erstattung bitte auf das ueblich Konto."
+  },
+  {
+   "tag": "f_de4",
+   "de": true,
+   "label": "finance",
+   "lure": true,
+   "document": "Die Umsatzsteuervoranmeldung fuer das dritte Quartal steht an. Die Vorschriften haben sich geaendert, daher moechte ich die Behandlung der Auslandsumsaetze klaeren."
+  },
+  {
+   "tag": "f_de5",
+   "de": true,
+   "label": "finance",
+   "lure": false,
+   "document": "Der Lastschrifteinzug ist am 15. erneut gescheitert, das Mandat wurde offenbar widerrufen. Koennen Sie die Daten neu senden, damit wir den offenen Betrag ausgleichen?"
+  },
+  {
+   "tag": "l_de1",
+   "de": true,
+   "label": "legal",
+   "lure": true,
+   "document": "Wir werden die Kuendigung nach Ziffer 11.2 mit einer Frist von 90 Tagen aussprechen. Bis dahin faellige Entgelte bleiben selbstverstaendlich zahlbar."
+  },
+  {
+   "tag": "l_de2",
+   "de": true,
+   "label": "legal",
+   "lure": false,
+   "document": "Bitte pruefen Sie die beiliegende wechselseitige Geheimhaltungsvereinbarung bis Donnerstag, insbesondere die Definition vertraulicher Informationen und die Nachwirkung."
+  },
+  {
+   "tag": "l_de3",
+   "de": true,
+   "label": "legal",
+   "lure": true,
+   "document": "Der Auftragsverarbeitungsvertrag muss wegen des neuen Unterauftragnehmers angepasst werden. Personenbezogene Daten liegen jetzt in einer zweiten Region."
+  },
+  {
+   "tag": "l_de4",
+   "de": true,
+   "label": "legal",
+   "lure": false,
+   "document": "Die Gegenseite lehnt die Mediation ab und ruft das Schiedsgericht an; vorgesehen ist ein Einzelschiedsrichter mit Sitz in London."
+  },
+  {
+   "tag": "l_de5",
+   "de": true,
+   "label": "legal",
+   "lure": true,
+   "document": "Frage zum Muster des Arbeitsvertrags: das Wettbewerbsverbot laeuft zwoelf Monate und duerfte unwirksam sein. Koennen wir es fuer neue Mitarbeiter verkuerzen?"
+  },
+  {
+   "tag": "e_de1",
+   "de": true,
+   "label": "engineering",
+   "lure": false,
+   "document": "Der Checkout liefert HTTP 500, sobald der Warenkorb mehr als 50 Positionen enthaelt. Der Stacktrace zeigt auf OrderValidator.java Zeile 212, reproduzierbar auf Staging."
+  },
+  {
+   "tag": "e_de2",
+   "de": true,
+   "label": "engineering",
+   "lure": false,
+   "document": "Wir rollen Release 0.9.4 zurueck. Die Worker starten unter Last alle vier Minuten neu, und die Nullpointer-Ausnahme in SessionCache.evict steht in jedem Log."
+  },
+  {
+   "tag": "e_de3",
+   "de": true,
+   "label": "engineering",
+   "lure": true,
+   "document": "Die naechtliche Migration dauert inzwischen sechs Stunden und der Abfrageplan zeigt einen vollen Scan. Das treibt auch die Datenbankkosten, wir sollten den Index setzen."
+  },
+  {
+   "tag": "e_de4",
+   "de": true,
+   "label": "engineering",
+   "lure": false,
+   "document": "Sicherheitshinweis zur eingebundenen Bildbibliothek: ein praepariertes PNG kann den Decoder ueberlaufen lassen. Der Patch ist verfuegbar, wir sollten heute neu deployen."
+  },
+  {
+   "tag": "e_de5",
+   "de": true,
+   "label": "engineering",
+   "lure": false,
+   "document": "Deren Schnittstelle antwortet ab etwa 300 Aufrufen pro Minute mit 429, und unsere Wiederholungslogik verschlimmert es. Wir brauchen ein Backoff vor dem Livegang."
+  },
+  {
+   "tag": "p_de1",
+   "de": true,
+   "label": "people",
+   "lure": false,
+   "document": "Ich moechte Elternzeit ab dem 01.02.2026 fuer zwoelf Wochen beantragen und haette gern Informationen zum stufenweisen Wiedereinstieg."
+  },
+  {
+   "tag": "p_de2",
+   "de": true,
+   "label": "people",
+   "lure": true,
+   "document": "Nach dem Beurteilungszyklus bitte ich um Bestaetigung der neuen Gehaltsstufe fuer die Mitarbeiterin und des Zeitpunkts der Erhoehung."
+  },
+  {
+   "tag": "p_de3",
+   "de": true,
+   "label": "people",
+   "lure": false,
+   "document": "Der neue Kollege faengt am Montag an. Koennt ihr bitte Laptop, Zugaenge und den Paten fuer die erste Woche rechtzeitig organisieren?"
+  },
+  {
+   "tag": "p_de4",
+   "de": true,
+   "label": "people",
+   "lure": true,
+   "document": "Sie hat gekuendigt, die Kuendigungsfrist betraegt laut Arbeitsvertrag drei Monate. Wir sollten die Uebergabe und den letzten Arbeitstag festlegen."
+  },
+  {
+   "tag": "p_de5",
+   "de": true,
+   "label": "people",
+   "lure": true,
+   "document": "Ich bitte um Freigabe fuer die Weiterbildung des Teams; die Kosten betragen 1.200 EUR pro Person und kaemen aus dem Entwicklungsbudget."
+  }
+ ],
+ "score": [
+  {
+   "tag": "s_en1",
+   "de": false,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8801: the footer copyright year still says 2025. Cosmetic, nobody has complained, fix whenever convenient."
+  },
+  {
+   "tag": "s_en2",
+   "de": false,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8802: internal admin page loads a little slowly for staff. No customer sees it and nothing is blocked."
+  },
+  {
+   "tag": "s_en3",
+   "de": false,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8803: a tooltip is misaligned on the settings screen in one browser. Purely visual."
+  },
+  {
+   "tag": "s_en4",
+   "de": false,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8811: CSV export drops the last column for a handful of accounts. They can re-run it from the old report meanwhile."
+  },
+  {
+   "tag": "s_en5",
+   "de": false,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8812: two users report the avatar upload failing over 5 MB. Resizing first works around it."
+  },
+  {
+   "tag": "s_en6",
+   "de": false,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8813: search ranking looks off for rare terms for some customers. The filter view still finds everything."
+  },
+  {
+   "tag": "s_en7",
+   "de": false,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8821: invoice PDFs fail to render for most customers since the template change. There is no way to get them out."
+  },
+  {
+   "tag": "s_en8",
+   "de": false,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8822: login is rejecting a large share of users after the token change and no workaround exists."
+  },
+  {
+   "tag": "s_en9",
+   "de": false,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8823: the nightly sync has not run for three days for many tenants and data is now stale everywhere."
+  },
+  {
+   "tag": "s_en10",
+   "de": false,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8831: checkout is down for everyone since 14:10 and no payments are completing. Revenue has stopped."
+  },
+  {
+   "tag": "s_en11",
+   "de": false,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8832: the whole platform is returning 503 and every customer is offline. All orders are failing."
+  },
+  {
+   "tag": "s_en12",
+   "de": false,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8833: the primary database is unreachable, the site is hard down and we are losing every transaction."
+  },
+  {
+   "tag": "s_de1",
+   "de": true,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8801: die Jahreszahl im Fusszeilenhinweis lautet noch 2025. Rein kosmetisch, niemand hat sich beschwert."
+  },
+  {
+   "tag": "s_de2",
+   "de": true,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8802: die interne Verwaltungsseite laedt fuer Mitarbeiter etwas langsam. Kein Kunde sieht sie."
+  },
+  {
+   "tag": "s_de3",
+   "de": true,
+   "level": 1,
+   "novel": false,
+   "document": "Ticket 8803: ein Hinweisfeld sitzt in einem Browser leicht verschoben. Rein optisch."
+  },
+  {
+   "tag": "s_de4",
+   "de": true,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8811: der CSV-Export laesst bei wenigen Konten die letzte Spalte weg. Der alte Bericht funktioniert weiterhin."
+  },
+  {
+   "tag": "s_de5",
+   "de": true,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8812: zwei Nutzer melden Fehler beim Hochladen von Bildern ueber 5 MB. Verkleinern hilft."
+  },
+  {
+   "tag": "s_de6",
+   "de": true,
+   "level": 2,
+   "novel": false,
+   "document": "Ticket 8813: die Suchreihenfolge wirkt bei seltenen Begriffen unpassend. Die Filteransicht findet alles."
+  },
+  {
+   "tag": "s_de7",
+   "de": true,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8821: Rechnungs-PDFs lassen sich seit der Umstellung fuer die meisten Kunden nicht erzeugen. Kein Ausweg."
+  },
+  {
+   "tag": "s_de8",
+   "de": true,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8822: die Anmeldung weist seit der Umstellung viele Nutzer ab und es gibt keine Umgehung."
+  },
+  {
+   "tag": "s_de9",
+   "de": true,
+   "level": 3,
+   "novel": false,
+   "document": "Ticket 8823: der naechtliche Abgleich laeuft seit drei Tagen fuer viele Mandanten nicht, die Daten sind veraltet."
+  },
+  {
+   "tag": "s_de10",
+   "de": true,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8831: der Checkout ist seit 14:10 fuer alle ausgefallen, es gehen keine Zahlungen mehr ein."
+  },
+  {
+   "tag": "s_de11",
+   "de": true,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8832: die gesamte Plattform liefert 503, alle Kunden sind offline und saemtliche Bestellungen scheitern."
+  },
+  {
+   "tag": "s_de12",
+   "de": true,
+   "level": 4,
+   "novel": false,
+   "document": "Ticket 8833: die Hauptdatenbank ist nicht erreichbar, die Seite ist komplett aus und jede Transaktion geht verloren."
+  },
+  {
+   "tag": "s_en13",
+   "de": false,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8804: the help centre article about password resets still shows an old screenshot. Not urgent, the next content sweep can pick it up."
+  },
+  {
+   "tag": "s_en14",
+   "de": false,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8805: scheduler log lines appear twice in our own dashboard. Noisy for us, invisible to anyone outside."
+  },
+  {
+   "tag": "s_en15",
+   "de": false,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8806: a staff-only report lists its columns in a different order since the upgrade. Nobody has asked for the old order back."
+  },
+  {
+   "tag": "s_en16",
+   "de": false,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8814: notification emails arrive about an hour late for three accounts on the legacy plan. The in-app alert still fires on time."
+  },
+  {
+   "tag": "s_en17",
+   "de": false,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8815: one team cannot reorder items by dragging them in Safari. The arrow buttons do the same job."
+  },
+  {
+   "tag": "s_en18",
+   "de": false,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8816: a couple of tenants see the wrong timezone in the audit log. The raw export carries the correct stamp."
+  },
+  {
+   "tag": "s_en19",
+   "de": false,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8824: attachments over 2 MB are rejected across most workspaces since the storage move and nothing else will take them."
+  },
+  {
+   "tag": "s_en20",
+   "de": false,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8825: the permissions screen is blank for every administrator, so no access can be granted at all today."
+  },
+  {
+   "tag": "s_en21",
+   "de": false,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8826: scheduled reports have stopped reaching a large part of the customer base and re-sending them does not help."
+  },
+  {
+   "tag": "s_en22",
+   "de": false,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8834: every request is timing out at the gateway, the product is unusable and orders are being lost by the minute."
+  },
+  {
+   "tag": "s_en23",
+   "de": false,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8835: we are serving an expired certificate, browsers refuse the site outright and trading has halted."
+  },
+  {
+   "tag": "s_en24",
+   "de": false,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8836: the storage cluster failed over badly, the entire estate is offline and we are bleeding money."
+  },
+  {
+   "tag": "s_de13",
+   "de": true,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8804: der Hilfeartikel zum Zuruecksetzen des Passworts zeigt noch einen alten Screenshot. Nicht dringend, der naechste Durchgang genuegt."
+  },
+  {
+   "tag": "s_de14",
+   "de": true,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8805: Protokollzeilen des Planers erscheinen in unserem eigenen Dashboard doppelt. Fuer uns laestig, nach aussen unsichtbar."
+  },
+  {
+   "tag": "s_de15",
+   "de": true,
+   "level": 1,
+   "novel": true,
+   "document": "Ticket 8806: ein interner Bericht zeigt die Spalten seit dem Upgrade in anderer Reihenfolge. Niemand hat die alte Reihenfolge zurueckverlangt."
+  },
+  {
+   "tag": "s_de16",
+   "de": true,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8814: Benachrichtigungen kommen bei drei Konten im Alttarif etwa eine Stunde zu spaet an. Der Hinweis in der App erscheint puenktlich."
+  },
+  {
+   "tag": "s_de17",
+   "de": true,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8815: ein Team kann Eintraege in Safari nicht per Ziehen umsortieren. Mit den Pfeiltasten geht es genauso."
+  },
+  {
+   "tag": "s_de18",
+   "de": true,
+   "level": 2,
+   "novel": true,
+   "document": "Ticket 8816: einige Mandanten sehen im Pruefprotokoll die falsche Zeitzone. Der Rohexport traegt den richtigen Zeitstempel."
+  },
+  {
+   "tag": "s_de19",
+   "de": true,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8824: Anhaenge ueber 2 MB werden seit der Umstellung in den meisten Arbeitsbereichen abgelehnt und nichts anderes nimmt sie an."
+  },
+  {
+   "tag": "s_de20",
+   "de": true,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8825: die Rechteverwaltung bleibt fuer alle Administratoren leer, es lassen sich heute keinerlei Zugaenge vergeben."
+  },
+  {
+   "tag": "s_de21",
+   "de": true,
+   "level": 3,
+   "novel": true,
+   "document": "Ticket 8826: geplante Berichte erreichen einen grossen Teil der Kunden nicht mehr und erneutes Senden hilft nicht."
+  },
+  {
+   "tag": "s_de22",
+   "de": true,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8834: saemtliche Anfragen laufen am Gateway in eine Zeitueberschreitung, das Produkt ist unbenutzbar und Auftraege gehen laufend verloren."
+  },
+  {
+   "tag": "s_de23",
+   "de": true,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8835: wir liefern ein abgelaufenes Zertifikat aus, Browser verweigern die Seite vollstaendig und der Handel steht still."
+  },
+  {
+   "tag": "s_de24",
+   "de": true,
+   "level": 4,
+   "novel": true,
+   "document": "Ticket 8836: der Speicherverbund ist fehlerhaft umgeschaltet, der gesamte Bestand ist offline und es entstehen laufend Verluste."
+  }
+ ],
+ "absent": [
+  {
+   "tag": "m_en1",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "order_date",
+    "delivery_date"
+   ],
+   "document": "From: p.hayes@brightwork.example\nSubject: RE: Restock request\n\nHi Dana,\n\nThanks for the quick turnaround. Please go ahead and book the order for Brightwork Studios Ltd — 45 units of the Matte Black Easel Stand at 82.00 GBP each. Order date 2025-10-06. We'll need it by 2025-10-24.\n\nCheers,\nPete Hayes\nProcurement Lead | Brightwork Studios | +44 20 7946 0102\n\n-----------------------------------------\nThis message and any attachments are confidential and intended solely for the addressee. If you have received it in error, please notify the sender.\n\nOn Fri, 3 Oct 2025, Dana Reeve wrote:\n> Can you confirm the quantity and delivery window?\n"
+  },
+  {
+   "tag": "m_en2",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_number"
+   ],
+   "document": "From: orders@vertex-labs.example\nSubject: PO 5590-B\n\nHello,\n\nPlease find our order below. Custmer: Vertex Labs Inc. We require 1,200 units of Nitrile Exam Gloves (M) at 0.14 USD/unit. Total 168.00 USD. PO number 5590-B.\n\nRegards,\nA. Okonkwo\n\n*** DISCLAIMER *** The information transmitted is intended only for the person to whom it is addressed and may contain confidential material.\n"
+  },
+  {
+   "tag": "m_en3",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "delivery_date",
+    "order_number"
+   ],
+   "document": "From: buyer@stonegate.example\nSubject: order\n\nhi there\n\njust need a quick reorder — stonegate builders, 300 x galvanised coach bolt 10mm, 0.35 eur each pls. deliver to site by 2025-09-30 if poss. order ref SG-7742. thanks!! sent from my phone\n"
+  },
+  {
+   "tag": "m_en4",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_date"
+   ],
+   "document": "From: k.tan@meridianfoods.example\nSubject: Weekly order — please confirm\n\nDear supplier,\n\nMeridian Foods Pte would like to place this week's order: 640 cartons of Cold-Pressed Coconut Oil (1L), unit price 3.90 SGD, grand total 2496.00 SGD. Ordered 2025-11-11.\n\nBest regards,\nKelvin Tan\nHead of Supply\nMeridian Foods Pte Ltd\nReg. No. 200812345K | www.meridianfoods.example\n\nPlease consider the environment before printing this email.\n"
+  },
+  {
+   "tag": "m_en5",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "delivery_date"
+   ],
+   "document": "From: procurement@arcticgear.example\nSubject: Fwd: order sheet\n\nTeam, forwarding the numbers. Arctic Gear Co needs 88 of the Insulated Flask 750ml, price per unit 11.25 CAD. Requested delivery 2026-01-15. Thanks.\n\n> ---------- Forwarded message ----------\n> From: warehouse@arcticgear.example\n> the 750ml not the 500ml this time\n"
+  },
+  {
+   "tag": "m_en6",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_number",
+    "order_date"
+   ],
+   "document": "From: sam@harbourpoint.example\nSubject: quote accepted\n\nHi,\n\nwe accept your quote. Harbour Point Marine, qty 24, Stainless Cleat 6in, at 27.50 usd, total 660.00 usd. our po is HP-2231, date 2025-12-02.\n\nregards, sam\nThis email has been scanned for viruses by our security appliance.\n"
+  },
+  {
+   "tag": "m_en7",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "delivery_date",
+    "order_number"
+   ],
+   "document": "From: orders@lumenoptics.example\nSubject: New PO attached (details in body too)\n\nGood morning,\n\nKindly process for Lumen Optics GmbH: 150 pieces, Anti-Reflective Lens Blank, at 6.80 EUR/pc. Delivery required 2025-10-19. Order no. LO-0098.\n\nMit freundlichen Grüßen / Kind regards,\nElena Vogt\n"
+  },
+  {
+   "tag": "m_en8",
+   "de": false,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "delivery_date"
+   ],
+   "document": "From: reorders@pinnacle.example\nSubject: same as last month\n\nhey — same as last month for Pinnacle Sports: 500 Rubber Grip Tape rolls @ 1.95 GBP. total's 975.00 GBP. need by 2025-11-28. cheers\n\nSent from Outlook for iOS\n"
+  },
+  {
+   "tag": "m_de1",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "order_date",
+    "delivery_date"
+   ],
+   "document": "Von: einkauf@bergblick.example\nBetreff: AW: Bestellung KW42\n\nHallo Frau Kern,\n\nvielen Dank. Bitte bestellen Sie für die Bergblick Handels GmbH 80 Stück des Wanderstock Alu Pro zu je 24,90 EUR. Bestelldatum 2025-10-13. Liefertermin bis 2025-10-27.\n\nMit freundlichen Grüßen\nMarkus Wald\nEinkauf | Bergblick Handels GmbH | Tel. 089 123456\n\n________________________________\nDiese E-Mail enthält vertrauliche Informationen. Sollten Sie nicht der richtige Adressat sein, informieren Sie bitte den Absender.\n"
+  },
+  {
+   "tag": "m_de2",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_number"
+   ],
+   "document": "Von: bestellung@nordlicht.example\nBetreff: Bestellung Nr. 7781\n\nSehr geehrte Damen und Herren,\n\ndie Nordlicht GmbH bestellt 2.500 Stück Einweghandschuhe Nitril (M) zum Einzelpreis von 0,12 EUR. Gesamtbetrag 300,00 EUR. Bestellnummer 7781.\n\nFreundliche Grüße,\nA. Schmitt\n\n*** Vertraulichkeitshinweis *** Diese Nachricht ist ausschließlich für den vorgesehenen Empfänger bestimmt.\n"
+  },
+  {
+   "tag": "m_de3",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "delivery_date",
+    "order_number"
+   ],
+   "document": "Von: kaufhaus@steinweg.example\nBetreff: nachbestellung\n\nhallo,\n\nkurze nachbestellung — steinweg baumarkt, 300 x verzinkte schlossschraube 10mm, je 0,35 eur. lieferung bitte bis 2025-09-30 an die filiale. bestellref SW-7742. danke!\nvon meinem iphone gesendet\n"
+  },
+  {
+   "tag": "m_de4",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_date"
+   ],
+   "document": "Von: k.brand@suedfrucht.example\nBetreff: Wochenbestellung — bitte bestätigen\n\nGuten Tag,\n\ndie Südfrucht Handel KG möchte die Wochenbestellung aufgeben: 640 Kartons Kaltgepresstes Kokosöl (1L), Stückpreis 3,90 EUR, Gesamtsumme 2.496,00 EUR. Bestellt am 2025-11-11.\n\nBeste Grüße,\nKarin Brand\nLeitung Beschaffung\nSüdfrucht Handel KG\nUSt-IdNr. DE123456789\n"
+  },
+  {
+   "tag": "m_de5",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "delivery_date"
+   ],
+   "document": "Von: beschaffung@polarausruestung.example\nBetreff: WG: bestellliste\n\nTeam, ich leite die zahlen weiter. Polar Ausrüstung GmbH benötigt 88 Stück der Isolierflasche 750ml, stückpreis 11,25 EUR. Gewünschte lieferung 2026-01-15. Danke.\n\n> ---------- Weitergeleitete Nachricht ----------\n> Von: lager@polarausruestung.example\n> diesmal die 750ml, nicht die 500ml\n"
+  },
+  {
+   "tag": "m_de6",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "order_number",
+    "order_date"
+   ],
+   "document": "Von: sabine@hafenpunkt.example\nBetreff: angebot angenommen\n\nHallo,\n\nwir nehmen ihr angebot an. Hafenpunkt Marine, menge 24, Edelstahlklampe 15cm, zu 27,50 eur, gesamt 660,00 eur. unsere bestellnr ist HP-2231, datum 2025-12-02.\n\ngrüße, sabine\nDiese E-Mail wurde von unserer Sicherheitssoftware auf Viren geprüft.\n"
+  },
+  {
+   "tag": "m_de7",
+   "de": true,
+   "present": [
+    "customer",
+    "quantity",
+    "unit_price",
+    "total",
+    "delivery_date"
+   ],
+   "document": "Von: bestellungen@gipfel.example\nBetreff: wie letzten monat\n\nhey — wie letzten monat für Gipfel Sport: 500 Griffband-Rollen à 1,95 EUR. gesamt 975,00 EUR. benötigt bis 2025-11-28. danke\n\nGesendet mit Outlook für iOS\n"
+  }
+ ]
+}

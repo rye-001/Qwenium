@@ -60,7 +60,7 @@ Qwen3ForwardPass::Qwen3ForwardPass(
             );
         }
 
-struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx, [[maybe_unused]] bool want_logits) {
+struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx, bool want_logits) {
     reset_context();
     ggml_cgraph* gf = new_graph();
     // effective_layer_count truncates for teacher-forced lens verification
@@ -142,8 +142,26 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
                                        /*use_flash=*/use_flash_attn_prefill());
     }
 
-    // 3. Final normalization and output projection
-    build_output_head(gf, inpL);
+    // 3. Output head. THE single per-recipe head-presence guard site for qwen3
+    // (docs/plan-feed-tokens.md → Head-presence locality constraint), shaped
+    // like qwen35/qwen36's. want_logits=false prunes the head; the KV cpy_k/v
+    // roots are expanded in build_attention, so the head-less graph still
+    // appends KV. The else-branch anchors the residual tip as the output the
+    // scheduler propagates backend assignment from.
+    //
+    // qwen3 used to IGNORE want_logits and always build the head. Beyond the
+    // wasted LM-head matmul, that made a head-less TAPPED prefill structurally
+    // identical to an untapped run_prefill of the same length — and ggml's
+    // allocator reuses the previous plan whenever node count and sizes match,
+    // without comparing output flags (ggml_gallocr_needs_realloc), so the tap's
+    // kq_soft was overwritten and get_attention_taps' [0,1] guard fired
+    // (ForwardPassTapTest.*Prefill on the qwen3 leg, 2026-09-25).
+    if (want_logits) {
+        build_output_head(gf, inpL);
+    } else {
+        ggml_build_forward_expand(gf, inpL);
+        ggml_set_output(inpL);
+    }
 
     return gf;
 }

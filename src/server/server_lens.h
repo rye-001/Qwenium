@@ -58,10 +58,12 @@
 // lens is a Qwen-family capability by measurement; the refusal is the mechanism
 // that keeps that honest.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -75,6 +77,43 @@ typedef struct ggml_backend_sched* ggml_backend_sched_t;
 namespace qinf {
 
 class GrammarVocab;
+
+// ── How the locate prefill is shaped (docs/note-lens-prefill-only-engine.md) ─
+// OneShot (default) — today's single tapped prefill over the whole prompt,
+//   materialized; the path every calibration constant was measured on.
+// Split — two passes cut at the document's end: the document untapped, then
+//   the instruction + keys + template tail tapped. Every row a mode reads sits
+//   after the document and attention is causal, so the readout sees the same
+//   inputs; only the chunk boundary's float noise differs. The tap shrinks
+//   from P x P rows to (P - doc) x P.
+// SplitFlash — Split with flash attention on the untapped document pass, which
+//   never materializes the document's P x P attention (the 8-9 GB GPU scratch
+//   at 10K). Refused on a recipe without flash support.
+// A model's calibration row says which shape /v1/locate uses
+// (LensConstants::locate_prefill_shape); a split arm is set there only after
+// the LOCSPLIT drift gate passed on that model.
+enum class LensPrefillShape { OneShot, Split, SplitFlash };
+// Wire name, used by the locate report's `prefill` member.
+inline const char* lens_prefill_shape_name(LensPrefillShape s) {
+    switch (s) {
+        case LensPrefillShape::OneShot:    return "one-shot";
+        case LensPrefillShape::Split:      return "split";
+        case LensPrefillShape::SplitFlash: return "split+flash";
+    }
+    return "one-shot";
+}
+
+// Whether a locate's document pass was kept under a `document_id` — see
+// LensDocumentStore. Wire name, used by the locate report's `prefix` member.
+enum class LensDocumentPrefix { None, Cold, Warm };
+inline const char* lens_document_prefix_name(LensDocumentPrefix p) {
+    switch (p) {
+        case LensDocumentPrefix::None: return "none";
+        case LensDocumentPrefix::Cold: return "cold";
+        case LensDocumentPrefix::Warm: return "warm";
+    }
+    return "none";
+}
 
 // ── Lens constants — one model's measured coordinates ────────────────────────
 // The member defaults below ARE the Qwen 3.6 calibration (plan §1.6;
@@ -298,6 +337,69 @@ struct LensConstants {
     int         score_layer = -1;
     int         score_head  = -1;
     const char* score_provenance = "not swept by SCOREHEAD";
+
+    // ── The INJECT pair: which sentence in the document addresses the MODEL ─
+    //
+    // The sixth job (fifth /v1/locate role), and the first that reads no key.
+    // Attention Tracker (arXiv 2411.00348): a few heads pull the prompt's
+    // closing rows off the real instruction and onto an instruction hidden in
+    // the data. So this pair is read from the TEMPLATE-TAIL rows (everything
+    // after the instruction), averaged, over the document — not from any key's
+    // query rows — and the key_aggregation field does not apply to it.
+    //
+    // A HIGHLIGHTER, NOT A DETECTOR. Inside one document it finds the injected
+    // sentence 9 times in 10; ACROSS documents a single threshold does not
+    // hold (AUC 0.83-0.90, 0.735 on polite German injections against German
+    // text that is merely ABOUT AI). It always points somewhere: a clean
+    // document still has a most instruction-like sentence. The provenance
+    // carries this so no caller ships it as "attack found".
+    //
+    // DEFAULT -1 = NOT MEASURED, refused rather than borrowed, as above.
+    // Appended LAST on purpose: the rows below are positional aggregates.
+    int         inject_layer = -1;
+    int         inject_head  = -1;
+    const char* inject_provenance = "not swept by INJHEAD";
+
+    // ── How /v1/locate shapes its prefill — a PER-MODEL licence ─────────────
+    // A split prefill (the document untapped, optionally under flash; then the
+    // rows after it tapped) moves the readouts by chunk-boundary and flash
+    // rounding. Whether that stays inside every head's decision margin is a
+    // property of the model and its quantization, so it is licensed per row,
+    // exactly like flash_prefill_ok, by the LOCSPLIT drift gate
+    // (tests/perf/attn_provenance.cpp). DEFAULT OneShot: an ungated model keeps
+    // the pass its constants were measured on, never inherits another model's
+    // licence. Appended LAST on purpose: the rows below are positional
+    // aggregates.
+    LensPrefillShape locate_prefill_shape = LensPrefillShape::OneShot;
+    const char*      locate_prefill_provenance = "not gated by LOCSPLIT: one-shot prefill";
+
+    // ── The verdict (POST /v1/verdict, docs/plan-lens-verdict.md) ────────────
+    // The layer whose output the one-token yes / no / unclear answer is read
+    // from (logit lens: stop after it, apply the output head). -1 = never
+    // measured ⇒ /v1/verdict is refused, never borrowed from another row. A
+    // per-model AND per-quant licence, like locate_prefill_shape. Appended
+    // LAST: the rows below are positional aggregates.
+    int         verdict_layer = -1;
+    const char* verdict_provenance = "not measured: no VERDICT2 run on this model";
+    // The longest prompt (tokens) the verdict's gate passed at; a longer
+    // request is answered but reports validated_envelope=false.
+    int         verdict_envelope_tokens = 0;
+
+    // ── Compare (POST /v1/compare, docs/plan-lens-compare.md) ───────────────
+    // The head that reads a SECOND version's rows back onto the original's
+    // units: a unit the second version covers is attended, a missing one is
+    // not. compare_threshold is the coverage (relative to the document's
+    // median unit) below which a unit is reported missing. -1 = never
+    // measured ⇒ /v1/compare is refused. Per model AND quant; appended LAST
+    // (positional aggregates).
+    int         compare_layer = -1;
+    int         compare_head  = -1;
+    double      compare_threshold = 0.0;
+    const char* compare_provenance = "not measured: no COMPARE2 run on this model";
+    // The gated envelope: the fewest original units and the longest prompt the
+    // gate passed at. Outside either, answered but validated_envelope=false.
+    int         compare_min_units = 0;
+    int         compare_envelope_tokens = 0;
 };
 
 // ── The calibration table — which models the lens may run on ─────────────────
@@ -337,14 +439,19 @@ struct LensConstants {
 // `file_type` sentinel: this row does not restrict on quantization, which is
 // the behaviour every row had before the field existed.
 inline constexpr uint32_t kLensAnyFileType = 0xFFFFFFFFu;
+// GGUF general.file_type of a Q4_K_M file (llama_ftype MOSTLY_Q4_K_M), read
+// from models/Qwen3.8-9B-Q4_K_M.gguf itself (Q8_0 reads 7). The first value a
+// row pins — see the Qwen3.8-9B rows.
+inline constexpr uint32_t kGgufFileTypeQ4_K_M = 15;
 
 struct LensCalibration {
     const char*   architecture;   // GGUF general.architecture
     uint32_t      block_count;    // GGUF <arch>.block_count, raw (see the key note)
     // ── The third key field, added 2026-09-18 because the collision the note
     // above predicted actually arrived ────────────────────────────────────────
-    // NO ROW PINS A FILE TYPE TODAY. The field stays anyway, and this comment
-    // is the reason — read it before deleting an "unused" key component.
+    // ONE ROW PINS A FILE TYPE (2026-09-25): Qwen3.8-9B at Q4_K_M, which
+    // carries the split+flash locate licence its Q8_0 sibling failed (LOCSPLIT).
+    // The history below is why the field existed before any row used it.
     //
     // It was added for Ternary-Bonsai-27B (prism-ml), which is `qwen35` with
     // block_count 64 — and so is Qwen3.6-27B, which sits in models/
@@ -381,50 +488,13 @@ struct LensCalibration {
     LensConstants constants;
 };
 
-inline const std::vector<LensCalibration>& lens_calibrations() {
-    static const std::vector<LensCalibration> kLensCalibrations = {
-        // Qwen 3.6-35B-A3B, the model the lens was built on. Two GGUF builds of
-        // one base model: the MTP build carries a trailing NextN draft block
-        // (41 = 40 + 1), the plain build does not (40). The decode stack is the
-        // same 40 layers in both and the lens never touches the draft head, so
-        // both are the SAME calibration — listed twice rather than keyed on a
-        // depth that would collide with uncalibrated models elsewhere.
-        {"qwen35moe", 41, kLensAnyFileType, "Qwen3.6-35B-A3B (MTP build)",
-         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
-        {"qwen35moe", 40, kLensAnyFileType, "Qwen3.6-35B-A3B (plain build, same 40-layer stack)",
-         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
-        // Qwen 3.8-9B. Its own head is L27H13, not L3H13 — 98% top-3 vs 84% on
-        // the same messy corpus, and 0% vs 7% ungrounded false alarm
-        // (note-lens-qwen38-probe.md §5.3, confirmed on an independent corpus,
-        // not overfit to the selection prompt). Thread-scale citation was then
-        // validated on this entry at 4774–6200 tokens with no degradation
-        // (note-ss2-thread-alarm.md Gate 0: 89% top-1 / 98% top-3).
-        //
-        // coverage_used_peak stays 0.705 — and as of 2026-09-15 that is a
-        // MEASURED choice, not the inherited one this comment used to describe.
-        //
-        // It read "the weak arm on both models, 87%/84% used-clear, never
-        // searched". Both halves of that are now superseded. The layer WAS
-        // searched (COVSEARCH: KEEP L11 on both), and the "weak arm" verdict
-        // came from a control group that turned out to be broken — OMISSION1
-        // ablated all 133 leg C spans per model and found that 53% (9B) / 38%
-        // (27B) of the spans labelled "filler" are CAUSALLY USED. Scored
-        // against causal labels instead, coverage separates used from unused at
-        // AUC 0.912 / 0.955, which is a strong signal, not a weak one.
-        //
-        // Why 0.705 and not the accuracy-optimal ~0.30: `skipped[]` is a
-        // RECALL-first screen ("anything ignored is in this list",
-        // docs/lens-format.md), and accuracy weights a missed omission the same
-        // as a spurious entry. Dropping to 0.31 takes the 9B from 97% recall to
-        // 83%. 0.705 is the right operating point for the claim we make.
-        //
-        // COVCAUSAL found L7 (9B) and L15 (27B) hold recall EXACTLY equal to
-        // L11 and buy ~7 points of precision — a shorter list, not a better
-        // claim, and two different layers, so there is no shared default to
-        // move to. Not moved. See docs/plan-lens-only-engine.md §4.
-        {"qwen35", 33, kLensAnyFileType, "Qwen3.8-9B",
-         "docs/note-lens-qwen38-probe.md §5.3; docs/note-ss2-thread-alarm.md",
-         LensConstants{/*citation_head*/ 13, /*citation_layer*/ 27, /*coverage_layer*/ 11,
+// ── Qwen 3.8-9B's measured constants — ONE definition, two rows ─────────────
+// The any-quant row and the Q4_K_M-pinned row must never disagree about a
+// coordinate: the pinned row exists only to carry a licence Q4_K_M earned and
+// Q8_0 did not (the split+flash locate prefill, LOCSPLIT 2026-09-25). So both
+// are built here, and the pinned one differs in exactly the licence fields.
+inline LensConstants qwen38_9b_constants() {
+    LensConstants k = LensConstants{/*citation_head*/ 13, /*citation_layer*/ 27, /*coverage_layer*/ 11,
                        /*coverage_used_peak*/ 0.705, /*ungrounded_body_mass*/ 0.538,
                        /*citation_topk*/ 8, /*model_label*/ "Qwen3.8-9B (attention lens)",
                        /*citation_probe*/ "note-lens-qwen38-probe.md \u00a75.3",
@@ -558,7 +628,153 @@ inline const std::vector<LensCalibration>& lens_calibrations() {
                        "question instruction shape, mean key aggregation, document score "
                        "summed over the body. Supersedes DECIDEHEAD's 87.5% for L15 h=11, "
                        "which was selection inflation on 24 documents and reads 64.6% here. "
-                       "Corpus synthetic and self-authored"}},
+                       "Corpus synthetic and self-authored",
+                       // INJHEAD + INJHARD 2026-09-24 (docs/note-lens-injection-probe.md).
+                       // FREE: L11 is locate's and choice's layer, so a
+                       // locate-only server pays nothing for it.
+                       //
+                       // Landed as a HIGHLIGHTER. Leg 1 (short docs, blunt
+                       // injections) read AUC 1.000 / 0.981; the pre-registered
+                       // confirmation on long documents fell to 0.83-0.90, and
+                       // within-document normalisation did not recover it. What
+                       // survived every leg is WHERE: the injected sentence is
+                       // the top segment 90.3% of the time against 1.8% chance.
+                       /*inject_layer*/ 11, /*inject_head*/ 0,
+                       /*inject_provenance*/
+                       "INJHEAD + INJHARD 2026-09-24, docs/note-lens-injection-probe.md. "
+                       "A HIGHLIGHTER, NOT A DETECTOR. Readout: mean of the template-tail "
+                       "rows (after the instruction) over document tokens; key_aggregation "
+                       "does not apply. WHERE: on 12 long documents (digests + CVs, up to "
+                       "1,365 tokens, injection ~2% of the text) the top sentence is the "
+                       "injected one 90.3% of the time (chance 1.8%), and an injected "
+                       "sentence outscores a harmless imperative at the same position 65 "
+                       "of 72. WHETHER: a single threshold does NOT transfer across "
+                       "documents \u2014 AUC injected-vs-lure 0.904 EN / 0.829 DE, 0.735 "
+                       "on polite German injections vs German text ABOUT AI, 64-69% caught "
+                       "at zero false alarms; within-document normalisation did not fix "
+                       "it. On short documents (leg 1, 55 bases) 1.000 EN / 0.981 DE, held "
+                       "out by language and by template. IT ALWAYS POINTS SOMEWHERE: show "
+                       "the top span as the most instruction-like sentence, never as an "
+                       "attack found. Measured ONLY under the question instruction shape. "
+                       "Not tested: adaptive attackers, keyword stuffing (no instruction, "
+                       "no distraction). Numbers above are Q4_K_M; Q8_0 AGREES on the "
+                       "pre-registered head: top sentence 88.9% (chance 1.8%), injected over "
+                       "lure 67 of 72, AUC 0.934 EN / 0.850 DE, hard German pair 0.753. "
+                       "Corpus synthetic and "
+                       "self-authored: 12 injection and 12 lure templates per language"};
+    k.locate_prefill_provenance =
+        "LOCSPLIT 2026-09-25: ONE-SHOT on this row. Split+flash FAILS the drift gate on Q8_0 "
+        "(absent, ~8K documents: top-1 span changed on 2 of 12 keys, one near-tie moved 29x its "
+        "margin; score, German questions: 1 of 36). Split WITHOUT flash passes on both quants but "
+        "is not licensed: it is slightly slower and buys nothing on its own. Q4_K_M carries its "
+        "own row with the split+flash licence.";
+    return k;
+}
+
+inline LensConstants qwen38_9b_q4km_constants() {
+    LensConstants k = qwen38_9b_constants();
+    k.locate_prefill_shape = LensPrefillShape::SplitFlash;
+    k.locate_prefill_provenance =
+        "LOCSPLIT 2026-09-25 (tests/perf/attn_provenance.cpp; docs/note-lens-prefill-only-engine.md "
+        "step 4). /v1/locate prefills the document untapped under FLASH, then the instruction, keys "
+        "and template tail tapped and materialized. On Q4_K_M, against the one-shot pass, all five "
+        "heads, key mode (15 order e-mails), question mode (6 CVs, 72 requirements) and ~4K/8K "
+        "documents, EN and DE: top-1 span identical 100%, the winning key never changed, no key's "
+        "peak moved by its own decision margin (worst 0.62 of a margin, one inject key; split "
+        "without flash <= 0.042). Top-3 order changed on a few near-ties (worst 91.7% identical). "
+        "At a 10K prompt: locate 27.5 -> 23.4 s, absent 45.5 -> 37.4 s, GPU compute buffer "
+        "8.2 -> 2.9 GB. THIN HEADROOM: the same gate FAILS on Q8_0 (absent, long documents: 2 of "
+        "12 top-1 spans changed; score, German questions: 1 of 36), so this licence is Q4_K_M "
+        "ONLY and the any-quant row stays one-shot.";
+    // The verdict (docs/plan-lens-verdict.md): read after layer 27 = 28 of 33
+    // blocks. Q4_K_M only — VERDICT2 ran on no other quantization.
+    k.verdict_layer = 27;
+    // The longest prompt of the set the gate passed at (REQHEAD's short CVs,
+    // DE 519 / EN 469 tokens). Longer prompts are answered but disclosed.
+    k.verdict_envelope_tokens = 519;
+    k.verdict_provenance =
+        "VERDICT2 + VERDICTGATE 2026-09-26 (tests/perf/attn_provenance.cpp; docs/plan-lens-verdict.md). "
+        "Three-way instruction (yes / no / unclear), answer read after layer 27 (28 of 33 blocks, within "
+        "5 points of full depth). Real CVs, 72 requirements EN/DE incl. 12 comparisons attention failed: "
+        "yes vs not-yes 100% / 100%; claims: contradicted -> no and not mentioned -> unclear 100% / 100%. "
+        "Requirements a CV does not mention come back mostly 'no', not 'unclear' (EN 75%, DE 67% unclear): "
+        "read 'no' and 'unclear' together as 'not stated as met'. NOT for sums (coin flip), hypotheticals "
+        "('would ... if' reads as half a yes: EN 70%, DE 70%), or long documents: CVs buried in 4K/8K "
+        "tokens hold EN 89-94% but German comparisons fell to 4 of 6 at 4K (a false yes at p=0.94). The shipped "
+        "driver reproduces the probe exactly (576/576); the split+flash document pass changes no answer "
+        "(576/576, max |dp| 0.0055). Q4_K_M ONLY.";
+    // Compare (docs/plan-lens-compare.md): L15 h1 — 16 of 33 blocks, inside
+    // every lens server's cut. Q4_K_M only — COMPARE2 ran on no other quant.
+    k.compare_layer = 15;
+    k.compare_head = 1;
+    k.compare_threshold = 0.50;
+    // The smallest original COMPARE2/COMPAREGATE gated (translation, 8
+    // sentences) and the longest prompt it passed at (AbsenceBench numbers).
+    k.compare_min_units = 8;
+    k.compare_envelope_tokens = 9762;
+    k.compare_provenance =
+        "COMPARE2 + COMPAREGATE 2026-09-26 (tests/perf/attn_provenance.cpp; docs/plan-lens-compare.md). "
+        "Generic compare instruction, original one unit per line, coverage = mean over the unit's tokens "
+        "of the max attention from the second version, relative to the median unit; missing below 0.50 "
+        "(chosen independently on translation 0.47 / 0.52 and AbsenceBench 0.43 / 0.50). Translation, "
+        "EN/DE notes of 8+ sentences, 0-2 sentences dropped: EN->DE 91.7% of drops flagged, 6.2% of "
+        "complete copies with a false flag; DE->EN 97.9% / 0.0%. AbsenceBench (external, 100 eval rows "
+        "each): numbers micro-F1 82.9, poetry 77.0; code diffs 8.3 — NOT for repetitive text. The "
+        "original's pass stays materialized: flash changed 6 of 31807 flags. Q4_K_M ONLY.";
+    return k;
+}
+
+inline const std::vector<LensCalibration>& lens_calibrations() {
+    static const std::vector<LensCalibration> kLensCalibrations = {
+        // Qwen 3.6-35B-A3B, the model the lens was built on. Two GGUF builds of
+        // one base model: the MTP build carries a trailing NextN draft block
+        // (41 = 40 + 1), the plain build does not (40). The decode stack is the
+        // same 40 layers in both and the lens never touches the draft head, so
+        // both are the SAME calibration — listed twice rather than keyed on a
+        // depth that would collide with uncalibrated models elsewhere.
+        {"qwen35moe", 41, kLensAnyFileType, "Qwen3.6-35B-A3B (MTP build)",
+         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
+        {"qwen35moe", 40, kLensAnyFileType, "Qwen3.6-35B-A3B (plain build, same 40-layer stack)",
+         "docs/note-qemmi-docs-p0.md (N3, N3b, COV1)", LensConstants{}},
+        // Qwen 3.8-9B. Its own head is L27H13, not L3H13 — 98% top-3 vs 84% on
+        // the same messy corpus, and 0% vs 7% ungrounded false alarm
+        // (note-lens-qwen38-probe.md §5.3, confirmed on an independent corpus,
+        // not overfit to the selection prompt). Thread-scale citation was then
+        // validated on this entry at 4774–6200 tokens with no degradation
+        // (note-ss2-thread-alarm.md Gate 0: 89% top-1 / 98% top-3).
+        //
+        // coverage_used_peak stays 0.705 — and as of 2026-09-15 that is a
+        // MEASURED choice, not the inherited one this comment used to describe.
+        //
+        // It read "the weak arm on both models, 87%/84% used-clear, never
+        // searched". Both halves of that are now superseded. The layer WAS
+        // searched (COVSEARCH: KEEP L11 on both), and the "weak arm" verdict
+        // came from a control group that turned out to be broken — OMISSION1
+        // ablated all 133 leg C spans per model and found that 53% (9B) / 38%
+        // (27B) of the spans labelled "filler" are CAUSALLY USED. Scored
+        // against causal labels instead, coverage separates used from unused at
+        // AUC 0.912 / 0.955, which is a strong signal, not a weak one.
+        //
+        // Why 0.705 and not the accuracy-optimal ~0.30: `skipped[]` is a
+        // RECALL-first screen ("anything ignored is in this list",
+        // docs/lens-format.md), and accuracy weights a missed omission the same
+        // as a spurious entry. Dropping to 0.31 takes the 9B from 97% recall to
+        // 83%. 0.705 is the right operating point for the claim we make.
+        //
+        // COVCAUSAL found L7 (9B) and L15 (27B) hold recall EXACTLY equal to
+        // L11 and buy ~7 points of precision — a shorter list, not a better
+        // claim, and two different layers, so there is no shared default to
+        // move to. Not moved. See docs/plan-lens-only-engine.md §4.
+        // Qwen 3.8-9B at Q4_K_M — the standard. The SAME constants as the any-quant
+        // row below (one builder, qwen38_9b_constants()), plus the one licence
+        // only this quantization earned: the split+flash locate prefill
+        // (LOCSPLIT). A pinned row wins the lookup over the any-quant row.
+        {"qwen35", 33, kGgufFileTypeQ4_K_M, "Qwen3.8-9B (Q4_K_M)",
+         "docs/note-lens-qwen38-probe.md \u00a75.3; docs/note-ss2-thread-alarm.md; LOCSPLIT",
+         qwen38_9b_q4km_constants()},
+        {"qwen35", 33, kLensAnyFileType, "Qwen3.8-9B",
+         "docs/note-lens-qwen38-probe.md §5.3; docs/note-ss2-thread-alarm.md",
+         qwen38_9b_constants()},
         // Qwen 3.8-27B. Its own head is L19H20 — and the method that found the
         // 9B's head would have picked the WRONG one here: the N3 leg selects on
         // three synthetic prompts, chose L11H22, and that head then scored 84.6%
@@ -946,9 +1162,16 @@ struct LensReport {
     // prompt prefill over the document that DOES run under the server's
     // setting (verify forces Materialized only for its second, tapped pass
     // over the extraction tokens). For those two the flag is the truth.
+    //
+    // A locate on a model licensed for LensPrefillShape::SplitFlash is the third
+    // case: its untapped DOCUMENT pass runs flash because the calibration row
+    // says so, whatever the server flags are — so it is stamped "flash-prefill"
+    // by route, not by flag. (Split without flash stays "materialized"; the
+    // report's `prefill` member names the shape either way.)
     enum class RoutePrefill {
         HonoursServerFlag,   // extract, verify — untapped prompt prefill runs as configured
-        AlwaysMaterialized,  // locate — its only prefill is the tapped one
+        AlwaysMaterialized,  // locate, one-shot or split — every pass materialized
+        DocumentPassFlash,   // locate, split+flash — the document pass is flash by licence
     };
 
     RuntimeConfig config;
@@ -1097,6 +1320,7 @@ inline const char* lens_attention_label(LensReport::RoutePrefill route,
     // the server was started with. Checked FIRST and unconditionally: this is
     // a property of the route, not a value the flags get a vote on.
     if (route == LensReport::RoutePrefill::AlwaysMaterialized) return "materialized";
+    if (route == LensReport::RoutePrefill::DocumentPassFlash)  return "flash-prefill";
     if (decode_is_flash)  return "flash";
     if (prefill_is_flash) return "flash-prefill";
     return "materialized";
@@ -1184,30 +1408,9 @@ bool lens_find_json_object(const std::string& raw, size_t& lo, size_t& hi);
 // would invalidate the calibration silently, with no version bump and no gate.
 struct LensConcept { std::string key, gloss, question; };
 
-// ── Warm document (docs/plan-lens-warm-document.md) ──────────────────────────
-// The lens prompt is `document + instruction_suffix`, so an edit to the key
-// vocabulary changes only a ~40-80 token SUFFIX of a multi-thousand-token
-// prompt. Re-prefilling the document on every edit is the dominant cost of the
-// UI's key-editing loop: measured 2026-09-07, skipping it saves 92.6% of pass-1
-// prefill at 1K tokens and 98.9% at 8K (plan §8.2).
-//
-// The mechanism is deliberately NOT a snapshot. `--attention-lens` is
-// single-slot EXCLUSIVE, so slot 0 belongs to the lens alone; a decode writes
-// only at positions >= the split, so the document's KV at [0, prefix_tokens)
-// survives untouched between requests. Warming is therefore "do not clear the
-// slot, rewind the cache position" — no serialization, no PrefixLibrary, no
-// disk. This is why the feature is small.
-//
-// Held by the server across requests, and reset fail-loud whenever anything it
-// depends on could have changed.
-struct LensWarmDocument {
-    std::string document_id;        // caller's handle; empty ⇒ nothing held
-    size_t      document_hash = 0;  // of the document BYTES — see http_server
-    uint32_t    prefix_tokens = 0;  // tokens of `document` in the rendered prompt
-    bool        valid = false;      // false ⇒ slot 0 holds nothing reusable
-
-    void invalidate() { *this = LensWarmDocument{}; }
-};
+// The kept document (`document_id` on /v1/extract and /v1/locate) lives in
+// LensDocumentStore, declared with the locate report below.
+class LensDocumentStore;
 
 // ── Driver ───────────────────────────────────────────────────────────────────
 struct LensExtractOptions {
@@ -1227,9 +1430,10 @@ struct LensExtractOptions {
     // masses depending on invisible server state. The caller knows when a
     // document is "the same" across an edit; the server does not.
     std::string document_id;
-    // Server-owned warm state, borrowed for this call. nullptr ⇒ no warming
+    // The server's kept documents, borrowed for this call (the same store
+    // /v1/locate uses, entries keyed per route). nullptr ⇒ no warming
     // regardless of document_id.
-    LensWarmDocument* warm = nullptr;
+    LensDocumentStore* store = nullptr;
     bool validated_envelope_only = false;  // reserved; false = accept + disclose
     // Per-request toggle for the candidate set (docs/plan-candidate-set.md).
     // Default OFF: pass 1 is untouched either way, and false means run_lens_extract
@@ -1431,17 +1635,23 @@ enum class LensKeyAggregation { Max, Mean };
 // heads — see the note above LensConstants::locate_layer. The route reads one
 // pair per request and says which on the wire, because the two carry different
 // provenance and therefore different rates.
-enum class LensHeadRole { Locate, Choice, Absent, Score };
+// Inject is the odd role out: it reads no key. See LensConstants::inject_layer.
+enum class LensHeadRole { Locate, Choice, Absent, Score, Inject };
 
 inline const char* lens_head_role_name(LensHeadRole r) {
     switch (r) {
         case LensHeadRole::Choice: return "choice";
         case LensHeadRole::Absent: return "absent";
         case LensHeadRole::Score:  return "score";
+        case LensHeadRole::Inject: return "inject";
         case LensHeadRole::Locate: break;
     }
     return "locate";
 }
+
+// The single `hits` entry a head="inject" report carries. Inject reads no key
+// (it reads the template tail), so there is no key to name the entry after.
+inline constexpr const char* lens_inject_entry = "instruction_like";
 
 inline const char* lens_key_aggregation_name(LensKeyAggregation a) {
     return a == LensKeyAggregation::Mean ? "mean" : "max";
@@ -1475,6 +1685,16 @@ struct LensLocateReport {
     // Which calibrated pair produced this report. Serialized beside
     // locate_provenance, which switches with it.
     LensHeadRole head_role = LensHeadRole::Locate;
+    // How the prefill that produced these spans was shaped (the model's
+    // LensConstants::locate_prefill_shape), serialized as `prefill` beside the
+    // `config` stamp: a split report is not byte-comparable with a one-shot one.
+    LensPrefillShape prefill_shape = LensPrefillShape::OneShot;
+    // Whether the document pass was KEPT (a `document_id` request): None = no
+    // id, nothing stored or restored; Cold = pass 1 ran and was stored; Warm =
+    // pass 1 was restored from the store. Serialized as `prefix` only when not
+    // None. Warm == cold by construction (the same split path, restored bytes),
+    // and LOCWARM gates it — disclosed anyway, as `uncalibrated` is.
+    LensDocumentPrefix document_prefix = LensDocumentPrefix::None;
     int prompt_len = 0, doc_lo = 0, doc_hi = 0;
     // The pair actually read — the LOCATE pair, not the citation pair. Named
     // for what it is: after LOCHEAD these are different heads doing different
@@ -1491,6 +1711,93 @@ struct LensLocateReport {
 
 std::string lens_locate_to_json(const LensLocateReport& r);
 
+// ── The kept document (`document_id` on /v1/locate) ─────────────────────────
+// 2026-09-26, step 6 of docs/note-lens-prefill-only-engine.md; design from
+// docs/plan-lens-warm-document.md, narrowed to /v1/locate.
+//
+// A split locate prefills the document first (pass 1, untapped) and the rows
+// after it second (pass 2, tapped). Pass 1 depends on the document alone, so a
+// caller that asks several questions of ONE document can keep it: the first
+// request with a `document_id` runs pass 1 and stores the slot (KV + DeltaNet
+// state, qinf::snapshot::capture_slot); later requests with the same id
+// restore it and run pass 2 only. Warm == cold by construction — the same
+// split path, with pass 1's bytes restored rather than recomputed.
+//
+// The rules, each a refusal or a miss, never a stale hit:
+//   * The ONLY hit test is exact equality of pass 1's tokens. The document
+//     hash below only decides between a fail-loud 400 (the id now names a
+//     DIFFERENT document) and a plain miss (same document, but the boundary
+//     token merged differently, e.g. key vs question instruction).
+//   * A kept pass 1 serves a request whose read layer is at or BELOW the depth
+//     it was computed to (truncate_after_layer): layers under the cut are the
+//     same computation whatever runs above them. A deeper request is a miss
+//     and replaces the entry.
+//   * One-shot rows are refused: without a split there is no pass 1 to keep,
+//     and keeping the whole prompt would not be warm == cold.
+//
+// Personal data (a CV is the motivating document): RAM only — never written to
+// disk, never logged. Dropped when idle past the TTL (checked on every
+// /v1/locate call, so an idle server holds its last documents until the next
+// call) and least-recently-used first beyond the size cap.
+//
+// Both lens routes that read a document keep it here (2026-09-26): /v1/locate
+// (above) and /v1/extract, whose older mechanism — rewind slot 0's position,
+// never a snapshot — was NOT warm == cold on a DeltaNet hybrid, because a
+// position rewind cannot rewind recurrent state (EXTWARM). Entries are keyed
+// per ROUTE as well as id: the two routes compute their document pass
+// differently (truncated tapped graph vs a full run_prefill), so one never
+// serves the other.
+//
+// Not thread-safe: the one caller holds model_mutex_, as every lens route does.
+enum class LensKeptRoute { Locate, Extract, Compare };
+// LensDocumentPrefix (the report's `prefix`) is declared beside LensPrefillShape.
+
+// FNV-1a over the document bytes. Chooses 400 vs miss; never decides a hit.
+uint64_t lens_document_hash(const std::string& document);
+
+inline constexpr size_t kLensDocumentStoreMax = 4;
+inline constexpr std::chrono::seconds kLensDocumentStoreTtl{15 * 60};
+
+class LensDocumentStore {
+public:
+    using Clock = std::chrono::steady_clock;
+    struct Entry {
+        uint64_t             document_hash = 0;
+        std::vector<int32_t> prefix_tokens;   // pass 1's tokens — the hit test
+        LensPrefillShape     shape = LensPrefillShape::Split;
+        int                  depth = -1;      // the truncate_after_layer pass 1 ran under
+        // capture_slot(slot 0) right after pass 1. Shared, so a request can
+        // hold it (extract's candidates pass restores it a second time) without
+        // copying ~0.7 GB, and an eviction cannot pull it out from under one.
+        std::shared_ptr<const std::vector<uint8_t>> blob;
+        Clock::time_point    last_used{};
+    };
+
+    LensDocumentStore(size_t max_documents, std::chrono::seconds ttl);
+
+    // Drop every entry idle longer than the TTL.
+    void expire(Clock::time_point now);
+    // The kept pass 1 this request may resume from, or nullptr (a miss). Throws
+    // when `id` is held for different document bytes. A hit refreshes its age.
+    Entry* find(LensKeptRoute route, const std::string& id, uint64_t document_hash,
+                const std::vector<int32_t>& prefix_tokens, LensPrefillShape shape,
+                int depth, Clock::time_point now);
+    // Store (or replace) `id` for `route`, evicting the least recently used
+    // entry (of either route) when full.
+    void put(LensKeptRoute route, const std::string& id, Entry entry, Clock::time_point now);
+    bool forget(LensKeptRoute route, const std::string& id);
+
+    size_t size() const { return entries_.size(); }
+    size_t bytes() const;
+    size_t max_documents() const { return max_; }
+    std::chrono::seconds ttl() const { return ttl_; }
+
+private:
+    size_t max_;
+    std::chrono::seconds ttl_;
+    std::map<std::pair<LensKeptRoute, std::string>, Entry> entries_;
+};
+
 // Single-slot, exclusive — same discipline as run_lens_extract and
 // run_lens_verify (slot 0, model lock held by the caller). Fails loud on an
 // empty document or vocabulary, a mixed key/question vocabulary, an oversized
@@ -1500,6 +1807,7 @@ std::string lens_locate_to_json(const LensLocateReport& r);
 // the route, because the measured weakness of this signal is twins — adjacent
 // near-identical lines — and a caller handed one span cannot see that it was
 // contested (RETRIEVE2B: every error was right-family-wrong-variant).
+
 LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched,
                                  ::Tokenizer* tok, const ModelMetadata& meta,
                                  uint32_t n_ctx_max,
@@ -1508,7 +1816,143 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
                                  const LensConstants& k,
                                  int top_k,
                                  LensKeyAggregation key_agg = LensKeyAggregation::Max,
-                                 LensHeadRole head_role = LensHeadRole::Locate);
+                                 LensHeadRole head_role = LensHeadRole::Locate,
+                                 LensPrefillShape shape = LensPrefillShape::OneShot,
+                                 // Keep / resume pass 1 under `document_id`
+                                 // (LensDocumentStore). Both or neither; a
+                                 // one-shot `shape` with an id is refused.
+                                 LensDocumentStore* store = nullptr,
+                                 const std::string& document_id = std::string());
+
+// ── The verdict (POST /v1/verdict; docs/plan-lens-verdict.md) ────────────────
+// A document and yes/no questions in; per question, ONE answer read off the
+// prefill's own last row — yes / no / unclear — with no decode step, plus a
+// receipt (the locate head's top spans over the question's rows). It covers
+// what attention cannot: negation, comparison, the latest value, and whether a
+// claim is supported, contradicted or not mentioned (BUNDLEB, VERDICT2).
+//
+// What it is NOT, measured and disclosed rather than guarded: sums (a coin
+// flip under every instruction — locate the numbers, add them in the client),
+// hypotheticals ("would … if" reads as half a yes), and long documents
+// (German comparisons flipped to a false yes at 4K/8K). A wrong answer looks as
+// confident as a right one and its receipt sits on the right line anyway, so
+// `p` is NOT a confidence and the receipt is NOT a check of the answer; the
+// report says whether the prompt is inside the length the gate passed at.
+enum class LensVerdictLanguage { En, De };
+inline const char* lens_verdict_language_name(LensVerdictLanguage l) {
+    return l == LensVerdictLanguage::De ? "de" : "en";
+}
+enum class LensVerdictAnswer { Yes, No, Unclear };
+inline const char* lens_verdict_answer_name(LensVerdictAnswer a) {
+    switch (a) {
+        case LensVerdictAnswer::Yes:     return "yes";
+        case LensVerdictAnswer::No:      return "no";
+        case LensVerdictAnswer::Unclear: return "unclear";
+    }
+    return "unclear";
+}
+struct LensVerdictQuestion { std::string id, question; };
+struct LensVerdictResult {
+    std::string id;
+    LensVerdictAnswer answer = LensVerdictAnswer::Unclear;
+    // Softmax over the three answer-token sets (first token of every spelling).
+    double p_yes = 0.0, p_no = 0.0, p_unclear = 0.0;
+    int prompt_len = 0;
+    std::vector<LensLocateHit> receipt;   // document-relative, peak-descending
+};
+struct LensVerdictReport {
+    std::string model;
+    LensReport::RuntimeConfig config;
+    LensPrefillShape prefill_shape = LensPrefillShape::Split;   // the document pass
+    LensDocumentPrefix document_prefix = LensDocumentPrefix::None;
+    bool validated_envelope = true;
+    int  envelope_tokens = 0;
+    int  verdict_layer = -1;
+    std::string verdict_provenance;
+    int  locate_layer = 0, locate_head = 0;   // the receipt's head
+    LensVerdictLanguage language = LensVerdictLanguage::En;
+    std::vector<LensVerdictResult> answers;   // in request order
+};
+
+// The instruction after the document: the three-way form VERDICT2 measured
+// (I3). Exposed so the gate probes run the SAME text the route ships.
+std::string lens_verdict_instruction(const std::string& question, LensVerdictLanguage language);
+std::string lens_verdict_to_json(const LensVerdictReport& r);
+
+// Single-slot, exclusive (slot 0, model lock held by the caller), like every
+// lens driver. One document pass per request, truncated after verdict_layer and
+// snapshotted; each question resumes from it. `shape` is the document pass's
+// shape — the row's locate_prefill_shape on the server (SplitFlash computes it
+// under flash); OneShot is treated as Split, because the verdict always splits.
+// With a store and an id the document pass is kept under LensKeptRoute::Locate:
+// it is locate's pass 1 computed deeper, so it serves locate too (a deeper pass
+// serves a shallower read). Fails loud on: a row without verdict_layer, no
+// questions or more than 64, an empty question or id, a duplicate id, a receipt
+// head deeper than the verdict layer, an oversized prompt.
+LensVerdictReport run_lens_verdict(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   ::Tokenizer* tok, const ModelMetadata& meta,
+                                   uint32_t n_ctx_max,
+                                   const std::string& document,
+                                   const std::vector<LensVerdictQuestion>& questions,
+                                   const LensConstants& k,
+                                   LensVerdictLanguage language,
+                                   LensPrefillShape shape,
+                                   LensDocumentStore* store = nullptr,
+                                   const std::string& document_id = std::string());
+
+// ── Compare (POST /v1/compare; docs/plan-lens-compare.md) ───────────────────
+// An original, as the caller's list of units, and a second version as free
+// text; per unit, whether the second version still covers it. One prefill: the
+// second version's rows are read back onto each unit (compare head) — a unit
+// the second version restates is attended, a missing one is not. Works where a
+// string diff cannot: the second version may be translated or reworded
+// (COMPARE2: EN<->DE translation, 92-98% of dropped sentences flagged, 0-6% of
+// complete copies falsely flagged; AbsenceBench poetry 78.0, numbers 82.9).
+// NOT for repetitive text (code diffs: AbsenceBench 8.3) — a repeated line is
+// always attended somewhere. `coverage` is a ranking relative to the
+// document's median unit, not a confidence.
+struct LensCompareUnit {
+    int    index = 0;          // the caller's unit index
+    double coverage = 0.0;     // relative to the median unit (1.0 = typical)
+    bool   missing = false;    // coverage < compare_threshold
+    bool   restated = false;   // false ⇒ no receipt (missing units)
+    LensLocateHit restated_at; // where in the second version it is attended from
+};
+struct LensCompareReport {
+    std::string model;
+    LensReport::RuntimeConfig config;
+    LensPrefillShape prefill_shape = LensPrefillShape::Split;   // the original's pass
+    LensDocumentPrefix document_prefix = LensDocumentPrefix::None;
+    bool   validated_envelope = true;
+    double threshold = 0.0;
+    int    compare_layer = 0, compare_head = 0;
+    std::string compare_provenance;
+    int    prompt_len = 0;
+    std::vector<LensCompareUnit> units;   // in request order
+};
+
+// The user message the route builds — COMPARE2's generic prompt, units one per
+// line. Exposed so the gate probes send the SAME text the route ships.
+std::string lens_compare_user_text(const std::vector<std::string>& original_units,
+                                   const std::string& revised);
+std::string lens_compare_to_json(const LensCompareReport& r);
+
+// Single-slot, exclusive (slot 0, model lock held by the caller). Pass 1 = the
+// instruction and the original, untapped (under flash when `shape` is
+// SplitFlash); pass 2 = the second version and the question, the compare head
+// tapped, truncated after compare_layer. With a store and an id the original's
+// pass is kept (LensKeptRoute::Compare) and later revisions resume from it.
+// Fails loud on: a row without a compare head, fewer than 2 units, an empty
+// unit, an empty revision, an oversized prompt.
+LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sched,
+                                   ::Tokenizer* tok, const ModelMetadata& meta,
+                                   uint32_t n_ctx_max,
+                                   const std::vector<std::string>& original_units,
+                                   const std::string& revised,
+                                   const LensConstants& k,
+                                   LensPrefillShape shape,
+                                   LensDocumentStore* store = nullptr,
+                                   const std::string& document_id = std::string());
 
 // Pure span-finder, exposed for tests: turn a per-position mass vector into at
 // most `top_k` disjoint token spans, highest peak first.
