@@ -51,6 +51,7 @@
 // ≥0.705, all probed on Qwen 3.6); that is a probe campaign, not a check, and
 // architecture.md §12 is explicit that there are no lens claims for Gemma.
 
+#include <cstring>
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdlib>
@@ -416,6 +417,134 @@ TEST_P(ForwardPassTapTest, LensShapedUntappedPassIsInertForNextDecode) {
     EXPECT_EQ(before, after)
         << "a lens-SHAPED but UNTAPPED pass perturbed the next decode — so D8 is "
            "graph-shape/galloc driven, not caused by the attention tap.";
+}
+
+// ── 6. Head-selected tap: a copy of the same softmax, nothing else ──────────
+// A lens job reads one head (bind a short list), so the route copies out only
+// those heads (set_attention_taps(layers, heads)). The claim is exact: every
+// selected block equals the full tap's block for that head BYTE FOR BYTE, the
+// logits are untouched, and it holds for decode AND prefill shapes — the lens
+// taps prefill (locate, verify) and decode (extract). Run per recipe, so the
+// cross-family rule is met by the same test on Gemma.
+namespace {
+// One tapped prefill of kPrompt, head-less (want_logits=false), taps as armed.
+std::vector<ForwardPassBase::AttentionTap> prefill_taps(ForwardPassBase& fp,
+                                                        ggml_backend_sched_t sched) {
+    fp.clear_slot(0);
+    fp.set_cache_pos(0, 0);
+    ggml_cgraph* gf = fp.build_prefill_graph(kPrompt, 0, 0, /*want_logits=*/false);
+    fp.mark_attention_taps(gf);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_alloc_graph(sched, gf);
+    fp.set_prefill_inputs(gf, kPrompt, 0);
+    ggml_backend_sched_graph_compute(sched, gf);
+    std::vector<ForwardPassBase::AttentionTap> out = fp.get_attention_taps(gf);
+    fp.clear_slot(0);
+    return out;
+}
+// Block `b` of `sel` must equal head sel.heads[b] of `full`, byte for byte.
+void expect_blocks_equal_full(const ForwardPassBase::AttentionTap& full,
+                              const ForwardPassBase::AttentionTap& sel,
+                              const std::string& arch, const char* shape) {
+    ASSERT_EQ(sel.layer, full.layer);
+    ASSERT_EQ(sel.n_kv, full.n_kv);
+    ASSERT_EQ(sel.n_q, full.n_q);
+    ASSERT_EQ(sel.n_head, (int)sel.heads.size());
+    const size_t block = (size_t)full.n_kv * full.n_q;
+    ASSERT_EQ(sel.rows.size(), block * sel.heads.size());
+    for (size_t b = 0; b < sel.heads.size(); ++b) {
+        const int h = sel.heads[b];
+        ASSERT_EQ(full.block_of(h), h);
+        EXPECT_EQ(sel.block_of(h), (int)b);
+        EXPECT_EQ(0, std::memcmp(sel.rows.data() + b * block,
+                                 full.rows.data() + (size_t)h * block, block * sizeof(float)))
+            << "arch " << arch << " " << shape << " layer " << full.layer << " head " << h
+            << ": the head-selected tap differs from the full tap's rows for that head";
+    }
+}
+}  // namespace
+
+TEST_P(ForwardPassTapTest, HeadSelectedTapEqualsFullTapDecode) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    const auto& meta = model_->get_metadata();
+    auto fp = make_fp();
+    auto layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+    const int n_head = (int)meta.attention_head_count;
+    // Out of order and not contiguous on purpose: the last head, then head 0.
+    const std::vector<int> heads = {n_head - 1, 0};
+
+    fp->set_attention_taps(layers);
+    std::vector<ForwardPassBase::AttentionTap> full;
+    const std::vector<float> logits_full = decode_once(*fp, sched, kPrompt, &full);
+
+    fp->set_attention_taps(layers, heads);
+    std::vector<ForwardPassBase::AttentionTap> sel;
+    const std::vector<float> logits_sel = decode_once(*fp, sched, kPrompt, &sel);
+    fp->set_attention_taps({});
+
+    EXPECT_EQ(logits_full, logits_sel)
+        << "selecting tap heads perturbed decode logits on arch '" << meta.architecture << "'";
+    ASSERT_EQ(full.size(), sel.size());
+    for (size_t i = 0; i < full.size(); ++i)
+        expect_blocks_equal_full(full[i], sel[i], meta.architecture, "decode");
+}
+
+TEST_P(ForwardPassTapTest, HeadSelectedTapEqualsFullTapPrefill) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    const auto& meta = model_->get_metadata();
+    auto fp = make_fp();
+    auto layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+    const std::vector<int> heads = {(int)meta.attention_head_count / 2};
+
+    fp->set_attention_taps(layers);
+    const auto full = prefill_taps(*fp, sched);
+    fp->set_attention_taps(layers, heads);
+    const auto sel = prefill_taps(*fp, sched);
+    fp->set_attention_taps({});
+
+    ASSERT_EQ(full.size(), sel.size());
+    for (size_t i = 0; i < full.size(); ++i) {
+        EXPECT_EQ(full[i].n_q, (int)kPrompt.size());
+        expect_blocks_equal_full(full[i], sel[i], meta.architecture, "prefill");
+    }
+}
+
+TEST_P(ForwardPassTapTest, TapHeadOutOfRangeOrRepeatedFailsLoud) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    const int n_head = (int)model_->get_metadata().attention_head_count;
+    auto fp = make_fp();
+    auto layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+    for (const std::vector<int>& bad : {std::vector<int>{n_head}, std::vector<int>{-1},
+                                        std::vector<int>{0, 0}}) {
+        fp->set_attention_taps({layers[0]}, bad);
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        ggml_cgraph* gf = fp->build_prefill_graph(kPrompt, 0, 0, /*want_logits=*/false);
+        EXPECT_THROW(fp->mark_attention_taps(gf), std::runtime_error);
+    }
+    fp->set_attention_taps({});
+    fp->clear_slot(0);
+}
+
+// Arming taps without a head list must NOT inherit the previous caller's list:
+// a /v1/locate (one head) followed by a /v1/verify (every head) on one server.
+TEST_P(ForwardPassTapTest, ArmingWithoutHeadsResetsHeadList) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    const auto& meta = model_->get_metadata();
+    auto fp = make_fp();
+    auto layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+    fp->set_attention_taps({layers[0]}, {0});
+    EXPECT_EQ(fp->attention_tap_heads(), std::vector<int>{0});
+    fp->set_attention_taps({layers[0]});
+    EXPECT_TRUE(fp->attention_tap_heads().empty());
+    const auto taps = prefill_taps(*fp, sched);
+    fp->set_attention_taps({});
+    ASSERT_EQ(taps.size(), 1u);
+    EXPECT_EQ(taps[0].n_head, (int)meta.attention_head_count);
 }
 
 INSTANTIATE_TEST_SUITE_P(

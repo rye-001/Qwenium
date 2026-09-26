@@ -361,18 +361,41 @@ public:
     struct AttentionTap {
         int layer;                 // attention layer index (il), as requested
         int n_kv;                  // KV positions in the row (= tensor ne[0])
-        int n_head;                // attention heads (= tensor ne[2])
+        int n_head;                // head BLOCKS in `rows`: every head (= tensor
+                                   // ne[2]) on a full tap, heads.size() on a
+                                   // head-selected one
         int n_q = 1;                // query rows this tap covers (= tensor ne[1]);
                                      // 1 at decode (today's shape, unchanged), >1 at
                                      // a tapped prefill block (verify).
-        std::vector<float> rows;   // flat kv + n_kv*(q + n_q*head); n_q==1 is
+        std::vector<float> rows;   // flat kv + n_kv*(q + n_q*block); n_q==1 is
                                     // exactly today's row-major [n_head][n_kv]
+        // heads[b] = the model head whose rows sit in block b. The identity
+        // 0..n_head-1 on a full tap, so indexing a full tap by head is unchanged.
+        std::vector<int> heads;
+        // Block holding model head `h`, or -1 when this tap did not keep it.
+        int block_of(int h) const {
+            for (size_t b = 0; b < heads.size(); ++b) if (heads[b] == h) return (int)b;
+            return -1;
+        }
     };
-    void set_attention_taps(std::vector<int> layers) { policy_.attention_taps = std::move(layers); }
+    // Arm the tap on `layers`. `heads` empty (default) = every head, today's
+    // tap; non-empty = copy out only those heads of each layer, in that order.
+    // ONE call sets both, so a caller that arms taps without naming heads resets
+    // the list instead of inheriting the previous caller's selection.
+    void set_attention_taps(std::vector<int> layers, std::vector<int> heads = {}) {
+        policy_.attention_taps = std::move(layers);
+        policy_.attention_tap_heads = std::move(heads);
+    }
     const std::vector<int>& attention_taps() const { return policy_.attention_taps; }
+    const std::vector<int>& attention_tap_heads() const { return policy_.attention_tap_heads; }
     // Mark each armed layer's `kq_soft.<il>` as a graph output on `gf`. No-op
     // when the layer set is empty (byte-inert). Fail-loud if an armed layer's
     // tap tensor is absent from the graph (names the layer, expected, actual).
+    // With a head list, `kq_soft.<il>` itself is NOT marked: each selected head
+    // is copied into its own output `kq_tap.<il>.<h>` (a view of one head's
+    // contiguous [n_kv, n_q] block, made contiguous), so only those copies stay
+    // alive and are read back. Fail-loud on a head outside [0, n_head) or a
+    // repeated head.
     void mark_attention_taps(ggml_cgraph* gf);
 
     // ── Routing capture / replay (MoE only) ──────────────────────────────

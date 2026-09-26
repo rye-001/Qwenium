@@ -7,10 +7,12 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <cctype>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "../../src/server/server_lens.h"
+#include "../../src/engine/model.h"   // ModelMetadata, for the verdict refusal tests
 
 using namespace qinf;
 
@@ -736,9 +738,15 @@ TEST(LensCalibrationGuard, AcceptsTheCalibratedModelsWithTheirOwnCoordinates) {
     // sharing a label would put the same `model` string on reports computed
     // from different layers and heads, which is the exact failure the table was
     // built to end.
+    // Pinned rows are skipped: a pinned row is its any-quant sibling's SAME
+    // calibration plus a licence that quantization earned (the Qwen3.8-9B
+    // Q4_K_M row; LensPrefillShapeLicence.TheTwoNineBRowsAgreeOnEveryCoordinate
+    // pins that), so it keeps the label; `config.weights` and `prefill` tell
+    // the reports apart.
     std::set<std::string> labels;
     for (const LensCalibration& c : lens_calibrations())
-        if (std::string(c.architecture) != "qwen35moe")   // the two 3.6 builds ARE one calibration
+        if (std::string(c.architecture) != "qwen35moe"    // the two 3.6 builds ARE one calibration
+            && c.file_type == kLensAnyFileType)
             EXPECT_TRUE(labels.insert(c.constants.model_label).second)
                 << "duplicate model_label: " << c.constants.model_label;
     for (const LensCalibration& c : lens_calibrations())
@@ -752,9 +760,8 @@ TEST(LensCalibrationGuard, RefusesUncalibratedModelsOfACalibratedArchitecture) {
     // under Qwen 3.8-9B's coordinates.
     EXPECT_EQ(lens_calibration_for("qwen35", 24, kLensAnyFileType), nullptr);   // Qwen3.5-0.8B
     EXPECT_EQ(lens_calibration_for("qwen35", 32, kLensAnyFileType), nullptr);   // Qwen3.5-9B
-    // Qwen3.6-27B is `qwen35`/64/ftype 15. Ternary-Bonsai-27B is `qwen35`/64 too
-    // and IS calibrated (ftype 41), so block_count 64 alone no longer decides —
-    // the quantization separates them, which is why file_type joined the key.
+    // Qwen3.6-27B is `qwen35`/64/ftype 15 and must stay refused at EVERY
+    // file_type, including the sentinel — no row claims {qwen35, 64} today.
     EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q4_K_M*/ 15), nullptr);  // Qwen3.6-27B
     EXPECT_EQ(lens_calibration_for("qwen35", 64, kLensAnyFileType), nullptr);
 
@@ -771,39 +778,28 @@ TEST(LensCalibrationGuard, RefusesUncalibratedModelsOfACalibratedArchitecture) {
 }
 
 // ── The quantization key field ───────────────────────────────────────────────
-// Ternary-Bonsai-27B and Qwen3.6-27B are BOTH `qwen35` with block_count 64.
-// One is calibrated and one must stay refused, so this pair is the whole
-// reason general.file_type is part of the key. If this test ever passes with
-// the third argument removed, the key has silently widened again.
-TEST(LensCalibrationGuard, FileTypeSeparatesTwoModelsThatShareArchAndBlockCount) {
-    const LensCalibration* bonsai = lens_calibration_for("qwen35", 64, /*ternary Q2_0*/ 41);
-    ASSERT_NE(bonsai, nullptr);
-    EXPECT_EQ(bonsai->constants.citation_layer, 59);   // L59H21, LEGCSEARCH 94.8%
-    EXPECT_EQ(bonsai->constants.citation_head,  21);
-
-    // The SAME arch and block_count at a different quantization is still refused.
-    EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q4_K_M*/ 15), nullptr);
-    EXPECT_EQ(lens_calibration_for("qwen35", 64, /*Q8_0*/    7), nullptr);
-
-    // Bonsai must not have borrowed Qwen3.8-27B's coordinates: its own L19H20
-    // survives ternary at rank 5 but lands at DE 89.8% against a 90% bar.
-    const LensCalibration* q38_27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
-    ASSERT_NE(q38_27, nullptr);
-    EXPECT_NE(bonsai->constants.citation_layer, q38_27->constants.citation_layer);
-
-    // Locate WAS swept on this model (LOCHEAD 2026-09-18, L35 h=6, 100% top3
-    // in both languages) and is free: verify already cuts at 60 blocks for the
-    // citation layer, so a locate layer <= 59 costs this server nothing.
-    EXPECT_EQ(bonsai->constants.locate_layer, 35);
-    EXPECT_EQ(bonsai->constants.locate_head,   6);
-    // It must stay SHALLOWER than the citation layer, because that is the whole
-    // reason it is free. If a future sweep moves it deeper than citation, the
-    // --lens-verify-only cut in http_server.cpp must grow to cover it — that
-    // max() folds locate in, and this is the assertion that says why.
-    EXPECT_LT(bonsai->constants.locate_layer, bonsai->constants.citation_layer);
-
-    // Still unmeasured, still refused: the drift gate never ran on ternary.
-    EXPECT_FALSE(bonsai->constants.flash_prefill_ok);
+// One row pins a file_type (2026-09-25): Qwen3.8-9B at Q4_K_M (15), carrying
+// the split+flash licence its Q8_0 sibling failed. The invariant held here: a
+// file_type that NO row pins for a given {architecture, block_count} must
+// resolve the same as any other, so the extra key component cannot change an
+// answer it was never meant to. (A pinned file_type is the next test's job.)
+TEST(LensCalibrationGuard, AnUnpinnedTableIgnoresTheFileType) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.file_type != kLensAnyFileType) continue;   // pinned rows: other test
+        std::set<uint32_t> pinned;
+        for (const LensCalibration& p : lens_calibrations())
+            if (p.file_type != kLensAnyFileType && std::string(p.architecture) == c.architecture &&
+                p.block_count == c.block_count)
+                pinned.insert(p.file_type);
+        for (uint32_t ft : {0u, 7u, 15u, 41u, 143u, kLensAnyFileType}) {
+            if (pinned.count(ft)) continue;
+            const LensCalibration* got =
+                lens_calibration_for(c.architecture, c.block_count, ft);
+            ASSERT_NE(got, nullptr) << c.architecture << "/" << c.block_count
+                                    << " must resolve at file_type " << ft;
+            EXPECT_EQ(got, &c) << "file_type " << ft << " changed which row won";
+        }
+    }
 }
 
 // A row that PINS a quantization must beat a row that accepts any, otherwise
@@ -1540,35 +1536,6 @@ TEST(LensWarmWire, WarmDisclosesItself) {
     EXPECT_EQ(j["prefix"], "warm");
 }
 
-TEST(LensWarmDocumentState, InvalidateClearsEveryField) {
-    LensWarmDocument w;
-    w.document_id = "lease-4471"; w.document_hash = 99; w.prefix_tokens = 1234; w.valid = true;
-    w.invalidate();
-    EXPECT_TRUE(w.document_id.empty());
-    EXPECT_EQ(w.document_hash, 0u);
-    EXPECT_EQ(w.prefix_tokens, 0u);
-    EXPECT_FALSE(w.valid);
-}
-
-TEST(LensWarmDocumentState, ReuseRequiresIdAndHashAndValidity) {
-    // Mirrors the predicate in run_lens_extract. The hash is the interlock that
-    // stops a primed prefix being served for different text — which would report
-    // receipts about a document the model never read.
-    const size_t h = std::hash<std::string>{}(std::string("the document"));
-    LensWarmDocument w;
-    w.document_id = "doc-a"; w.document_hash = h; w.prefix_tokens = 10; w.valid = true;
-
-    auto reuse = [&](const std::string& id, size_t hash) {
-        return w.valid && !id.empty() && w.document_id == id && w.document_hash == hash;
-    };
-    EXPECT_TRUE (reuse("doc-a", h));            // same id, same bytes
-    EXPECT_FALSE(reuse("doc-a", h + 1));        // SAME id, DIFFERENT document
-    EXPECT_FALSE(reuse("doc-b", h));            // different id
-    EXPECT_FALSE(reuse("", h));                 // no id ⇒ never warm
-    w.valid = false;
-    EXPECT_FALSE(reuse("doc-a", h));            // nothing held
-}
-
 TEST(LensCandidateWire, FormatVersionIsV4) {
     LensReport r;
     nlohmann::json j = nlohmann::json::parse(lens_report_to_json(r));
@@ -2162,4 +2129,911 @@ TEST(LensLocateJson, CarriesUncalibratedAndOmitsExtractionOrigin) {
     ASSERT_TRUE(j["hits"].contains("nothing_here"));
     EXPECT_TRUE(j["hits"]["nothing_here"].empty())
         << "a key with no hits keeps its slot rather than vanishing";
+}
+
+// The 9B's locate pair (LOCHEAD 2026-09-19). Pins the coordinates AND the two
+// properties that make them safe to ship: locate does not move the cut, and it
+// is not the citation coordinate.
+TEST(LensCalibrationGuard, NineBLocatePairIsSweptAndFree) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+
+    EXPECT_EQ(q9->constants.locate_layer, 11);
+    EXPECT_EQ(q9->constants.locate_head,   6);
+
+    // FREE. The --lens-verify-only cut is max(citation, coverage, locate) + 1.
+    // locate == coverage here, so folding it in changes nothing. If a future
+    // sweep moves locate past citation, this fails and the server pays for it.
+    EXPECT_LE(q9->constants.locate_layer, q9->constants.coverage_layer);
+    EXPECT_LE(q9->constants.locate_layer, q9->constants.citation_layer);
+    const int cut = std::max({q9->constants.citation_layer,
+                              q9->constants.coverage_layer,
+                              q9->constants.locate_layer}) + 1;
+    EXPECT_EQ(cut, 28) << "the 9B verify-only cut must stay 28 of 33 blocks";
+
+    // Locate is NOT the citation coordinate. Measured on the same corpus:
+    // reading locate off the citation layer scores 49.3%, rank 107 of 128.
+    EXPECT_NE(q9->constants.locate_layer, q9->constants.citation_layer);
+
+    // /v1/locate is no longer refused on this model.
+    EXPECT_GE(q9->constants.locate_layer, 0);
+    EXPECT_GE(q9->constants.locate_head,  0);
+    EXPECT_STRNE(q9->constants.locate_provenance, "not swept by LOCHEAD");
+}
+
+// The 27B's locate pair is the mirror image of the 9B's: DELIBERATELY NOT FREE.
+// It is the only row where locate sets the cut, so it is the only row that can
+// catch a regression in `max(citation, coverage, locate)` — if someone drops
+// locate from that max in http_server.cpp, the 9B keeps working and this model
+// silently taps a block the verify-only server never loaded.
+TEST(LensCalibrationGuard, TwentySevenBLocatePairIsSweptAndSetsTheCut) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+
+    EXPECT_EQ(q27->constants.locate_layer, 27);
+    EXPECT_EQ(q27->constants.locate_head,  10);
+
+    // NOT free, and that is the point: locate is deeper than BOTH other
+    // constants, so it alone decides the cut.
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.citation_layer);
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.coverage_layer);
+
+    const int cut = std::max({q27->constants.citation_layer,
+                              q27->constants.coverage_layer,
+                              q27->constants.locate_layer}) + 1;
+    EXPECT_EQ(cut, 28) << "the 27B verify-only cut is 28 of 65 — locate sets it";
+
+    // The cost this row accepted, stated as an assertion so it cannot drift
+    // unnoticed: without locate the cut would have been 20.
+    const int cut_without_locate = std::max(q27->constants.citation_layer,
+                                            q27->constants.coverage_layer) + 1;
+    EXPECT_EQ(cut_without_locate, 20)
+        << "landing locate cost this model 8 blocks; if this number moves, the "
+           "trade recorded in note-lens-qwen38-27b-probe.md §8 no longer holds";
+
+    // Direction of the depth profile is the OPPOSITE of the 9B's. Asserted
+    // because the 9B write-up originally generalized the wrong way round.
+    EXPECT_NE(q27->constants.locate_layer, q27->constants.citation_layer);
+
+    EXPECT_GE(q27->constants.locate_layer, 0);
+    EXPECT_GE(q27->constants.locate_head,  0);
+    EXPECT_STRNE(q27->constants.locate_provenance, "not swept by LOCHEAD");
+}
+
+// Cross-model: the two calibrated Qwen3.8 rows disagree about WHERE locate
+// lives, and that disagreement is load-bearing — it is why locate_layer is a
+// per-row constant and not a rule of thumb.
+TEST(LensCalibrationGuard, LocateDepthDirectionIsNotAFamilyConstant) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9,  nullptr);
+    ASSERT_NE(q27, nullptr);
+
+    // 9B: locate SHALLOWER than citation. 27B: locate DEEPER than citation.
+    // Same architecture string, opposite answers.
+    EXPECT_LT(q9->constants.locate_layer,  q9->constants.citation_layer);
+    EXPECT_GT(q27->constants.locate_layer, q27->constants.citation_layer);
+}
+
+// ── config.attention must describe the pass that RAN, not the server's flags ──
+//
+// lens-format.md's contract for `config` is "the numerical configuration that
+// produced THIS report" plus "two reports are only comparable when this
+// matches". Both halves broke on /v1/locate: its only pass is the tapped
+// prefill, which run_lens_locate forces materialized, so a locate report from
+// a --flash-attn server IS byte-comparable with one from a plain server — and
+// the old label told readers it was not.
+TEST(LensAttentionLabel, LocateIsMaterializedWhateverTheServerFlagsSay) {
+    using RP = LensReport::RoutePrefill;
+    // Every flag combination, including ones the server cannot currently
+    // produce: the route property must not depend on any of them.
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, false, false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, false, true),  "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, true,  false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, true,  true),  "materialized");
+}
+
+// The regression, stated as the comparison it protects: a locate report from a
+// flash server and one from a plain server must carry the SAME stamp, because
+// the pass that produced them is the same pass.
+TEST(LensAttentionLabel, TwoLocateReportsAcrossFlashSettingsStayComparable) {
+    using RP = LensReport::RoutePrefill;
+    EXPECT_STREQ(lens_attention_label(RP::AlwaysMaterialized, /*decode*/ false, /*prefill*/ true),
+                 lens_attention_label(RP::AlwaysMaterialized, false, false))
+        << "a locate report must not claim a configuration its pass never ran under";
+}
+
+// A locate on a model LICENSED for split+flash ran its document pass under
+// flash because its calibration row says so — whatever the server flags are.
+// The stamp must say so, or a reader compares it with a materialized report.
+TEST(LensAttentionLabel, SplitFlashLocateIsFlashPrefillWhateverTheServerFlagsSay) {
+    using RP = LensReport::RoutePrefill;
+    for (bool d : {false, true})
+        for (bool pf : {false, true})
+            EXPECT_STREQ(lens_attention_label(RP::DocumentPassFlash, d, pf), "flash-prefill");
+}
+
+// extract and verify are NOT the same case — each has an untapped prompt
+// prefill that really does run under the flag, so the fix must not flatten
+// them to "materialized" and lose a real numerical difference.
+TEST(LensAttentionLabel, ExtractAndVerifyStillReportTheServerConfiguration) {
+    using RP = LensReport::RoutePrefill;
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, false, false), "materialized");
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, false, true),  "flash-prefill");
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, true,  false), "flash");
+    // Decode-flash wins over prefill-flash: "flash" is the stronger statement
+    // and the one a reader must not under-read.
+    EXPECT_STREQ(lens_attention_label(RP::HonoursServerFlag, true,  true),   "flash");
+}
+
+// The label set is closed — lens-format.md documents exactly three values and
+// an importer switches on them.
+TEST(LensAttentionLabel, EmitsOnlyTheThreeDocumentedValues) {
+    using RP = LensReport::RoutePrefill;
+    const std::set<std::string> allowed = {"materialized", "flash-prefill", "flash"};
+    for (RP r : {RP::HonoursServerFlag, RP::AlwaysMaterialized, RP::DocumentPassFlash})
+        for (bool d : {false, true})
+            for (bool pf : {false, true})
+                EXPECT_TRUE(allowed.count(lens_attention_label(r, d, pf)) == 1)
+                    << "undocumented label: " << lens_attention_label(r, d, pf);
+}
+
+// ── LensKeyAggregation — the opt-in reduction over a key's query rows ────────
+//
+// MAX is what LOCHEAD measured and must stay the default, byte-identical to the
+// behaviour that predates the enum. MEAN exists for SENTENCE-length keys, where
+// max inverts into a defect: one filler token spikes and the wordiest key wins
+// regardless of content (DECIDE1 2026-09-20 — a 4-way routing task collapsed
+// into a single category until the filler was removed, +25 points).
+TEST(LensKeyAggregationContract, MaxIsTheDefaultAndIsNamedOnTheWire) {
+    EXPECT_STREQ(lens_key_aggregation_name(LensKeyAggregation::Max),  "max");
+    EXPECT_STREQ(lens_key_aggregation_name(LensKeyAggregation::Mean), "mean");
+    LensLocateReport r;
+    EXPECT_EQ(r.key_aggregation, LensKeyAggregation::Max)
+        << "the default must remain MAX: it is the reduction LOCHEAD measured, "
+           "and every shipped locate_provenance rate is quoted under it";
+}
+
+// A report scored under MEAN sits outside LOCHEAD's measurement, exactly as a
+// question vocabulary does. If this ever stops being disclosed, a caller reads
+// a 96.0% provenance rate for a request that was never measured at 96.0%.
+TEST(LensKeyAggregationContract, MeanIsSerializedSoAReportCannotHideIt) {
+    LensLocateReport r;
+    r.model = "m"; r.locate_layer = 11; r.locate_head = 6; r.top_k = 3;
+    r.locate_provenance = "LOCHEAD 2026-09-19";
+    r.key_aggregation = LensKeyAggregation::Mean;
+    r.uncalibrated = true;                      // what run_lens_locate sets
+    const std::string js = lens_locate_to_json(r);
+    EXPECT_NE(js.find("\"key_aggregation\":\"mean\""), std::string::npos)
+        << "the reduction must travel with the report";
+    EXPECT_NE(js.find("\"uncalibrated\":true"), std::string::npos)
+        << "MEAN is off-calibration and must say so, like question mode";
+
+    r.key_aggregation = LensKeyAggregation::Max;
+    r.uncalibrated = false;
+    EXPECT_NE(lens_locate_to_json(r).find("\"key_aggregation\":\"max\""),
+              std::string::npos)
+        << "emitted unconditionally: an absent member would make a reader guess "
+           "whether it meant max or an old server";
+}
+
+// The two reductions must actually differ on a multi-row key, or the parameter
+// is decorative. Mirrors the shape of the real loop: rows x document positions,
+// one row carrying a lone spike.
+TEST(LensKeyAggregationContract, MaxAndMeanDisagreeOnASpikyKey) {
+    // 3 query rows over 2 document positions.
+    //   row0: [0.90, 0.10]   <- the filler token's spurious spike on position 0
+    //   row1: [0.02, 0.50]
+    //   row2: [0.02, 0.50]   <- two rows agree on position 1
+    // The spike must be big enough to win MAX and still lose MEAN; a first
+    // draft of this fixture used 0.05/0.40 and the mean came out 0.333 vs
+    // 0.300, i.e. the spike won both and the test proved nothing.
+    const std::vector<std::vector<float>> rows = {{0.90f, 0.10f},
+                                                  {0.02f, 0.50f},
+                                                  {0.02f, 0.50f}};
+    std::vector<float> mx(2, 0.0f), mn(2, 0.0f);
+    for (const auto& r : rows)
+        for (size_t d = 0; d < 2; ++d) {
+            if (r[d] > mx[d]) mx[d] = r[d];
+            mn[d] += r[d];
+        }
+    for (float& v : mn) v /= (float)rows.size();
+
+    // MAX hands the spike the win; MEAN hands it to the position two rows agree on.
+    EXPECT_GT(mx[0], mx[1]) << "max follows the lone spike";
+    EXPECT_LT(mn[0], mn[1]) << "mean follows the agreement — this is the +25 points";
+}
+
+// ── The CHOICE pair — a third job on the same layer ─────────────────────────
+TEST(LensChoiceHead, NineBCarriesASweptChoicePairOnTheLocateLayer) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.choice_layer, 11);
+    EXPECT_EQ(q9->constants.choice_head,   3);
+
+    // THE POINT OF THIS PAIR: same layer as locate, different head, so serving
+    // choice costs a --lens-locate-only server no extra blocks.
+    EXPECT_EQ(q9->constants.choice_layer, q9->constants.locate_layer)
+        << "choice is free on this model precisely because it shares locate's layer";
+    EXPECT_NE(q9->constants.choice_head, q9->constants.locate_head)
+        << "...but it is NOT the locate head: reading choice there scores 87.5% "
+           "against this pair's 92.5%";
+
+    // The rate is conditional on a recipe, so the provenance must carry it.
+    // A bare layer/head pair would be a receipt with its conditions stripped.
+    const std::string prov = q9->constants.choice_provenance;
+    EXPECT_NE(prov.find("DECIDEHEAD"), std::string::npos);
+    EXPECT_NE(prov.find("92.5%"),      std::string::npos);
+    EXPECT_NE(prov.find("question"),   std::string::npos) << "instruction shape";
+    EXPECT_NE(prov.find("mean"),       std::string::npos) << "key aggregation";
+    EXPECT_NE(prov.find("Q4_K_M"),     std::string::npos) << "quant stability";
+}
+
+// Every other row must stay unswept rather than inheriting the 9B's coordinate.
+// Borrowing a head across models is the false-receipt failure this table exists
+// to prevent, and DECIDEHEAD has only run on the 9B.
+// Was "every row but the 9B is empty", which stopped being the invariant the
+// moment a second model was swept. The invariant was never the model list — it
+// is that a row NEVER inherits another model's coordinates. So: layer and head
+// are set together or not at all, and a row carrying a pair must carry its own
+// provenance rather than the default (the default is what an inherited pair
+// would still be wearing).
+TEST(LensChoiceHead, ARowCarriesItsOwnPairOrRefuses) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        const bool has = c.constants.choice_layer >= 0;
+        EXPECT_EQ(has, c.constants.choice_head >= 0)
+            << c.model << ": layer and head must be set together or not at all";
+        EXPECT_FALSE(std::string(c.constants.choice_provenance).empty()) << c.model;
+        if (has)
+            EXPECT_STRNE(c.constants.choice_provenance, "not swept by DECIDEHEAD")
+                << c.model << " carries a pair under the default provenance, which is "
+                              "what an inherited coordinate looks like";
+    }
+}
+
+TEST(LensChoiceHead, HeadRoleIsNamedOnTheWireAndDefaultsToLocate) {
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Locate), "locate");
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Choice), "choice");
+    LensLocateReport r;
+    EXPECT_EQ(r.head_role, LensHeadRole::Locate)
+        << "default must stay locate: the route predates the choice pair";
+    r.model = "m"; r.locate_layer = 11; r.locate_head = 3; r.top_k = 3;
+    r.head_role = LensHeadRole::Choice;
+    r.locate_provenance = "DECIDEHEAD 2026-09-20";
+    const std::string js = lens_locate_to_json(r);
+    EXPECT_NE(js.find("\"head_role\":\"choice\""), std::string::npos)
+        << "a reader must be able to tell which job's calibration applies";
+    EXPECT_NE(js.find("DECIDEHEAD"), std::string::npos)
+        << "provenance must switch with the pair, not stay locate's";
+}
+
+// The 9B row is kLensAnyFileType, so it serves Q8_0 AND Q4_K_M — and the same
+// pair measures 96.0% top-3 on one and 93.3% on the other. A provenance naming
+// only one of them makes every report on the other file overstate itself, which
+// is the failure this table exists to prevent. Guarded because the temptation
+// to "tidy" a long string back to a single number is real.
+TEST(LensChoiceHead, NineBLocateProvenanceNamesBothQuants) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::string p = q9->constants.locate_provenance;
+    EXPECT_NE(p.find("Q8_0"),   std::string::npos) << "must name the quant it was swept on";
+    EXPECT_NE(p.find("Q4_K_M"), std::string::npos) << "...and the one it also serves";
+    EXPECT_NE(p.find("96.0%"),  std::string::npos) << "Q8_0 top-3";
+    EXPECT_NE(p.find("93.3%"),  std::string::npos) << "Q4_K_M top-3";
+    EXPECT_NE(p.find("88.0%"),  std::string::npos) << "Q8_0 top-1";
+    EXPECT_NE(p.find("84.0%"),  std::string::npos) << "Q4_K_M top-1";
+    // The row is unpinned, which is WHY both rates have to be here.
+    EXPECT_EQ(q9->file_type, kLensAnyFileType);
+}
+
+// ── The ABSENT pair — the fourth job, and the first that is NOT free ────────
+TEST(LensAbsentHead, NineBCarriesASweptAbsencePairThatCostsDepth) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.absent_layer, 19);
+    EXPECT_EQ(q9->constants.absent_head,  10);
+
+    // Unlike choice, absence does NOT share locate's layer. That is the whole
+    // cost of this pair and the reason the locate-only cut moved 12 -> 20:
+    // there is no stable shallow absence head (L11 is h=8 on Q4_K_M and h=6 on
+    // Q8_0), so depth was paid for a coordinate that survives a file swap.
+    EXPECT_GT(q9->constants.absent_layer, q9->constants.locate_layer);
+    EXPECT_GT(q9->constants.absent_layer, q9->constants.choice_layer);
+
+    // The locate-only server must load every head it can serve.
+    const int locate_only_cut = std::max({q9->constants.locate_layer,
+                                          q9->constants.choice_layer,
+                                          q9->constants.absent_layer}) + 1;
+    EXPECT_EQ(locate_only_cut, 20) << "absence sets the locate-only cut on this model";
+    // Verify-only is unaffected: citation is deeper still.
+    const int verify_only_cut = std::max({q9->constants.citation_layer,
+                                          q9->constants.coverage_layer,
+                                          q9->constants.locate_layer,
+                                          q9->constants.choice_layer,
+                                          q9->constants.absent_layer}) + 1;
+    EXPECT_EQ(verify_only_cut, 28) << "citation still dominates the verify-only cut";
+
+    // AUC is a separation, not a rate — the provenance must not let a reader
+    // mistake 0.9948 for an accuracy, and must carry both quants.
+    const std::string p = q9->constants.absent_provenance;
+    EXPECT_NE(p.find("ABSENTHEAD"), std::string::npos);
+    EXPECT_NE(p.find("0.9948"),     std::string::npos) << "Q4_K_M AUC";
+    EXPECT_NE(p.find("0.9953"),     std::string::npos) << "Q8_0 AUC";
+    EXPECT_NE(p.find("89.6%"),      std::string::npos) << "the operating point a buyer hears";
+    EXPECT_NE(p.find("SEPARATION"), std::string::npos) << "AUC must not read as a rate";
+}
+
+TEST(LensAbsentHead, ARowCarriesItsOwnPairOrRefuses) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        const bool has = c.constants.absent_layer >= 0;
+        EXPECT_EQ(has, c.constants.absent_head >= 0)
+            << c.model << ": layer and head must be set together or not at all";
+        EXPECT_FALSE(std::string(c.constants.absent_provenance).empty()) << c.model;
+        if (has)
+            EXPECT_STRNE(c.constants.absent_provenance, "not swept by ABSENTHEAD") << c.model;
+    }
+}
+
+// Two models now carry an absence pair, and geometry does not transfer between
+// them — the 9B's sits at L19 of 33 and the 27B's at L31 of 65. If these ever
+// coincide, suspect a copy rather than a coincidence.
+TEST(LensAbsentHead, TheTwoSweptModelsLandOnDifferentCoordinates) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    ASSERT_NE(q27, nullptr);
+    ASSERT_GE(q9->constants.absent_layer, 0);
+    ASSERT_GE(q27->constants.absent_layer, 0);
+    EXPECT_NE(std::make_pair(q9->constants.absent_layer, q9->constants.absent_head),
+              std::make_pair(q27->constants.absent_layer, q27->constants.absent_head));
+}
+
+// Four jobs, four pairs, all distinct — the per-action design in one assert.
+TEST(LensAbsentHead, TheThreeJobsReadThreeDifferentHeads) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::set<std::pair<int,int>> pairs = {
+        {q9->constants.locate_layer, q9->constants.locate_head},
+        {q9->constants.choice_layer, q9->constants.choice_head},
+        {q9->constants.absent_layer, q9->constants.absent_head},
+        {q9->constants.score_layer,  q9->constants.score_head}};
+    EXPECT_EQ(pairs.size(), 4u) << "locate, choice, absence and score must not collapse "
+                                   "onto one coordinate — reuse has measured badly every "
+                                   "time";
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Absent), "absent");
+}
+
+// ── SCOREHEAD: the ordinal pair ─────────────────────────────────────────────
+TEST(LensScoreHead, NineBCarriesTheSweptOrdinalPair) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.score_layer, 19);
+    EXPECT_EQ(q9->constants.score_head, 11);
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Score), "score");
+}
+
+// The trap this file exists to catch. `kLensCalibrations` uses POSITIONAL
+// aggregate initialisation — the /*field*/ markers are comments — so appending
+// the score triple anywhere but last silently shifts every pair after it and
+// still compiles. Score sits beside absence on the same layer, which makes a
+// swap between exactly those two invisible to a layer check; pin the HEADS.
+TEST(LensScoreHead, ScoreAndAbsentShareALayerButNotAHead) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.score_layer, q9->constants.absent_layer)
+        << "score is free precisely because it shares absence's layer";
+    EXPECT_NE(q9->constants.score_head, q9->constants.absent_head)
+        << "adjacent heads, measured differently: h=10 won absence, h=11 the ordinal";
+}
+
+// The score pair moves no cut. Absence already pays for layer 19, so a server
+// that serves absence serves score for nothing — if this ever fails, the score
+// head has drifted off absence's layer and someone is paying depth for it.
+TEST(LensScoreHead, ScoreIsFreeOnALocateOnlyServer) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const int without = std::max({q9->constants.locate_layer,
+                                  q9->constants.choice_layer,
+                                  q9->constants.absent_layer}) + 1;
+    const int with    = std::max({q9->constants.locate_layer,
+                                  q9->constants.choice_layer,
+                                  q9->constants.absent_layer,
+                                  q9->constants.score_layer}) + 1;
+    EXPECT_EQ(with, without);
+    EXPECT_EQ(with, 20);
+}
+
+// An ordinal head is not selected by accuracy and its provenance has to say so
+// out loud, because 66.7% sitting alone in a table reads like a bad head rather
+// than a number the sweep deliberately did not optimise.
+TEST(LensScoreHead, ProvenanceWarnsThatExactMatchIsNotTheNumber) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::string prov = q9->constants.score_provenance;
+    EXPECT_NE(prov.find("NOT THE PRODUCT NUMBER"), std::string::npos);
+    EXPECT_NE(prov.find("UNCALIBRATED"), std::string::npos)
+        << "a caller that rounds the fraction to an integer level reads low";
+    EXPECT_NE(prov.find("Q8_0"), std::string::npos);
+    EXPECT_NE(prov.find("Q4_K_M"), std::string::npos)
+        << "quant stability was measured for this pair; the receipt must name both";
+}
+
+// An unswept model must be refused, not served off a neighbour's coordinates.
+// "Unswept" and "swept and declined" are BOTH -1 and both refused — the pair
+// is absent either way — but they are different facts and the provenance is
+// where the difference lives, so a row may carry -1 with a non-default string.
+TEST(LensScoreHead, ModelsWithoutASweptOrdinalPairDeclareItUnmeasured) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.constants.score_layer >= 0) continue;
+        EXPECT_EQ(c.constants.score_head, -1) << c.model;
+        EXPECT_FALSE(std::string(c.constants.score_provenance).empty()) << c.model;
+    }
+}
+
+// ── INJHEAD: the injection highlighter ──────────────────────────────────────
+TEST(LensInjectHead, NineBCarriesTheSweptInjectionPair) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    EXPECT_EQ(q9->constants.inject_layer, 11);
+    EXPECT_EQ(q9->constants.inject_head, 0);
+    EXPECT_STREQ(lens_head_role_name(LensHeadRole::Inject), "inject");
+    EXPECT_STREQ(lens_inject_entry, "instruction_like");
+}
+
+// Positional aggregate init again: the inject triple was appended after the
+// score triple. Inject shares locate's AND choice's layer, so only the heads
+// can show a swap — pin all three on L11 apart.
+TEST(LensInjectHead, SharesLayerElevenButNoHead) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const LensConstants& k = q9->constants;
+    EXPECT_EQ(k.inject_layer, k.locate_layer);
+    EXPECT_EQ(k.inject_layer, k.choice_layer);
+    const std::set<int> heads = {k.inject_head, k.locate_head, k.choice_head};
+    EXPECT_EQ(heads.size(), 3u) << "three jobs on L11, three heads";
+    // And the score triple it was appended after is still where it was.
+    EXPECT_EQ(k.score_layer, 19);
+    EXPECT_EQ(k.score_head, 11);
+}
+
+// Free on a locate-only server: it must not move the 20-block cut.
+TEST(LensInjectHead, InjectIsFreeOnALocateOnlyServer) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const LensConstants& k = q9->constants;
+    const int without = std::max({k.locate_layer, k.choice_layer, k.absent_layer, k.score_layer}) + 1;
+    const int with    = std::max({k.locate_layer, k.choice_layer, k.absent_layer, k.score_layer,
+                                  k.inject_layer}) + 1;
+    EXPECT_EQ(with, without);
+    EXPECT_EQ(with, 20);
+}
+
+// The measured limit is the product boundary: a highlighter, not a detector.
+// If an edit ever shortens the provenance to its headline rate, a caller loses
+// the one sentence that stops them shipping "attack found".
+TEST(LensInjectHead, ProvenanceSaysHighlighterNotDetector) {
+    const LensCalibration* q9 = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    const std::string prov = q9->constants.inject_provenance;
+    EXPECT_NE(prov.find("A HIGHLIGHTER, NOT A DETECTOR"), std::string::npos);
+    EXPECT_NE(prov.find("ALWAYS POINTS SOMEWHERE"), std::string::npos);
+    EXPECT_NE(prov.find("0.735"), std::string::npos) << "the hardest measured pair stays named";
+    EXPECT_NE(prov.find("Q4_K_M"), std::string::npos);
+    EXPECT_NE(prov.find("Q8_0"), std::string::npos)
+        << "the 9B row admits both quants; the receipt must say what each measured";
+}
+
+TEST(LensInjectHead, ModelsWithoutASweptInjectPairDeclareItUnmeasured) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.constants.inject_layer >= 0) continue;
+        EXPECT_EQ(c.constants.inject_head, -1) << c.model;
+        EXPECT_FALSE(std::string(c.constants.inject_provenance).empty()) << c.model;
+    }
+}
+
+// ── The 27B: absence landed, choice and score swept and DECLINED ────────────
+TEST(LensTwentySevenB, CarriesTheSweptAbsencePair) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.absent_layer, 31);
+    EXPECT_EQ(q27->constants.absent_head, 23);
+    // Absence sets this model's locate-only cut: 4 blocks deeper than locate.
+    EXPECT_GT(q27->constants.absent_layer, q27->constants.locate_layer);
+}
+
+// A -1 that means "we measured it and said no" must never read as "we never
+// looked". Score was swept on 2026-09-20 and refused; a future reader who saw
+// the default string would re-run a sweep that has already answered.
+TEST(LensTwentySevenB, RefusedPairsDoNotClaimToBeUnswept) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.score_layer, -1);
+    const std::string sc = q27->constants.score_provenance;
+    EXPECT_STRNE(q27->constants.score_provenance, "not swept by SCOREHEAD");
+    EXPECT_NE(sc.find("REFUSED"), std::string::npos);
+    // The reason has to survive, not just the verdict.
+    EXPECT_NE(sc.find("ZERO of the"), std::string::npos);
+}
+
+// The 27B choice pair is the one place in this table where a head was landed
+// over a STRICTLY BETTER pooled rate. If a future edit "upgrades" it to the
+// 100% head, these asserts are what should stop it: the reason lives in the
+// provenance, and the depth it costs is real.
+TEST(LensTwentySevenB, ChoiceIsTheHeldOutWinnerNotThePooledWinner) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    EXPECT_EQ(q27->constants.choice_layer, 39);
+    EXPECT_EQ(q27->constants.choice_head, 7);
+    const std::string ch = q27->constants.choice_provenance;
+    EXPECT_NE(ch.find("HELD-OUT SYMMETRY, NOT FOR THE POOLED RATE"), std::string::npos);
+    EXPECT_NE(ch.find("L47 h=13"), std::string::npos)
+        << "the better pooled head that was declined must stay named";
+    // Choice is NOT free here, unlike the 9B — it sets the cut.
+    EXPECT_GT(q27->constants.choice_layer, q27->constants.absent_layer);
+    EXPECT_GT(q27->constants.choice_layer, q27->constants.locate_layer);
+}
+
+// Choice is free on the 9B and costs depth on the 27B. Neither is a property
+// of "choice"; both are properties of a model, which is why the cut is
+// computed from the constants instead of being written down per mode.
+TEST(LensTwentySevenB, ChoiceIsFreeOnOneModelAndNotTheOther) {
+    const LensCalibration* q9  = lens_calibration_for("qwen35", 33, kLensAnyFileType);
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q9, nullptr);
+    ASSERT_NE(q27, nullptr);
+    auto cut = [](const LensConstants& k, bool with_choice) {
+        int c = k.locate_layer;
+        if (with_choice) c = std::max(c, k.choice_layer);
+        c = std::max(c, k.absent_layer);
+        c = std::max(c, k.score_layer);
+        return c + 1;
+    };
+    EXPECT_EQ(cut(q9->constants, true), cut(q9->constants, false)) << "9B: choice is free";
+    EXPECT_EQ(cut(q9->constants, true), 20);
+    EXPECT_GT(cut(q27->constants, true), cut(q27->constants, false)) << "27B: choice pays";
+    EXPECT_EQ(cut(q27->constants, true), 40);
+}
+
+// Only one 27B file exists, so the cross-quant agreement that qualified every
+// 9B pair was unavailable. That limit belongs in the receipt, not in a doc.
+TEST(LensTwentySevenB, EveryDecisionProvenanceNamesTheSingleQuantLimit) {
+    const LensCalibration* q27 = lens_calibration_for("qwen35", 65, kLensAnyFileType);
+    ASSERT_NE(q27, nullptr);
+    for (const char* prov : {q27->constants.choice_provenance,
+                             q27->constants.absent_provenance,
+                             q27->constants.score_provenance})
+        EXPECT_NE(std::string(prov).find("Q3_K_M"), std::string::npos) << prov;
+}
+
+// ── LOCSPLIT: the locate prefill shape is a per-model, per-quant licence ─────
+// Split+flash passed the drift gate on Qwen3.8-9B Q4_K_M and FAILED on Q8_0,
+// so it lives on a Q4_K_M-pinned row; the any-quant row stays one-shot.
+TEST(LensPrefillShapeLicence, NineBQ4KMIsLicensedForSplitFlash) {
+    const LensCalibration* q4 = lens_calibration_for("qwen35", 33, kGgufFileTypeQ4_K_M);
+    ASSERT_NE(q4, nullptr);
+    EXPECT_EQ(q4->file_type, kGgufFileTypeQ4_K_M) << "the pinned row must win the lookup";
+    EXPECT_EQ(q4->constants.locate_prefill_shape, LensPrefillShape::SplitFlash);
+    const std::string prov = q4->constants.locate_prefill_provenance;
+    EXPECT_NE(prov.find("LOCSPLIT"), std::string::npos);
+    EXPECT_NE(prov.find("Q4_K_M"), std::string::npos);
+    EXPECT_NE(prov.find("FAILS on Q8_0"), std::string::npos)
+        << "the thin headroom must stay named next to the licence";
+}
+
+TEST(LensPrefillShapeLicence, NineBQ8AndAnyQuantStayOneShot) {
+    for (uint32_t ft : {kLensAnyFileType, 7u /* Q8_0 */}) {
+        const LensCalibration* c = lens_calibration_for("qwen35", 33, ft);
+        ASSERT_NE(c, nullptr);
+        EXPECT_EQ(c->file_type, kLensAnyFileType);
+        EXPECT_EQ(c->constants.locate_prefill_shape, LensPrefillShape::OneShot);
+        EXPECT_NE(std::string(c->constants.locate_prefill_provenance).find("FAILS"), std::string::npos);
+    }
+}
+
+// The pinned row exists ONLY to carry the licence: every coordinate must equal
+// the any-quant row's (both come from qwen38_9b_constants()).
+TEST(LensPrefillShapeLicence, TheTwoNineBRowsAgreeOnEveryCoordinate) {
+    const LensConstants a = lens_calibration_for("qwen35", 33, kLensAnyFileType)->constants;
+    const LensConstants q = lens_calibration_for("qwen35", 33, kGgufFileTypeQ4_K_M)->constants;
+    EXPECT_EQ(a.citation_layer, q.citation_layer);   EXPECT_EQ(a.citation_head, q.citation_head);
+    EXPECT_EQ(a.coverage_layer, q.coverage_layer);   EXPECT_EQ(a.coverage_used_peak, q.coverage_used_peak);
+    EXPECT_EQ(a.locate_layer, q.locate_layer);       EXPECT_EQ(a.locate_head, q.locate_head);
+    EXPECT_EQ(a.choice_layer, q.choice_layer);       EXPECT_EQ(a.choice_head, q.choice_head);
+    EXPECT_EQ(a.absent_layer, q.absent_layer);       EXPECT_EQ(a.absent_head, q.absent_head);
+    EXPECT_EQ(a.score_layer, q.score_layer);         EXPECT_EQ(a.score_head, q.score_head);
+    EXPECT_EQ(a.inject_layer, q.inject_layer);       EXPECT_EQ(a.inject_head, q.inject_head);
+    EXPECT_EQ(a.flash_prefill_ok, q.flash_prefill_ok);
+    EXPECT_STREQ(a.model_label, q.model_label);
+    EXPECT_STREQ(a.locate_provenance, q.locate_provenance);
+}
+
+// Every other model keeps the pass its constants were measured on — a licence
+// is never inherited from another row.
+// The rule, not today's table: a licence is measured on one quantization, and an
+// any-quant row also serves files nobody gated — so a licence may only sit on a
+// file_type-pinned row.
+TEST(LensPrefillShapeLicence, NoAnyQuantRowCarriesALicence) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        EXPECT_FALSE(std::string(c.constants.locate_prefill_provenance).empty()) << c.model;
+        if (c.constants.locate_prefill_shape == LensPrefillShape::OneShot) continue;
+        EXPECT_NE(c.file_type, kLensAnyFileType) << c.model;
+    }
+    EXPECT_EQ(LensConstants{}.locate_prefill_shape, LensPrefillShape::OneShot);
+}
+
+TEST(LensPrefillShapeLicence, WireNamesAndTheReportMember) {
+    EXPECT_STREQ(lens_prefill_shape_name(LensPrefillShape::OneShot), "one-shot");
+    EXPECT_STREQ(lens_prefill_shape_name(LensPrefillShape::Split), "split");
+    EXPECT_STREQ(lens_prefill_shape_name(LensPrefillShape::SplitFlash), "split+flash");
+    LensLocateReport r;
+    EXPECT_NE(lens_locate_to_json(r).find("\"prefill\":\"one-shot\""), std::string::npos)
+        << "the member is emitted unconditionally, one-shot by default";
+    r.prefill_shape = LensPrefillShape::SplitFlash;
+    EXPECT_NE(lens_locate_to_json(r).find("\"prefill\":\"split+flash\""), std::string::npos);
+}
+
+// ── LensDocumentStore — /v1/locate's kept document ───────────────────────────
+// The store decides hit / miss / refusal; run_lens_locate does the restore.
+// Pure bookkeeping, so it is tested here without a model.
+namespace {
+LensDocumentStore::Entry kept_entry(const std::string& doc, std::vector<int32_t> pre, int depth,
+                                    LensPrefillShape shape = LensPrefillShape::SplitFlash) {
+    LensDocumentStore::Entry e;
+    e.document_hash = lens_document_hash(doc);
+    e.prefix_tokens = std::move(pre);
+    e.shape = shape;
+    e.depth = depth;
+    e.blob = std::make_shared<const std::vector<uint8_t>>(100, 0xAB);
+    return e;
+}
+}  // namespace
+
+TEST(LensDocumentStore, SameDocumentSameTokensShallowerOrEqualDepthIsAHit) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    st.put(LensKeptRoute::Locate, "cv", kept_entry("doc A", {1, 2, 3}, 19), t0);
+    const uint64_t h = lens_document_hash("doc A");
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "cv", h, {1, 2, 3}, LensPrefillShape::SplitFlash, 19, t0), nullptr);
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "cv", h, {1, 2, 3}, LensPrefillShape::SplitFlash, 11, t0), nullptr)
+        << "a pass 1 computed to layer 19 serves a request read at layer 11";
+}
+
+TEST(LensDocumentStore, DeeperRequestOtherTokensOrOtherShapeIsAMiss) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    st.put(LensKeptRoute::Locate, "cv", kept_entry("doc A", {1, 2, 3}, 11), t0);
+    const uint64_t h = lens_document_hash("doc A");
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "cv", h, {1, 2, 3}, LensPrefillShape::SplitFlash, 19, t0), nullptr)
+        << "layers above the kept depth were never computed";
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "cv", h, {1, 2, 4}, LensPrefillShape::SplitFlash, 11, t0), nullptr)
+        << "same text, different boundary token: pass 1 differs, so no hit";
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "cv", h, {1, 2, 3}, LensPrefillShape::Split, 11, t0), nullptr);
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "other", h, {1, 2, 3}, LensPrefillShape::SplitFlash, 11, t0), nullptr);
+}
+
+TEST(LensDocumentStore, AnIdReusedForADifferentDocumentFailsLoud) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    st.put(LensKeptRoute::Locate, "cv", kept_entry("doc A", {1, 2, 3}, 11), t0);
+    EXPECT_THROW(st.find(LensKeptRoute::Locate, "cv", lens_document_hash("doc B"), {1, 2, 3}, LensPrefillShape::SplitFlash, 11, t0),
+                 std::runtime_error);
+}
+
+TEST(LensDocumentStore, IdleEntriesExpireAndAHitRefreshesTheAge) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    const uint64_t h = lens_document_hash("doc A");
+    st.put(LensKeptRoute::Locate, "cv", kept_entry("doc A", {1}, 11), t0);
+    st.put(LensKeptRoute::Locate, "old", kept_entry("doc B", {2}, 11), t0);
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "cv", h, {1}, LensPrefillShape::SplitFlash, 11, t0 + std::chrono::seconds(50)), nullptr);
+    st.expire(t0 + std::chrono::seconds(90));
+    EXPECT_EQ(st.size(), 1u) << "'old' idle 90 s is gone; 'cv' was used at 50 s";
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "cv", h, {1}, LensPrefillShape::SplitFlash, 11, t0 + std::chrono::seconds(100)), nullptr);
+    st.expire(t0 + std::chrono::seconds(200));
+    EXPECT_EQ(st.size(), 0u);
+}
+
+TEST(LensDocumentStore, FullStoreEvictsTheLeastRecentlyUsed) {
+    LensDocumentStore st(2, std::chrono::seconds(600));
+    const auto t0 = LensDocumentStore::Clock::now();
+    st.put(LensKeptRoute::Locate, "a", kept_entry("A", {1}, 11), t0);
+    st.put(LensKeptRoute::Locate, "b", kept_entry("B", {2}, 11), t0 + std::chrono::seconds(1));
+    ASSERT_NE(st.find(LensKeptRoute::Locate, "a", lens_document_hash("A"), {1}, LensPrefillShape::SplitFlash, 11,
+                      t0 + std::chrono::seconds(2)), nullptr);
+    st.put(LensKeptRoute::Locate, "c", kept_entry("C", {3}, 11), t0 + std::chrono::seconds(3));
+    EXPECT_EQ(st.size(), 2u);
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "b", lens_document_hash("B"), {2}, LensPrefillShape::SplitFlash, 11,
+                      t0 + std::chrono::seconds(4)), nullptr) << "b was least recently used";
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "a", lens_document_hash("A"), {1}, LensPrefillShape::SplitFlash, 11,
+                      t0 + std::chrono::seconds(4)), nullptr);
+    EXPECT_EQ(st.bytes(), 2 * (100 + sizeof(int32_t)));
+    EXPECT_TRUE(st.forget(LensKeptRoute::Locate, "a"));
+    EXPECT_FALSE(st.forget(LensKeptRoute::Locate, "a"));
+}
+
+TEST(LensDocumentStore, RoutesKeepSeparateEntriesUnderOneId) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    const uint64_t h = lens_document_hash("doc A");
+    st.put(LensKeptRoute::Locate, "cv", kept_entry("doc A", {1, 2}, 11), t0);
+    EXPECT_EQ(st.find(LensKeptRoute::Extract, "cv", h, {1, 2}, LensPrefillShape::SplitFlash, 11, t0), nullptr)
+        << "the routes compute pass 1 differently, so neither serves the other";
+    st.put(LensKeptRoute::Extract, "cv", kept_entry("doc A", {1, 2}, 33), t0);
+    EXPECT_EQ(st.size(), 2u);
+    EXPECT_NE(st.find(LensKeptRoute::Locate, "cv", h, {1, 2}, LensPrefillShape::SplitFlash, 11, t0), nullptr);
+    EXPECT_NE(st.find(LensKeptRoute::Extract, "cv", h, {1, 2}, LensPrefillShape::SplitFlash, 33, t0), nullptr);
+}
+
+TEST(LensDocumentStore, AnEntryWithoutASnapshotIsRefused) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    LensDocumentStore::Entry e = kept_entry("doc A", {1}, 11);
+    e.blob.reset();
+    EXPECT_THROW(st.put(LensKeptRoute::Locate, "cv", std::move(e), LensDocumentStore::Clock::now()),
+                 std::runtime_error);
+}
+
+TEST(LensDocumentStore, ZeroCapacityOrTtlIsRefused) {
+    EXPECT_THROW(LensDocumentStore(0, std::chrono::seconds(60)), std::runtime_error);
+    EXPECT_THROW(LensDocumentStore(4, std::chrono::seconds(0)), std::runtime_error);
+}
+
+TEST(LensDocumentStore, PrefixMemberOnlyOnADocumentIdRequest) {
+    LensLocateReport r;
+    EXPECT_EQ(lens_locate_to_json(r).find("\"prefix\""), std::string::npos);
+    r.document_prefix = LensDocumentPrefix::Cold;
+    EXPECT_NE(lens_locate_to_json(r).find("\"prefix\":\"cold\""), std::string::npos);
+    r.document_prefix = LensDocumentPrefix::Warm;
+    EXPECT_NE(lens_locate_to_json(r).find("\"prefix\":\"warm\""), std::string::npos);
+}
+
+// ── /v1/verdict (docs/plan-lens-verdict.md) ──────────────────────────────────
+TEST(LensVerdictLicence, OnlyTheQ4KMNineBRowIsLicensed) {
+    EXPECT_EQ(lens_calibration_for("qwen35", 33, kGgufFileTypeQ4_K_M)->constants.verdict_layer, 27);
+    EXPECT_EQ(lens_calibration_for("qwen35", 33, kLensAnyFileType)->constants.verdict_layer, -1)
+        << "VERDICT2 ran on Q4_K_M only; Q8_0 takes the any-quant row";
+    EXPECT_EQ(LensConstants{}.verdict_layer, -1);
+}
+
+TEST(LensVerdictLicence, NoAnyQuantRowCarriesAVerdictAndEveryLicenceHasItsNumbers) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.constants.verdict_layer < 0) continue;
+        EXPECT_NE(c.file_type, kLensAnyFileType) << c.model;
+        EXPECT_GT(c.constants.verdict_envelope_tokens, 0) << c.model;
+        EXPECT_GE(c.constants.verdict_layer, c.constants.locate_layer)
+            << c.model << ": the receipt's head must sit inside the verdict's cut";
+        EXPECT_EQ(std::string(c.constants.verdict_provenance).find("PENDING"), std::string::npos) << c.model;
+    }
+}
+
+TEST(LensVerdictRefusal, AnUnmeasuredRowIsRefusedBeforeAnyEngineWork) {
+    LensConstants k;   // verdict_layer = -1
+    EXPECT_THROW(run_lens_verdict(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, "doc",
+                                  {{"q1", "Is it?"}}, k, LensVerdictLanguage::En, LensPrefillShape::Split),
+                 std::runtime_error);
+}
+
+TEST(LensVerdictRefusal, BadQuestionListsAreRefusedBeforeAnyEngineWork) {
+    LensConstants k;
+    k.verdict_layer = 27; k.locate_layer = 11; k.locate_head = 6;
+    auto call = [&](const std::vector<LensVerdictQuestion>& qs) {
+        return run_lens_verdict(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, "doc", qs, k,
+                                LensVerdictLanguage::En, LensPrefillShape::Split);
+    };
+    EXPECT_THROW(call({}), std::runtime_error);
+    EXPECT_THROW(call({{"", "Is it?"}}), std::runtime_error);
+    EXPECT_THROW(call({{"q1", ""}}), std::runtime_error);
+    EXPECT_THROW(call({{"q1", "A?"}, {"q1", "B?"}}), std::runtime_error);
+    std::vector<LensVerdictQuestion> many;
+    for (int i = 0; i < 65; ++i) many.push_back({"q" + std::to_string(i), "A?"});
+    EXPECT_THROW(call(many), std::runtime_error);
+    LensConstants deep = k;
+    deep.locate_layer = 31;
+    EXPECT_THROW(run_lens_verdict(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, "doc", {{"q1", "A?"}}, deep,
+                                  LensVerdictLanguage::En, LensPrefillShape::Split),
+                 std::runtime_error) << "a receipt head above the verdict's cut was never computed";
+}
+
+TEST(LensVerdictWire, InstructionCarriesTheQuestionInBothLanguages) {
+    const std::string en = lens_verdict_instruction("Is it red?", LensVerdictLanguage::En);
+    const std::string de = lens_verdict_instruction("Ist es rot?", LensVerdictLanguage::De);
+    EXPECT_EQ(en.rfind("\n\nQuestion: Is it red?\n", 0), 0u);
+    EXPECT_NE(en.find("unclear"), std::string::npos);
+    EXPECT_EQ(de.rfind("\n\nFrage: Ist es rot?\n", 0), 0u);
+    EXPECT_NE(de.find("Unklar"), std::string::npos);
+}
+
+TEST(LensVerdictWire, ReportShape) {
+    LensVerdictReport r;
+    r.verdict_layer = 27;
+    r.envelope_tokens = 700;
+    r.validated_envelope = false;
+    LensVerdictResult a;
+    a.id = "r1"; a.answer = LensVerdictAnswer::No; a.p_yes = 0.1; a.p_no = 0.7; a.p_unclear = 0.2;
+    LensLocateHit h; h.byte_lo = 3; h.byte_hi = 9; h.mass = 0.5; h.peak = 0.4;
+    a.receipt.push_back(h);
+    r.answers.push_back(a);
+    nlohmann::json j = nlohmann::json::parse(lens_verdict_to_json(r));
+    EXPECT_FALSE(j.contains("prefix")) << "prefix only on a document_id request";
+    EXPECT_EQ(j["validated_envelope"], false);
+    EXPECT_EQ(j["verdict"]["blocks"], 28);
+    ASSERT_EQ(j["answers"].size(), 1u);
+    EXPECT_EQ(j["answers"][0]["id"], "r1");
+    EXPECT_EQ(j["answers"][0]["answer"], "no");
+    EXPECT_NEAR(j["answers"][0]["p"]["unclear"].get<double>(), 0.2, 1e-9);
+    EXPECT_EQ(j["answers"][0]["receipt"][0]["byte_hi"], 9);
+    r.document_prefix = LensDocumentPrefix::Warm;
+    EXPECT_EQ(nlohmann::json::parse(lens_verdict_to_json(r))["prefix"], "warm");
+}
+
+// ── /v1/compare (docs/plan-lens-compare.md) ──────────────────────────────────
+TEST(LensCompareLicence, OnlyTheQ4KMNineBRowIsLicensed) {
+    const LensConstants q = lens_calibration_for("qwen35", 33, kGgufFileTypeQ4_K_M)->constants;
+    EXPECT_EQ(q.compare_layer, 15);
+    EXPECT_EQ(q.compare_head, 1);
+    EXPECT_EQ(lens_calibration_for("qwen35", 33, kLensAnyFileType)->constants.compare_layer, -1)
+        << "COMPARE2 ran on Q4_K_M only; Q8_0 takes the any-quant row";
+    EXPECT_EQ(LensConstants{}.compare_layer, -1);
+}
+
+TEST(LensCompareLicence, NoAnyQuantRowCarriesACompareHeadAndEveryLicenceHasItsNumbers) {
+    for (const LensCalibration& c : lens_calibrations()) {
+        if (c.constants.compare_layer < 0) continue;
+        EXPECT_NE(c.file_type, kLensAnyFileType) << c.model;
+        EXPECT_GE(c.constants.compare_head, 0) << c.model;
+        EXPECT_GT(c.constants.compare_threshold, 0.0) << c.model;
+        EXPECT_GT(c.constants.compare_min_units, 0) << c.model;
+        EXPECT_GT(c.constants.compare_envelope_tokens, 0) << c.model;
+        EXPECT_EQ(std::string(c.constants.compare_provenance).find("PENDING"), std::string::npos) << c.model;
+    }
+}
+
+TEST(LensCompareRefusal, BadRequestsAreRefusedBeforeAnyEngineWork) {
+    LensConstants none;   // no compare head
+    EXPECT_THROW(run_lens_compare(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, {"a", "b"}, "x", none,
+                                  LensPrefillShape::Split), std::runtime_error);
+    LensConstants k;
+    k.compare_layer = 15; k.compare_head = 1; k.compare_threshold = 0.5;
+    auto call = [&](const std::vector<std::string>& units, const std::string& revised) {
+        return run_lens_compare(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, units, revised, k,
+                                LensPrefillShape::Split);
+    };
+    EXPECT_THROW(call({"only one"}, "x"), std::runtime_error) << "coverage is relative to a median";
+    EXPECT_THROW(call({"a", "  "}, "x"), std::runtime_error);
+    EXPECT_THROW(call({"a", "b"}, " \n"), std::runtime_error);
+}
+
+TEST(LensCompareWire, UserTextPutsOneUnitPerLineBeforeTheSecondVersion) {
+    const std::string u = lens_compare_user_text({"First part.", "Second part."}, "Erster Teil.");
+    const size_t a = u.find("First part.\nSecond part.");
+    const size_t b = u.find("Erster Teil.");
+    ASSERT_NE(a, std::string::npos);
+    ASSERT_NE(b, std::string::npos);
+    EXPECT_LT(a, b);
+    EXPECT_EQ(u.rfind("Here is the original document", 0), 0u);
+}
+
+TEST(LensCompareWire, ReportShape) {
+    LensCompareReport r;
+    r.threshold = 0.5; r.compare_layer = 15; r.compare_head = 1;
+    LensCompareUnit kept; kept.index = 0; kept.coverage = 1.0; kept.restated = true;
+    kept.restated_at.byte_lo = 0; kept.restated_at.byte_hi = 12;
+    LensCompareUnit gone; gone.index = 1; gone.coverage = 0.08; gone.missing = true;
+    r.units = {kept, gone};
+    nlohmann::json j = nlohmann::json::parse(lens_compare_to_json(r));
+    EXPECT_FALSE(j.contains("prefix"));
+    EXPECT_EQ(j["compare"]["layer"], 15);
+    ASSERT_EQ(j["units"].size(), 2u);
+    EXPECT_EQ(j["units"][0]["missing"], false);
+    EXPECT_EQ(j["units"][0]["restated_at"]["byte_hi"], 12);
+    EXPECT_EQ(j["units"][1]["missing"], true);
+    EXPECT_TRUE(j["units"][1]["restated_at"].is_null());
+}
+
+TEST(LensDocumentStore, CompareEntriesAreTheirOwnRoute) {
+    LensDocumentStore st(4, std::chrono::seconds(60));
+    const auto t0 = LensDocumentStore::Clock::now();
+    const uint64_t h = lens_document_hash("doc A");
+    st.put(LensKeptRoute::Compare, "c", kept_entry("doc A", {1, 2}, 15), t0);
+    EXPECT_EQ(st.find(LensKeptRoute::Locate, "c", h, {1, 2}, LensPrefillShape::SplitFlash, 11, t0), nullptr);
+    EXPECT_NE(st.find(LensKeptRoute::Compare, "c", h, {1, 2}, LensPrefillShape::SplitFlash, 15, t0), nullptr);
 }

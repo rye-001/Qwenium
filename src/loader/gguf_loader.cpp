@@ -260,6 +260,13 @@ void GGUFLoader::validate_tensor_shape(struct ggml_tensor *tensor,
 
 size_t GGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
 {
+    // parse_tensor_inventory already vetted every type it read, so this cannot
+    // fire for a parsed file. It is here because THIS is the function that
+    // dereferences type_traits[], and a TensorMetadata can also be built by
+    // hand (tests do). Cheap, and it keeps the OOB read impossible rather than
+    // merely unreachable-by-inspection.
+    validate_tensor_type(meta.name, static_cast<uint32_t>(meta.type));
+
     size_t elements = 1;
     for (uint64_t dim : meta.shape)
     {
@@ -605,13 +612,41 @@ void GGUFLoader::parse_tensor_inventory(size_t& offset, uint64_t tensor_count)
         memcpy(tensor_meta.shape.data(), file_mapper_->data() + offset, n_dims * sizeof(uint64_t));
         offset += n_dims * sizeof(uint64_t);
 
-        tensor_meta.type = read_value_from_mem<ggml_type>(offset);
+        // Read the type as the uint32 it is on disk and vet it BEFORE it
+        // becomes a ggml_type. Past this line every consumer is free to call
+        // ggml_type_size()/ggml_blck_size() on it, which a Release build will
+        // not check for them.
+        const uint32_t type_id = read_value_from_mem<uint32_t>(offset);
+        validate_tensor_type(tensor_meta.name, type_id);
+        tensor_meta.type = static_cast<ggml_type>(type_id);
         tensor_meta.offset = read_value_from_mem<uint64_t>(offset);
 
         metadata_.tensor_inventory[tensor_meta.name] = tensor_meta;
     }
     std::cout << "Successfully parsed " << metadata_.tensor_inventory.size()
               << " tensor metadata entries." << std::endl;
+}
+
+// Fail-loud gate on the tensor type id. Contract and rationale: gguf_loader.h.
+void validate_tensor_type(const std::string& tensor_name, uint32_t type_id)
+{
+    if (type_id < static_cast<uint32_t>(GGML_TYPE_COUNT)) {
+        return;
+    }
+    // Name the fork types we have actually identified, so the message says
+    // what the file is rather than only that we refused it. Anything else
+    // gets the range and the number.
+    std::string what;
+    if (type_id == 142) what = " (PrismML PQ2_0, 2.13 bpw)";
+    if (type_id == 143) what = " (PrismML PTQ1_0, 1.75 bpw)";
+    throw GGUFLoadError(
+        "validate_tensor_type: tensor '" + tensor_name +
+        "' expected a ggml type id in [0, " + std::to_string(GGML_TYPE_COUNT) +
+        "), actual " + std::to_string(type_id) + what +
+        ". This build cannot read that weight format. A type id at or above "
+        "GGML_TYPE_COUNT means the file was written by a ggml fork with its own "
+        "quantization types; running it needs those types ported, not just "
+        "admitted here.");
 }
 
 // Dispatch inventory validation via the model registry.

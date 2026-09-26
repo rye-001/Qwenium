@@ -14,6 +14,8 @@
 //       (MTP drafting, plan-mtp-decode.md §5 D3). Default off.
 //     attention_taps     — layers whose attention rows are materialized for the
 //       lens (plan-qemmi-lens.md P1/A1). Empty = marks no node.
+//     attention_tap_heads — which heads of those layers are copied out. Empty
+//       = all heads (today's tap). Only meaningful with attention_taps set.
 //     kv_write_mode      — Cpy (default, baked-offset ggml_cpy) vs SetRows
 //       (value-driven, position is a graph input).
 //     decode_kv_bucket   — 0 (default, exact n_kv) vs B (round up to B).
@@ -74,6 +76,15 @@ struct DecodePolicy {
     bool             slice_prefill_head = true;
     bool             output_hidden      = false;
     std::vector<int> attention_taps;
+    // Which heads of each tapped layer are copied out. Empty (default) = every
+    // head, today's tap. Non-empty = only these, in this order: a job reads one
+    // head (bind a short list), and the full tap is 16 x P x P floats — 6.2 GB
+    // and 5.8 s of readback at a 10K prompt (docs/note-lens-locate-baseline.md).
+    // The selected heads are COPIES of the same softmax, so their values are
+    // byte-identical to the full tap's; only what is kept alive changes. Set
+    // together with attention_taps (ForwardPassBase::set_attention_taps), so
+    // arming taps without heads can never inherit an earlier caller's list.
+    std::vector<int> attention_tap_heads;
     KvWriteMode      kv_write_mode      = KvWriteMode::Cpy;
     AttnImpl         attn_impl          = AttnImpl::Materialized;
 

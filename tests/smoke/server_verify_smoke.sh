@@ -249,7 +249,7 @@ SERVER_PID=""
 # answers are correct answers. A model that earned the licence must cash it; a
 # model that has not must REFUSE the flag and say which gate it failed. Before
 # 2026-09-18 this leg assumed the first case, so the whole script could only run
-# on the 9B — the 35B and Ternary-Bonsai-27B, which both carry
+# on the 9B — the 35B, which carries
 # flash_prefill_ok=false, died here with a correct refusal scored as a failure.
 try_start_server "--attention-lens --flash-attn" "$WORK/flash.log"
 FLASH_STATE="$TRY_STATE"

@@ -233,3 +233,827 @@ None of these were acted on. Each is an architecture decision.
 - **`LensConstants` was not changed**, and the architecture refusal added in the
   same change was not relaxed. Making the constants per-model is an architecture
   decision, not a probe outcome.
+
+## LEGCSEARCH on the messy bilingual corpus (2026-09-19) — L3H13 does NOT hold
+
+§3's table above is Prompt A, **N = 28 English value tokens, 128 candidates**.
+It ranked `L3 H13` second at 92.9% top1 / 96.4% top3, one place behind
+`L27 H13`. Because `L3` sits below the coverage layer (`L11`), shipping it
+would have cut `--lens-verify-only` from 28 of 33 blocks to 12 — **48% of the
+stack** — so it was worth scoring properly.
+
+Scored on the Leg C corpus (15 docs EN+DE, the same corpus that judges every
+other model's citation head), the shallow head collapses:
+
+| rank | layer head | top1 | top3 | EN | DE | bar | verify blocks |
+|---|---|---|---|---|---|---|---|
+| 1 | **L27 H13** | 88.6% | **97.8%** | 97.7% | 97.9% | PASS | 28/33 |
+| 2 | L31 H3 | 78.2% | 93.0% | 92.7% | 93.3% | PASS | 32/33 |
+| 3 | L31 H0 | 67.8% | 91.0% | 90.4% | 91.8% | PASS | 32/33 |
+| 4 | L31 H1 | 69.2% | 90.8% | 90.4% | 91.2% | PASS | 32/33 |
+| 7 | **L3 H13** | 74.8% | **83.8%** | 84.5% | 83.0% | **fail** | 12/33 |
+
+`L3 H13` misses the 90% bar by **6.2 points pooled, and on BOTH halves** — so
+this is not the German-weakness failure mode that disqualified `L19 H20` on
+Bonsai. The shallow head simply does not carry the citation signal once the
+corpus is messy. The N=28 English probe overestimated it by ~13 points.
+
+Per-layer best head, top3 — the signal has a sharp onset at L27, not a gradient:
+
+| layer | 3 | 7 | 11 | 15 | 19 | 23 | 27 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| best top3 | 83.8 | 75.3 | 70.2 | 82.3 | 82.8 | 79.2 | **97.8** | 93.0 |
+
+**No head at or below L23 clears the bar.** The sweep's own summary line reads
+"shallowest passer: the same candidate — no depth/quality trade here".
+Cross-language selection holds both directions (EN→L27H13→DE 97.9%,
+DE→L27H13→EN 97.7%).
+
+`L27 H13` is confirmed: best AND shallowest passer. The row is unchanged, and
+the 48% cut does not exist on this model.
+
+## LOCHEAD (2026-09-19) — the 9B has a locate head, at L11, and it costs nothing
+
+`/v1/locate` was refused on this model: the row carried `locate_layer = -1`.
+Swept all 128 (layer, head) pairs on the Leg C messy corpus, 75 scored keys
+(EN 40 / DE 35).
+
+| rank | layer head | top1 | top3 | EN | DE |
+|---|---|---|---|---|---|
+| 1 | **L11 h=6** | 88.0% | **96.0%** | 95.0% | 97.1% |
+| 2 | L15 h=11 | 88.0% | 96.0% | 95.0% | 97.1% |
+| 3 | L15 h=1 | 81.3% | 94.7% | 97.5% | 91.4% |
+| 13 | L7 h=3 | 68.0% | 92.0% | 92.5% | 91.4% |
+| 107 | L3 h=13 (the citation coordinate) | 33.3% | 49.3% | — | — |
+
+Ranks 1 and 2 tie exactly. **L11 wins on depth** — the same tiebreak the 35B's
+row already documents ("L11 was chosen over the higher-scoring L23" because it
+equals `max(citation_layer, coverage_layer)`).
+
+**It is free.** `max(citation 27, coverage 11, locate 11) + 1 = 28` — the
+`--lens-verify-only` cut is unchanged at 28/33. A hypothetical locate-only
+server would need 12/33, i.e. 64% of the stack skipped.
+
+### Locate and citation run in OPPOSITE directions on the same model
+
+Per-layer best head, top3, both swept on the same corpus:
+
+| layer | 3 | 7 | 11 | 15 | 19 | 23 | 27 | 31 |
+|---|---|---|---|---|---|---|---|---|
+| **locate** (key→source) | 50.7 | 92.0 | **96.0** | 96.0 | 93.3 | 88.0 | 86.7 | 84.0 |
+| **citation** (generated→source) | 83.8 | 75.3 | 70.2 | 82.3 | 82.8 | 79.2 | **97.8** | 93.0 |
+
+Locate peaks early and decays with depth; citation is near-flat until a sharp
+onset at L27. This is the fourth model on which the generated→source head is
+not the key→source head, and the cleanest demonstration of why: they are not
+merely different coordinates, they have inverted depth profiles. Reading
+locate off the citation layer scores 49.3% here (rank 107 of 128).
+
+## Addendum 2026-09-19 — LOCABSENT: can locate tell a key is NOT there?
+
+**Yes, the signal is real and survives a position control: AUC 0.927 bilingual
+(EN 0.930 / DE 0.922). At ZERO false accusations it catches 62–71% of genuine
+absences; at ~5–10% false-alarm, 79–83%. It is a HINT, not a verdict, and no
+constant is landed.**
+
+This is the gap that made the omission claim hollow: `/v1/locate` always returns
+spans, so a field the document does not contain came back as three confident
+byte ranges with no signal.
+
+### Setup
+
+| | |
+|---|---|
+| Model | `models/Qwen3.8-9B-Q8_0.gguf`, shipped pair **L11 h=6** read from the calibration table (never env overrides) |
+| Present | each document's own labelled fields — **75** (EN 40 / DE 35) |
+| Absent | **6 concepts × 15 docs = 90**: `warranty_period`, `incoterms`, `vat_number`, `discount_rate`, `payment_terms`, `contract_number` — every one verified absent from all 15 documents in both languages |
+| Scores | `raw` = peak attention on the best document position (what the route emits); `conc` = `raw × doc_tokens` (length-free) |
+| Driver | `LOCABSENT=1 LOCABSENT_SHUFFLE=1`, `tests/perf/attn_provenance.cpp` |
+| Logs | `.session-results/9b_locabsent{,2,3,_rev,_shuf,_n2}.log` |
+
+### The confound this leg found in itself — read this before the numbers
+
+The first three runs appended the absent keys after the present ones, so every
+present key sat at positions 1..N and every absent key after them. **The score
+is dominated by a key's POSITION in the request.** Reversing the absent list,
+same documents and same model, moved `contract_number`'s median from 8.40 to
+**28.20** and `warranty_period`'s from 10.14 to **2.17**:
+
+    position in request |  1st    2nd    3rd    4th    5th    6th
+    forward  (conc p50) | 10.14   8.07   2.64   2.75   2.56   8.40
+    reversed (conc p50) | 28.20   9.26   4.39   2.47   2.00   2.17
+
+So "absent scores lower" in the append-order arm was partly "absent was listed
+later", and **the AUC 0.9615 it produced is not a measurement of absence.**
+`LOCABSENT_SHUFFLE=1` interleaves the classes with a fixed seed and is the only
+arm whose AUC means what the header says. Every number below is from that arm.
+A tell that the control worked: EN and DE AUC came into agreement (0.930 /
+0.922) where the confounded arm had them 0.976 / 0.944.
+
+### Result — position-balanced, cross-language
+
+Threshold chosen on one language at a false-alarm target, scored on the other.
+The budgeted error is a **false absent** — telling a caller a field is missing
+when it is on the page — because that is the error the omission claim cannot
+survive.
+
+    score=raw
+      target | chose T on | T       | scored on | false-alarm | absent-detected
+          5% | EN         | 0.0850  | DE        |      0.0%   |     71.4%
+          5% | DE         | 0.0908  | EN        |      5.0%   |     62.5%
+         10% | EN         | 0.1296  | DE        |      5.7%   |     78.6%
+         10% | DE         | 0.1307  | EN        |     10.0%   |     83.3%
+
+`raw` beats `conc` at every operating point. **That is not a finding about long
+documents**: this corpus spans only ~84–198 document tokens, so the length
+confound `conc` exists to remove is untested, and raw must not be assumed to
+transfer to a 4 KB CV.
+
+### Two dependencies that stop a bare constant from shipping
+
+**1. Recall varies by concept; safety does not.** At one threshold
+(`raw` T=0.0908), detection per held-out concept:
+
+    discount_rate 86.7% | vat_number 73.3% | warranty_period 80.0%
+    payment_terms 80.0% | incoterms    53.3% | contract_number 26.7%
+
+`contract_number` is the floor, and the reason is structural: **every document
+carries an order number / PO**, so the missing field has a strong wrong place to
+look. The generalizable statement is *absence detection degrades when a
+structurally similar field IS present* — which is also the realistic case.
+
+**2. The score is a property of the REQUEST, not of (document, key).** Going
+from 2 absent keys to 6 moved the absent median from 0.0922 to 0.0646 (1.43×)
+while the present median held at 0.294 → 0.291 (1.2%). This asymmetry is the
+good news: a fixed threshold's **false-alarm rate is stable** (it is set from
+present fields, which barely move) while its **recall drifts with schema size**.
+Safe, variable yield — the better of the two failure modes.
+
+### Verdict
+
+- **Not another scalar-confidence kill.** AUC 0.927 under a position control is
+  a real signal, unlike the three margin/confidence probes this repo has closed.
+- **Ship as a soft badge, never a boolean.** "weak evidence for this key" at the
+  0-false-alarm threshold is defensible and catches ~2 in 3 real absences.
+  A hard `"absent": true` at these rates would be a new way to lie.
+- **No constant landed.** Moving/adding a lens calibration constant is the
+  user's decision, and two things should precede it: a **long-document leg**
+  (the length range here cannot choose raw vs conc) and a **key-count leg** to
+  size the recall drift at the schema size the product actually sends.
+
+## Scouting 2026-09-20 — decisions from span-only: what failed, and what worked
+
+**SCOUTING, NOT A PROBE.** N=4–8 hand-written cases, one model (9B Q8_0), no
+held-out split. Enough to choose what to build; not enough to claim a rate.
+
+### Dead ends (do not re-propose)
+
+**1. Options planted in the prompt, winning span read as the decision — 0/6.**
+The span lands on the *evidence*, never the option: "is the invoice overdue"
+returned `ueberfaellig` and `Rechnung`; "seniority level" returned `Senior` and
+`Staff Engineer`. Where it did touch an option it was lexical overlap (question
+"over**due**" → option text "**due**"), not reasoning. This re-confirms the
+standing law — *attention marks consideration, not commitment* — in a new
+regime. PROOF1's "commitment is the SLOT" does not rescue it; a planted option
+is not that kind of slot.
+
+**2. Negated option keys — negation is invisible.** "the contract can be
+terminated" vs "cannot be terminated" both land on `term`, and the winner is
+whichever has better lexical overlap. Attention has no NOT.
+
+**3. Polarity yes/no — 2/4.** "payment is overdue and unpaid" scored HIGHER on
+the document saying payment was made on time (0.395 vs 0.226), because that
+document is still *about payment*. Absence works for **structural** presence
+("is there a termination clause", 7.3x; "warranty period", 11.1x) and fails for
+**state** ("is the thing true"). That boundary is the rule to remember.
+
+### What worked: choice as argmax over evidence presence
+
+Do not ask the model to pick. Score each option's *content description* as a
+locate key and take the argmax — one key per category, the span as the receipt.
+4-way routing (finance / legal / engineering / people), 8 documents EN+DE:
+
+| arm | prefills | latency | score |
+|---|---|---|---|
+| all 4 keys in **ONE** call | 1 | **232 ms** | **7/8** |
+| 4 rotations, averaged | 4 | 1338 ms | **8/8** |
+
+Chance is 2/8. For reference Jev answers in 70–500 ms and scores 67.8% on its
+own benchmark — different task and data, so not a comparison, only a scale.
+
+**Position bias perturbs magnitudes but does not flip a confident argmax.**
+Rotating the key order on one document: engineering won every time at 0.72 /
+0.80 / 0.87 / 0.71. That is what makes the one-call arm viable despite the
+position dependence measured in LOCABSENT.
+
+**Long keys need care.** The single one-call failure was `contract -> finance`,
+caused by one stray token pairing (`an` ↔ ` agreement`) spiking to 0.507 while
+the same key's next span was 0.047. The server takes `max` over the key's
+tokens, which is right for short field names and wrong for sentences. Two fixes
+both work: decompose the key into content words and average (fixes it), or
+rotate (fixes it).
+
+**Margin is NOT a usable confidence.** The miss had margin 0.13; a hit had 0.09.
+Escalating to rotation on a small margin is a defensible heuristic, not a
+calibrated gate — the fourth time scalar confidence has failed in this repo.
+
+### Score on a scale — weakest of the three
+
+Ordered levels as content descriptions, 4 CVs: **exact 2/4, within-1 4/4**. The
+Jev-style expected value is monotone but compressed (0.82 / 1.36 / 1.99 / 1.93)
+and the top two levels collapse. Do not claim `score`.
+
+### Where this leaves the three Jev types
+
+| Jev | span-only route | status |
+|---|---|---|
+| `choice` | argmax over evidence keys | **strong** — 7/8 one-call, 8/8 rotated |
+| `noul` | structural presence (LOCABSENT) | **measured** — AUC 0.927 |
+| `score` | ordinal argmax | **weak** — within-1 only |
+| (polarity / judgement) | — | **does not work** |
+
+Next, if pursued: a real `DECIDE1` probe — a labelled routing corpus, bilingual,
+both halves, option order rotated, with the one-call and rotated arms scored
+separately. Client-side this needs **no server change**: it is `/v1/locate` with
+category descriptions as `key_vocabulary`.
+
+## DECIDE1 2026-09-20 — choice as argmax over evidence presence, measured
+
+**75.0% on a 4-way routing task in ONE 231 ms prefill (chance 25%), which
+decomposes into 95.8% on clean documents and 43.8% on documents deliberately
+seeded with another category's vocabulary. The scouting figure of 87.5% was
+optimistic by 12 points — this is why the probe was built.**
+
+Driver: `py/lens_decide1.py`, run against the shipped `POST /v1/locate` on a
+`--lens-locate-only` 9B (not a probe-local tap — the product question is whether
+a client can do this with no server change, so it goes through the real route).
+Corpus: **40 documents, 20 EN / 20 DE, 4 categories, 16 carrying lures.**
+Log: `.session-results/decide1_9b.log`.
+
+### Arms
+
+| arm | keys | prefills | latency | overall | EN | DE |
+|---|---|---|---|---|---|---|
+| A | sentence descriptions, canonical order | 1 | 234 ms | 50.0% | 40.0% | 60.0% |
+| B | sentence descriptions, 4 rotations | 4 | 936 ms | 62.5% | 55.0% | 70.0% |
+| **C** | **content-word parts, one call** | **1** | **231 ms** | **75.0%** | 70.0% | 80.0% |
+| D | content-word parts, rotated | 4 | — | 75.0% | 75.0% | 75.0% |
+
+### What arm A's failure diagnosed
+
+Arm A collapsed into `finance`: legal→finance 6 times, people→finance 4,
+engineering→finance 2. The cause is ours, not the model's. **The server takes
+`max` over a key's tokens**, so a description carrying more filler — *"**an**
+invoice, **a** payment, **a** budget, or **an** amount **of** money owed"* —
+gets more chances for one stray token to spike. Scouting had already seen the
+exact mechanism (`an` ↔ ` agreement` at 0.507 while the same key's next span was
+0.047); this corpus shows it dominating a whole task.
+
+Removing the filler (arm C) recovers **+25 points at identical latency** and the
+`finance` row becomes 10/10. Two consequences worth keeping:
+
+- **Position stops mattering once the filler is gone.** Arms C and D tie at
+  75.0%, where the sentence arms gained 12.5 points from rotation. The position
+  sensitivity LOCABSENT measured is largely a stopword artifact in this regime.
+  (Arm A's canonical order was also the worst of the four — 50.0% against a
+  50.0–65.0% spread — because `finance` led the list and its bias compounded.)
+- **`max`-over-key-tokens is the wrong aggregation for sentence-length keys.**
+  It is correct for the short field names locate was calibrated on. If decision
+  routing is ever pursued server-side, a mean-over-key-tokens option is the
+  change to make, and it would remove the client's need to decompose by hand.
+
+### The real boundary: clean 95.8% vs lure 43.8%
+
+| | arm A | arm C |
+|---|---|---|
+| clean documents (24) | 62.5% | **95.8%** |
+| lure documents (16) | 31.2% | **43.8%** |
+
+The lures are documents whose *primary* intent is one category while their
+vocabulary is another's: a termination notice that mentions outstanding fees, an
+HR note about salary bands, a migration ticket about the database bill. Evidence
+argmax detects **presence**, and in a lure both categories are genuinely
+present — so it cannot weigh primary intent. This is the same boundary LOCABSENT
+found for absence (structural presence works, state does not), and it should be
+stated in any product claim rather than averaged away.
+
+### Cross-lingual
+
+On the 20 German documents, an **English** schema scored 60.0% and a **German**
+schema 70.0%. A client sending one schema to every language pays ~10 points;
+localize the category descriptions.
+
+### Honesty caveats
+
+- **`PARTS_EN` was written AFTER seeing arm A's confusion matrix.** The
+  *mechanism* (strip filler) was identified in scouting on different data, so
+  this is not pure fitting — but the specific word choices are not out-of-sample
+  the way arm A is. Arm C's 75.0% should be read as an upper estimate until it
+  is re-run on a corpus written after the parts were frozen.
+- **The corpus is synthetic and self-authored**, the same limitation the Leg C
+  corpus carries. It measures the mechanism, not the market.
+- One model, one task shape. No claim beyond 4-way topical routing.
+
+### Verdict
+
+Span-only can serve Jev's `choice` for **topical routing/triage where the
+categories are separable by content** — 95.8% there, at 231 ms, with the
+evidence span attached. It should NOT be sold for mixed-intent documents, where
+it is 43.8% and a coin-flip-plus. Combined with `noul` (LOCABSENT, AUC 0.927)
+that is two of Jev's three types, honestly bounded.
+
+## Quant comparison 2026-09-20 — Q4_K_M vs Q8_0 on the 9B
+
+**Q4_K_M costs 2.7 points of locate top-3 and 4.0 of top-1, saves 1.78x memory,
+and leaves the derived signals unchanged. The important finding is not the
+trade — it is that a Q4_K_M report currently CLAIMS the Q8_0 rate.**
+
+Motivation: span-only loads 12 of 33 blocks, so the question was whether the
+freed budget should buy *more precision*. It should not — measured below, the
+opposite direction is where the interesting trade is.
+
+| | Q8_0 | Q4_K_M | delta |
+|---|---|---|---|
+| file | 9.11 GB | 5.38 GB | |
+| **Metal, `--lens-locate-only`** | **3661 MB** | **2055 MB** | **1.78x smaller** |
+| locate L11 h=6, top-3 | 96.0% | **93.3%** | **-2.7** |
+| locate L11 h=6, top-1 | 88.0% | **84.0%** | **-4.0** |
+| L11 h=6 rank of 128 | 1 (tied with L15 h=11) | **2** | |
+| LOCABSENT AUC (raw, position-balanced) | 0.9270 | 0.9209 | -0.006, noise |
+| DECIDE1 arm C (1 prefill) | 75.0% | 80.0% | +5.0, noise at N=40 |
+| locate smoke, locate-only | 9/9 | 9/9 | unchanged |
+
+### The degradation is real; the two derived numbers are not a difference
+
+L11 h=6 losing 2.7 points of top-3 and 4.0 of top-1 is a consistent, directional
+shift on the shipped claim. By contrast DECIDE1 moved *up* 5 points and
+LOCABSENT's AUC moved down 0.006 — at N=40 and N=165 those are noise, and the
+fact that they moved in opposite directions is itself the evidence. **Anything
+this corpus reports at the 5-point level is not a finding.** That retires one
+claim from the DECIDE1 write-up above: the "localize the schema, worth ~10
+points" result does not replicate here (Q4_K_M gives EN 65.0% / DE 60.0%, the
+reverse ordering), so treat schema language as unmeasured.
+
+### The head selection is quant-dependent
+
+On Q8_0, L11 h=6 and L15 h=11 tied exactly (both 88.0 / 96.0) and L11 was taken
+on depth. **At Q4_K_M the tie breaks**: L15 h=11 leads at 85.3 / 96.0 while
+L11 h=6 falls to 84.0 / 93.3. So the calibrated coordinate is not optimal on a
+file it is currently served for.
+
+### The receipt problem this exposes
+
+The 9B row is `kLensAnyFileType`, so a Q4_K_M 9B is **admitted today under
+constants measured on Q8_0** — and its report carries
+
+    locate_provenance: "... L11 h=6 = 88.0% top1 / 96.0% top3 ..."
+
+which is **false for that file**; the measured rate there is 84.0 / 93.3. The
+spans are still good and both halves still clear the 90% bar, so this is not a
+broken route — it is a receipt overstating itself, which is the failure class
+this table exists to prevent. `config.weights` does differ between the two
+files, so the reports are already marked incomparable; the provenance string is
+the part that lies.
+
+Three options, all of them the user's call because each moves or pins a
+calibration constant:
+
+1. **Pin the 9B row to Q8_0's `file_type`** — a Q4_K_M 9B is then refused
+   fail-loud instead of served with another file's numbers. Strictest, and it
+   is exactly what the `file_type` key was kept for.
+2. **Add a Q4_K_M row** with its own measured pair (L15 h=11 = 85.3 / 96.0, or
+   L11 h=6 = 84.0 / 93.3 to keep the shallower cut) and its own provenance.
+3. **Accept and document** — cheapest, but leaves a provenance string that is
+   wrong for one admitted file.
+
+### Recommendation on the original question
+
+Do **not** spend the freed budget on a higher quant. Q8_0 is already near
+lossless here, our errors are mechanism errors rather than precision errors, and
+the binding constraint is throughput (~1.4 req/s per process), not accuracy.
+Q4_K_M is the interesting direction: **1.78x more replicas for 2.7 points of
+top-3**, which is a trade worth making for a routing/triage deployment and worth
+declining for one where a caller acts on a single span (top-1 84.0%).
+
+## key_aggregation landed 2026-09-20 — +17.5 points on sentence keys
+
+DECIDE1 diagnosed the defect: the locate driver reduced a key's query rows with
+**MAX**, which is correct for the 1–4 token field names LOCHEAD swept and wrong
+for sentence-length keys, where one filler token spikes and the wordiest key
+wins. `POST /v1/locate` now takes `key_aggregation: "max" | "mean"`.
+
+Measured on the DECIDE1 corpus (9B Q8_0, 40 docs, same run, only the flag changed):
+
+| arm | `max` | `mean` | delta |
+|---|---|---|---|
+| A — sentence descriptions, 1 call | 50.0% | **67.5%** | **+17.5** |
+| B — sentence descriptions, rotated | 62.5% | **80.0%** | **+17.5** |
+| C — hand-decomposed content words, 1 call | 75.0% | 80.0% | +5.0 (noise) |
+| D — decomposed, rotated | 75.0% | 77.5% | +2.5 (noise) |
+
+The shape is the point: **mean helps exactly where max was broken (sentence
+keys, +17.5) and does nothing where max was already right (short decomposed
+keys, within noise).** That is what a correct fix looks like, as opposed to a
+tuning knob that moves every number a bit.
+
+It also **removes most of the reason for a client to hand-decompose**: arm A
+under `mean` (67.5%, one prefill) closes most of the gap to hand-built parts
+under `max` (75.0%), and arm B under `mean` (80.0%) matches arm C outright.
+
+### Contract
+
+- Default `"max"`, byte-identical to the behaviour that predates the field.
+- The value is echoed in the report as `key_aggregation`, emitted
+  unconditionally so an absent member cannot be confused with an old server.
+- `"mean"` sets **`uncalibrated: true`**, for the same reason a question
+  vocabulary does: every shipped `locate_provenance` rate was measured under
+  `max`, so quoting 96.0% for a `mean` request would be a receipt claiming a
+  number nobody measured.
+- An unknown value is a fail-loud **400** naming both accepted values.
+- Verified live: `max`→`uncalibrated:false`, `mean`→`uncalibrated:true`,
+  omitted→`max`, `"median"`→400.
+
+980/980 unit tests; locate smoke green on both the locate-only and verify-only
+legs (gate 8 included).
+
+## DECIDEHEAD 2026-09-20 — the locate head was the wrong head for decisions
+
+**Held-out: CHOICE 85–95%, SCORE 50–83.3% exact with 91–95% within-1. The
+incumbent locate pair ranks 20 of 128 on choice and 53 of 128 on score. Every
+decision number this repo had before today was read off a head calibrated for a
+different task.**
+
+Driver: `DECIDEHEAD=1`, `tests/perf/attn_provenance.cpp`. One tapped prefill per
+(document × instruction shape) yields all 128 candidates, LOCHEAD's trick.
+Corpora: CHOICE 40 docs EN+DE 4-way (mirrors `py/lens_decide1.py`), SCORE 24
+docs EN+DE over 4 ordered urgency levels. Log: `.session-results/9b_decidehead2.log`.
+
+### Why this leg existed
+
+DECIDE1's 80% and the 2/4 ordinal scouting were both read off **L11 h=6**, the
+pair LOCHEAD calibrated for *"given a field name, find its value's span"*. There
+was precedent for that being wrong: LOCHEAD found the **citation** head ranks
+372 of 384 at locate. Declaring "span-only cannot rate" from one head chosen for
+another job would have repeated that mistake exactly.
+
+It was the right call to check. **On score the incumbent scores 45.8%; the best
+head scores 87.5%.** The earlier conclusion was a measurement of the wrong head.
+
+### Four levers, one pass
+
+| task | best config (pooled) | head | exact | EN / DE |
+|---|---|---|---|---|
+| CHOICE | question / mean-mass | **L19 h=10** | 97.5% | 95.0 / 100.0 |
+| SCORE | extract / max-mass | **L15 h=11** | 87.5% | 91.7 / 83.3 |
+| SCORE (within-1) | question / mean-peak | L15 h=1 | 87.5% | **100% within-1** |
+
+- **The head is the biggest lever.** Incumbent → best is +10 points on choice
+  (87.5 → 97.5) and **+41.7 on score** (45.8 → 87.5).
+- **`mass` beats `peak`** in most winning configs — total attention over the
+  document, not one best position. That is the opposite of what locate wants,
+  and it makes sense: a decision is about how much of the document a description
+  covers, not where its single best match sits.
+- **The question instruction shape wins** both pooled bests and is structurally
+  immune to the comma-collision defect (options go on their own lines).
+- **`mean` key-aggregation** appears in both pooled bests, consistent with
+  DECIDE1's +17.5.
+
+### Held out — select on one language, score on the other
+
+The pooled table above chooses the best of 128 × 8 = **1024 candidates on the
+data it reports**. That maximum is inflated even when the signal is real, so
+these are the numbers to quote:
+
+| task | selected on | config | head | scored on | exact |
+|---|---|---|---|---|---|
+| CHOICE | EN | extract / max-peak | L7 h=1 | DE | **85.0%** |
+| CHOICE | DE | question / mean-mass | L19 h=10 | EN | **95.0%** |
+| SCORE | EN | extract / max-mass | L15 h=11 | DE | **83.3%** |
+| SCORE | DE | question / max-peak | L11 h=14 | EN | **50.0%** |
+
+**CHOICE transfers. SCORE does not, reliably.** Choice holds 85–95% in both
+directions even though the two halves select *different* configs. Score swings
+83.3 → 50.0 depending on which language chose the head, and the selected head
+and variant differ too — that instability is the finding, not a detail.
+Score's **within-1 is the stable part at 91–95%**.
+
+### Depth
+
+Choice's per-layer curve rises to L19 and falls after: L7 90.0%, L11 92.5%,
+L15 92.5%, **L19 97.5%**, L23 95.0%, L31 80.0%. So a decision head costs
+**20 of 33 blocks** — more than locate's 12, less than the verify cut's 28.
+L11 at 92.5% is available for free on a locate-only server if the 5 points are
+not worth 8 blocks.
+
+### What this changes
+
+- **"Span-only cannot rate" is withdrawn.** It was a claim about L11 h=6.
+- **Choice is strong and held-out-validated**: 85–95% bilingual on 4-way
+  routing, against Jev's 67.8% on its own benchmark (different data — a scale,
+  not a comparison).
+- **Score should be sold as within-1, not exact.** 91–95% never-more-than-one-
+  level-out is defensible; the exact rate is not stable across languages yet.
+- A decision head would be a **separate constant** from the locate pair, on a
+  separate layer, with a different score variant. That is a calibration-table
+  change and therefore the user's call; nothing is landed.
+
+### Caveats
+
+- N=40 (choice) and N=24 (score) are small; score especially.
+- Corpora are synthetic and self-authored, same limitation as Leg C.
+- One model, one task shape per type.
+
+### DECIDEHEAD on Q4_K_M (2026-09-20) — the useful heads are quant-stable
+
+Re-run because quantization was already shown to reorder heads (the locate
+L11 h=6 / L15 h=11 tie breaks at Q4). It does move the top of the table — but
+not the two candidates that matter.
+
+| | Q8_0 | Q4_K_M |
+|---|---|---|
+| CHOICE pooled best | 97.5% (L19 h=10) | 95.0% (L15 h=9) |
+| CHOICE held out EN→DE / DE→EN | 85.0 / 95.0 | 80.0 / 85.0 |
+| **CHOICE at L11 h=3 (free, 12 blocks)** | **92.5%** | **92.5%** |
+| CHOICE incumbent L11 h=6 | 87.5% (rank 20) | 82.5% (rank 30) |
+| SCORE pooled best | 87.5% (**L15 h=11**) | 87.5% (**L15 h=11**) |
+| SCORE held out EN→DE / DE→EN | 83.3 / 50.0 | 83.3 / 66.7 |
+| SCORE incumbent L11 h=6 | 45.8% (rank 53) | 37.5% (rank 77) |
+
+Three things this settles:
+
+- **`L11 h=3` gives exactly 92.5% on both quants.** The free routing head — same
+  twelve blocks a locate-only server already loads — is the most stable number
+  in either sweep. That is the candidate to build on.
+- **`L15 h=11` tops the ordinal task on both quants.** The score head is not a
+  quant artifact either, even though its *held-out* behaviour still is not
+  trustworthy.
+- **The score held-out asymmetry is NOT a quant effect.** EN→DE holds at 83.3%
+  on both while DE→EN reads 50.0% / 66.7%. German consistently selects a worse
+  configuration, which is a property of the task and corpus, not of precision.
+  It stays the reason not to land an exact-score constant.
+
+Also consistent with the quant comparison above: the incumbent locate pair
+degrades on Q4 for both tasks (87.5→82.5, 45.8→37.5), which is the same
+directional loss LOCHEAD measured for locate itself (96.0→93.3).
+
+## ABSENTHEAD 2026-09-20 — the locate head was wrong for absence too
+
+**`L19 h=10` is rank 1 of 128 on BOTH quants. Absence at zero false accusations
+goes from ~65% to 89.6%. The incumbent pair's AUC 0.927 was a rate for one head,
+not a ceiling for the model.**
+
+Driver: `ABSENTHEAD=1`. Same machinery as DECIDEHEAD — one tapped prefill per
+(document × instruction shape) yields all 128 candidates. Corpus and labels are
+LOCABSENT's: 75 present vs 90 absent over 6 verified-absent concepts, hoisted to
+`lens_absent_concepts()` so the two legs cannot drift. Position-balanced
+interleaving is mandatory here, not optional — LOCABSENT's first AUC of 0.9615
+measured list position rather than absence. Logs:
+`.session-results/9b_q4_absenthead2.log`, `…_q8_absenthead.log`.
+
+**Objective is AUC, not accuracy.** Absence has no argmax; it is a separation,
+and the threshold is a product choice made afterwards. Ranking heads by accuracy
+at some threshold would bake that choice into head selection.
+
+### Result
+
+| | AUC (Q4_K_M) | AUC (Q8_0) |
+|---|---|---|
+| incumbent L11 h=6 | 0.9612 (rank 11) | 0.9713 (rank 4) |
+| **L19 h=10** | **0.9948 (rank 1)** | **0.9953 (rank 1)** |
+| best at L11 (free) | h=8, 0.9861 | h=6, 0.9713 |
+
+**Held out**, selecting on one language and scoring the other, both quants
+converge on the same configuration — `question / mean-mass` at `L19 h=10` —
+and it scores **0.9905 on DE on both files**, identical to four decimal places.
+
+### Operating points, because AUC is not a product claim
+
+`L19 h=10`, threshold chosen on one language at a false-alarm target, scored on
+the other. The budgeted error is a false *absent*.
+
+| quant | target | chose T on | false-alarm | **detected** |
+|---|---|---|---|---|
+| Q4_K_M | 2% | DE → EN | **0.0%** | **89.6%** |
+| Q4_K_M | 2% | EN → DE | 2.9% | 92.9% |
+| Q8_0 | 2% | DE → EN | **0.0%** | 79.2% |
+| Q8_0 | 10% | either | 7.5–8.6% | **100.0%** |
+
+Against LOCABSENT's incumbent at the same 0% false-alarm point: **62.5–71.4%**.
+The head swap is worth roughly **+20 points of recall at zero false accusations**.
+
+### Two things that did not transfer, and one that did
+
+- **The free head at L11 is NOT quant-stable**: `h=8` on Q4_K_M (0.9861),
+  `h=6` on Q8_0 (0.9713). Unlike the choice pair — where L11 h=3 measured
+  92.5% on both — there is no stable free absence head. Absence has to pay for
+  its depth.
+- **The pooled-best *config* differs by quant** (`question/mean-mass` on Q4,
+  `extract/mean-peak` on Q8) even though the *head* does not. The held-out
+  selection is what agrees; quote that.
+- **`mean` aggregation and L19 win on both**, as they did for choice. `L19 h=10`
+  is now top-ranked for choice (Q8) *and* absence (both quants), which raises a
+  question worth a probe of its own: whether it is a general semantic-matching
+  head rather than a per-job one.
+
+### The cost, if this lands
+
+`L19` is **20 of 33 blocks**. A server that serves absence needs
+`max(locate 11, choice 11, absent 19) + 1 = 20` rather than today's 12 — on
+Q4_K_M roughly 2055 MB → ~3.1 GB. Still far below verify-only's 28 blocks, but
+it ends "span-only is 12 blocks". Nothing is landed; moving a cut is the user's
+call.
+
+### Landed 2026-09-20 — `absent_layer 19, absent_head 10`
+
+`head: "absent"` on `POST /v1/locate`, the third calibrated job. Verified live
+on Q4_K_M: `head=locate → L11h6`, `head=choice → L11h3`, `head=absent → L19h10`,
+each switching its own provenance, with `uncalibrated` following the right
+recipe per job (locate was swept under `max`, choice and absence under `mean`).
+
+**The cut moved, and that is the price:**
+
+    --lens-locate-only ON: loaded 20/33 blocks — cut at
+    max(locate_layer=11, choice_layer=11, absent_layer=19) + 1
+
+2055 MB → **3038 MB** on Q4_K_M. Verify-only is unchanged at 28/33 — citation
+at L27 still dominates there. A `--lens-locate-only` server that only needs
+locate and choice still *could* run at 12 blocks, but the mode loads for every
+head it can serve rather than for the ones a given caller happens to use;
+splitting that would be a fourth mode, not a flag.
+
+One bug worth recording: the calibration rows use **positional** aggregate
+initialisation — the `/*field_name*/` markers are comments, not designated
+initialisers. The first draft of this change inserted the absence triple before
+the choice triple, which compiles cleanly and silently swaps the two pairs. The
+existing `LensChoiceHead` test would have caught it; the ordering was fixed
+before it ran. Any future pair must be appended in **struct declaration order**.
+
+987/987 unit tests; locate smoke green on Q4_K_M (locate-only) and Q8_0
+(verify-only, gate 8 included).
+
+## SCOREHEAD 2026-09-20 — the ordinal job, and the first head that is both free and best
+
+DECIDEHEAD left the `score` job in a state we could not ship: 87.5% pooled, but
+held out the selection was asymmetric — EN chose a configuration worth 83.3% on
+DE, DE chose a *different* one worth 50–67% on EN. A pair we cannot obtain by
+choosing twice is not a pair we can land, so this leg was not a search for a
+bigger number. It was a search for a **stable** one, and it changed three things
+to get there.
+
+**The objective stopped being argmax.** DECIDEHEAD's own numbers carried the
+diagnosis: exact swung 50–87.5% while within-1 sat at 91–95%. A reader that is
+almost never more than one level out, but flips between the two adjacent levels
+it is choosing among, has a stable *signal* and an unstable *readout* — so
+ranking heads by argmax accuracy was ranking them on the coin flip. Every
+document now gets a **fractional score**: the option masses are non-negative, so
+dividing by their sum is a distribution with **no temperature and nothing
+fitted**, and the expected level is the probability-weighted index. Heads rank by
+**ordinal concordance** — over every pair of documents on different levels, how
+often the higher one scores higher. Threshold-free, for the same reason
+ABSENTHEAD ranks by AUC, and a direct generalisation of it.
+
+**The corpus doubled and the grid did not grow.** DECIDEHEAD searched 1024
+configurations against 24 documents, where one document is 8.3 points. When the
+failure mode *is* selection-on-noise, widening the search is the wrong move. So:
+48 documents, four variants, selection fixed to the question shape that
+DECIDEHEAD had already shown wins. `decide_score_corpus()` was left untouched and
+`score_corpus_extended()` was added on top of it, so every DECIDEHEAD number
+already quoted in a provenance string stays reproducible.
+
+ABSENTHEAD's `conc` variant is absent here **by proof, not omission**: it
+rescales a document's score by that document's length, and every reduction here
+is within one document and then sum-normalised, so `conc` is identically `peak`
+for this task.
+
+### The result, both quants
+
+| | Q4_K_M | Q8_0 |
+|---|---|---|
+| best head | **L19 h=11** | **L19 h=11** |
+| concordance | **1.0000**, unique (1 of 128) | **1.0000**, unique (1 of 128) |
+| separation (worst adjacent gap, pooled SD) | **3.48** | 2.70 |
+| within-1 | 89.6% | 83.3% |
+| exact (argmax) | 66.7% | 58.3% |
+
+**Q4_K_M is better than Q8_0 on this job too** — higher quant remains the wrong
+direction, now for the third signal in a row.
+
+### Concordance saturates; separation is what chose
+
+The first Q4 run ranked by concordance alone and put ten heads inside a 3-point
+band. That is the shape of the COVSEARCH G3 defect — a metric pinned near its
+ceiling cannot choose, and every "rank 1" it prints may be a tie. Concordance
+kept its job (it says the *order* is right) and gained a tie-break with no
+ceiling: the smallest gap between adjacent levels in pooled within-level standard
+deviations. It immediately earned its place. Rank 2 (L19 h=8) orders the corpus
+at 0.9942 but separates at only 1.62 and reaches 64.6% within-1: **ordered
+without being apart**. L19 h=11 separates at 3.48.
+
+With the tie-break in, the top turned out to be genuinely unique — but the
+*number of heads tied at each half's top* is now printed, so a future saturated
+run cannot quietly hand out a free rank 1.
+
+### Held out on three axes
+
+Q4_K_M, all three selecting L19 h=11:
+
+| axis | selected on | picks | scored on the other half |
+|---|---|---|---|
+| **language** (content fixed — the corpus is parallel) | EN | L19 h=11 | 66.7% exact / 87.5% within-1 |
+| | DE | L19 h=11 | 66.7% exact / 87.5% within-1 |
+| **bilingual halves** (language fixed — noise only) | half A | L19 h=**10** | 62.5% / 100.0% |
+| | half B | L19 h=11 | 66.7% / 79.2% |
+| **corpus origin** | original 24 | L19 h=11 | 60.0% / 84.0% |
+| | novel 24 | L19 h=11 | 73.9% / 95.7% |
+
+The language axis is symmetric in both the head it picks **and** the rate it
+scores — which is precisely what DECIDEHEAD could not do. The halves axis swaps
+between h=10 and h=11, two adjacent heads on the same layer, with the loser still
+scoring 0.9904 concordance and 100% within-1 on the half it did not see; read
+that as *no disagreement detected*, not as agreement proven, because the tie
+counts (4 and 5) say a 24-document half does partly saturate.
+
+The third axis exists because **the 24 novel documents were written by the same
+hand that reports this result**, which is a conflict of interest unless it is
+measured. It clears: both halves pick the same head *and* the same variant, and
+the novel documents turn out to be **harder**, not easier (scoring on the
+originals reads 73.9%, on the novel ones 60.0%; Q8_0 agrees, 65.2% vs 52.0%). The
+corpus extension did not manufacture the answer.
+
+### DECIDEHEAD's 87.5% did not survive
+
+L15 h=11 — DECIDEHEAD's ordinal winner on both quants — reads **64.6% exact** on
+N=48. The old figure was selection inflation on N=24 and should not be quoted
+again. This is the N=24–40 noise floor collecting a second scalp, after the
+"localize the schema, worth ~10 points" claim.
+
+### Do not ship the argmax
+
+66.7% exact next to separation 3.48 is not a contradiction. The per-level profile
+is monotone and cleanly split by language:
+
+    true level | n  | mean score | EN     DE
+    0          | 12 |      0.620 | 0.602  0.638
+    1          | 12 |      1.020 | 1.008  1.033
+    2          | 12 |      1.494 | 1.527  1.461
+    3          | 12 |      2.128 | 2.202  2.054
+
+— but it is **compressed and offset**: a true level 3 reads 2.13, not 3. So the
+argmax over raw masses systematically undershoots while the fractional score is
+fine. The ordering carries the information; the scale does not. Two ways out, and
+they are not equivalent:
+
+* an **affine map** (≈ `1.98·s − 1.10` fits those four means to within 0.15 of a
+  level). That is **two fitted numbers** — a kind of lens constant we have never
+  landed, fitted on one rubric, and there is no reason it transfers to a
+  customer's own levels.
+* emit the **fractional score and the per-level probabilities** and let the
+  product own the mapping. This happens to be the shape Jev returns
+  (`score` / `confidence` / `legend` / `probabilities`).
+
+The second needs no fitted constant and is the recommendation. Either way the
+integer argmax is the wrong thing to put in front of a buyer.
+
+### L19 is a semantic-matching *layer*, not one general head
+
+The standing open question was whether L19 h=10 is a general-purpose matcher: it
+is the landed absent head and it topped choice on Q8_0. This leg sharpens it into
+a better answer. Within L19 on the ordinal job the heads spread widely —
+h=11 at 1.0000 / sep 3.48, h=8 at 0.9942 / sep 1.62, h=10 at 0.9861 / sep 1.97.
+Three neighbours, all near the top on *ordering*, all different on *separating*.
+So **L19 is where this model finishes semantic matching**, and which head serves
+a job is still a per-job question: h=10 won absence, h=11 wins the ordinal.
+
+### The first head that is both free and best
+
+The depth curve peaks **at** L19 and falls off after it — L23 0.9722, L27 0.9803,
+L31 0.9444 — so there is no depth trade to argue: going deeper is strictly worse.
+And the locate-only cut already loads L0..L19 for the absent head, so a score head
+at L19 costs **zero additional blocks**. Choice was free by luck (it landed on the
+same layer as locate); absent had to buy 8 blocks. This is the first pair that is
+free *and* optimal.
+
+### Landed 2026-09-20
+
+`score_layer 19, score_head 11` on the 9B row, plus `head: "score"` on
+`/v1/locate`. Verified live on a `--lens-locate-only` Q4_K_M server: the cut is
+**unmoved at 20/33 blocks** and the banner now prints
+`max(locate_layer=11, choice_layer=11, absent_layer=19, score_layer=19) + 1`, so
+an operator can still reproduce the block count by hand. Four documents written
+after the sweep and absent from its corpus read **0.46 / 1.05 / 1.56 / 2.17**
+through the shipped route against the sweep's own 0.62 / 1.02 / 1.49 / 2.13 —
+the same monotone, compressed scale, arriving through the product path.
+
+`head: "score"` with `mean` reports `uncalibrated:false`; with `max` it reports
+`true`, because locate is the only job swept under `max`. The role selection in
+`run_lens_locate` became a switch over `LensHeadRole` instead of a chain of
+ternaries — at four roles the chain had stopped being readable, and a switch
+with no `default` is the version the compiler checks when a fifth arrives.
+
+992/992 unit tests (5 new, including one that pins the *heads* rather than the
+layers: score and absence share layer 19, so the positional-aggregate-init trap
+would swap exactly those two invisibly to a layer check). Locate smoke green on
+Q4_K_M locate-only.
+
+`SCOREHEAD=1` on `tests/perf/attn_provenance.cpp`; logs in
+`.session-results/9b_scorehead_q4.log` and `_q8.log`.

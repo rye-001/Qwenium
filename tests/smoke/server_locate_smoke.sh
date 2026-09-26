@@ -22,9 +22,12 @@
 #                  not), and `locate_provenance` names the run either way.
 #   3b. FLOOR     — the labelled values must actually be found. A FLOOR that
 #                  catches breakage, NOT a calibration: the real rate is
-#                  LOCHEAD's per-model top3 rate (35B L11h5 89.3%, Bonsai-27B
-#                  L35h6 100%) over 75 keys, and four keys on one
-#                  document cannot re-measure it.
+#                  LOCHEAD's per-model top3 rate (9B L11h6 96.0% on Q8_0 /
+#                  93.3% on Q4_K_M, 35B L11h5 89.3%, 27B L27h10 94.7%) over 75
+#                  keys, and four keys on one document cannot
+#                  re-measure it. Note top3 is not top1 —
+#                  the 9B is 88.0% top1, which is the rate a caller acting on a
+#                  SINGLE span is actually running on.
 #   4. VERBATIM  — every returned range slices real document bytes, and the
 #                  ranges for one key are disjoint and ordered by PEAK (not by
 #                  `mass`, which is the span SUM and can rank differently — this
@@ -61,6 +64,7 @@
 #   tests/smoke/server_locate_smoke.sh
 #   MODEL=models/Qwen3.8-9B-Q8_0.gguf tests/smoke/server_locate_smoke.sh
 #   VERIFY_ONLY=1 tests/smoke/server_locate_smoke.sh     # the cheap-server case
+#   LOCATE_ONLY=1 tests/smoke/server_locate_smoke.sh     # the cheapest one
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -71,6 +75,14 @@ MODEL="${MODEL:-models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf}"
 PORT="${PORT:-18108}"
 CTX="${CTX:-4096}"
 VERIFY_ONLY="${VERIFY_ONLY:-0}"
+# --lens-locate-only serves /v1/locate ALONE, so gate 8 (which needs /v1/verify)
+# cannot run here and is SKIPPED rather than silently passing. Gates 1-7 are the
+# ones that describe locate itself, and they must hold identically on a server
+# that loaded locate_layer+1 blocks — that equivalence is the point of the mode.
+LOCATE_ONLY="${LOCATE_ONLY:-0}"
+if [[ "$VERIFY_ONLY" == "1" && "$LOCATE_ONLY" == "1" ]]; then
+  echo "FAIL: expected at most one of VERIFY_ONLY / LOCATE_ONLY, got both"; exit 1
+fi
 
 for f in "$SERVER" "$MODEL"; do
   [[ -e "$f" ]] || { echo "FAIL: missing '$f'"; exit 1; }
@@ -83,7 +95,8 @@ trap cleanup EXIT
 
 EXTRA=()
 [[ "$VERIFY_ONLY" == "1" ]] && EXTRA+=(--lens-verify-only)
-echo "Work dir: $WORK   model: $MODEL   verify-only: $VERIFY_ONLY"
+[[ "$LOCATE_ONLY" == "1" ]] && EXTRA+=(--lens-locate-only)
+echo "Work dir: $WORK   model: $MODEL   verify-only: $VERIFY_ONLY   locate-only: $LOCATE_ONLY"
 
 # ${EXTRA[@]+...} and not "${EXTRA[@]}": bash 3.2 (the macOS default) treats an
 # EMPTY array as unbound under `set -u`, so the plain form kills the common case.
@@ -97,10 +110,11 @@ for _ in $(seq 1 300); do
   echo -n "."; sleep 1
 done
 
-PORT="$PORT" python3 - <<'PY'
+PORT="$PORT" LOCATE_ONLY="$LOCATE_ONLY" python3 - <<'PY'
 import json, os, sys, urllib.request, urllib.error
 
 PORT = os.environ["PORT"]
+LOCATE_ONLY = os.environ.get("LOCATE_ONLY", "0") == "1"
 DOC = ("Von: einkauf@bergblick.example\nBetreff: Bestellung KW42\n\n"
        "Bitte bestellen Sie fuer die Bergblick Handels GmbH 80 Stueck des "
        "Wanderstock Alu Pro zu je 24,90 EUR. Bestelldatum 2025-10-13.\n")
@@ -172,7 +186,8 @@ for key, want in TRUTH.items():
 check(len(found) >= 2, "floor",
       f"{len(found)} of 4 labelled values inside a returned span ({', '.join(found)}) "
       f"— floor is 2; the per-model rate is in this report's locate_provenance, "
-      f"not a constant (35B L11h5 = 89.3% top3, Bonsai-27B L35h6 = 100%)")
+      f"not a constant (9B L11h6 = 96.0/88.0 on Q8_0 and 93.3/84.0 on Q4_K_M "
+      f"top3/top1, 35B L11h5 = 89.3%, 27B L27h10 = 94.7% top3 / 81.3% top1)")
 
 # ── Gate 4: VERBATIM ─────────────────────────────────────────────────────────
 bad = []
@@ -229,6 +244,23 @@ check(json.dumps(r2, sort_keys=True) == json.dumps(r, sort_keys=True), "stable",
       "two identical calls returned identical bytes")
 
 # ── Gate 8: NO-POISON ──────────────────────────────────────────────────
+# Needs /v1/verify, which --lens-locate-only refuses by design. Skipped LOUDLY:
+# a silent skip would let this script report a full pass on a server that never
+# ran the gate the script exists for.
+if LOCATE_ONLY:
+    # What IS checkable here: the routes this mode withdraws must actually be
+    # gone. A locate-only server that still answered /v1/verify would be
+    # serving a citation layer it never loaded.
+    for ep, body in (("/v1/verify", {"document": DOC, "key_vocabulary": KEYS,
+                                     "extraction": "{}"}),
+                     ("/v1/extract", {"document": DOC, "key_vocabulary": KEYS})):
+        _, err = post(ep, body)
+        check(err is not None and err[0] == 404, "locate-only-refusals",
+              f"{ep} -> {err[0] if err else 200} (must be 404 on --lens-locate-only)")
+    print("[no-poison] SKIPPED — needs /v1/verify, which --lens-locate-only refuses")
+    print("=" * 16, "LOCATE SMOKE PASS (locate-only: 7 gates + refusals)", "=" * 16)
+    sys.exit(1 if fails else 0)
+
 # The locate document must be LONGER than the verify one: galloc reuses a
 # cached plan when the new graph FITS, so a shorter locate cannot poison and a
 # gate built on one would pass while the defect is live.

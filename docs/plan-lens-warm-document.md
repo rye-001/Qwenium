@@ -1,5 +1,14 @@
 # Plan — the warm document (`document_id` on `/v1/extract`)
 
+> **2026-09-26 — the mechanism below was WRONG on a hybrid, and is replaced.**
+> "Do not clear the slot, rewind the cache position" restores KV (append
+> semantics) but not DeltaNet's recurrent state (overwrite semantics), and
+> every lens model is a hybrid. §8.1's warm == cold 15/15 primed the document
+> and prefilled the suffix with NO decode between — a sequence the server never
+> runs. EXTWARM measured the real one: 0/6. `document_id` on `/v1/extract` and
+> `/v1/locate` now keeps a snapshot of the document pass (`LensDocumentStore`,
+> server_lens.h); see architecture.md and lens-format.md.
+
 Status: **PROPOSED, not approved. All correctness probes PASS and the speed is measured — see §8. The saving is 13x at 1K and 91x at 8K on pass-1 prefill.** Touches a named seam
 (`lens-format.md`, `/v1/extract`) and the prefill path that produces every
 receipt the lens reports, so it needs explicit user approval and an

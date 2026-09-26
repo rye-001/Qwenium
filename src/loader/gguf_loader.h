@@ -2,13 +2,15 @@
 // gguf_loader.h — GGUF file -> ModelMetadata.
 //
 // Responsibility: mmap a GGUF file, parse its header/metadata/tensor directory,
-//   and populate ModelMetadata — including the two fail-loud validators that
+//   and populate ModelMetadata — including the three fail-loud validators that
 //   decide whether this build can run the file at all:
+//     validate_tensor_type             — is every tensor's ggml type one THIS
+//                                        build knows? (throws if not)
 //     validate_architecture            — is general.architecture in the registry's
 //                                        allow-list? (throws if not)
 //     validate_inventory_for_architecture — does the file carry every tensor the
 //                                        recipe needs, correctly shaped?
-//   Both run during load_metadata, so a completed load IS acceptance. This is
+//   All three run during load_metadata, so a completed load IS acceptance. This is
 //   the engine's only architecture/inventory gate; there is no second copy.
 // State owned: the file mapping and the parsed directory. The mapping is handed
 //   to Model and released once weights are copied to the backend (see model.h).
@@ -179,3 +181,24 @@ std::unique_ptr<GGUFLoader> create_gguf_loader();
 // registry.  Throws GGUFLoadError for an unregistered architecture, or when
 // the registered validator rejects the inventory.
 void validate_inventory_for_architecture(const ModelMetadata& meta);
+
+// Is `type_id` a ggml type THIS build knows? Throws GGUFLoadError if not.
+//
+// WHY THIS IS ITS OWN GATE. ggml_type_size() and ggml_blck_size() guard with
+// plain assert(), which NDEBUG removes — so in a Release build an out-of-range
+// type id silently indexes type_traits[] past its end and returns garbage
+// instead of failing. That garbage reaches us as a tensor byte count: a
+// 5.9 GB ternary file measured "567 MB" before this check existed, which is
+// the size a ggml context would then have been given for it. ggml's own
+// GGML_ASSERT in ggml_new_tensor_impl does abort, but only later, after we
+// have already sized memory off a bogus number.
+//
+// Runs on EVERY GGUF, text model or mmproj, because an unknown type is fatal
+// regardless of which tensor namespace the file uses.
+//
+// The live case: Prism ML's Ternary Bonsai 2 ships PQ2_0 (142) and PTQ1_0
+// (143), fork types well past GGML_TYPE_COUNT. Those files also carry a
+// prism.hadamard.* weight rotation that the runtime must mirror on
+// activations, so admitting the type id alone would not be enough to run them
+// correctly — see docs/architecture.md.
+void validate_tensor_type(const std::string& tensor_name, uint32_t type_id);
