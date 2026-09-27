@@ -63,6 +63,18 @@ step 4 (split pass, flash on the document) reduces those.
 
 ## 4. Found on the way: qwen3's tapped prefill read overwritten memory
 
+> **FIXED 2026-09-27 (user approved option (a)).** Every tapped pass now
+> allocates through `ForwardPassBase::alloc_readback_graph`, and
+> `get_attention_taps` refuses any other allocation. The hazard was wider than
+> stated below: with head-selected taps, two graphs of the same truncation that
+> tap DIFFERENT layers have equal node counts, and the recycled slot can hold a
+> later layer's `kq_soft` — also in [0, 1], so the range check misses it.
+> `SameShapeDifferentTapLayerGetsItsOwnPlan` reproduced it on all four recipes
+> (qwen35/qwen3 silently wrong, gemma3/gemma4 refused) and passes now. The
+> reserve-the-real-graph design proposed below is WRONG: splitting a graph
+> twice leaves stale input copies (logits off by up to 23); the helper
+> reserves a one-node graph instead. See architecture.md §12 (the tap seam).
+
 The new prefill tests failed on the qwen3 leg only: a **full** tapped prefill
 returned values outside [0, 1] (the `get_attention_taps` guard fired).
 

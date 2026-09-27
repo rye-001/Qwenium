@@ -63,6 +63,8 @@
 #include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/forward_pass_base.h"
+#include "../../src/models/graph_arena.h"
+#include "../../src/layers/routing_trace.h"
 
 namespace {
 
@@ -173,8 +175,7 @@ protected:
 
         ggml_cgraph* gf = fp.build_decoding_graph(tokens, slots, positions);
         fp.mark_attention_taps(gf);        // no-op when the tap set is empty
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp.alloc_readback_graph(sched, gf);
         fp.set_decode_inputs(gf, tokens, slots, positions);
         ggml_backend_sched_graph_compute(sched, gf);
 
@@ -434,8 +435,7 @@ std::vector<ForwardPassBase::AttentionTap> prefill_taps(ForwardPassBase& fp,
     fp.set_cache_pos(0, 0);
     ggml_cgraph* gf = fp.build_prefill_graph(kPrompt, 0, 0, /*want_logits=*/false);
     fp.mark_attention_taps(gf);
-    ggml_backend_sched_reset(sched);
-    ggml_backend_sched_alloc_graph(sched, gf);
+    fp.alloc_readback_graph(sched, gf);
     fp.set_prefill_inputs(gf, kPrompt, 0);
     ggml_backend_sched_graph_compute(sched, gf);
     std::vector<ForwardPassBase::AttentionTap> out = fp.get_attention_taps(gf);
@@ -545,6 +545,143 @@ TEST_P(ForwardPassTapTest, ArmingWithoutHeadsResetsHeadList) {
     fp->set_attention_taps({});
     ASSERT_EQ(taps.size(), 1u);
     EXPECT_EQ(taps[0].n_head, (int)meta.attention_head_count);
+}
+
+// ── The plan a tapped pass runs on is made for THAT pass ─────────────────────
+// ggml_gallocr_needs_realloc reuses the previous memory plan when the node
+// count matches and every node fits, without comparing output flags. Two
+// head-selected tapped prefills of the SAME shape (same truncation, one head
+// each, want_logits=false) that tap DIFFERENT layers have equal node counts,
+// so the second — over a shorter prompt, so it fits — could inherit a plan in
+// which its layer's kq_soft was recycled by a later layer. The later layer's
+// kq_soft is the same size and also lies in [0, 1], so get_attention_taps'
+// range check cannot see it: a silent wrong tap. The reference is the same
+// pass alone on a fresh scheduler.
+TEST_P(ForwardPassTapTest, SameShapeDifferentTapLayerGetsItsOwnPlan) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    auto fp = make_fp();
+    const std::vector<int> layers = discover_tap_layers(*fp, sched);
+    if (layers.size() < 3) GTEST_SKIP() << "needs three attention layers";
+    const int deep = layers.back(), first = layers.front(), second = layers[layers.size() - 2];
+    std::vector<int32_t> long_prompt, short_prompt;
+    for (int32_t t = 1; t <= 96; ++t) long_prompt.push_back(t);
+    for (int32_t t = 1; t <= 40; ++t) short_prompt.push_back(t);
+
+    auto tapped = [&](ggml_backend_sched_t s, int layer, const std::vector<int32_t>& prompt) {
+        fp->set_attention_taps({layer}, {0});
+        fp->clear_slot(0);
+        fp->set_cache_pos(0, 0);
+        ggml_cgraph* gf = fp->build_prefill_graph(prompt, 0, 0, /*want_logits=*/false);
+        fp->mark_attention_taps(gf);
+        fp->alloc_readback_graph(s, gf);
+        fp->set_prefill_inputs(gf, prompt, 0);
+        ggml_backend_sched_graph_compute(s, gf);
+        std::vector<ForwardPassBase::AttentionTap> out = fp->get_attention_taps(gf);
+        fp->set_attention_taps({});
+        fp->clear_slot(0);
+        return out;
+    };
+
+    fp->set_truncate_after_layer(deep);
+    // Reference: the second pass alone, on a scheduler nothing else has used.
+    std::vector<ggml_backend_t> backends;
+    if (model_->has_metal_backend()) backends.push_back(model_->get_backend_metal());
+    backends.push_back(model_->get_backend_cpu());
+    ggml_backend_sched_t fresh = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(),
+                                                        FP_GRAPH_SIZE, model_->has_metal_backend(), false);
+    const auto ref = tapped(fresh, second, short_prompt);
+    ggml_backend_sched_free(fresh);
+    // The hazard order on the shared scheduler: a LONGER pass tapping another
+    // layer at the same depth, then the second pass.
+    (void)tapped(sched, first, long_prompt);
+    const auto got = tapped(sched, second, short_prompt);
+    fp->set_truncate_after_layer(-1);
+
+    ASSERT_EQ(ref.size(), 1u);
+    ASSERT_EQ(got.size(), 1u);
+    ASSERT_EQ(got[0].rows.size(), ref[0].rows.size());
+    EXPECT_EQ(0, std::memcmp(got[0].rows.data(), ref[0].rows.data(), ref[0].rows.size() * sizeof(float)))
+        << model_->get_metadata().architecture << ": the tap of layer " << second
+        << " after a longer same-shape pass tapping layer " << first
+        << " expected byte-identical to the same pass on a fresh scheduler, actual differs";
+}
+
+// The protocol is enforced, not documented: a tap read from a graph that was
+// not marked and allocated through alloc_readback_graph fails loud instead of
+// reading a reused plan.
+TEST_P(ForwardPassTapTest, TapReadOffAnyOtherAllocFailsLoud) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    auto fp = make_fp();
+    const std::vector<int> layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+    fp->set_attention_taps({layers[0]}, {0});
+
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    ggml_cgraph* gf = fp->build_prefill_graph(kPrompt, 0, 0, /*want_logits=*/false);
+    fp->alloc_readback_graph(sched, gf);                                    // not marked: a plain alloc
+    fp->set_prefill_inputs(gf, kPrompt, 0);
+    ggml_backend_sched_graph_compute(sched, gf);
+    EXPECT_THROW(fp->get_attention_taps(gf), std::runtime_error);            // ... so the read refuses
+
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    gf = fp->build_prefill_graph(kPrompt, 0, 0, /*want_logits=*/false);
+    fp->mark_attention_taps(gf);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_alloc_graph(sched, gf);                              // the old, plain alloc
+    fp->set_prefill_inputs(gf, kPrompt, 0);
+    ggml_backend_sched_graph_compute(sched, gf);
+    EXPECT_THROW(fp->get_attention_taps(gf), std::runtime_error);
+
+    // The regular sequence still works, and a second read of one graph does not.
+    const auto ok = prefill_taps(*fp, sched);
+    EXPECT_EQ(ok.size(), 1u);
+    fp->set_attention_taps({});
+    fp->clear_slot(0);
+}
+
+// The same plan-reuse hazard for MoE routing capture: mark_moe_routing only
+// sets output flags on nodes the graph already has, so a captured prefill has
+// the node count of an uncaptured one of the same shape, and after a LONGER
+// uncaptured pass it can inherit a plan in which `moe_idx.<il>` is scratch.
+// The reference is the same captured pass on a fresh scheduler. Dense
+// recipes capture nothing and skip.
+TEST_P(ForwardPassTapTest, RoutingCaptureAfterSameShapePassGetsItsOwnPlan) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    auto fp = make_fp();
+    std::vector<int32_t> long_prompt, short_prompt;
+    for (int32_t t = 1; t <= 96; ++t) long_prompt.push_back(t);
+    for (int32_t t = 1; t <= 40; ++t) short_prompt.push_back(t);
+
+    std::vector<ggml_backend_t> backends;
+    if (model_->has_metal_backend()) backends.push_back(model_->get_backend_metal());
+    backends.push_back(model_->get_backend_cpu());
+    ggml_backend_sched_t fresh = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(),
+                                                        FP_GRAPH_SIZE, model_->has_metal_backend(), false);
+    RoutingTrace ref;
+    fp->set_routing_capture(&ref);
+    fp->clear_slot(0); fp->set_cache_pos(0, 0);
+    fp->run_prefill(short_prompt, 0, 0, fresh);
+    fp->set_routing_capture(nullptr);
+    ggml_backend_sched_free(fresh);
+    if (ref.per_layer().empty()) GTEST_SKIP() << "dense recipe: no routing to capture";
+
+    fp->clear_slot(0); fp->set_cache_pos(0, 0);
+    fp->run_prefill(long_prompt, 0, 0, sched);            // uncaptured, longer
+    RoutingTrace got;
+    fp->set_routing_capture(&got);
+    fp->clear_slot(0); fp->set_cache_pos(0, 0);
+    fp->run_prefill(short_prompt, 0, 0, sched);           // captured, shorter: fits the cached plan
+    fp->set_routing_capture(nullptr);
+    fp->clear_slot(0);
+
+    const auto a = got.per_layer(), b = ref.per_layer();
+    int differ = 0; for (const auto& kv : b) differ += a.count(kv.first) == 0 || a.at(kv.first) != kv.second;
+    EXPECT_EQ(got.digest(), ref.digest())
+        << model_->get_metadata().architecture << ": routing captured after a longer uncaptured "
+        << "same-shape prefill expected identical to a fresh scheduler, actual " << differ << " of "
+        << b.size() << " layers differ";
 }
 
 INSTANTIATE_TEST_SUITE_P(

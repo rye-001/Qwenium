@@ -101,6 +101,17 @@ head is **not tied** to its embedding: `output.weight` is 4096 × 248320 Q6_K,
 match `verdict_depth` exactly) would need that head loaded — a separate,
 opt-in decision (phase 2), never a silent change to an existing mode.
 
+> **Phase 2 LANDED 2026-09-27: `--lens-verdict`** (requires
+> `--lens-verify-only`; refused on a full or locate-only server and on a row
+> without `verdict_layer`). `Model::load_tensors(max_blocks, keep_output_head)`
+> keeps the final norm and output weight on a partial load; `verdict_layer` is
+> folded into the verify-only cut (no change on the 9B: 28/33). Gates: 7/7
+> verdict responses (22 questions EN/DE, plus a kept document cold → warm)
+> byte-identical to the full server; plain verify-only unchanged (footprint
+> 5,025 MB at `-c 11264`, `/v1/verdict` still 404); the head costs +796 MB
+> (4,577 → 5,373 MB at `-c 4096`); suite 1050/1050, HTTP 18/18, locate smokes
+> on all three server kinds.
+
 ## 6. Calibration
 
 `LensConstants` gains `verdict_layer` (27 → 28 blocks) and `verdict_provenance`,

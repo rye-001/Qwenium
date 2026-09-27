@@ -100,8 +100,13 @@ public:
     // loaded subset would make a verify-only report incomparable with a
     // full-server one, which is exactly what config.weights exists to
     // prevent (docs/lens-format.md).
+    //
+    // `keep_output_head` (default false): on a partial load, also keep
+    // output_norm.weight and output.weight — for a truncated server that reads
+    // logits after its last loaded block (--lens-verdict, /v1/verdict). No
+    // effect on a full load, which always keeps them.
     void load_tensor_metadata(ggml_context* ctx, std::unordered_map<std::string, ggml_tensor*>& tensors,
-                               uint32_t max_blocks = UINT32_MAX);
+                               uint32_t max_blocks = UINT32_MAX, bool keep_output_head = false);
     
     // NEW: Get raw tensor data pointer (for backend copying)
     const void* get_tensor_data(const std::string& name) const;

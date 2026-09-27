@@ -1500,8 +1500,7 @@ LensRun run_lens_tapped_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
             // base's capture hook cannot see it — arm it explicitly. Without
             // this the digest would cover the prompt and not the generation.
             if (fp->routing_capture()) fp->mark_moe_routing(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);   // a plan made for THIS tapped graph
             fp->set_decode_inputs(gf, tks, slots, positions);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "lens_tapped_decode");
@@ -2108,8 +2107,7 @@ LensReport run_lens_verify(ForwardPassBase* fp, ggml_backend_sched_t sched,
     {
         ggml_cgraph* gf = fp->build_prefill_graph(prompt_tokens, 0, 0, /*want_logits=*/false);
         if (fp->routing_capture()) fp->mark_moe_routing(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);   // plain alloc unless capture marked
         fp->set_prefill_inputs(gf, prompt_tokens, 0);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(sched, gf), "run_lens_verify(prompt)");
@@ -2140,8 +2138,7 @@ LensReport run_lens_verify(ForwardPassBase* fp, ggml_backend_sched_t sched,
         ggml_cgraph* gf = fp->build_prefill_graph(answer_tokens, P, 0, /*want_logits=*/false);
         fp->mark_attention_taps(gf);
         if (fp->routing_capture()) fp->mark_moe_routing(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);   // a plan made for THIS tapped graph
         fp->set_prefill_inputs(gf, answer_tokens, P);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(sched, gf), "run_lens_verify(extraction)");
@@ -2746,8 +2743,7 @@ LensLocateReport run_lens_locate(ForwardPassBase* fp, ggml_backend_sched_t sched
         const std::vector<int32_t> rows(prompt_tokens.begin() + q_off, prompt_tokens.end());
         ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/false);
         fp->mark_attention_taps(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);   // a plan made for THIS tapped graph
         fp->set_prefill_inputs(gf, rows, q_off);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(sched, gf), "run_lens_locate");
@@ -3107,8 +3103,7 @@ LensVerdictReport run_lens_verdict(ForwardPassBase* fp, ggml_backend_sched_t sch
         const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
         ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/true);
         fp->mark_attention_taps(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);   // a plan made for THIS tapped graph
         fp->set_prefill_inputs(gf, rows, q_off);
         qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
                                               "run_lens_verdict (question pass)");
@@ -3198,6 +3193,18 @@ const char* kCompareMid = "\n\nHere is a second version. It may be translated or
 const char* kCompareTail = "\n\nWhich parts of the original are missing from the second version?";
 }  // namespace
 
+double lens_compare_baseline(const std::vector<double>& raw) {
+    if (raw.empty()) throw std::runtime_error("lens_compare_baseline: raw coverages expected non-empty, actual empty");
+    std::vector<double> srt = raw;
+    std::sort(srt.begin(), srt.end());
+    const size_t q = (srt.size() + 3) / 4;
+    double s = 0;
+    for (size_t i = srt.size() - q; i < srt.size(); ++i) s += srt[i];
+    const double b = s / (double)q;
+    if (!std::isfinite(b)) throw std::runtime_error("lens_compare_baseline: baseline expected finite, actual non-finite");
+    return std::max(b, 1e-12);
+}
+
 std::string lens_compare_user_text(const std::vector<std::string>& original_units, const std::string& revised) {
     std::string a;
     for (size_t i = 0; i < original_units.size(); ++i) a += (i ? "\n" : "") + original_units[i];
@@ -3252,7 +3259,7 @@ LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sch
             "quantization and set compare_layer/compare_head/compare_threshold on its calibration row.");
     if (original_units.size() < 2)
         throw std::runtime_error("run_lens_compare: original_units expected at least 2 (coverage is relative to "
-                                 "the document's median unit), actual " + std::to_string(original_units.size()));
+                                 "the document's best-covered units), actual " + std::to_string(original_units.size()));
     for (size_t i = 0; i < original_units.size(); ++i)
         if (original_units[i].find_first_not_of(" \t\r\n") == std::string::npos)
             throw std::runtime_error("run_lens_compare: original unit " + std::to_string(i) +
@@ -3390,8 +3397,7 @@ LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sch
         const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
         ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, /*want_logits=*/false);
         fp->mark_attention_taps(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);   // a plan made for THIS tapped graph
         fp->set_prefill_inputs(gf, rows, q_off);
         qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf),
                                               "run_lens_compare (second-version pass)");
@@ -3408,7 +3414,7 @@ LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sch
         throw std::runtime_error("run_lens_compare: tap expected to hold compare_head over the original");
 
     // ── Coverage: per original token, the MAX over the second version's rows;
-    //    per unit, the mean over its tokens; relative to the median unit ─────
+    //    per unit, the mean over its tokens; relative to the top-quarter mean ─
     const int olo = ut.front().first, ohi = ut.back().second;
     std::vector<float> mx((size_t)(ohi - olo), 0.f);
     auto row_of = [&](int r) { return T.rows.data() + (size_t)T.n_kv * ((size_t)(r - q_off) + (size_t)T.n_q * (size_t)blk); };
@@ -3424,13 +3430,11 @@ LensCompareReport run_lens_compare(ForwardPassBase* fp, ggml_backend_sched_t sch
         if (!std::isfinite(raw.back()))
             throw std::runtime_error("run_lens_compare: coverage expected finite, actual non-finite");
     }
-    std::vector<double> srt = raw;
-    std::sort(srt.begin(), srt.end());
-    const double med = std::max(srt[srt.size() / 2], 1e-12);
+    const double base = lens_compare_baseline(raw);
     for (size_t i = 0; i < ut.size(); ++i) {
         LensCompareUnit cu;
         cu.index = (int)i;
-        cu.coverage = raw[i] / med;
+        cu.coverage = raw[i] / base;
         cu.missing = cu.coverage < k.compare_threshold;
         if (!cu.missing) {
             // Receipt: the span of the second version whose rows attend this unit most.

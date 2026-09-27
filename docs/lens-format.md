@@ -937,10 +937,14 @@ POST /v1/verdict
   yes), long documents (at 4K–8K, German comparisons flipped to a false yes).
 * **Measured (Qwen3.8-9B Q4_K_M):** real CVs, 72 requirements, yes vs not-yes
   **100% / 100%** EN / DE, including the 12 comparisons attention failed.
-* **Where it is served:** the full `--attention-lens` server only.
-  `--lens-verify-only` and `--lens-locate-only` refuse it: they do not load the
-  output head. A model row without a measured verdict layer refuses it — today
-  every row but Qwen3.8-9B at Q4_K_M.
+* **Where it is served:** the full `--attention-lens` server, and a
+  `--lens-verify-only` server started with **`--lens-verdict`** (2026-09-27),
+  which also loads the output head (Qwen3.8-9B: +796 MB, no extra blocks — the
+  verdict reads after layer 27, inside the verify-only cut). Answers are
+  byte-identical to the full server's. A plain `--lens-verify-only` and
+  `--lens-locate-only` refuse it (404): they do not load the output head. A
+  model row without a measured verdict layer refuses it — today every row but
+  Qwen3.8-9B at Q4_K_M — and `--lens-verdict` refuses to start on such a row.
 * **`document_id`** keeps the document exactly as `/v1/locate` does (same
   store, same rules, `prefix` cold/warm): a verdict's document pass is locate's
   computed deeper, so it also serves a later `/v1/locate` on the same id.
@@ -962,7 +966,7 @@ POST /v1/compare
 ```json
 { "format_version": "qemmi-lens/v4", "model": "...", "config": {...},
   "prefill": "split", "prefix": "cold", "validated_envelope": true,
-  "threshold": 0.5, "compare": {"layer": 15, "head": 1, "provenance": "..."},
+  "threshold": 0.35, "compare": {"layer": 15, "head": 1, "provenance": "..."},
   "prompt_len": 412,
   "units": [ {"index": 0, "coverage": 1.02, "missing": false,
               "restated_at": {"byte_lo": 0, "byte_hi": 29, "peak": 0.41}},
@@ -970,17 +974,24 @@ POST /v1/compare
 ```
 
 * **`coverage`** is the unit's attention from the second version, relative to
-  the document's median unit (1.0 = typical). A ranking, **not a confidence**.
+  the mean of the document's best-covered quarter of units (1.0 = as covered
+  as the best units). A ranking, **not a confidence**. Until 2026-09-27 it was
+  relative to the median unit, which failed when more than half the units were
+  missing (a summary): the median was then itself a missing unit, and 35–49%
+  of drops went unflagged. It now holds while **at least a quarter** of the
+  original survives.
 * **`missing`** = `coverage < threshold`, the model's calibrated value.
 * **`restated_at`** — where in the second version the unit is attended from:
   the receipt for "covered". `null` for a missing unit.
 * **`validated_envelope`** is false when the original has fewer units than the
   gate's smallest (8) or the prompt is longer than its longest (9,762 tokens).
 * **`prefill`** is always `"split"`: the original's pass is materialized, never
-  flash — flash changed 6 of 31,807 flags at the gate.
-* **Measured** (Qwen3.8-9B Q4_K_M, threshold 0.50): translations with 0–2
-  sentences dropped, EN→DE 91.7% of drops flagged and 6.2% of complete copies
-  falsely flagged, DE→EN 97.9% / 0%; AbsenceBench numbers F1 82.9, poetry 77.0.
+  flash — flash changed 4–6 of 31,807 flags at the gates.
+* **Measured** (Qwen3.8-9B Q4_K_M, threshold 0.35, COMPARE3 + COMPAREGATE
+  2026-09-27): translations with 0–2 sentences dropped, 87.5–95.8% of drops
+  flagged and 0% of complete copies falsely flagged, both directions; with
+  50–75% dropped (summary-like), 95.6–98.1% flagged and 0% of kept units
+  flagged; AbsenceBench numbers F1 83.2, poetry 76.5.
 * **Not for repetitive text** — code diffs, tables of repeated values: a
   repeated line is always attended somewhere (AbsenceBench diffs: 8.3). For a
   word-for-word copy, a string diff is the right tool.
@@ -1006,7 +1017,12 @@ POST /v1/compare
 > (the old code ran cold instead). The measurements below predate the fix.
 
 A request may carry an optional `"document_id"`: an opaque caller-chosen handle
-saying *this is the same document I named last time*.
+saying *this is the same document I named last time*. Accepted on `/v1/extract`,
+`/v1/locate` (split rows), `/v1/verdict` and `/v1/compare`. **`/v1/verify`
+refuses it with a 400** (2026-09-27; until then it was silently ignored):
+verify prefills its whole prompt in one pass, and reusing a kept document would
+split that pass, which has no drift gate on this route — accepting the member
+and running cold would imply a reuse that never happened.
 
 ```json
 { "document": "...", "document_id": "lease-4471", "key_vocabulary": [...] }

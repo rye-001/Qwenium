@@ -844,7 +844,7 @@ bool is_skipped_block_tensor(const std::string& name, uint32_t max_blocks) {
 
 // Load tensor metadata only (no data copying)
 void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std::string, ggml_tensor *> &tensors,
-                                       uint32_t max_blocks)
+                                       uint32_t max_blocks, bool keep_output_head)
 {
     if (!file_mapper_) {
         throw GGUFLoadError("Model not loaded or mapped.");
@@ -860,8 +860,10 @@ void GGUFLoader::load_tensor_metadata(ggml_context *ctx, std::unordered_map<std:
         if (partial) {
             // The output head and final norm are never read by a forward pass
             // truncated after any block < block_count — verify never decodes,
-            // so there is no logit to compute and nothing reads them.
-            if (name == "output_norm.weight" || name == "output.weight") continue;
+            // so there is no logit to compute and nothing reads them — unless
+            // the caller reads logits after its last loaded block
+            // (keep_output_head: --lens-verdict).
+            if (!keep_output_head && (name == "output_norm.weight" || name == "output.weight")) continue;
             if (is_skipped_block_tensor(name, max_blocks)) continue;
         }
         std::vector<int64_t> shape(meta.shape.begin(), meta.shape.end());

@@ -52,11 +52,13 @@ one objection, adopted: users cannot *see* when it is wrong (a false "yes" at
 * **Licence, per model and quant:** `LensConstants::verdict_layer` (27),
   `verdict_provenance`, `verdict_envelope_tokens` (519), appended last, −1 =
   refused. Set only on the 9B **Q4_K_M** row.
-* **Served on the full `--attention-lens` server only.** Truncated servers load
+* **Served on the full `--attention-lens` server** (and, since 2026-09-27, on
+  `--lens-verify-only` with `--lens-verdict`, which loads the head — see
+  plan-lens-verdict.md phase 2). Truncated servers load
   `token_embd` and the blocks but no output head, and the 9B's is untied
   (`output.weight` 4096 × 248320 Q6_K, ~834 MB) — so `--lens-verify-only` and
   `--lens-locate-only` refuse (404) and keep their size. Runs on
-  `locate_scheduler()` (every pass is a truncated prefill).
+  `locate_scheduler()` (every pass is a truncated prefill) — merged into the main scheduler 2026-09-27, see architecture.md §6.
 * Docs: architecture.md (module map + paragraph), lens-format.md (verdict
   section with its non-uses), plan-lens-verdict.md (marked landed).
 

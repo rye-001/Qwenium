@@ -351,7 +351,7 @@ int main() {
         ggml_backend_sched_reset(sched);
         ggml_cgraph* gf_img = fp->build_prefill_graph(image_tokens, pos, 0, false);
         fp->mark_attention_taps(gf_img);
-        ggml_backend_sched_alloc_graph(sched, gf_img);
+        fp->alloc_readback_graph(sched, gf_img);
         fp->set_prefill_inputs(gf_img, image_tokens, pos);
         qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf_img), "image chunk");
         fp->advance_cache(n_img, 0);
@@ -362,7 +362,7 @@ int main() {
         ggml_backend_sched_reset(sched);
         ggml_cgraph* gf_q = fp->build_prefill_graph(suffix_tokens, pos, 0, true);
         fp->mark_attention_taps(gf_q);
-        ggml_backend_sched_alloc_graph(sched, gf_q);
+        fp->alloc_readback_graph(sched, gf_q);
         fp->set_prefill_inputs(gf_q, suffix_tokens, pos);
         qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf_q), "suffix chunk");
         std::vector<RawTap> taps_q = read_prefill_taps(gf_q, attn_layers);
