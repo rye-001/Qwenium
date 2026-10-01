@@ -237,7 +237,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; `/v1/locate` — document + keys → byte ranges, nothing generated and nothing audited, on its own calibrated head; `/v1/verdict` — document + yes/no questions → yes / no / unclear read off the prefill's last row, full lens server or verify-only with `--lens-verdict`; `/v1/compare` — an original's units + a second version → which units are missing, every lens server; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `image_verdict` (`/v1/verdict` with an **image** — yes / no / unclear about visible marks from the answer logits after one image pass, questions resumed from a snapshot; its own calibration table and gates: `--mmproj`, a full model, a measured row; NOT the lens, reads no attention), `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; `/v1/locate` — document + keys → byte ranges, nothing generated and nothing audited, on its own calibrated head; `/v1/verdict` — document + yes/no questions → yes / no / unclear read off the prefill's last row, full lens server or verify-only with `--lens-verdict`; `/v1/compare` — an original's units + a second version → which units are missing, every lens server; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -1176,9 +1176,15 @@ beside the slot it restores into and guarded by `model_mutex_`; `qinf-server`
 now links `qinf-snapshot` for it. The only hit test is exact equality of pass
 1's tokens; the document hash only turns an id reused for other text into a
 400. A pass 1 serves any read at or below the layer it was computed to
-(truncation is causal in depth). One-shot rows refuse an id. RAM only: 4
-documents, LRU, 15-minute idle TTL checked on every `/v1/locate` — fixed
-defaults, not flags (`kLensDocumentStoreMax`, `kLensDocumentStoreTtl`). Gated
+(truncation is causal in depth). One-shot rows refuse an id. RAM only: at
+most **`--lens-kept-documents`** entries (default 4, 2026-09-27) keyed (route, id) — extract, locate (verdict shares it), compare — so
+one document kept on all three fills 3; LRU across routes; 15-minute idle TTL
+checked on every extract/locate/verdict/compare call; ids are 1–256 bytes on
+every route. The TTL is a fixed default, not a flag (`kLensDocumentStoreTtl`);
+the size flag exists because the store, not the GPU, sets how many users stay
+warm: users who take turns past the size all go cold (0/15 warm at 5 users on
+4 entries, 24/24 at 8 users on 8 — docs/note-lens-concurrency.md). An entry is
+~64 KB per document token + ~48 MB DeltaNet state on the 9B (F32 KV). Gated
 by LOCWARM: warm bit-identical to cold on 115/115 reports; 10K locate 22.4 s →
 0.30 s. **`/v1/extract` uses the same store** (2026-09-26): its older warm path
 (`LensWarmDocument` — keep slot 0, rewind the position) is deleted, because a
@@ -1212,6 +1218,35 @@ are byte-identical to the full server's (7/7 responses, 22 questions). Licensed 
 `LensConstants::verdict_layer` / `verdict_provenance` / `verdict_envelope_tokens`
 (appended last; −1 = refused) — set only on the 9B Q4_K_M row. Every pass is a
 truncated prefill, on the main scheduler like every verb.
+
+**The image verdict (`POST /v1/verdict` with `"image"`, 2026-10-01,
+docs/plan-image-verdict.md).** A different concern that only shares the URL:
+`handle_image_verdict` (http_server.cpp) claims a body carrying `"image"` and
+returns before any lens gate; a document body reaches the lens handler
+unchanged (G0: 11 responses, valid and refused, byte-identical with and
+without the dispatch). The logic is `src/server/image_verdict` (in
+`qinf-server`): encode + prefill up to the end of the image span **once**,
+`capture_slot` (the RPOS section carries the M-RoPE position, §12), then per
+question `restore_slot` and a prefill of the question alone from
+`get_rope_pos`; P(yes) vs P(no) with `run_lens_verdict`'s token sets; the LLM
+prefill pinned **materialized** (how the cuts were measured). Questions are a
+calibrated **mark** (the server words it exactly as measured: signature,
+stamp, date) or a free question (0.5, `calibrated: false`); answer = yes if
+p ≥ cut_yes, no if p < cut_no, else unclear (stamp 1.0 / 0.5: never yes —
+lookalikes score like real stamps, docs/note-stamp-lures.md). Gates of its
+own — `--mmproj`, a full model (a truncated lens server is refused), and an
+`ImageVerdictCalibration` row keyed `{arch, block_count, file_type,
+projector, projection_dim}` (one row: Qwen3.6-35B-A3B UD-Q3_K_XL + its
+mmproj) — reported at startup. `ServerVision` gained only plain accessors and
+`prepare_image`; `server_lens` is untouched. Slot 0, exclusive, under the
+model lock like the lens verbs; the slot is left clean (a chat request after
+it answers normally). Reproduces the probe bit for bit (G2, 166/166). Format
+`qemmi-verdict-image/v1`. **`image_id`** (1..256 bytes) keeps the post-image
+snapshot in the image verdict's own `ImageVerdictStore` (not the lens's): a hit
+needs the same id, the same image (preprocessed pixels' content id) and the
+same image-inclusive tokens; the same id for another image is a 400; 4 entries,
+LRU, 15-minute TTL, fixed (no flag). Warm answers are the cold ones exactly on
+the 35B-A3B (G4), 3 questions 11.1 s → 0.7 s.
 
 **Compare (`POST /v1/compare`, 2026-09-26, docs/plan-lens-compare.md).** The
 seventh mode, the first read ACROSS two documents: the original (the caller's
@@ -1344,6 +1379,21 @@ Two interfaces carry the whole boundary, and both have two implementations
   investigation because every component was correct in isolation.
   `ForwardPassBase::set_prefill_inputs` now refuses it fail-loud
   (`GraphInputSet::has_slot`, pinned by `test_graph_input`).
+
+**Encoder attention is flash attention, always (2026-09-30, user decision; no
+flag).** Both ViTs (`siglip_encoder`, `qwen3vl_encoder`) use one
+`ggml_flash_attn_ext` per layer — K/V cast to F16, F32 accumulation — instead
+of `kq` → `soft_max` → `kqv`. The materialized form wrote an `n_pos × n_pos`
+score matrix per head per layer (a 1024 × 1440 page = 5760 patches: ~2.1 GB
+per layer) and was 64% of the Qwen tower's time: **10.0 → 6.1 s per page**
+on the 35B-A3B's mmproj (`docs/note-verdict-img-probe.md` §11). Unlike the
+text side's opt-in `--flash-attn` (§5), there is no switch: the encoder is
+never tapped (the lens reads the LLM, and image attention readouts are closed),
+so nothing needs the materialized scores. **Not bit-identical to the old
+form:** Qwen page embeddings moved by rel-L2 ~1% (the same with F32 K/V — it is
+the reduction order, not F16); SigLIP moved *closer* to the captured llama.cpp
+reference (rel-L2 2.94e-3 → 2.59e-3, min cosine 0.999977 → 0.999984), and
+MedGemma's greedy description of the e2e X-ray is word-for-word unchanged.
 
 Preprocessing splits along the same grain as the seams. The **recipe** —
 `vision/image_preprocess.h`, `ImagePreprocess` plus one factory per projector —
@@ -1978,14 +2028,20 @@ Current, verified against the tree at time of writing:
   exercise *is* gated automatically and model-free
   (`tests/unit/test_rope_divergence.cpp`). See `plan-qwen35-vision-impl.md`
   §6 (P5, P6) and §8.6.
-- **VL sessions are not snapshottable or prefix-cacheable.** An M-RoPE image
-  span occupies nx·ny KV rows while advancing the sequence position by only
-  max(nx, ny), and the snapshot blob records a row count with no rope
-  coordinate — so such a slot cannot be round-tripped. `capture_slot` refuses a
-  slot with a recorded divergence, and the CLI refuses `--image-prefix-cache` on
-  an M-RoPE recipe at setup. Gemma (one position per row) is unaffected.
-  Lifting this needs the snapshot header bump described in
-  `plan-qwen35-vision-impl.md` §4 decision 3.
+- **VL sessions are snapshottable; the image-prefix caches are not M-RoPE-safe
+  yet.** An M-RoPE image span occupies nx·ny KV rows while advancing the
+  sequence position by only max(nx, ny). Since 2026-10-01 a snapshot carries
+  that rope coordinate: `capture_slot` appends an **`RPOS` section** (the slot's
+  `RopeDivergence{delta, rows_after}`, read through
+  `ForwardPassBase::rope_record` / `set_rope_record`) **only for a diverged
+  slot**, as the blob's last section, and `restore_slot` re-installs it when the
+  blob's section count says it is there — so text blobs and Gemma image blobs
+  are byte-identical to before (measured), and a restored Qwen image slot
+  resumes bit-identically (`test-image-prefix-roundtrip` on the 35B-A3B: 389
+  rows, rope position 29, logits max diff 0). The CLI `--image-prefix-cache`
+  and the server's V2 cache still refuse an M-RoPE recipe at setup: they place
+  the question by KV rows; porting them to `get_rope_pos` is a separate
+  decision (`docs/plan-image-verdict.md` §4).
 
 ## 13. Keeping this document alive
 

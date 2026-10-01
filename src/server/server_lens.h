@@ -1743,16 +1743,19 @@ std::string lens_locate_to_json(const LensLocateReport& r);
 //
 // Personal data (a CV is the motivating document): RAM only — never written to
 // disk, never logged. Dropped when idle past the TTL (checked on every
-// /v1/locate call, so an idle server holds its last documents until the next
-// call) and least-recently-used first beyond the size cap.
+// extract, locate, verdict and compare call, with or without an id — not on
+// verify — so an idle server holds its last documents until the next such
+// call) and least-recently-used first beyond the size cap. The cap counts ENTRIES, not documents: one document kept on
+// extract, locate and compare fills three.
 //
-// Both lens routes that read a document keep it here (2026-09-26): /v1/locate
-// (above) and /v1/extract, whose older mechanism — rewind slot 0's position,
-// never a snapshot — was NOT warm == cold on a DeltaNet hybrid, because a
-// position rewind cannot rewind recurrent state (EXTWARM). Entries are keyed
-// per ROUTE as well as id: the two routes compute their document pass
+// Every lens route that reads a document keeps it here: /v1/locate (above),
+// /v1/verdict (on the Locate route, computed deeper), /v1/compare (the
+// original), and /v1/extract, whose older mechanism — rewind slot 0's
+// position, never a snapshot — was NOT warm == cold on a DeltaNet hybrid,
+// because a position rewind cannot rewind recurrent state (EXTWARM). Entries
+// are keyed per ROUTE as well as id: the routes compute their document pass
 // differently (truncated tapped graph vs a full run_prefill), so one never
-// serves the other.
+// serves another.
 //
 // Not thread-safe: the one caller holds model_mutex_, as every lens route does.
 enum class LensKeptRoute { Locate, Extract, Compare };
@@ -1761,6 +1764,7 @@ enum class LensKeptRoute { Locate, Extract, Compare };
 // FNV-1a over the document bytes. Chooses 400 vs miss; never decides a hit.
 uint64_t lens_document_hash(const std::string& document);
 
+// The DEFAULT size; --lens-kept-documents overrides it per process.
 inline constexpr size_t kLensDocumentStoreMax = 4;
 inline constexpr std::chrono::seconds kLensDocumentStoreTtl{15 * 60};
 

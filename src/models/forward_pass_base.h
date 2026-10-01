@@ -143,9 +143,9 @@ public:
     // is every recipe and every text path — byte-identical, no new bookkeeping.
     //
     // KNOWN LIMIT: a slot truncated back *into* or *before* an image span keeps
-    // the stale delta. The prefix-cache / snapshot paths must carry the rope
-    // coordinate to be VL-safe (docs/plan-qwen35-vision-impl.md §3.2, §4
-    // decision 3); until they do, VL sessions are single-turn-safe only.
+    // the stale delta. Snapshots carry the coordinate (the RPOS section,
+    // session/slot_snapshot.cpp, 2026-10-01 — docs/plan-image-verdict.md §4);
+    // the prefix caches still refuse M-RoPE image turns at setup.
     int32_t get_rope_pos(uint32_t slot) const {
         const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
         const RopeDivergence* rec = live_rope_record(slot);
@@ -176,9 +176,9 @@ public:
     }
 
     // True when this slot's rows and rope positions have diverged — i.e. it has
-    // hosted an image span. Snapshot / prefix-cache paths ask before persisting
-    // or restoring: the blob format carries a row count and no rope coordinate,
-    // so a diverged slot cannot be round-tripped faithfully (plan §4 decision 3).
+    // hosted an image span. capture_slot asks, to append the RPOS section that
+    // carries the rope coordinate (session/slot_snapshot.cpp); the image-prefix
+    // caches refuse M-RoPE recipes at setup (they place the question by rows).
     bool has_rope_divergence(uint32_t slot) const {
         return live_rope_record(slot) != nullptr;
     }
@@ -186,6 +186,34 @@ public:
     // Drop a slot's divergence record explicitly. get_rope_pos also self-heals
     // (see above), so this is belt-and-braces for callers that clear a slot.
     void reset_rope_pos(uint32_t slot) { rope_row_delta_.erase(slot); }
+
+    // The slot's live divergence record, for the snapshot's RPOS section
+    // (session/slot_snapshot.cpp — the one consumer). False when the slot has
+    // not diverged, i.e. every text slot and every Gemma image slot.
+    bool rope_record(uint32_t slot, int32_t& delta, int32_t& rows_after) const {
+        const RopeDivergence* rec = live_rope_record(slot);
+        if (!rec) return false;
+        delta = rec->delta;
+        rows_after = rec->rows_after;
+        return true;
+    }
+
+    // Re-install a record on restore, AFTER the slot's rows are back: a record
+    // past the slot's row count would be stale on its first read, and a
+    // non-positive delta is not a divergence. Fail-loud on either.
+    void set_rope_record(uint32_t slot, int32_t delta, int32_t rows_after) {
+        if (delta <= 0)
+            throw std::runtime_error(
+                "set_rope_record: slot '" + std::to_string(slot) +
+                "' delta: expected > 0, got: " + std::to_string(delta));
+        const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
+        if (rows_after > rows || rows_after < delta)
+            throw std::runtime_error(
+                "set_rope_record: slot '" + std::to_string(slot) +
+                "' rows_after: expected within [delta=" + std::to_string(delta) +
+                ", rows=" + std::to_string(rows) + "], got: " + std::to_string(rows_after));
+        rope_row_delta_[slot] = RopeDivergence{delta, rows_after};
+    }
 
     void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
                      ggml_backend_sched_t scheduler, int pos_override = -1) {

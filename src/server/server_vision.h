@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "vision/bitmap.h"            // qinf::vision::Bitmap (prepare_image returns one)
 #include "vision/image_preprocess.h"  // qinf::vision::ImagePreprocess (value member)
 
 class Model;
@@ -74,6 +75,20 @@ public:
     // keeps its no-think image path. See docs/server-image-multirequest-bug.md §5.
     bool image_wants_thinking() const { return image_wants_thinking_; }
 
+    // ── Capability surface read by the image verdict ─────────────────────────
+    // (POST /v1/verdict with an image, docs/plan-image-verdict.md.) Plain
+    // handles only — this class knows nothing about verdicts; the integration
+    // assembles them for src/server/image_verdict. prepare_image decodes the
+    // image FILE bytes and applies this projector's preprocessing (fail-loud on
+    // an undecodable image), exactly as the chat path does.
+    qinf::vision::Bitmap prepare_image(const std::vector<uint8_t>& image_bytes) const;
+    qinf::vision::IVisionEncoder& encoder() const { return *vencoder_; }
+    int32_t boi_id() const { return boi_id_; }
+    int32_t soft_id() const { return soft_id_; }
+    int32_t eoi_id() const { return eoi_id_; }
+    const std::string& projector_tag() const { return projector_tag_; }
+    uint32_t projection_dim() const;
+
     // ── The MultimodalPrefillFunc body ───────────────────────────────────────
     // Decode → preprocess → tokenize → expand the image marker → encode →
     // splice → text prefill, then sample the first token. Writes the full
@@ -100,6 +115,7 @@ private:
     std::unique_ptr<qinf::vision::VisionLoader>   vloader_;
     std::unique_ptr<qinf::vision::IVisionEncoder> vencoder_;
     int32_t boi_id_ = -1, eoi_id_ = -1, soft_id_ = -1;
+    std::string projector_tag_;
     std::string image_marker_prefix_;
     bool image_wants_thinking_ = false;  // Gemma 4 image input → thinking branch
     qinf::vision::ImagePreprocess preprocess_;

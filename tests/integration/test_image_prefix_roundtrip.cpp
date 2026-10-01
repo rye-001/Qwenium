@@ -10,7 +10,7 @@
 // encode and the image-position prefill) and prefills only its own text.
 //
 // This harness is the gate that decides whether that substitution is safe. It
-// reuses Phase 4's machinery unchanged — KvCacheSection / SessionManifest /
+// reuses Phase 4's machinery unchanged — capture_slot / restore_slot /
 // PrefixLibrary — adding only the image-extended key and the capture/restore
 // taken at the post-image boundary (the seam-reuse invariant: V2 hosts without
 // bending the existing modules).
@@ -65,22 +65,19 @@
 #include "models/model_registry.h"
 #include "session/compat_header.h"
 #include "session/session_manifest.h"
+#include "session/slot_snapshot.h"
 #include "session/snapshot_io.h"
 #include "state/deltanet_state.h"
 #include "state/kv_cache_simple.h"
 #include "vision/bitmap.h"
-#include "vision/gemma4uv_encoder.h"
 #include "vision/i_vision_encoder.h"
-#include "vision/siglip_encoder.h"
 #include "vision/vision_loader.h"
 #include "vision/vision_model.h"
+#include "vision/vision_profile.h"
 
 namespace {
 
 using qinf::session::CompatHeader;
-using qinf::session::SessionManifest;
-using qinf::session::SnapshotReader;
-using qinf::session::SnapshotWriter;
 
 constexpr uint32_t kCtx = 1024;
 constexpr int kDecodeN = 12;
@@ -126,27 +123,6 @@ CompatHeader make_header(const ModelMetadata& m,
     return h;
 }
 
-// The image-prefix blob's sections, in a fixed order shared by capture/restore:
-// one AppendKV section per KV cache (Gemma4 → 2; others → 1), in the recipe's
-// snapshot_kv_caches() order, plus (where the recipe has one) the authoritative
-// OverwriteRecurrent state — all for slot 0. V2 adds NO section type (seam-reuse
-// invariant); two KvCacheSections share the section id and are matched by
-// position.
-struct PrefixSections {
-    std::vector<std::unique_ptr<KvCacheSection>> kvs;
-    std::unique_ptr<DeltaNetStateSection> dn;
-};
-void build_sections(SessionManifest& m, PrefixSections& sec, ForwardPassBase* fp) {
-    for (simple_kv_cache* kv : fp->snapshot_kv_caches()) {
-        sec.kvs.push_back(std::make_unique<KvCacheSection>(*kv, 0));
-        m.add(sec.kvs.back().get());
-    }
-    if (fp->snapshot_recurrent()) {
-        sec.dn = std::make_unique<DeltaNetStateSection>(*fp->snapshot_recurrent(), 0);
-        m.add(sec.dn.get());
-    }
-}
-
 struct Branch {
     std::vector<int32_t> seq;
     std::vector<float> first_logits;  // the question-prefill tail (picks token 0)
@@ -164,7 +140,9 @@ Branch run_decode(ForwardPassBase* fp, ggml_backend_sched_t sched,
     out.seq.push_back(cur);
     context.push_back(cur);
     for (int i = 1; i < kDecodeN; ++i) {
-        int pos = static_cast<int>(fp->get_cache_pos(0));
+        // The ROPE position, not the KV row count: identical for Gemma (one
+        // position per row), the only correct one after an M-RoPE image span.
+        int pos = fp->get_rope_pos(0);
         std::vector<float> logits = fp->run_prefill({cur}, pos, 0, sched);
         std::vector<float> tail(logits.end() - vocab_size, logits.end());
         cur = pick(tail, context);
@@ -196,6 +174,12 @@ qinf::vision::Bitmap make_gray_bitmap(const qinf::vision::VisionModel& vmodel) {
     bmp.channels = 3;
     if (cfg.projector_type == PT::Gemma3Siglip) {
         bmp.width = bmp.height = static_cast<int>(cfg.image_size);
+    } else if (cfg.projector_type == PT::Qwen3VlMerger) {
+        // 512×768 → 16×24 = 384 tokens; NON-square, so the M-RoPE span's
+        // position advance (max(nx, ny) = 24) differs from both sides and from
+        // its 384 rows — the case the snapshot's RPOS section exists for.
+        bmp.width = 512;
+        bmp.height = 768;
     } else {  // Gemma4Uv: 480×480 → 10×10 = 100 tokens, within budget
         bmp.width = bmp.height = 480;
     }
@@ -203,20 +187,6 @@ qinf::vision::Bitmap make_gray_bitmap(const qinf::vision::VisionModel& vmodel) {
         static_cast<size_t>(3) * bmp.width * bmp.height, 0.5f);
     bmp.content_id = 0x5EEDC0FFEEull;  // producer-set (chunk-list builder's job)
     return bmp;
-}
-
-// The image soft-token placeholder id. Its embedding is OVERWRITTEN by the
-// encoded image, so any in-vocab id yields identical KV — but use the real
-// projector marker when present so the harness mirrors production.
-int32_t soft_token_id(Tokenizer* tok, const qinf::vision::VisionModel& vmodel) {
-    using PT = qinf::vision::VisionProjectorType;
-    const std::string marker =
-        vmodel.config().projector_type == PT::Gemma3Siglip ? "<image_soft_token>"
-                                                           : "<|image|>";
-    const auto& vocab = tok->get_vocabulary();
-    for (size_t i = 0; i < vocab.size(); ++i)
-        if (vocab[i] == marker) return static_cast<int32_t>(i);
-    return 0;  // overwritten anyway; 0 is a safe in-vocab fallback
 }
 
 }  // namespace
@@ -255,18 +225,15 @@ int main(int argc, char** argv) {
         std::cerr << "mmproj load failed: " << e.what() << "\n";
         return 1;
     }
-    using PT = qinf::vision::VisionProjectorType;
-    std::unique_ptr<qinf::vision::IVisionEncoder> encoder;
-    if (vmodel.config().projector_type == PT::Gemma3Siglip)
-        encoder = std::make_unique<qinf::vision::SiglipEncoder>(
-            vmodel, backend, vmodel.config().projection_dim);
-    else
-        encoder = std::make_unique<qinf::vision::Gemma4UvEncoder>(
-            vmodel, backend, vmodel.config().projection_dim);
+    // The production projector dispatch: encoder, markers and soft-token id for
+    // whichever family the mmproj is (gemma3-siglip, gemma4uv, qwen3vl-merger).
+    qinf::vision::VisionProfile vprofile = qinf::vision::make_vision_profile(
+        vmodel, backend, tok->get_vocabulary(), "test-image-prefix-roundtrip: argv[2]");
+    qinf::vision::IVisionEncoder* encoder = vprofile.encoder.get();
 
     qinf::vision::Bitmap bmp = make_gray_bitmap(vmodel);
     const uint32_t n_img = encoder->mm_tokens_for(bmp);
-    const int32_t soft_id = soft_token_id(tok, vmodel);
+    const int32_t soft_id = vprofile.soft_id;
 
     // The FIXED preceding context (everything before the image span — the V2
     // reuse condition) and the per-question variable TURN. The image-inclusive
@@ -288,9 +255,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> context = full;  // decode history starts at end of `full`
 
     std::cout << "=== image-prefix round-trip: " << meta.architecture << " ("
-              << meta.model_name << ") projector="
-              << (vmodel.config().projector_type == PT::Gemma3Siglip ? "gemma3-siglip"
-                                                                     : "gemma4uv")
+              << meta.model_name << ") projector=" << vprofile.projector_tag
               << " n_prefix=" << n_prefix << " (text=" << span_start
               << "+img=" << n_img << ") n_question=" << question.size() << " ===\n";
 
@@ -314,6 +279,7 @@ int main(int argc, char** argv) {
     CompatHeader header;
     std::vector<uint8_t> blob;
     Branch live;
+    int live_rope_pos = -1;   // the question's position after the image span
     const uint64_t key = PrefixLibrary::key_for(preceding, bmp.content_id);
     {
         auto fp = create_forward_pass(model, &meta, kCtx, 1);
@@ -333,22 +299,18 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        // Capture the warm image-prefix blob (header + KV [+ recurrent]) + publish.
-        {
-            SessionManifest m;
-            PrefixSections sec;
-            build_sections(m, sec, fp.get());
-            SnapshotWriter w;
-            m.capture(w, header);
-            blob = w.buffer();
-        }
+        // Capture the warm image-prefix blob through the production API (header
+        // + KV [+ recurrent] [+ RPOS for an M-RoPE span]) and publish it.
+        blob = qinf::snapshot::capture_slot(*fp, 0, header);
         PrefixLibrary(dir, header).store(key, blob);
+        live_rope_pos = fp->get_rope_pos(0);
 
         std::vector<float> logits =
-            fp->run_prefill(question, static_cast<int>(n_prefix), 0, sched);
+            fp->run_prefill(question, live_rope_pos, 0, sched);
         std::vector<float> tail(logits.end() - vocab_size, logits.end());
         live = run_decode(fp.get(), sched, context, tail, vocab_size);
     }
+    std::cout << "post-image rows=" << n_prefix << " rope position=" << live_rope_pos << "\n";
     std::cout << "captured image-prefix blob: " << blob.size() << " B, key=" << key
               << ", build_path_tag=" << header.build_path_tag
               << " content_id=" << bmp.content_id << "\n";
@@ -364,19 +326,20 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL: warm load missed key " << key << "\n";
             return 3;
         }
-        SessionManifest m;
-        PrefixSections sec;
-        build_sections(m, sec, fp.get());
-        SnapshotReader r(loaded);
-        m.restore(r, expected);  // memcpy KV(+recurrent) + cursor → n_prefix
+        qinf::snapshot::restore_slot(*fp, 0, loaded, expected);  // KV(+recurrent)(+RPOS)
 
         if (fp->get_cache_pos(0) != n_prefix) {
             std::cerr << "FAIL: restored cursor expected " << n_prefix << ", got "
                       << fp->get_cache_pos(0) << "\n";
             return 3;
         }
+        if (fp->get_rope_pos(0) != live_rope_pos) {
+            std::cerr << "FAIL: restored rope position expected " << live_rope_pos
+                      << ", got " << fp->get_rope_pos(0) << "\n";
+            return 3;
+        }
         std::vector<float> logits =
-            fp->run_prefill(question, static_cast<int>(n_prefix), 0, sched);
+            fp->run_prefill(question, fp->get_rope_pos(0), 0, sched);
         std::vector<float> tail(logits.end() - vocab_size, logits.end());
         warm = run_decode(fp.get(), sched, context, tail, vocab_size);
     }

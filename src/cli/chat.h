@@ -8,8 +8,9 @@
 // Seams it drives: decode_step (per token), the speculative bridge, vision via
 //   vision_profile + image/image_loader, and the opt-in warm-KV caches
 //   (--prefix-cache, --image-prefix-cache) through session/.
-// Known behaviour debt (architecture.md §12): the loop does not terminate on
-//   stdin EOF — feed it `printf 'prompt\n\nexit\n' | qwenium ...` in scripts.
+// Input rules (chat_input.h): a turn ends on an empty line; exit/quit or end
+//   of input end the conversation, so `printf 'prompt\n' | qwenium --chat`
+//   answers once and exits (the stdin-EOF loop, fixed 2026-09-30).
 // No unit test: an interactive loop over a real model. Covered end-to-end by
 //   tests/smoke/ (image coherence, conversational mode).
 

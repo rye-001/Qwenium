@@ -316,17 +316,18 @@ std::vector<float> Qwen3VlEncoder::encode(const Bitmap& bitmap) {
                                GGML_ROPE_TYPE_VISION, 32768, 10000.0f,
                                1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-        // Attention: bidirectional over the whole image, no mask.
-        ggml_tensor* q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-        ggml_tensor* k = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
-        ggml_tensor* v = ggml_cont(ctx, ggml_permute(ctx, Vcur, 1, 2, 0, 3));
-
-        ggml_tensor* kq = ggml_mul_mat(ctx, k, q);
-        kq = ggml_soft_max_ext(ctx, kq, /*mask=*/nullptr, kq_scale, 0.0f);
-
-        ggml_tensor* kqv = ggml_mul_mat(ctx, v, kq);
-        cur = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-        cur = ggml_cont_2d(ctx, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
+        // Attention: bidirectional over the whole image, no mask — flash
+        // attention, K/V in F16, F32 accumulation. The materialized form wrote a
+        // [n_pos, n_pos] score matrix per head per layer (5760 patches: 16 × 33 M
+        // floats ≈ 2.1 GB) and was 64% of the tower's time; flash attention never
+        // materializes it (docs/note-verdict-img-probe.md §11). Not bit-identical
+        // to the materialized form (~1e-4 on random inputs).
+        ggml_tensor* q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);                 // [d_head, n_pos, n_head]
+        ggml_tensor* k = ggml_cast(ctx, ggml_permute(ctx, Kcur, 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor* v = ggml_cast(ctx, ggml_permute(ctx, Vcur, 0, 2, 1, 3), GGML_TYPE_F16);
+        cur = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx, cur, n_embd, n_pos);                        // [d_head, n_head, n_pos] → rows
 
         cur = ggml_mul_mat(ctx, require(model_, p + "attn_out.weight"), cur);
         cur = ggml_add(ctx, cur, require(model_, p + "attn_out.bias"));

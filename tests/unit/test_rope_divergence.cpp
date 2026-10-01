@@ -197,3 +197,42 @@ TEST(RopeDivergence, MorePositionsThanRowsFailsLoud) {
     RowCounterRecipe fp = make_recipe();
     EXPECT_THROW(fp.note_span_rows_vs_positions(0, 8, 9), std::runtime_error);
 }
+
+// ── The snapshot's view of the record (rope_record / set_rope_record) ─────────
+// The RPOS snapshot section (session/slot_snapshot.cpp) reads the live record
+// on capture and re-installs it on restore; these pin that round trip.
+
+TEST(RopeDivergence, RopeRecordIsAbsentWithoutADivergence) {
+    RowCounterRecipe fp = make_recipe();
+    feed_image_turn(fp, 0, kPre, /*img_rows=*/256, /*img_pos=*/256, kPost);   // scalar: no record
+    int32_t delta = -1, rows_after = -1;
+    EXPECT_FALSE(fp.rope_record(0, delta, rows_after));
+}
+
+TEST(RopeDivergence, RopeRecordRoundTripsThroughSetRopeRecord) {
+    RowCounterRecipe src = make_recipe();
+    feed_image_turn(src, 0, kPre, kImgRows, kImgPos, kPost);
+    int32_t delta = 0, rows_after = 0;
+    ASSERT_TRUE(src.rope_record(0, delta, rows_after));
+    EXPECT_EQ(delta, kImgRows - kImgPos);
+
+    // A fresh slot with the same rows restored (as the KV sections do), then the
+    // record re-installed: same rope position as the source.
+    RowCounterRecipe dst = make_recipe();
+    dst.set_cache_pos(src.get_cache_pos(0), 0);
+    dst.set_rope_record(0, delta, rows_after);
+    EXPECT_TRUE(dst.has_rope_divergence(0));
+    EXPECT_EQ(dst.get_rope_pos(0), src.get_rope_pos(0));
+    EXPECT_EQ(dst.get_rope_pos(0), kPosAfterTurn);
+}
+
+// Fail-loud: a record that is no divergence, or one past the restored rows
+// (it would be stale on its first read), is refused rather than installed.
+TEST(RopeDivergence, SetRopeRecordRefusesAnImpossibleRecord) {
+    RowCounterRecipe fp = make_recipe();
+    fp.set_cache_pos(100, 0);
+    EXPECT_THROW(fp.set_rope_record(0, 0, 50), std::runtime_error);     // delta not > 0
+    EXPECT_THROW(fp.set_rope_record(0, 10, 101), std::runtime_error);   // past the rows
+    EXPECT_THROW(fp.set_rope_record(0, 60, 50), std::runtime_error);    // rows_after < delta
+    EXPECT_FALSE(fp.has_rope_divergence(0));
+}

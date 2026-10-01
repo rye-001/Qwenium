@@ -28,4 +28,9 @@ constexpr SectionId kDeltaNetStateSectionId = 0x4E544C44u;  // "DLTN"
 // so lane Control. The context-free encoder output cached to skip the ViT pass.
 constexpr SectionId kImageEmbeddingSectionId = 0x474D4D49u;  // "IMMG"
 
+// A slot's rows-vs-rope-positions record (M-RoPE image spans). Written only for
+// a diverged slot, as the blob's LAST section, so every other blob is
+// byte-identical to the format before it existed (slot_snapshot.cpp).
+constexpr SectionId kRopeCoordinateSectionId = 0x534F5052u;  // "RPOS"
+
 }  // namespace qinf::session

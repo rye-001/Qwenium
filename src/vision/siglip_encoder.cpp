@@ -262,17 +262,18 @@ std::vector<float> SiglipEncoder::encode(const Bitmap& bitmap) {
         K = ggml_reshape_3d(ctx, K, d_head, n_head, n_pos);
         V = ggml_reshape_3d(ctx, V, d_head, n_head, n_pos);
 
+        // Scaled attention, no mask — flash attention, K/V in F16, F32
+        // accumulation; the materialized [n_pos, n_pos] score matrix per head
+        // is never written (docs/note-verdict-img-probe.md §11, measured on the
+        // Qwen tower; same op shape here). Not bit-identical to the
+        // materialized form.
         // [d_head, n_pos, n_head]
         ggml_tensor* q = ggml_permute(ctx, Q, 0, 2, 1, 3);
-        ggml_tensor* k = ggml_permute(ctx, K, 0, 2, 1, 3);
-        // kq = k^T q → [n_pos(k), n_pos(q), n_head]; scaled softmax, no mask
-        ggml_tensor* kq = ggml_mul_mat(ctx, k, q);
-        kq = ggml_soft_max_ext(ctx, kq, /*mask=*/nullptr, kq_scale, 0.0f);
-        // v: [n_pos, d_head, n_head] so mul_mat(v, kq) → [d_head, n_pos, n_head]
-        ggml_tensor* v = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));
-        ggml_tensor* kqv = ggml_mul_mat(ctx, v, kq);
+        ggml_tensor* k = ggml_cast(ctx, ggml_permute(ctx, K, 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor* v = ggml_cast(ctx, ggml_permute(ctx, V, 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor* kqv = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
         // → [d_head, n_head, n_pos] → [n_embd, n_pos]
-        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
         cur = ggml_reshape_2d(ctx, kqv, n_embd, n_pos);
 
         // output projection (+bias)

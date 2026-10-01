@@ -370,6 +370,7 @@ add_executable(test-image-prefix-roundtrip
     integration/test_image_prefix_roundtrip.cpp
 )
 target_link_libraries(test-image-prefix-roundtrip PRIVATE
+    qinf-snapshot
     qinf-orchestration
     qinf-image
     qinf-models
@@ -505,6 +506,20 @@ gtest_discover_tests(forward-pass-base-tests)
 # Qemmi-Lens pure computation (docs/plan-qemmi-lens.md P2) — compute_lens_report
 # / lens_report_to_json exercised with synthetic tap rows (no model). Compiles
 # server_lens.cpp directly; the driver half links the model/grammar libs.
+# The image verdict's model-free parts: table, wording, refusals, bands, JSON
+# (src/server/image_verdict.cpp, in qinf-server). The driver is gated against
+# the probe on the real model — docs/plan-image-verdict.md §7, G2.
+add_executable(image-verdict-tests
+    unit/test_image_verdict.cpp
+)
+target_link_libraries(image-verdict-tests PRIVATE
+    qinf-server
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
+)
+target_compile_features(image-verdict-tests PRIVATE cxx_std_17)
+gtest_discover_tests(image-verdict-tests)
+
 add_executable(server-lens-tests
     unit/test_server_lens.cpp
 )
@@ -1109,6 +1124,16 @@ target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main qinf-image)
 target_compile_features(image-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-loader-tests)
 
+# The chat loop's input rules (src/cli/chat_input.cpp compiled directly — the
+# cli builds an executable, not a lib). No model: pure stream logic.
+add_executable(chat-input-tests
+    unit/test_chat_input.cpp
+    ${CMAKE_SOURCE_DIR}/src/cli/chat_input.cpp
+)
+target_link_libraries(chat-input-tests PRIVATE GTest::gtest_main)
+target_compile_features(chat-input-tests PRIVATE cxx_std_17)
+gtest_discover_tests(chat-input-tests)
+
 # Per-slot rows-vs-positions bookkeeping on ForwardPassBase (pure arithmetic —
 # a stub recipe that only counts KV rows; no ggml graph, no model file).
 add_executable(rope-divergence-tests
@@ -1534,6 +1559,34 @@ target_link_libraries(probe-image-prefill-lens PRIVATE
     ggml
 )
 target_compile_features(probe-image-prefill-lens PRIVATE cxx_std_17)
+
+# VERDICT-IMG: the verdict readout (P(yes) vs P(no) off the prefill's last row)
+# on images, through the production prefill_multimodal path. Logits only, no
+# attention taps. Images: perf/probe_verdict_img_render.swift. COST mode
+# times image-once + per-question resume (capture/restore_slot).
+add_executable(probe-verdict-img
+    perf/probe_verdict_img.cpp
+)
+target_link_libraries(probe-verdict-img PRIVATE
+    qinf-server          # DRIVER mode: run_image_verdict (G2)
+    qinf-snapshot
+    qinf-orchestration
+    qinf-image
+    qinf-vision
+    qinf-models
+    qinf-loader
+    qinf-engine
+    ggml
+)
+target_compile_features(probe-verdict-img PRIVATE cxx_std_17)
+
+# ENCODER cost: one Qwen3-VL vision layer at a page's shape, dense vs
+# materialized attention vs flash attention (F32 / F16 K/V), on Metal.
+add_executable(bench-vit-layer
+    perf/bench_vit_layer.cpp
+)
+target_link_libraries(bench-vit-layer PRIVATE ggml)
+target_compile_features(bench-vit-layer PRIVATE cxx_std_17)
 
 # PR 4.1 investigation — per-stage MoE timing.
 # Disposable: once the breakdown identifies the right fusion shape, this binary
