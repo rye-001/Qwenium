@@ -136,6 +136,28 @@ TEST(ModelPartialLoad, EmbeddingLoadedHeadAndFinalNormAreNot) {
 }
 
 // ============================================================
+// Test: keep_output_head on a partial load keeps the final norm and the
+// output weight (a truncated server that reads logits after its last loaded
+// block — --lens-verdict) and still skips every block from max_blocks on.
+// ============================================================
+TEST(ModelPartialLoad, KeepOutputHeadLoadsHeadAndFinalNorm) {
+    SKIP_IF_NO_MODEL();
+
+    Model m;
+    m.load_metadata(get_qwen35_model_path());
+    ASSERT_GT(m.get_metadata().block_count, 3u);
+    m.load_tensors(/*max_blocks=*/3, /*keep_output_head=*/true);
+
+    EXPECT_NE(m.get_token_embedding_weight(), nullptr);
+    EXPECT_NE(m.get_output_norm_weight(), nullptr)
+        << "keep_output_head expected output_norm.weight on a partial load";
+    EXPECT_EQ(m.get_output_weight() != nullptr, m.get_metadata().tensor_inventory.count("output.weight") > 0)
+        << "keep_output_head expected output.weight exactly when the file carries one (tied models do not)";
+    for (uint32_t i = 3; i < m.get_metadata().block_count; ++i)
+        EXPECT_EQ(m.get_block(i).attn_norm_weight, nullptr) << "block " << i << " should NOT be loaded (>= 3)";
+}
+
+// ============================================================
 // Test: an ordinary full load (no max_blocks argument, i.e. the pre-existing
 // call shape) is unaffected -- every block loads, output_norm.weight loads.
 // Guards against the partial-load branch leaking into the default path.

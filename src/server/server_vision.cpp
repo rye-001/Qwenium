@@ -70,6 +70,7 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
         "ServerVision: parameter '--mmproj'");
 
     const std::string projector_tag = vprofile.projector_tag;
+    projector_tag_        = projector_tag;
     vencoder_             = std::move(vprofile.encoder);
     boi_id_               = vprofile.boi_id;
     eoi_id_               = vprofile.eoi_id;
@@ -103,23 +104,20 @@ ServerVision::ServerVision(Model& model, ForwardPassBase& forward_pass,
                 "(snapshot_kv_caches non-empty), actual: a recipe without L2 "
                 "snapshot support (" + model_label() + ")");
         // A 2-D image span writes nx*ny KV rows while advancing the position by
-        // only max(nx, ny). The snapshot blob records a row count and no rope
-        // coordinate, so such a slot cannot be round-tripped (plan §4 decision 3
-        // — VL sessions are non-snapshottable in v1). Two things go wrong without
-        // this: the V2 suffix prefill below computes its position as
-        // `start_pos + img_end_local`, which is ROWS, and a restored blob has no
-        // rope coordinate to restore. `capture_slot` refuses too, but only AFTER
-        // a full model load, mmproj load and ViT encode — and once per REQUEST,
-        // which on a server means a 500 per image instead of a refusal to start.
-        // Same refusal the CLI makes at setup (cli/chat.cpp).
+        // only max(nx, ny). Snapshots carry the rope coordinate since 2026-10-01
+        // (the RPOS section, docs/plan-image-verdict.md §4), but this V2 path
+        // still computes its suffix position as `start_pos + img_end_local`,
+        // which is ROWS — porting it to get_rope_pos is a separate decision.
+        // Refuse at setup rather than answer from the wrong positions. Same
+        // refusal the CLI makes at setup (cli/chat.cpp).
         if (img_recipe->image_span_is_2d())
             throw std::runtime_error(
                 "ServerVision: parameter '--image-prefix-cache': expected a "
                 "recipe whose image span advances one position per KV row, "
                 "actual: an M-RoPE recipe (" + model_label() + "), whose image "
-                "span occupies nx*ny rows but max(nx, ny) positions. The "
-                "snapshot format carries no rope coordinate, so VL sessions are "
-                "not prefix-cacheable in v1 — drop --image-prefix-cache");
+                "span occupies nx*ny rows but max(nx, ny) positions. This "
+                "image-prefix cache positions the question by KV rows, so it is "
+                "not M-RoPE-safe — drop --image-prefix-cache");
         image_prefix_lib_ = std::make_unique<PrefixLibrary>(
             image_prefix_cache_dir,
             qinf::snapshot::make_snapshot_header(
@@ -139,6 +137,15 @@ std::string ServerVision::model_label() const {
     const auto& m = model_.get_metadata();
     return "arch='" + m.architecture + "', name='" + m.model_name + "'";
 }
+
+qinf::vision::Bitmap ServerVision::prepare_image(const std::vector<uint8_t>& image_bytes) const {
+    if (image_bytes.empty())
+        throw std::runtime_error("ServerVision: parameter 'image': expected image file bytes, actual 0 bytes");
+    return qinf::image::load_image_to_bitmap_from_memory(image_bytes.data(), image_bytes.size(),
+                                                         preprocess_);
+}
+
+uint32_t ServerVision::projection_dim() const { return vmodel_->config().projection_dim; }
 
 int ServerVision::run_multimodal_prefill(int slot_id,
                                          const qinf::InferenceRequest& req,

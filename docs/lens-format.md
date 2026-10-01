@@ -655,7 +655,7 @@ spans) and stays `"one-shot"`, as does every other model. Reports with different
 byte-comparable — compare like with like, as for `config`.
 
 **`document_id` on `/v1/locate`** (2026-09-26, additive) — optional, a string
-of 1–256 characters naming the document for later requests. The first request
+of 1–256 bytes (UTF-8, not characters) naming the document for later requests. The first request
 with an id runs the document pass and keeps it in the server's RAM; a later
 request with the same id and the same document skips it and prefills only the
 instruction and keys. The report then carries **`prefix`**: `"cold"` (computed
@@ -671,9 +671,13 @@ reports across all five heads, key and question mode, up to ~8K tokens. At a
   question mode) is a plain miss and recomputes.
 * A document kept for a deeper head (e.g. `absent`, L19) serves a shallower one
   (`locate`, L11); the reverse is a miss that recomputes and keeps the deeper one.
-* **RAM only, never disk, never logged.** At most 4 documents per process,
-  least recently used dropped first; a document idle for 15 minutes is dropped
-  at the next `/v1/locate`. A kept 10K-token document costs ~674 MB.
+* **RAM only, never disk, never logged.** At most **4 entries** per process
+  by default (`--lens-kept-documents N` sets it),
+  least recently used dropped first, and an entry is per route, not per
+  document (see "The store" under the warm document below). An entry idle for
+  15 minutes is dropped at the next `/v1/extract`, `/v1/locate`, `/v1/verdict`
+  or `/v1/compare` call, with or without an id (`/v1/verify` does not check).
+  A kept 10K-token document costs ~674 MB.
 
 `POST /v1/locate` also takes an optional **`head`** (2026-09-20) — `"locate"`
 (default), `"choice"`, `"absent"`, `"score"` or `"inject"` (2026-09-24, see
@@ -937,13 +941,93 @@ POST /v1/verdict
   yes), long documents (at 4K–8K, German comparisons flipped to a false yes).
 * **Measured (Qwen3.8-9B Q4_K_M):** real CVs, 72 requirements, yes vs not-yes
   **100% / 100%** EN / DE, including the 12 comparisons attention failed.
-* **Where it is served:** the full `--attention-lens` server only.
-  `--lens-verify-only` and `--lens-locate-only` refuse it: they do not load the
-  output head. A model row without a measured verdict layer refuses it — today
-  every row but Qwen3.8-9B at Q4_K_M.
+* **Where it is served:** the full `--attention-lens` server, and a
+  `--lens-verify-only` server started with **`--lens-verdict`** (2026-09-27),
+  which also loads the output head (Qwen3.8-9B: +796 MB, no extra blocks — the
+  verdict reads after layer 27, inside the verify-only cut). Answers are
+  byte-identical to the full server's. A plain `--lens-verify-only` and
+  `--lens-locate-only` refuse it (404): they do not load the output head. A
+  model row without a measured verdict layer refuses it — today every row but
+  Qwen3.8-9B at Q4_K_M — and `--lens-verdict` refuses to start on such a row.
 * **`document_id`** keeps the document exactly as `/v1/locate` does (same
   store, same rules, `prefix` cold/warm): a verdict's document pass is locate's
   computed deeper, so it also serves a later `/v1/locate` on the same id.
+
+## The image verdict (`POST /v1/verdict` with `"image"`, 2026-10-01; docs/plan-image-verdict.md)
+
+**Not the lens** — same URL, its own concern: one page image and yes/no
+questions about **visible marks** (signed? stamped? a field filled?), per
+question `yes` / `no` / `unclear` read off the answer logits after one image
+pass. **No attention is read and there is no receipt** (image attention
+readouts are closed). Not for reading text or numbers off the image (items,
+prices, totals) — OCR → the text lens is the path for that.
+
+```json
+POST /v1/verdict
+{ "image": "data:image/jpeg;base64,...",
+  "questions": [
+    {"id": "sig",   "mark": "signature", "subject": "invoice", "box": "Approved by"},
+    {"id": "stamp", "mark": "stamp",     "subject": "invoice"},
+    {"id": "date",  "mark": "date",      "field": "'Date paid' field"},
+    {"id": "qr",    "question": "Is there a QR code on the page?"} ],
+  "image_id": "inv-77" }       // optional, 1..256 bytes: keep the image pass
+```
+
+```json
+{ "format_version": "qemmi-verdict-image/v1",
+  "model": "Qwen3.6-35B-A3B (UD-Q3_K_XL) + Qwen3.6 mmproj",
+  "image": {"tokens": 1530, "grid": [34, 45], "pass": "cold"},
+  "answers": [
+    {"id": "stamp", "answer": "unclear", "p": {"yes": 0.86, "no": 0.14},
+     "mark": "stamp", "question": "Does the invoice carry a stamp?",
+     "cut": {"yes": 1.0, "no": 0.5}, "calibrated": true, "prompt_len": 1561},
+    {"id": "qr", "answer": "no", "p": {"yes": 0.003, "no": 0.997},
+     "question": "Is there a QR code on the page?",
+     "cut": {"yes": 0.5, "no": 0.5}, "calibrated": false, "prompt_len": 1560} ] }
+```
+
+* **Calibrated marks** — the server words the question itself, exactly as it
+  was measured, so the mark's cut applies. Their params are the question's
+  other string members:
+
+  | mark | params | wording | cut yes / no |
+  |---|---|---|---|
+  | `signature` | `subject`, `box` | Is the {subject} signed by hand in the '{box}' box? | 0.5 / 0.5 |
+  | `stamp` | `subject` | Does the {subject} carry a stamp? | **1.0 / 0.5 — never `yes`** |
+  | `date` | `field` | Is the {field} filled in? | 0.5 / 0.5 |
+
+* **`answer`** = `yes` if p ≥ cut.yes, `no` if p < cut.no, else **`unclear`**.
+  **The stamp never answers `yes`** (2026-10-01): its yes-cut is 1.0, which
+  no p reaches — not even a saturated 1.0. A stamp answers **`no`** (nothing
+  stamp-like on the page) or **`unclear`** (something stamp-like: look). Why:
+  a badge the form prints in a stamp's shape (a ring around one word such as
+  "URGENT") and a stamp showing through from the back of the sheet score like
+  real stamps (up to 0.995), and no cut separates them
+  (`docs/note-stamp-lures.md`). No real stamp has scored below 0.5 (synthetic
+  ≥ 0.934, real paper ≥ 0.959), so **a stamp `no` is reliable**. Some
+  lookalikes (filled round logos, "RECEIVED"/"PAID" printed in colour) also
+  land in `unclear`. **Treat `unclear` as "look"**, not as no.
+* **Free questions** (`question`) are answered at 0.5 and marked
+  `"calibrated": false` — nothing was measured for their wording.
+* **Measured (Qwen3.6-35B-A3B UD-Q3_K_XL):** synthetic notes with lures and
+  degraded scans, a fresh stamp set, and 12 real phone photos of printed sheets
+  (pen and pencil marks): every calibrated mark right at its cut, 36/36 on real
+  paper — the stamp by a margin under 0.1. Printed stamps only (no rubber-stamp
+  ink was available).
+* **`image_id`** keeps the post-image state (4 images, least recently used
+  out, 15 minutes idle): a later request with the same id **and the same
+  image** skips the encode and the image pass — answers identical to cold.
+  The same id with another image is a 400. `image.pass` says `cold` / `warm`.
+* **Cost** (35B-A3B, one A4 photo, 1530 image tokens): cold 10.9 s for one
+  question, +0.2 s per extra question (10 questions 12.8 s); warm 0.32 s for
+  one, 2.4 s for ten.
+* **Where it is served:** a server started with `--mmproj` on a **full**
+  model with a measured calibration row — today only Qwen3.6-35B-A3B
+  UD-Q3_K_XL with its mmproj. `--attention-lens` is not needed. Anything else
+  is a 404 that says why (no `--mmproj`; an uncalibrated model, quantization or
+  projector; a truncated lens server); the startup log says the same.
+* With `"image"`, the members `document`, `document_id` and `language` are
+  refused (400). One image per request.
 
 ## Compare (`POST /v1/compare`, 2026-09-26; docs/plan-lens-compare.md)
 
@@ -962,7 +1046,7 @@ POST /v1/compare
 ```json
 { "format_version": "qemmi-lens/v4", "model": "...", "config": {...},
   "prefill": "split", "prefix": "cold", "validated_envelope": true,
-  "threshold": 0.5, "compare": {"layer": 15, "head": 1, "provenance": "..."},
+  "threshold": 0.35, "compare": {"layer": 15, "head": 1, "provenance": "..."},
   "prompt_len": 412,
   "units": [ {"index": 0, "coverage": 1.02, "missing": false,
               "restated_at": {"byte_lo": 0, "byte_hi": 29, "peak": 0.41}},
@@ -970,17 +1054,24 @@ POST /v1/compare
 ```
 
 * **`coverage`** is the unit's attention from the second version, relative to
-  the document's median unit (1.0 = typical). A ranking, **not a confidence**.
+  the mean of the document's best-covered quarter of units (1.0 = as covered
+  as the best units). A ranking, **not a confidence**. Until 2026-09-27 it was
+  relative to the median unit, which failed when more than half the units were
+  missing (a summary): the median was then itself a missing unit, and 35–49%
+  of drops went unflagged. It now holds while **at least a quarter** of the
+  original survives.
 * **`missing`** = `coverage < threshold`, the model's calibrated value.
 * **`restated_at`** — where in the second version the unit is attended from:
   the receipt for "covered". `null` for a missing unit.
 * **`validated_envelope`** is false when the original has fewer units than the
   gate's smallest (8) or the prompt is longer than its longest (9,762 tokens).
 * **`prefill`** is always `"split"`: the original's pass is materialized, never
-  flash — flash changed 6 of 31,807 flags at the gate.
-* **Measured** (Qwen3.8-9B Q4_K_M, threshold 0.50): translations with 0–2
-  sentences dropped, EN→DE 91.7% of drops flagged and 6.2% of complete copies
-  falsely flagged, DE→EN 97.9% / 0%; AbsenceBench numbers F1 82.9, poetry 77.0.
+  flash — flash changed 4–6 of 31,807 flags at the gates.
+* **Measured** (Qwen3.8-9B Q4_K_M, threshold 0.35, COMPARE3 + COMPAREGATE
+  2026-09-27): translations with 0–2 sentences dropped, 87.5–95.8% of drops
+  flagged and 0% of complete copies falsely flagged, both directions; with
+  50–75% dropped (summary-like), 95.6–98.1% flagged and 0% of kept units
+  flagged; AbsenceBench numbers F1 83.2, poetry 76.5.
 * **Not for repetitive text** — code diffs, tables of repeated values: a
   repeated line is always attended somewhere (AbsenceBench diffs: 8.3). For a
   word-for-word copy, a string diff is the right tool.
@@ -1006,11 +1097,36 @@ POST /v1/compare
 > (the old code ran cold instead). The measurements below predate the fix.
 
 A request may carry an optional `"document_id"`: an opaque caller-chosen handle
-saying *this is the same document I named last time*.
+of 1–256 bytes saying *this is the same document I named last time*. Accepted on `/v1/extract`,
+`/v1/locate` (split rows), `/v1/verdict` and `/v1/compare`. **`/v1/verify`
+refuses it with a 400** (2026-09-27; until then it was silently ignored):
+verify prefills its whole prompt in one pass, and reusing a kept document would
+split that pass, which has no drift gate on this route — accepting the member
+and running cold would imply a reuse that never happened.
 
 ```json
 { "document": "...", "document_id": "lease-4471", "key_vocabulary": [...] }
 ```
+
+**The store.** One per process, at most **4 entries** by default (the server
+flag `--lens-kept-documents N` sets it; the startup banner prints it), least recently used
+dropped first across all routes. An entry is keyed by **route and id**, with
+three routes: extract, locate (`/v1/verdict` shares it), and compare. So:
+
+* The same id on different routes never collides, and never meets the
+  different-bytes 400 across routes. That refusal is within one route only.
+* One document kept on extract, locate and compare fills **3 of the 4
+  entries**, about 0.7 GB each for a 10K-token document. A second document
+  kept the same way then evicts the first document's oldest entries.
+* **Users who take turns stay warm only while their entries fit.** With one
+  entry more than the size, every turn is cold (5 users on 4 entries: 0/15
+  warm, 6.8 s a turn; on 8 entries: all warm, 0.4 s). Size the store for the
+  number of documents in active use, not the number of requests.
+* An entry costs about 64 KB per document token plus ~48 MB of DeltaNet state
+  on Qwen3.8-9B (F32 KV): ~175 MB at 2K tokens, ~690 MB at 10K. The process
+  footprint grows by more than that (+3.2 GB for 8 entries at ~2K; not
+  explained yet, likely memory the allocator keeps from each capture's
+  temporary copies). Plan RAM on the footprint, not the entry size.
 
 Omit it and nothing changes — the payload is byte-identical to before this
 feature existed. Send it and, when the server still holds that document's

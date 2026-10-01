@@ -40,7 +40,9 @@ qinf::session::CompatHeader make_snapshot_header(
 
 // Capture slot `slot`'s KV (one AppendKV section per cache, in
 // snapshot_kv_caches() order) plus the authoritative OverwriteRecurrent state
-// (when the recipe has one), framed under `header`. Returns the manifest blob.
+// (when the recipe has one), plus — only for a slot whose rows and rope
+// positions diverged (an M-RoPE image span) — its rope coordinate as a last
+// RPOS section, framed under `header`. Returns the manifest blob.
 std::vector<uint8_t> capture_slot(ForwardPassBase& fp, uint32_t slot,
                                   const qinf::session::CompatHeader& header);
 
@@ -48,7 +50,8 @@ std::vector<uint8_t> capture_slot(ForwardPassBase& fp, uint32_t slot,
 // header against `expected` (throws fail-loud naming the first mismatched
 // field). Sections are built in the SAME order as capture_slot and matched
 // positionally by the manifest. After this the slot cursor is at the captured
-// span length; the caller resumes/prefills from there with NO feed_tokens /
+// span length and, for a blob carrying RPOS, get_rope_pos is the captured rope
+// position; the caller resumes/prefills from get_rope_pos with NO feed_tokens /
 // prefill of the captured span.
 void restore_slot(ForwardPassBase& fp, uint32_t slot,
                   const std::vector<uint8_t>& blob,

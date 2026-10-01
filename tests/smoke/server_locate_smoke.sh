@@ -34,7 +34,11 @@
 #                  gate caught that disagreement on its first real run).
 #   5. TOP_K     — top_k is honored as a CEILING on spans per key, and fewer is
 #                  a legitimate answer (nothing is padded to reach it).
-#   6. REFUSALS  — `messages` and `document_id` are 400s, not silent no-ops.
+#   6. REFUSALS  — `messages` is a 400, not a silent no-op. `document_id` (the
+#                  kept document, docs/note-lens-kept-document.md) follows the
+#                  row's prefill licence: on a split row a repeat is "warm" with
+#                  identical hits and the id reused for other bytes is a 400;
+#                  on a one-shot row the id itself is a 400.
 #   7. STABLE    — two identical locate calls return identical bytes.
 #   8. NO-POISON  — verify, then locate over a LONGER document, then the SAME
 #                  verify: the two reports must agree decision-for-decision and
@@ -50,7 +54,11 @@
 #                  protected. DeltaNet layers 4 and 6 wrote over it and every
 #                  later /v1/verify returned a confident FALSE receipt — negative
 #                  body_mass, four of seven badges flipped, no error raised, for
-#                  the life of the process.
+#                  the life of the process. Fixed first by a dedicated locate
+#                  scheduler; since 2026-09-27 by ForwardPassBase::
+#                  alloc_readback_graph (a memory plan per read-back pass), and
+#                  locate shares the main scheduler again — so this gate now
+#                  tests the fix on the very sharing that caused the defect.
 #
 #                  It reproduced ONLY under --lens-verify-only (the full server's
 #                  reserve_max_batch plants a large stable plan first), and the
@@ -226,15 +234,26 @@ check(not over3 and not over1, "top_k",
       "honored as a ceiling at both 3 and 1" if not (over3 or over1)
       else f"exceeded: top_k=3 {over3}, top_k=1 {over1}")
 
-# ── Gate 6: REFUSALS ─────────────────────────────────────────────────────────
+# ── Gate 6: REFUSALS, and the kept document by the row's licence ────────────
 _, e_msgs = post("/v1/locate", {"messages": ["a"], "key_vocabulary": KEYS})
-_, e_did  = post("/v1/locate", {"document": DOC, "key_vocabulary": KEYS,
-                                "document_id": "d1"})
-check(e_msgs is not None and e_msgs[0] == 400 and
-      e_did is not None and e_did[0] == 400, "refusals",
-      f"messages -> {e_msgs[0] if e_msgs else 'accepted'}, "
-      f"document_id -> {e_did[0] if e_did else 'accepted'} "
-      f"(both must be 400, never a silent no-op)")
+kd = {"document": DOC, "key_vocabulary": KEYS, "document_id": "smoke-kept-1"}
+cold, e_cold = post("/v1/locate", kd)
+if r.get("prefill") == "one-shot":
+    kept_ok = e_cold is not None and e_cold[0] == 400
+    kept_msg = f"one-shot row: document_id -> {e_cold[0] if e_cold else 'accepted'} (must be 400)"
+else:
+    warm, e_warm = post("/v1/locate", kd)
+    _, e_other = post("/v1/locate", {**kd, "document": DOC + " Extra line."})
+    kept_ok = (e_cold is None and e_warm is None and cold.get("prefix") == "cold"
+               and warm.get("prefix") == "warm" and cold["hits"] == warm["hits"]
+               and e_other is not None and e_other[0] == 400)
+    kept_msg = (f"{r.get('prefill')} row: document_id cold -> "
+                f"{cold.get('prefix') if cold else e_cold[0]}, repeat -> "
+                f"{warm.get('prefix') if warm else e_warm[0]}"
+                f"{', same hits' if cold and warm and cold['hits'] == warm['hits'] else ', hits DIFFER'}"
+                f", id reused for other bytes -> {e_other[0] if e_other else 'accepted'} (must be 400)")
+check(e_msgs is not None and e_msgs[0] == 400 and kept_ok, "refusals",
+      f"messages -> {e_msgs[0] if e_msgs else 'accepted'} (must be 400); {kept_msg}")
 
 # ── Gate 7: STABLE ───────────────────────────────────────────────────────────
 r2, e2 = post("/v1/locate", {"document": DOC, "key_vocabulary": KEYS, "top_k": 3})
@@ -258,8 +277,11 @@ if LOCATE_ONLY:
         check(err is not None and err[0] == 404, "locate-only-refusals",
               f"{ep} -> {err[0] if err else 200} (must be 404 on --lens-locate-only)")
     print("[no-poison] SKIPPED — needs /v1/verify, which --lens-locate-only refuses")
+    if fails:
+        print("=" * 16, "LOCATE SMOKE FAIL (locate-only): " + ", ".join(fails), "=" * 16)
+        sys.exit(1)
     print("=" * 16, "LOCATE SMOKE PASS (locate-only: 7 gates + refusals)", "=" * 16)
-    sys.exit(1 if fails else 0)
+    sys.exit(0)
 
 # The locate document must be LONGER than the verify one: galloc reuses a
 # cached plan when the new graph FITS, so a shorter locate cannot poison and a
@@ -289,8 +311,8 @@ v_after, e = post("/v1/verify", {"document": DOC, "key_vocabulary": KEYS,
                                  "extraction": EXTRACTION})
 if e:
     # The [0,1] guard in get_attention_taps turning a false receipt into a 400 is
-    # the backstop working, not the gate passing: the scheduler split is what is
-    # under test here, and a 400 means it is not in place.
+    # the backstop working, not the gate passing: alloc_readback_graph is what is
+    # under test here, and a 400 means it is not doing its job.
     print(f"[no-poison] FAIL — verify AFTER locate returned HTTP {e[0]}: {e[1][:300]}")
     fails.append("no-poison")
 else:

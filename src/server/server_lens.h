@@ -388,8 +388,9 @@ struct LensConstants {
     // ── Compare (POST /v1/compare, docs/plan-lens-compare.md) ───────────────
     // The head that reads a SECOND version's rows back onto the original's
     // units: a unit the second version covers is attended, a missing one is
-    // not. compare_threshold is the coverage (relative to the document's
-    // median unit) below which a unit is reported missing. -1 = never
+    // not. compare_threshold is the coverage (relative to the mean of the
+    // document's top quarter of units, lens_compare_baseline) below which a
+    // unit is reported missing. -1 = never
     // measured ⇒ /v1/compare is refused. Per model AND quant; appended LAST
     // (positional aggregates).
     int         compare_layer = -1;
@@ -707,20 +708,25 @@ inline LensConstants qwen38_9b_q4km_constants() {
     // every lens server's cut. Q4_K_M only — COMPARE2 ran on no other quant.
     k.compare_layer = 15;
     k.compare_head = 1;
-    k.compare_threshold = 0.50;
+    // Coverage relative to the top-quarter mean (lens_compare_baseline) since
+    // 2026-09-27 — COMPARE3; the median-relative 0.50 missed 35-49% of drops
+    // when most of an original was missing.
+    k.compare_threshold = 0.35;
     // The smallest original COMPARE2/COMPAREGATE gated (translation, 8
     // sentences) and the longest prompt it passed at (AbsenceBench numbers).
     k.compare_min_units = 8;
     k.compare_envelope_tokens = 9762;
     k.compare_provenance =
-        "COMPARE2 + COMPAREGATE 2026-09-26 (tests/perf/attn_provenance.cpp; docs/plan-lens-compare.md). "
+        "COMPARE2 + COMPARE3 + COMPAREGATE 2026-09-26/27 (tests/perf/attn_provenance.cpp; docs/plan-lens-compare.md). "
         "Generic compare instruction, original one unit per line, coverage = mean over the unit's tokens "
-        "of the max attention from the second version, relative to the median unit; missing below 0.50 "
-        "(chosen independently on translation 0.47 / 0.52 and AbsenceBench 0.43 / 0.50). Translation, "
-        "EN/DE notes of 8+ sentences, 0-2 sentences dropped: EN->DE 91.7% of drops flagged, 6.2% of "
-        "complete copies with a false flag; DE->EN 97.9% / 0.0%. AbsenceBench (external, 100 eval rows "
-        "each): numbers micro-F1 82.9, poetry 77.0; code diffs 8.3 — NOT for repetitive text. The "
-        "original's pass stays materialized: flash changed 6 of 31807 flags. Q4_K_M ONLY.";
+        "of the max attention from the second version, relative to the mean of the best-covered quarter "
+        "of units; missing below 0.35. Chosen on COMPARE3 trials and confirmed on fresh ones (pre-registered): "
+        "normal (0-2 of 8+ sentences dropped) 87.5-95.8% of drops flagged, 0% of complete copies falsely "
+        "flagged; heavy (50-75% dropped, as a summary) 95.6-98.1% flagged, 0% of kept units flagged — the "
+        "median-relative 0.50 it replaces caught 51-65% there. COMPAREGATE at 0.35: translation DE->EN "
+        "95.8% / 0.0%, EN->DE 87.5% / 0.0%; AbsenceBench (100 eval rows each) numbers micro-F1 83.2, poetry "
+        "76.5; code diffs 8.3 — NOT for repetitive text. Needs at least a quarter of the original to "
+        "survive. The original's pass stays materialized: flash changed 4 of 31807 flags. Q4_K_M ONLY.";
     return k;
 }
 
@@ -1737,16 +1743,19 @@ std::string lens_locate_to_json(const LensLocateReport& r);
 //
 // Personal data (a CV is the motivating document): RAM only — never written to
 // disk, never logged. Dropped when idle past the TTL (checked on every
-// /v1/locate call, so an idle server holds its last documents until the next
-// call) and least-recently-used first beyond the size cap.
+// extract, locate, verdict and compare call, with or without an id — not on
+// verify — so an idle server holds its last documents until the next such
+// call) and least-recently-used first beyond the size cap. The cap counts ENTRIES, not documents: one document kept on
+// extract, locate and compare fills three.
 //
-// Both lens routes that read a document keep it here (2026-09-26): /v1/locate
-// (above) and /v1/extract, whose older mechanism — rewind slot 0's position,
-// never a snapshot — was NOT warm == cold on a DeltaNet hybrid, because a
-// position rewind cannot rewind recurrent state (EXTWARM). Entries are keyed
-// per ROUTE as well as id: the two routes compute their document pass
+// Every lens route that reads a document keeps it here: /v1/locate (above),
+// /v1/verdict (on the Locate route, computed deeper), /v1/compare (the
+// original), and /v1/extract, whose older mechanism — rewind slot 0's
+// position, never a snapshot — was NOT warm == cold on a DeltaNet hybrid,
+// because a position rewind cannot rewind recurrent state (EXTWARM). Entries
+// are keyed per ROUTE as well as id: the routes compute their document pass
 // differently (truncated tapped graph vs a full run_prefill), so one never
-// serves the other.
+// serves another.
 //
 // Not thread-safe: the one caller holds model_mutex_, as every lens route does.
 enum class LensKeptRoute { Locate, Extract, Compare };
@@ -1755,6 +1764,7 @@ enum class LensKeptRoute { Locate, Extract, Compare };
 // FNV-1a over the document bytes. Chooses 400 vs miss; never decides a hit.
 uint64_t lens_document_hash(const std::string& document);
 
+// The DEFAULT size; --lens-kept-documents overrides it per process.
 inline constexpr size_t kLensDocumentStoreMax = 4;
 inline constexpr std::chrono::seconds kLensDocumentStoreTtl{15 * 60};
 
@@ -1909,11 +1919,11 @@ LensVerdictReport run_lens_verdict(ForwardPassBase* fp, ggml_backend_sched_t sch
 // (COMPARE2: EN<->DE translation, 92-98% of dropped sentences flagged, 0-6% of
 // complete copies falsely flagged; AbsenceBench poetry 78.0, numbers 82.9).
 // NOT for repetitive text (code diffs: AbsenceBench 8.3) — a repeated line is
-// always attended somewhere. `coverage` is a ranking relative to the
-// document's median unit, not a confidence.
+// always attended somewhere. `coverage` is a ranking relative to the mean of
+// the document's best-covered quarter of units, not a confidence.
 struct LensCompareUnit {
     int    index = 0;          // the caller's unit index
-    double coverage = 0.0;     // relative to the median unit (1.0 = typical)
+    double coverage = 0.0;     // relative to the top-quarter mean (1.0 = as covered as the best units)
     bool   missing = false;    // coverage < compare_threshold
     bool   restated = false;   // false ⇒ no receipt (missing units)
     LensLocateHit restated_at; // where in the second version it is attended from
@@ -1933,6 +1943,16 @@ struct LensCompareReport {
 
 // The user message the route builds — COMPARE2's generic prompt, units one per
 // line. Exposed so the gate probes send the SAME text the route ships.
+// The baseline a unit's coverage is divided by: the mean of the highest
+// ceil(n/4) raw coverages. Not the median (until 2026-09-27): when more than
+// half the units are missing the median IS a missing unit and the other
+// missing ones read ~1.0 — a summary, which drops most of an original, caught
+// 51-65% of its drops (COMPARE3). The top quarter stays on covered units while
+// at least a quarter of the original survives, and a mean over it is not
+// moved by one verbatim-copied unit the way the max is. Fail-loud on an empty
+// or non-finite input.
+double lens_compare_baseline(const std::vector<double>& raw);
+
 std::string lens_compare_user_text(const std::vector<std::string>& original_units,
                                    const std::string& revised);
 std::string lens_compare_to_json(const LensCompareReport& r);

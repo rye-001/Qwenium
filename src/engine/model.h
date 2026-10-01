@@ -202,7 +202,12 @@ public:
     // tensor regardless of max_blocks, so a partial request without a Metal
     // backend is refused fail-loud rather than silently loading (and paying
     // for) the full model while claiming a saving that did not happen.
-    void load_tensors(uint32_t max_blocks = UINT32_MAX);
+    //
+    // `keep_output_head` (default false): on a partial load, also load
+    // output_norm.weight and output.weight (when the file has one; a tied model
+    // reads token_embd), so logits can be read after the last loaded block —
+    // --lens-verdict on a --lens-verify-only server. No effect on a full load.
+    void load_tensors(uint32_t max_blocks = UINT32_MAX, bool keep_output_head = false);
 
     // Opt-in: back the weights buffer with the GGUF's mmap'd pages
     // (ggml_backend_dev_buffer_from_host_ptr) instead of allocating a fresh

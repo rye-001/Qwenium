@@ -97,7 +97,7 @@ public:
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         if (routing_capture_) mark_moe_routing(gf);   // before alloc, like the taps
-        ggml_backend_sched_alloc_graph(scheduler, gf);
+        alloc_readback_graph(scheduler, gf);           // plain alloc unless capture marked
         set_prefill_inputs(gf, tokens, pos);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(scheduler, gf), "run_prefill");
@@ -143,9 +143,9 @@ public:
     // is every recipe and every text path — byte-identical, no new bookkeeping.
     //
     // KNOWN LIMIT: a slot truncated back *into* or *before* an image span keeps
-    // the stale delta. The prefix-cache / snapshot paths must carry the rope
-    // coordinate to be VL-safe (docs/plan-qwen35-vision-impl.md §3.2, §4
-    // decision 3); until they do, VL sessions are single-turn-safe only.
+    // the stale delta. Snapshots carry the coordinate (the RPOS section,
+    // session/slot_snapshot.cpp, 2026-10-01 — docs/plan-image-verdict.md §4);
+    // the prefix caches still refuse M-RoPE image turns at setup.
     int32_t get_rope_pos(uint32_t slot) const {
         const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
         const RopeDivergence* rec = live_rope_record(slot);
@@ -176,9 +176,9 @@ public:
     }
 
     // True when this slot's rows and rope positions have diverged — i.e. it has
-    // hosted an image span. Snapshot / prefix-cache paths ask before persisting
-    // or restoring: the blob format carries a row count and no rope coordinate,
-    // so a diverged slot cannot be round-tripped faithfully (plan §4 decision 3).
+    // hosted an image span. capture_slot asks, to append the RPOS section that
+    // carries the rope coordinate (session/slot_snapshot.cpp); the image-prefix
+    // caches refuse M-RoPE recipes at setup (they place the question by rows).
     bool has_rope_divergence(uint32_t slot) const {
         return live_rope_record(slot) != nullptr;
     }
@@ -186,6 +186,34 @@ public:
     // Drop a slot's divergence record explicitly. get_rope_pos also self-heals
     // (see above), so this is belt-and-braces for callers that clear a slot.
     void reset_rope_pos(uint32_t slot) { rope_row_delta_.erase(slot); }
+
+    // The slot's live divergence record, for the snapshot's RPOS section
+    // (session/slot_snapshot.cpp — the one consumer). False when the slot has
+    // not diverged, i.e. every text slot and every Gemma image slot.
+    bool rope_record(uint32_t slot, int32_t& delta, int32_t& rows_after) const {
+        const RopeDivergence* rec = live_rope_record(slot);
+        if (!rec) return false;
+        delta = rec->delta;
+        rows_after = rec->rows_after;
+        return true;
+    }
+
+    // Re-install a record on restore, AFTER the slot's rows are back: a record
+    // past the slot's row count would be stale on its first read, and a
+    // non-positive delta is not a divergence. Fail-loud on either.
+    void set_rope_record(uint32_t slot, int32_t delta, int32_t rows_after) {
+        if (delta <= 0)
+            throw std::runtime_error(
+                "set_rope_record: slot '" + std::to_string(slot) +
+                "' delta: expected > 0, got: " + std::to_string(delta));
+        const int32_t rows = static_cast<int32_t>(get_cache_pos(slot));
+        if (rows_after > rows || rows_after < delta)
+            throw std::runtime_error(
+                "set_rope_record: slot '" + std::to_string(slot) +
+                "' rows_after: expected within [delta=" + std::to_string(delta) +
+                ", rows=" + std::to_string(rows) + "], got: " + std::to_string(rows_after));
+        rope_row_delta_[slot] = RopeDivergence{delta, rows_after};
+    }
 
     void feed_tokens(const std::vector<int32_t>& tokens, uint32_t slot,
                      ggml_backend_sched_t scheduler, int pos_override = -1) {
@@ -204,7 +232,7 @@ public:
         ggml_cgraph* gf =
             build_prefill_graph(tokens, pos, slot, /*want_logits=*/false);
         if (routing_capture_) mark_moe_routing(gf);
-        ggml_backend_sched_alloc_graph(scheduler, gf);
+        alloc_readback_graph(scheduler, gf);           // plain alloc unless capture marked
         set_prefill_inputs(gf, tokens, pos);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(scheduler, gf), "feed_tokens");
@@ -341,10 +369,12 @@ public:
     // tap-off byte-identity gate holds.
     //
     // Usage mirrors the QDOCS probe sequence, caller-driven so no recipe method
-    // changes: build_decoding_graph(...) → mark_attention_taps(gf) → alloc →
-    // set_decode_inputs → compute → get_attention_taps(gf). Marking must happen
-    // after build and before graph alloc (galloc would otherwise reuse the
-    // buffer). Single query token per call (decode); the row is [n_kv, n_head].
+    // changes: build_decoding_graph(...) → mark_attention_taps(gf) →
+    // alloc_readback_graph(sched, gf) → set_decode_inputs → compute →
+    // get_attention_taps(gf). Marking must happen after build and before graph
+    // alloc (galloc would otherwise reuse the buffer), and the alloc must be
+    // alloc_readback_graph (see there). Single query token per call (decode); the
+    // row is [n_kv, n_head].
     //
     // ── Prefill shape (teacher-forced verification, plan-lens-server-shape.md
     //    §3.4) ─────────────────────────────────────────────────────────────
@@ -398,6 +428,35 @@ public:
     // repeated head.
     void mark_attention_taps(ggml_cgraph* gf);
 
+    // Allocate a graph whose intermediates are READ BACK after compute — the
+    // attention taps (mark_attention_taps) and MoE routing capture
+    // (mark_moe_routing) — with a memory plan made for THIS graph. Every such
+    // graph allocates through here, after its marks and before set_*_inputs;
+    // get_attention_taps and read_moe_routing refuse a graph that did not
+    // (fail-loud, naming the state they found).
+    //
+    // Why a plain ggml_backend_sched_alloc_graph is not enough:
+    // ggml_gallocr_needs_realloc reuses the previous plan whenever the node
+    // count matches and every node fits, and never compares output flags. A
+    // tapped graph shaped like an earlier one on the same scheduler (same
+    // truncation and head count, a different tapped layer; or a full tap after
+    // an untapped pass) inherits a plan in which its tap is ordinary scratch,
+    // recycled by a later layer. When that later layer is another kq_soft —
+    // same size, also within [0, 1] — get_attention_taps' range check cannot
+    // see it: a silent wrong receipt (measured 2026-09-27 on qwen35 and qwen3;
+    // gemma3/gemma4 tripped the range check instead —
+    // SameShapeDifferentTapLayerGetsItsOwnPlan). The cached plan is replaced by
+    // one for a one-node graph first, so this graph's alloc must plan afresh
+    // from its own output flags (the .cpp says why not reserve(gf) + alloc(gf)).
+    // Routing capture has the same hazard: mark_moe_routing only flags nodes
+    // the graph already has, so a captured prefill after a longer uncaptured
+    // one of the same shape recorded the wrong experts in 40 of 40 layers on
+    // Qwen3.6-35B-A3B and 29 of 30 on gemma-4-26B-A4B, silently
+    // (RoutingCaptureAfterSameShapePassGetsItsOwnPlan). With nothing marked
+    // this is the plain reset + alloc, so a call site whose taps or capture are
+    // optional can use it always.
+    void alloc_readback_graph(ggml_backend_sched_t sched, ggml_cgraph* gf);
+
     // ── Routing capture / replay (MoE only) ──────────────────────────────
     //
     // Same build -> mark -> alloc -> compute -> read ordering as the attention
@@ -410,7 +469,9 @@ public:
     // be chunked and decode arrives one row at a time.
     void mark_moe_routing(ggml_cgraph* gf);
     // Returns the number of MoE layers captured. ZERO means this recipe is
-    // dense — a legitimate answer, not an error.
+    // dense — a legitimate answer, not an error. A graph that HAS routing must
+    // have been marked and allocated through alloc_readback_graph, else this
+    // throws; one read per graph.
     int  read_moe_routing(ggml_cgraph* gf, RoutingTrace& trace, int pos);
 
     // CAPTURE, as a standing mode rather than a per-call-site chore. Borrowed;
@@ -431,8 +492,9 @@ public:
     void set_routing_replay(const RoutingTrace* trace) { policy_.routing_replay = trace; }
     const RoutingTrace* routing_replay() const { return policy_.routing_replay; }
     // Read the marked rows back after compute. Result[i] corresponds to
-    // attention_taps()[i]. Fail-loud if a tap tensor is missing (the caller
-    // forgot mark_attention_taps before alloc).
+    // attention_taps()[i]. Fail-loud if the graph was not marked and allocated
+    // through alloc_readback_graph, or a tap tensor is missing. Reading consumes
+    // the plan state: one read per tapped graph.
     std::vector<AttentionTap> get_attention_taps(ggml_cgraph* gf);
 
     // ── Prefill truncation: opt-in, default-off (docs/plan-lens-server-shape.md
@@ -754,4 +816,16 @@ protected:
     // the byte-reproducible path; --persistent-graph is the only thing that sets
     // kv_write_mode and decode_kv_bucket, and it sets them together.
     DecodePolicy policy_;
+
+    // Where the current read-back graph is in mark → alloc_readback_graph →
+    // read, one state per reader. mark_* sets Marked (for its graph),
+    // alloc_readback_graph moves Marked → Planned, the reader
+    // (get_attention_taps / read_moe_routing) requires Planned and resets to
+    // None. A reader whose graph was allocated any other way therefore fails
+    // loud instead of reading a plan made for another graph.
+    enum class ReadbackPlan { None, Marked, Planned };
+    ReadbackPlan tap_plan_ = ReadbackPlan::None;
+    const ggml_cgraph* tap_plan_graph_ = nullptr;
+    ReadbackPlan route_plan_ = ReadbackPlan::None;
+    const ggml_cgraph* route_plan_graph_ = nullptr;
 };

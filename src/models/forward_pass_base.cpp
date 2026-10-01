@@ -266,6 +266,8 @@ std::vector<float> ForwardPassBase::get_output_hidden(ggml_cgraph* gf) {
 // recipe; marking an existing node as an output adds no compute, so the tap-off
 // path (empty layer set → this is a no-op) is byte-identical to today.
 void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
+    tap_plan_ = ReadbackPlan::None;
+    tap_plan_graph_ = nullptr;
     const std::vector<int>& heads = policy_.attention_tap_heads;
     for (int il : policy_.attention_taps) {
         std::string nm = "kq_soft." + std::to_string(il);
@@ -311,6 +313,54 @@ void ForwardPassBase::mark_attention_taps(ggml_cgraph* gf) {
             ggml_build_forward_expand(gf, sel);
         }
     }
+    if (!policy_.attention_taps.empty()) {
+        tap_plan_ = ReadbackPlan::Marked;
+        tap_plan_graph_ = gf;
+    }
+}
+
+// A memory plan made for THIS tapped graph — see the header for why a plain
+// ggml_backend_sched_alloc_graph can hand a tapped graph another graph's plan.
+//
+// How: first reserve a one-node graph, which replaces the scheduler's cached
+// plan (and never shrinks its buffers — galloc only grows them); the tapped
+// graph's node count then differs from the cached plan, so its ONE alloc makes
+// a fresh plan from its own output flags. Not ggml_backend_sched_reserve(gf)
+// followed by alloc(gf): each of those splits `gf`, and the split rewrites
+// node->src[j] to per-backend input copies living in the scheduler's split
+// context, which the second split frees — the graph then computes from stale
+// copies (measured: TapOffByteIdentical logits off by up to 23 on every
+// recipe). The one-node graph is built and freed per call, so the same
+// rewrite can never leave a stale pointer behind in it.
+void ForwardPassBase::alloc_readback_graph(ggml_backend_sched_t sched, ggml_cgraph* gf) {
+    ggml_backend_sched_reset(sched);
+    // What was MARKED on this graph decides, not what is armed: a caller may
+    // prefill untapped with taps armed for its next decode (run_prefill does
+    // not read taps). A reader whose graph was not marked and planned here is
+    // refused at the read, which is where a wrong plan would do harm.
+    const bool taps  = tap_plan_ == ReadbackPlan::Marked && tap_plan_graph_ == gf;
+    const bool route = route_plan_ == ReadbackPlan::Marked && route_plan_graph_ == gf;
+    if (!taps && !route) {
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            throw std::runtime_error("alloc_readback_graph: graph alloc expected to succeed, actual failure (nothing marked)");
+        return;
+    }
+    {
+        ggml_init_params ip = {ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(4, false),
+                               nullptr, /*no_alloc=*/true};
+        ggml_context* ctx = ggml_init(ip);
+        if (!ctx) throw std::runtime_error("alloc_readback_graph: a context for the one-node plan expected, actual null");
+        ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_cgraph* one = ggml_new_graph_custom(ctx, 4, false);
+        ggml_build_forward_expand(one, ggml_scale(ctx, a, 1.0f));
+        const bool ok = ggml_backend_sched_reserve(sched, one);   // ends with a sched reset
+        ggml_free(ctx);
+        if (!ok) throw std::runtime_error("alloc_readback_graph: reserving the one-node plan expected to succeed, actual failure");
+    }
+    if (!ggml_backend_sched_alloc_graph(sched, gf))
+        throw std::runtime_error("alloc_readback_graph: graph alloc on a fresh plan expected to succeed, actual failure");
+    if (taps)  tap_plan_ = ReadbackPlan::Planned;
+    if (route) route_plan_ = ReadbackPlan::Planned;
 }
 
 void ForwardPassBase::add_routing_replay_input() {
@@ -319,6 +369,9 @@ void ForwardPassBase::add_routing_replay_input() {
 }
 
 void ForwardPassBase::mark_moe_routing(ggml_cgraph* gf) {
+    route_plan_ = ReadbackPlan::None;
+    route_plan_graph_ = nullptr;
+    int marked = 0;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor* t = ggml_graph_node(gf, i);
         if (std::string(ggml_get_name(t)).rfind("moe_idx.", 0) != 0) continue;
@@ -330,10 +383,31 @@ void ForwardPassBase::mark_moe_routing(ggml_cgraph* gf) {
         ggml_tensor* src = t->view_src ? t->view_src : t;
         ggml_set_output(src);
         ggml_build_forward_expand(gf, src);
+        ++marked;
+    }
+    // A dense graph marks nothing and stays on the plain alloc path.
+    if (marked > 0) {
+        route_plan_ = ReadbackPlan::Marked;
+        route_plan_graph_ = gf;
     }
 }
 
 int ForwardPassBase::read_moe_routing(ggml_cgraph* gf, RoutingTrace& trace, int pos) {
+    bool has_routing = false;
+    for (int i = 0; i < ggml_graph_n_nodes(gf) && !has_routing; ++i)
+        has_routing = std::string(ggml_get_name(ggml_graph_node(gf, i))).rfind("moe_idx.", 0) == 0;
+    if (has_routing) {
+        if (route_plan_ != ReadbackPlan::Planned || route_plan_graph_ != gf)
+            throw std::runtime_error(
+                std::string("read_moe_routing: expected a graph marked with mark_moe_routing(gf) and "
+                            "allocated with alloc_readback_graph(sched, gf), actual ") +
+                (route_plan_ == ReadbackPlan::Marked && route_plan_graph_ == gf
+                     ? "marked but allocated some other way"
+                     : "a graph that was not marked for this read") +
+                " — on a reused ggml memory plan moe_idx can hold another tensor's bytes.");
+        route_plan_ = ReadbackPlan::None;
+        route_plan_graph_ = nullptr;
+    }
     int found = 0;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor* t = ggml_graph_node(gf, i);
@@ -361,6 +435,18 @@ int ForwardPassBase::read_moe_routing(ggml_cgraph* gf, RoutingTrace& trace, int 
 
 std::vector<ForwardPassBase::AttentionTap>
 ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
+    if (!policy_.attention_taps.empty()) {
+        if (tap_plan_ != ReadbackPlan::Planned || tap_plan_graph_ != gf)
+            throw std::runtime_error(
+                std::string("get_attention_taps: expected a graph marked with mark_attention_taps(gf) and "
+                            "allocated with alloc_readback_graph(sched, gf), actual ") +
+                (tap_plan_ == ReadbackPlan::Marked && tap_plan_graph_ == gf
+                     ? "marked but allocated some other way"
+                     : "a graph that was not marked for this read") +
+                " — on a reused ggml memory plan the tap can hold another layer's attention.");
+        tap_plan_ = ReadbackPlan::None;
+        tap_plan_graph_ = nullptr;
+    }
     std::vector<AttentionTap> out;
     out.reserve(policy_.attention_taps.size());
     const std::vector<int>& heads = policy_.attention_tap_heads;
@@ -442,10 +528,9 @@ ForwardPassBase::get_attention_taps(ggml_cgraph* gf) {
                 std::to_string(tap.rows.size()) + " (shape [" +
                 std::to_string(tap.n_kv) + "," + std::to_string(tap.n_q) + "," +
                 std::to_string(tap.n_head) + "]) — these bytes are not this "
-                "pass's attention. The graph reused the tap's memory: a "
-                "previously allocated graph on this scheduler had a different "
-                "set of tapped layers, so galloc's cached plan does not protect "
-                "this one. Give the differing pass its own scheduler.");
+                "pass's attention: the tap's memory was overwritten during the "
+                "pass although alloc_readback_graph planned it for this graph. A "
+                "backstop — report it; do not work around it.");
         }
         out.push_back(std::move(tap));
     }

@@ -2997,9 +2997,26 @@ TEST(LensCompareRefusal, BadRequestsAreRefusedBeforeAnyEngineWork) {
         return run_lens_compare(nullptr, nullptr, nullptr, ModelMetadata{}, 4096, units, revised, k,
                                 LensPrefillShape::Split);
     };
-    EXPECT_THROW(call({"only one"}, "x"), std::runtime_error) << "coverage is relative to a median";
+    EXPECT_THROW(call({"only one"}, "x"), std::runtime_error) << "coverage is relative to the best-covered units";
     EXPECT_THROW(call({"a", "  "}, "x"), std::runtime_error);
     EXPECT_THROW(call({"a", "b"}, " \n"), std::runtime_error);
+}
+
+// The baseline is the mean of the top ceil(n/4) raw coverages, so it stays on
+// COVERED units when most of the original is missing — the case the median
+// failed (COMPARE3: a summary's drops were caught 51-65% of the time).
+TEST(LensCompareBaseline, TopQuarterMeanStaysOnCoveredUnits) {
+    // 8 units, 6 missing: the median is a missing unit, the top quarter is not.
+    const std::vector<double> raw = {0.90, 1.00, 0.05, 0.04, 0.06, 0.03, 0.02, 0.05};
+    EXPECT_DOUBLE_EQ(lens_compare_baseline(raw), (0.90 + 1.00) / 2.0);
+    // ceil(n/4): 1 unit of 3, 2 of 5, 2 of 8, 3 of 9.
+    EXPECT_DOUBLE_EQ(lens_compare_baseline({1.0, 2.0, 3.0}), 3.0);
+    EXPECT_DOUBLE_EQ(lens_compare_baseline({1.0, 2.0, 3.0, 4.0, 5.0}), 4.5);
+    EXPECT_DOUBLE_EQ(lens_compare_baseline({1, 2, 3, 4, 5, 6, 7, 8, 9}), 8.0);
+    // Order does not matter; an all-zero document does not divide by zero.
+    EXPECT_DOUBLE_EQ(lens_compare_baseline({5.0, 1.0, 4.0, 2.0}), 5.0);
+    EXPECT_GT(lens_compare_baseline({0.0, 0.0}), 0.0);
+    EXPECT_THROW(lens_compare_baseline({}), std::runtime_error);
 }
 
 TEST(LensCompareWire, UserTextPutsOneUnitPerLineBeforeTheSecondVersion) {

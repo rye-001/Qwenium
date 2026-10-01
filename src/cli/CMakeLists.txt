@@ -2,6 +2,7 @@
 add_executable(qwenium-cli
     complete.cpp
     chat.cpp
+    chat_input.cpp
     main.cpp
     session_mode.cpp
 )

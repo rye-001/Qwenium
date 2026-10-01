@@ -102,6 +102,11 @@ docs/demo
 !docs/note-lens-verdict-route.md
 !docs/note-lens-prefill-speed.md
 !docs/plan-lens-compare.md
+!docs/note-lens-compare-and-probe-d.md
+!docs/note-lens-concurrency.md
+!docs/note-verdict-img-probe.md
+!docs/note-stamp-lures.md
+!docs/plan-image-verdict.md
 !docs/img-lens-probe-figs
 !docs/img-lens-probe-figs/*.png
 *.jpg

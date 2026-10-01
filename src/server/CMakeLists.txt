@@ -55,6 +55,7 @@ target_link_libraries(inference_server INTERFACE
 add_library(qinf-server STATIC
     server_lens.cpp
     image_data_uri.cpp
+    image_verdict.cpp   # /v1/verdict with an image (docs/plan-image-verdict.md) — not the lens
 )
 
 target_include_directories(qinf-server PUBLIC
@@ -65,6 +66,8 @@ target_include_directories(qinf-server PUBLIC
 target_link_libraries(qinf-server PUBLIC
     qinf-models
     qinf-snapshot   # /v1/locate's kept document (LensDocumentStore): capture/restore of slot 0
+    qinf-orchestration   # image_verdict: prefill_multimodal
+    qinf-image           # image_verdict: expand_image_markers
     sampling
     nlohmann_json::nlohmann_json
     ggml

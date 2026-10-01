@@ -49,6 +49,7 @@
 #include "engine/model.h"
 #include "../../src/models/model_registry.h"
 #include "../../src/models/forward_pass_base.h"
+#include "../../src/models/graph_arena.h"
 #include "../../src/loader/tokenizer.h"
 #include "../../src/sampling/prompt_lookup.h"   // DP1: shipped PLD, called not reimplemented
 #include "../../src/sampling/grammar_vocab.h"   // Qemmi-Docs leg A: the fixed KV grammar
@@ -3717,8 +3718,7 @@ static int run_locate_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "LOCHEAD");
@@ -4131,8 +4131,7 @@ static int run_locate_absence(ForwardPassBase* fp, ggml_backend_sched_t sched,
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "LOCABSENT");
@@ -4426,8 +4425,7 @@ static int run_absent_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
             {
                 ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
                 fp->mark_attention_taps(gf);
-                ggml_backend_sched_reset(sched);
-                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->alloc_readback_graph(sched, gf);
                 fp->set_prefill_inputs(gf, ptoks, 0);
                 qinf::engine::require_compute_success(
                     ggml_backend_sched_graph_compute(sched, gf), "ABSENTHEAD");
@@ -4953,8 +4951,7 @@ static int run_decide_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
                 {
                     ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
                     fp->mark_attention_taps(gf);
-                    ggml_backend_sched_reset(sched);
-                    ggml_backend_sched_alloc_graph(sched, gf);
+                    fp->alloc_readback_graph(sched, gf);
                     fp->set_prefill_inputs(gf, ptoks, 0);
                     qinf::engine::require_compute_success(
                         ggml_backend_sched_graph_compute(sched, gf), "DECIDEHEAD");
@@ -5368,8 +5365,7 @@ static int run_injection_head_search(ForwardPassBase* fp, ggml_backend_sched_t s
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "INJHEAD");
@@ -5778,8 +5774,7 @@ static int run_injection_hard(ForwardPassBase* fp, ggml_backend_sched_t sched,
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "INJHARD");
@@ -6264,8 +6259,7 @@ static int run_search_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(
                 ggml_backend_sched_graph_compute(sched, gf), "SEARCHHEAD");
@@ -6681,8 +6675,7 @@ static int run_compare_head_search(ForwardPassBase* fp, ggml_backend_sched_t sch
             {
                 ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
                 fp->mark_attention_taps(gf);
-                ggml_backend_sched_reset(sched);
-                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->alloc_readback_graph(sched, gf);
                 fp->set_prefill_inputs(gf, ptoks, 0);
                 qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "COMPAREHEAD");
                 tp = fp->get_attention_taps(gf);
@@ -6913,8 +6906,7 @@ static int run_compare_hard(ForwardPassBase* fp, ggml_backend_sched_t sched,
         {
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "COMPAREHARD");
             tp = fp->get_attention_taps(gf);
@@ -7241,8 +7233,7 @@ static int run_bind_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
                 {
                     ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
                     fp->mark_attention_taps(gf);
-                    ggml_backend_sched_reset(sched);
-                    ggml_backend_sched_alloc_graph(sched, gf);
+                    fp->alloc_readback_graph(sched, gf);
                     fp->set_prefill_inputs(gf, ptoks, 0);
                     qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "BINDHEAD");
                     tp = fp->get_attention_taps(gf);
@@ -7480,8 +7471,7 @@ static int run_redact_head_search(ForwardPassBase* fp, ggml_backend_sched_t sche
             {
                 ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
                 fp->mark_attention_taps(gf);
-                ggml_backend_sched_reset(sched);
-                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->alloc_readback_graph(sched, gf);
                 fp->set_prefill_inputs(gf, ptoks, 0);
                 qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "REDACTHEAD");
                 tp = fp->get_attention_taps(gf);
@@ -7793,8 +7783,7 @@ static int run_req_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched,
             {
                 ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
                 fp->mark_attention_taps(gf);
-                ggml_backend_sched_reset(sched);
-                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->alloc_readback_graph(sched, gf);
                 fp->set_prefill_inputs(gf, ptoks, 0);
                 qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "REQHEAD");
                 tp = fp->get_attention_taps(gf);
@@ -8063,8 +8052,7 @@ static int run_bundle_a(ForwardPassBase* fp, ggml_backend_sched_t sched,
         {
             ggml_cgraph* gf = fp->build_prefill_graph(R.toks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, R.toks, 0);
             qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "BUNDLEA");
             tp = fp->get_attention_taps(gf);
@@ -8695,8 +8683,7 @@ static int run_locperf(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenize
             const auto t0 = std::chrono::steady_clock::now();
             ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched);
-            ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, ptoks, 0);
             const double b = ms_since(t0);
             const auto t1 = std::chrono::steady_clock::now();
@@ -9236,8 +9223,7 @@ static int run_bundle_b(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokeniz
         fp->set_cache_pos(0, 0);
         ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, /*want_logits=*/true);
         if (tapped) fp->mark_attention_taps(gf);
-        ggml_backend_sched_reset(sched);
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);
         fp->set_prefill_inputs(gf, ptoks, 0);
         qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "BUNDLEB");
         Read r;
@@ -10626,7 +10612,7 @@ static int run_absbench(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokeniz
             const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
             ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched); ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, rows, q_off);
             qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "ABSBENCH pass 2");
             taps = fp->get_attention_taps(gf);
@@ -10827,7 +10813,7 @@ static int run_compare2(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokeniz
             const std::vector<int32_t> rows(toks.begin() + q_off, toks.end());
             ggml_cgraph* gf = fp->build_prefill_graph(rows, q_off, 0, false);
             fp->mark_attention_taps(gf);
-            ggml_backend_sched_reset(sched); ggml_backend_sched_alloc_graph(sched, gf);
+            fp->alloc_readback_graph(sched, gf);
             fp->set_prefill_inputs(gf, rows, q_off);
             qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "COMPARE2 pass 2");
             taps = fp->get_attention_taps(gf);
@@ -11161,6 +11147,1210 @@ static int run_comparegate(ForwardPassBase* fp, ggml_backend_sched_t sched, Toke
     return 0;
 }
 
+// ── COREF — who is "she" / "it" / "the Supplier"? (probe D, step 8) ─────────
+// A doc-internal readout, no key: the referring expression's own attention
+// onto the earlier mentions. Three arms, EN and DE:
+//   easy  — different gender (sanity only, not gated)
+//   hard  — same gender/type, Winograd-style minimal pairs: one phrase flips
+//           the answer while both candidates keep their positions
+//   alias — contract defined terms: "X (hereinafter 'the Supplier')" …
+//           "the Supplier" → which company? Pairs swap the roles, not the names.
+// Readouts (pre-registered, selected jointly with the head):
+//   ROW    = the reference's last token's row (sees only the text before it)
+//   CLAUSE = mean over rows from the reference to the end of its sentence
+//           (the Winograd cue usually FOLLOWS the pronoun)
+// Candidate score = max over the candidate's tokens; prediction = argmax.
+// Nearest-mention and first-mention baselines are 50% by construction on hard
+// and alias. Selection: best (head, readout) on one language's hard+alias
+// items, scored on the other. Bar (set before the run): held out >= 80% on
+// hard AND on alias, both directions.
+struct CorefItem { std::string arm; bool de; std::string text; int gold; };
+
+static std::vector<CorefItem> coref_items() {
+    std::vector<CorefItem> v;
+    auto add = [&](const char* arm, bool de, const std::string& t, int g) { v.push_back({arm, de, t, g}); };
+    // easy — gender
+    for (int de = 0; de < 2; ++de) {
+        const char* s1 = de ? "{1|%s} traf {2|%s} am Bahnhof. {p|%s} hatte den unterschriebenen Vertrag dabei."
+                            : "{1|%s} met {2|%s} at the station. {p|%s} had brought the signed contract.";
+        const char* s2 = de ? "{1|%s} rief {2|%s} wegen der verspäteten Lieferung an. {p|%s} versprach, die Rechnung noch einmal zu prüfen."
+                            : "{1|%s} called {2|%s} about the late delivery. {p|%s} promised to check the invoice again.";
+        const char* she = de ? "Sie" : "She"; const char* he = de ? "Er" : "He";
+        const char* mw = de ? "Herr Weber" : "Mr Weber"; const char* fn = de ? "Frau Novak" : "Mrs Novak";
+        struct P { const char* s; const char* m; const char* f; };
+        for (const P& p : {P{s1, "Thomas", "Laura"}, P{s2, mw, fn}}) {
+            char b[512];
+            std::snprintf(b, sizeof b, p.s, p.m, p.f, she); add("easy", de, b, 2);
+            std::snprintf(b, sizeof b, p.s, p.m, p.f, he);  add("easy", de, b, 1);
+            std::snprintf(b, sizeof b, p.s, p.f, p.m, she); add("easy", de, b, 1);
+            std::snprintf(b, sizeof b, p.s, p.f, p.m, he);  add("easy", de, b, 2);
+        }
+    }
+    // hard — Winograd-style pairs {stem, ending a, gold a, ending b, gold b}
+    struct W { const char* stem; const char* ea; int ga; const char* eb; int gb; };
+    const std::vector<W> hen = {
+        {"The {1|supplier} sent the {2|buyer} a reminder because {p|it} ", "had not been paid.", 1, "had not paid.", 2},
+        {"The {1|box} did not fit into the {2|crate} because {p|it} ", "was too big.", 1, "was too small.", 2},
+        {"The {1|manager} fired the {2|clerk} because {p|he} ", "was lazy.", 2, "had lost patience.", 1},
+        {"{1|Anna} paid {2|Maria} because {p|she} ", "had finished the translation.", 2, "had received the translation.", 1},
+        {"The {1|landlord} sued the {2|tenant} because {p|he} ", "had not paid the rent.", 2, "was still owed the rent.", 1},
+        {"The {1|bank} refused the {2|company} a loan because {p|it} ", "was too risky.", 2, "was too cautious.", 1},
+        {"{1|Peter} warned {2|Jonas} because {p|he} ", "had seen the error.", 1, "was about to make the error.", 2},
+        {"The {1|auditor} praised the {2|accountant} because {p|she} ", "had kept clean books.", 2, "was pleased with the books.", 1},
+        {"The {1|laptop} did not fit in the {2|bag} because {p|it} ", "was too large.", 1, "was too small.", 2},
+        {"The {1|report} could not be attached to the {2|ticket} because {p|it} ", "was too long.", 1, "was already closed.", 2},
+        {"{1|Sarah} hired {2|Emma} because {p|she} ", "needed a translator.", 1, "was an experienced translator.", 2},
+        {"The {1|doctor} phoned the {2|patient} because {p|he} ", "had the test results.", 1, "had missed the appointment.", 2},
+    };
+    const std::vector<W> hde = {
+        {"Der {1|Lieferant} schickte dem {2|Käufer} eine Mahnung, weil {p|er} ", "noch nicht bezahlt worden war.", 1, "noch nicht bezahlt hatte.", 2},
+        {"Der {1|Karton} passte nicht in den {2|Container}, weil {p|er} ", "zu groß war.", 1, "zu klein war.", 2},
+        {"Der {1|Chef} entließ den {2|Angestellten}, weil {p|er} ", "faul war.", 2, "die Geduld verloren hatte.", 1},
+        {"{1|Anna} bezahlte {2|Maria}, weil {p|sie} ", "die Übersetzung fertiggestellt hatte.", 2, "die Übersetzung erhalten hatte.", 1},
+        {"Der {1|Vermieter} verklagte den {2|Mieter}, weil {p|er} ", "die Miete nicht bezahlt hatte.", 2, "noch Miete zu bekommen hatte.", 1},
+        {"Die {1|Bank} verweigerte der {2|Firma} einen Kredit, weil {p|sie} ", "zu riskant war.", 2, "zu vorsichtig war.", 1},
+        {"{1|Peter} warnte {2|Jonas}, weil {p|er} ", "den Fehler gesehen hatte.", 1, "den Fehler gleich machen würde.", 2},
+        {"Die {1|Prüferin} lobte die {2|Buchhalterin}, weil {p|sie} ", "die Bücher sauber geführt hatte.", 2, "mit den Büchern zufrieden war.", 1},
+        {"Der {1|Laptop} passte nicht in den {2|Rucksack}, weil {p|er} ", "zu groß war.", 1, "zu klein war.", 2},
+        {"Der {1|Bericht} konnte nicht an den {2|Antrag} angehängt werden, weil {p|er} ", "zu lang war.", 1, "schon geschlossen war.", 2},
+        {"{1|Sarah} stellte {2|Emma} ein, weil {p|sie} ", "eine Übersetzerin brauchte.", 1, "eine erfahrene Übersetzerin war.", 2},
+        {"Der {1|Arzt} rief den {2|Patienten} an, weil {p|er} ", "die Testergebnisse hatte.", 1, "den Termin verpasst hatte.", 2},
+    };
+    for (int de = 0; de < 2; ++de)
+        for (const W& w : de ? hde : hen) {
+            add("hard", de, std::string(w.stem) + w.ea, w.ga);
+            add("hard", de, std::string(w.stem) + w.eb, w.gb);
+        }
+    // alias — contract defined terms; names fixed, roles swapped between variants
+    struct C { const char* n1; const char* n2; const char* rx; const char* ax; const char* ry; const char* ay; };
+    const std::vector<C> cen = {
+        {"Acme GmbH", "Borealis AG", "Supplier", "deliver the goods by 30 June", "Customer", "pay each invoice within 30 days"},
+        {"Kestrel GmbH", "Mirador AG", "Carrier", "collect the pallets every Monday", "Shipper", "label every pallet before collection"},
+        {"Halden GmbH", "Corvin AG", "Licensor", "provide updates for three years", "Licensee", "use the software on at most ten devices"},
+        {"Pellam GmbH", "Tessin AG", "Landlord", "repair the heating before winter", "Tenant", "pay the rent on the first of each month"},
+        {"Brenner GmbH", "Aldor AG", "Contractor", "print 5,000 copies by 1 March", "Client", "supply the final files by 1 February"},
+        {"Quintel GmbH", "Varel AG", "Sponsor", "fund the study in full", "Provider", "store all samples at minus 80 degrees"},
+    };
+    const std::vector<C> cde = {
+        {"Acme GmbH", "Borealis AG", "Lieferant", "liefert die Ware bis zum 30. Juni", "Kunde", "zahlt jede Rechnung innerhalb von 30 Tagen"},
+        {"Kestrel GmbH", "Mirador AG", "Frachtführer", "holt die Paletten jeden Montag ab", "Versender", "beschriftet jede Palette vor der Abholung"},
+        {"Halden GmbH", "Corvin AG", "Lizenzgeber", "stellt drei Jahre lang Updates bereit", "Lizenznehmer", "nutzt die Software auf höchstens zehn Geräten"},
+        {"Pellam GmbH", "Tessin AG", "Vermieter", "repariert die Heizung vor dem Winter", "Mieter", "zahlt die Miete am Ersten jedes Monats"},
+        {"Brenner GmbH", "Aldor AG", "Auftragnehmer", "druckt bis zum 1. März 5.000 Exemplare", "Auftraggeber", "liefert die finalen Dateien bis zum 1. Februar"},
+        {"Quintel GmbH", "Varel AG", "Sponsor", "finanziert die Studie vollständig", "Dienstleister", "lagert alle Proben bei minus 80 Grad"},
+    };
+    for (int de = 0; de < 2; ++de)
+        for (const C& c : de ? cde : cen)
+            for (int swap = 0; swap < 2; ++swap) {
+                const char* r1 = swap ? c.ry : c.rx; const char* r2 = swap ? c.rx : c.ry;
+                for (int q = 0; q < 2; ++q) {
+                    const char* rq = q ? c.ry : c.rx; const char* aq = q ? c.ay : c.ax;
+                    std::string t = de
+                        ? std::string("Dieser Vertrag wird geschlossen zwischen der {1|") + c.n1 + "} (nachfolgend „" + r1 +
+                          "“) und der {2|" + c.n2 + "} (nachfolgend „" + r2 + "“). Die Parteien vereinbaren Folgendes. "
+                          "Dieser Vertrag tritt mit Unterzeichnung in Kraft und läuft zwei Jahre. Der {p|" + rq + "} " + aq + "."
+                        : std::string("This agreement is made between {1|") + c.n1 + "} (hereinafter \"the " + r1 +
+                          "\") and {2|" + c.n2 + "} (hereinafter \"the " + r2 + "\"). The parties agree on the following terms. "
+                          "This agreement enters into force on signature and runs for two years. The {p|" + rq + "} shall " + aq + ".";
+                    add("alias", de, t, std::strcmp(rq, r1) == 0 ? 1 : 2);
+                }
+            }
+    return v;
+}
+
+// Strip {1|..} {2|..} {p|..} tags; byte ranges of each tag in the stripped text.
+static std::string coref_strip(const std::string& s, std::map<char, std::pair<size_t, size_t>>& at) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] == '{' && i + 2 < s.size() && s[i + 2] == '|') {
+            const char tag = s[i + 1];
+            const size_t e = s.find('}', i);
+            if (e == std::string::npos) throw std::runtime_error("COREF: unclosed tag in '" + s + "'");
+            const size_t b0 = out.size();
+            out += s.substr(i + 3, e - i - 3);
+            if (at.count(tag)) throw std::runtime_error("COREF: tag expected once, repeated in '" + s + "'");
+            at[tag] = {b0, out.size()};
+            i = e + 1;
+        } else out += s[i++];
+    }
+    for (char t : {'1', '2', 'p'})
+        if (!at.count(t)) throw std::runtime_error(std::string("COREF: tag '") + t + "' expected in '" + s + "'");
+    return out;
+}
+
+static int run_coref(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok,
+                     const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COREF — the reference's own row onto the earlier mentions      ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::vector<CorefItem> items = coref_items();
+    const int NL = (int)attn_layers.size(), NH = 16, NC = NL * NH * 2;   // config = (layer, head, readout)
+    auto cfg_name = [&](int c) {
+        const int r = c % 2, h = (c / 2) % NH, l = c / 2 / NH;
+        return std::string("L") + std::to_string(attn_layers[(size_t)l]) + "h" + std::to_string(h) + (r ? " CLAUSE" : " ROW");
+    };
+    std::vector<std::vector<char>> ok(items.size(), std::vector<char>((size_t)NC, 0));
+    const int last_layer = attn_layers.back();
+    for (size_t it = 0; it < items.size(); ++it) {
+        std::map<char, std::pair<size_t, size_t>> at;
+        const std::string text = coref_strip(items[it].text, at);
+        const std::string prompt = qdocs_chat_prompt(text, "");
+        const size_t base = prompt.find(text);
+        if (base == std::string::npos) throw std::runtime_error("COREF: passage expected verbatim in the prompt");
+        const std::vector<int32_t> toks = tok->encode(prompt);
+        const int P = (int)toks.size();
+        const std::vector<size_t> cum = cum_bytes(tok, toks);
+        auto span = [&](size_t x0, size_t x1, int& lo, int& hi) {
+            lo = P; hi = 0;
+            for (int i = 0; i < P; ++i) if (cum[(size_t)i] < x1 && cum[(size_t)i + 1] > x0) { lo = std::min(lo, i); hi = i + 1; }
+            if (lo >= hi) throw std::runtime_error("COREF: no token covers a tagged span in '" + text + "'");
+        };
+        int c1lo, c1hi, c2lo, c2hi, plo, phi;
+        span(base + at['1'].first, base + at['1'].second, c1lo, c1hi);
+        span(base + at['2'].first, base + at['2'].second, c2lo, c2hi);
+        span(base + at['p'].first, base + at['p'].second, plo, phi);
+        if (!(c1hi <= c2lo && c2hi <= plo))
+            throw std::runtime_error("COREF: expected candidate 1 < candidate 2 < reference, in '" + text + "'");
+        const size_t dot = text.find('.', at['p'].second);
+        int elo, ehi; span(base + at['p'].first, base + (dot == std::string::npos ? text.size() : dot + 1), elo, ehi);
+
+        fp->set_truncate_after_layer(last_layer);
+        fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+        fp->set_attention_taps(std::vector<int>(attn_layers.begin(), attn_layers.end()));
+        fp->clear_slot(0); fp->set_cache_pos(0, 0);
+        ggml_cgraph* gf = fp->build_prefill_graph(toks, 0, 0, false);
+        fp->mark_attention_taps(gf);
+        fp->alloc_readback_graph(sched, gf);
+        fp->set_prefill_inputs(gf, toks, 0);
+        qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "COREF prefill");
+        const std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
+        fp->set_attention_taps({}); fp->set_truncate_after_layer(-1); fp->clear_slot(0);
+
+        for (int l = 0; l < NL; ++l) {
+            const ForwardPassBase::AttentionTap* T = nullptr;
+            for (const auto& t : taps) if (t.layer == attn_layers[(size_t)l]) T = &t;
+            if (!T || T->n_q != P) throw std::runtime_error("COREF: full prefill tap expected on every attention layer");
+            for (int h = 0; h < NH; ++h) {
+                const int blk = T->block_of(h);
+                auto rowp = [&](int r) { return T->rows.data() + (size_t)T->n_kv * ((size_t)r + (size_t)T->n_q * (size_t)blk); };
+                for (int rd = 0; rd < 2; ++rd) {
+                    const int r0 = rd ? elo : phi - 1, r1 = rd ? ehi : phi;
+                    auto cand = [&](int lo, int hi) {
+                        double best = 0;
+                        for (int t = lo; t < hi; ++t) {
+                            double s = 0; for (int r = r0; r < r1; ++r) s += rowp(r)[t];
+                            best = std::max(best, s / (r1 - r0));
+                        }
+                        return best;
+                    };
+                    const double s1 = cand(c1lo, c1hi), s2 = cand(c2lo, c2hi);
+                    const int pred = s1 > s2 ? 1 : s2 > s1 ? 2 : 0;
+                    ok[it][(size_t)((l * NH + h) * 2 + rd)] = pred == items[it].gold;
+                }
+            }
+        }
+    }
+
+    auto acc = [&](int c, bool de, const std::string& arm) {
+        long n = 0, k = 0;
+        for (size_t i = 0; i < items.size(); ++i)
+            if (items[i].de == de && (arm.empty() ? items[i].arm != "easy" : items[i].arm == arm)) { ++n; k += ok[i][(size_t)c]; }
+        return n ? 100.0 * k / n : 0.0;
+    };
+    auto count = [&](bool de, const std::string& arm) { long n = 0; for (const auto& x : items) n += x.de == de && x.arm == arm; return n; };
+    std::printf("items: EN easy %ld hard %ld alias %ld | DE easy %ld hard %ld alias %ld\n",
+                count(false, "easy"), count(false, "hard"), count(false, "alias"), count(true, "easy"), count(true, "hard"), count(true, "alias"));
+    // Baselines: nearest mention = candidate 2, first mention = candidate 1.
+    for (int de = 0; de < 2; ++de)
+        for (const char* arm : {"easy", "hard", "alias"}) {
+            long n = 0, g2 = 0; for (const auto& x : items) if (x.de == de && x.arm == arm) { ++n; g2 += x.gold == 2; }
+            std::printf("  baseline %s %-5s: nearest mention %5.1f%%, first mention %5.1f%%\n", de ? "DE" : "EN", arm, 100.0 * g2 / n, 100.0 * (n - g2) / n);
+        }
+
+    std::printf("\nIN-SAMPLE best per arm (ceiling, not a result):\n");
+    for (int de = 0; de < 2; ++de)
+        for (const char* arm : {"easy", "hard", "alias"}) {
+            std::vector<std::pair<double, int>> r;
+            for (int c = 0; c < NC; ++c) r.push_back({acc(c, de, arm), -c});
+            std::sort(r.rbegin(), r.rend());
+            std::printf("  %s %-5s:", de ? "DE" : "EN", arm);
+            for (int i = 0; i < 4; ++i) std::printf("  %s %.1f", cfg_name(-r[(size_t)i].second).c_str(), r[(size_t)i].first);
+            std::printf("\n");
+        }
+
+    std::printf("\nBEST PER LAYER on hard (ROW / CLAUSE), EN | DE:\n");
+    for (int l = 0; l < NL; ++l) {
+        double b[2][2] = {{0, 0}, {0, 0}};
+        for (int h = 0; h < NH; ++h) for (int rd = 0; rd < 2; ++rd) for (int de = 0; de < 2; ++de)
+            b[de][rd] = std::max(b[de][rd], acc((l * NH + h) * 2 + rd, de, "hard"));
+        std::printf("  L%-2d  EN %5.1f / %5.1f | DE %5.1f / %5.1f\n", attn_layers[(size_t)l], b[0][0], b[0][1], b[1][0], b[1][1]);
+    }
+
+    std::printf("\nLANDED HEADS (per language; hard / alias / easy):\n");
+    struct LH { const char* job; int layer, head; };
+    for (const LH& lh : {LH{"locate", 11, 6}, LH{"choice", 11, 3}, LH{"inject", 11, 0}, LH{"compare", 15, 1}, LH{"absent", 19, 10}, LH{"score", 19, 11}}) {
+        int l = -1; for (int i = 0; i < NL; ++i) if (attn_layers[(size_t)i] == lh.layer) l = i;
+        for (int rd = 0; rd < 2; ++rd) {
+            const int c = (l * NH + lh.head) * 2 + rd;
+            std::printf("  %-8s %-14s EN %5.1f / %5.1f / %5.1f | DE %5.1f / %5.1f / %5.1f\n", lh.job, cfg_name(c).c_str(),
+                        acc(c, false, "hard"), acc(c, false, "alias"), acc(c, false, "easy"),
+                        acc(c, true, "hard"), acc(c, true, "alias"), acc(c, true, "easy"));
+        }
+    }
+
+    std::printf("\nHELD OUT — select (head, readout) on one language's hard+alias, score on the other (bar: hard >= 80 AND alias >= 80):\n");
+    bool pass = true;
+    for (int sel = 0; sel < 2; ++sel) {
+        int best = 0; double bv = -1;
+        for (int c = 0; c < NC; ++c) { const double a = acc(c, sel, ""); if (a > bv) { bv = a; best = c; } }
+        const bool sc = !sel;
+        const double h = acc(best, sc, "hard"), a = acc(best, sc, "alias"), e = acc(best, sc, "easy");
+        const bool p = h >= 80.0 && a >= 80.0;
+        pass = pass && p;
+        std::printf("  select on %s: %-14s (in-sample %.1f) -> %s: hard %5.1f, alias %5.1f, easy %5.1f — %s\n",
+                    sel ? "DE" : "EN", cfg_name(best).c_str(), bv, sc ? "DE" : "EN", h, a, e, p ? "PASS" : "FAIL");
+        if (std::getenv("COREF_VERBOSE"))
+            for (size_t i = 0; i < items.size(); ++i)
+                if (items[i].de == sc && !ok[i][(size_t)best]) std::printf("     miss [%s] %s\n", items[i].arm.c_str(), items[i].text.c_str());
+    }
+    std::printf("COREF bar: %s\n", pass ? "PASS" : "FAIL");
+    return 0;
+}
+
+// ── SPLIT — where one document ends and the next begins (probe D, step 8) ────
+// A structure readout, no key. Streams of short documents, one line per
+// sentence (notes, tickets) or per line (order e-mails, headers stripped,
+// blank lines collapsed), joined by a single newline: every line break is a
+// candidate, the breaks between documents are the boundaries. Readout at a
+// break: the next line's first rows (<= 8 tokens), attention mass onto the
+// stream text BEFORE the break, over their mass onto the whole stream so far
+// (template and sink excluded). NEAR = the 48 tokens before the break, ALL =
+// everything before it. A boundary should look back LESS.
+// Arms per language: mixed (notes of different topics — easy), same (notes of
+// one topic — gate), tickets (software tickets back to back, "Ticket NNNN:"
+// stripped — gate), orders (order e-mails — information only; greetings and
+// sign-offs mark them). Baselines: RULE (next line opens with a greeting or the
+// previous line is a sign-off) and TEXTTILING (1 - cosine of content words, 2
+// lines either side). Bar (set before the run): select (head, readout) on one
+// language's same+tickets, score on the other: AUC >= 0.85 on same AND tickets
+// in both directions, each >= TEXTTILING + 0.10.
+static double auc_of(const std::vector<std::pair<double, bool>>& data);
+
+struct SplitStream { std::string arm; bool de; std::vector<std::string> lines; std::vector<char> boundary; };
+
+static std::vector<SplitStream> split_streams() {
+    std::vector<SplitStream> out;
+    auto lines_of_note = [](const std::string& d) { return cmp_sentences(d); };
+    auto lines_of_ticket = [](std::string d) {
+        if (d.rfind("Ticket ", 0) == 0) { const size_t c = d.find(": "); if (c != std::string::npos) d = d.substr(c + 2); }
+        return cmp_sentences(d);
+    };
+    auto lines_of_email = [](const std::string& d) {
+        std::vector<std::string> v; size_t s = 0;
+        while (s <= d.size()) {
+            size_t e = d.find('\n', s); if (e == std::string::npos) e = d.size();
+            std::string l = d.substr(s, e - s);
+            while (!l.empty() && (l.back() == ' ' || l.back() == '\r')) l.pop_back();
+            bool header = false;
+            for (const char* h : {"From:", "Subject:", "To:", "Date:", "Von:", "Betreff:", "An:", "Datum:"}) header |= l.rfind(h, 0) == 0;
+            if (!l.empty() && !header) v.push_back(l);
+            s = e + 1;
+        }
+        return v;
+    };
+    auto build = [&](const char* arm, bool de, const std::vector<std::vector<std::string>>& docs) {
+        SplitStream st{arm, de, {}, {}};
+        for (size_t k = 0; k < docs.size(); ++k)
+            for (size_t i = 0; i < docs[k].size(); ++i) { st.lines.push_back(docs[k][i]); st.boundary.push_back(k > 0 && i == 0); }
+        out.push_back(st);
+    };
+    const std::vector<QDecide> notes = decide_choice_corpus(), tickets = decide_score_corpus();
+    const std::vector<QDoc> orders = qdocs_legb_corpus();
+    for (int de = 0; de < 2; ++de) {
+        std::map<int, std::vector<std::string>> by_topic; std::vector<std::string> all_notes, all_tickets, all_orders;
+        for (const QDecide& d : notes) if (d.de == (bool)de) { by_topic[d.label].push_back(d.document); all_notes.push_back(d.document); }
+        for (const QDecide& d : tickets) if (d.de == (bool)de) all_tickets.push_back(d.document);
+        for (const QDoc& d : orders) if (d.de == (bool)de) all_orders.push_back(d.document);
+        for (int s = 0; s < 20; ++s) {
+            std::mt19937 rng(0x5B17u + 101u * (uint32_t)s + 7u * (uint32_t)de);
+            {   // mixed: 5 notes, no two neighbours share a topic
+                std::vector<std::vector<std::string>> d; int prev = -1;
+                std::vector<QDecide> pool; for (const QDecide& x : notes) if (x.de == (bool)de) pool.push_back(x);
+                std::shuffle(pool.begin(), pool.end(), rng);
+                for (const QDecide& x : pool) { if ((int)d.size() == 5) break; if (x.label == prev) continue; d.push_back(lines_of_note(x.document)); prev = x.label; }
+                build("mixed", de, d);
+            }
+            {   // same: the 5 notes of one topic, shuffled
+                std::vector<std::string> p = by_topic[s % 4]; std::shuffle(p.begin(), p.end(), rng);
+                std::vector<std::vector<std::string>> d; for (const std::string& x : p) d.push_back(lines_of_note(x));
+                build("same", de, d);
+            }
+            {   // tickets: 5 of 12
+                std::vector<std::string> p = all_tickets; std::shuffle(p.begin(), p.end(), rng); p.resize(5);
+                std::vector<std::vector<std::string>> d; for (const std::string& x : p) d.push_back(lines_of_ticket(x));
+                build("tickets", de, d);
+            }
+            {   // orders: 3 of 6
+                std::vector<std::string> p = all_orders; std::shuffle(p.begin(), p.end(), rng); p.resize(3);
+                std::vector<std::vector<std::string>> d; for (const std::string& x : p) d.push_back(lines_of_email(x));
+                build("orders", de, d);
+            }
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> split_words(const std::string& s) {
+    static const std::set<std::string> stop = {"the","a","an","and","or","of","to","in","on","for","is","are","was","be","it","this","that",
+        "we","our","you","your","i","my","with","at","by","from","as","so","please","has","have","not","no","any","all",
+        "der","die","das","und","oder","ein","eine","einen","zu","im","in","am","an","auf","für","ist","sind","war","es","wir","sie",
+        "ihr","ich","mit","von","bei","als","bitte","hat","haben","nicht","kein","den","dem","des","wird","noch"};
+    std::vector<std::string> v; std::string w;
+    auto flush = [&]() { if (!w.empty() && !stop.count(w)) v.push_back(w); w.clear(); };
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c >= 128) w += (char)std::tolower(c); else flush();
+    }
+    flush();
+    return v;
+}
+
+static int run_split(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok,
+                     const std::vector<int32_t>& attn_layers) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ SPLIT — does the next line look back across a document break?  ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::vector<SplitStream> streams = split_streams();
+    const int NL = (int)attn_layers.size(), NH = 16, NC = NL * NH * 2;
+    auto cfg_name = [&](int c) {
+        const int r = c % 2, h = (c / 2) % NH, l = c / 2 / NH;
+        return std::string("L") + std::to_string(attn_layers[(size_t)l]) + "h" + std::to_string(h) + (r ? " ALL" : " NEAR");
+    };
+    struct Cand { std::string arm; bool de; bool boundary; double rule, tiling; std::vector<float> s; };
+    std::vector<Cand> cands;
+    const int last_layer = attn_layers.back();
+    for (const SplitStream& st : streams) {
+        std::string text; std::vector<size_t> line_at;
+        for (size_t i = 0; i < st.lines.size(); ++i) { if (i) text += "\n"; line_at.push_back(text.size()); text += st.lines[i]; }
+        const std::string prompt = qdocs_chat_prompt(text, "");
+        const size_t base = prompt.find(text);
+        if (base == std::string::npos) throw std::runtime_error("SPLIT: stream expected verbatim in the prompt");
+        const std::vector<int32_t> toks = tok->encode(prompt);
+        const int P = (int)toks.size();
+        const std::vector<size_t> cum = cum_bytes(tok, toks);
+        auto first_tok_at = [&](size_t byte) { for (int i = 0; i < P; ++i) if (cum[(size_t)i + 1] > byte) return i; return P; };
+        const int lo = first_tok_at(base);
+
+        fp->set_truncate_after_layer(last_layer);
+        fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+        fp->set_attention_taps(std::vector<int>(attn_layers.begin(), attn_layers.end()));
+        fp->clear_slot(0); fp->set_cache_pos(0, 0);
+        ggml_cgraph* gf = fp->build_prefill_graph(toks, 0, 0, false);
+        fp->mark_attention_taps(gf);
+        fp->alloc_readback_graph(sched, gf);
+        fp->set_prefill_inputs(gf, toks, 0);
+        qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "SPLIT prefill");
+        const std::vector<ForwardPassBase::AttentionTap> taps = fp->get_attention_taps(gf);
+        fp->set_attention_taps({}); fp->set_truncate_after_layer(-1); fp->clear_slot(0);
+
+        auto lower = [](std::string s) { for (char& c : s) c = (char)std::tolower((unsigned char)c); return s; };
+        for (size_t i = 1; i < st.lines.size(); ++i) {
+            const int s = first_tok_at(base + line_at[i]);
+            const int e = std::min(i + 1 < st.lines.size() ? first_tok_at(base + line_at[i + 1]) : first_tok_at(base + text.size()), s + 8);
+            if (!(lo < s && s < e && e <= P)) throw std::runtime_error("SPLIT: line token range expected inside the stream");
+            Cand c{st.arm, st.de, (bool)st.boundary[i], 0, 0, std::vector<float>((size_t)NC, 0.f)};
+            const std::string nx = lower(st.lines[i]), pv = lower(st.lines[i - 1]);
+            for (const char* g : {"hello", "hi ", "hi,", "dear", "good morning", "hallo", "guten tag", "sehr geehrte", "liebe", "moin"})
+                if (nx.rfind(g, 0) == 0) c.rule = 1;
+            for (const char* g : {"thanks", "thank you", "regards", "best", "cheers", "danke", "vielen dank", "grüße", "gruß", "mit freundlichen"})
+                if (pv.rfind(g, 0) == 0) c.rule = 1;
+            std::map<std::string, int> a, b;
+            for (size_t k = (i >= 2 ? i - 2 : 0); k < i; ++k) for (const auto& w : split_words(st.lines[k])) a[w]++;
+            for (size_t k = i; k < std::min(i + 2, st.lines.size()); ++k) for (const auto& w : split_words(st.lines[k])) b[w]++;
+            double dot = 0, na = 0, nb = 0;
+            for (const auto& kv : a) { na += kv.second * kv.second; if (b.count(kv.first)) dot += kv.second * b[kv.first]; }
+            for (const auto& kv : b) nb += kv.second * kv.second;
+            c.tiling = 1.0 - (na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 0.0);
+            for (int l = 0; l < NL; ++l) {
+                const ForwardPassBase::AttentionTap* T = nullptr;
+                for (const auto& t : taps) if (t.layer == attn_layers[(size_t)l]) T = &t;
+                if (!T || T->n_q != P) throw std::runtime_error("SPLIT: full prefill tap expected on every attention layer");
+                for (int h = 0; h < NH; ++h) {
+                    const int blk = T->block_of(h);
+                    double near = 0, all = 0;
+                    for (int r = s; r < e; ++r) {
+                        const float* row = T->rows.data() + (size_t)T->n_kv * ((size_t)r + (size_t)T->n_q * (size_t)blk);
+                        double den = 0, pa = 0, pn = 0;
+                        for (int t = lo; t <= r; ++t) den += row[t];
+                        for (int t = lo; t < s; ++t) { pa += row[t]; if (t >= s - 48) pn += row[t]; }
+                        near += den > 0 ? pn / den : 0; all += den > 0 ? pa / den : 0;
+                    }
+                    // Boundary score: LOW look-back = boundary, so negate.
+                    c.s[(size_t)((l * NH + h) * 2 + 0)] = (float)(-near / (e - s));
+                    c.s[(size_t)((l * NH + h) * 2 + 1)] = (float)(-all / (e - s));
+                }
+            }
+            cands.push_back(std::move(c));
+        }
+    }
+
+    auto sel_auc = [&](const std::string& arm, bool de, auto score) {
+        std::vector<std::pair<double, bool>> v;
+        for (const Cand& c : cands) if (c.de == de && (arm == "gate" ? (c.arm == "same" || c.arm == "tickets") : c.arm == arm)) v.push_back({score(c), c.boundary});
+        return auc_of(v);
+    };
+    const std::vector<std::string> arms = {"mixed", "same", "tickets", "orders"};
+    std::printf("candidates (boundaries / all):");
+    for (int de = 0; de < 2; ++de) for (const auto& a : arms) {
+        long n = 0, b = 0; for (const Cand& c : cands) if (c.de == de && c.arm == a) { ++n; b += c.boundary; }
+        std::printf(" %s-%s %ld/%ld", de ? "DE" : "EN", a.c_str(), b, n);
+    }
+    std::printf("\n\nBASELINES (AUC):\n");
+    for (int de = 0; de < 2; ++de)
+        for (const auto& a : arms)
+            std::printf("  %s %-8s RULE %.3f  TEXTTILING %.3f\n", de ? "DE" : "EN", a.c_str(),
+                        sel_auc(a, de, [](const Cand& c) { return c.rule; }), sel_auc(a, de, [](const Cand& c) { return c.tiling; }));
+
+    std::printf("\nIN-SAMPLE best per arm (ceiling, not a result):\n");
+    for (int de = 0; de < 2; ++de)
+        for (const auto& a : arms) {
+            std::vector<std::pair<double, int>> r;
+            for (int k = 0; k < NC; ++k) r.push_back({sel_auc(a, de, [k](const Cand& c) { return (double)c.s[(size_t)k]; }), -k});
+            std::sort(r.rbegin(), r.rend());
+            std::printf("  %s %-8s:", de ? "DE" : "EN", a.c_str());
+            for (int i = 0; i < 4; ++i) std::printf("  %s %.3f", cfg_name(-r[(size_t)i].second).c_str(), r[(size_t)i].first);
+            std::printf("\n");
+        }
+
+    std::printf("\nLANDED HEADS (AUC mixed / same / tickets / orders):\n");
+    struct LH { const char* job; int layer, head; };
+    for (const LH& lh : {LH{"locate", 11, 6}, LH{"choice", 11, 3}, LH{"compare", 15, 1}, LH{"absent", 19, 10}, LH{"score", 19, 11}}) {
+        int l = -1; for (int i = 0; i < NL; ++i) if (attn_layers[(size_t)i] == lh.layer) l = i;
+        for (int rd = 0; rd < 2; ++rd) {
+            const int k = (l * NH + lh.head) * 2 + rd;
+            std::printf("  %-8s %-11s", lh.job, cfg_name(k).c_str());
+            for (int de = 0; de < 2; ++de) {
+                std::printf(" %s", de ? "| DE" : "EN");
+                for (const auto& a : arms) std::printf(" %.3f", sel_auc(a, de, [k](const Cand& c) { return (double)c.s[(size_t)k]; }));
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("\nHELD OUT — select on one language's same+tickets, score on the other (bar: AUC >= 0.85 on same AND tickets, each >= TEXTTILING + 0.10):\n");
+    bool pass = true;
+    for (int sel = 0; sel < 2; ++sel) {
+        int best = 0; double bv = -1;
+        for (int k = 0; k < NC; ++k) { const double a = sel_auc("gate", sel, [k](const Cand& c) { return (double)c.s[(size_t)k]; }); if (a > bv) { bv = a; best = k; } }
+        const bool sc = !sel;
+        std::printf("  select on %s: %-11s (in-sample %.3f) -> %s:", sel ? "DE" : "EN", cfg_name(best).c_str(), bv, sc ? "DE" : "EN");
+        for (const auto& a : arms) {
+            const double v = sel_auc(a, sc, [best](const Cand& c) { return (double)c.s[(size_t)best]; });
+            const double tt = sel_auc(a, sc, [](const Cand& c) { return c.tiling; });
+            std::printf("  %s %.3f", a.c_str(), v);
+            if (a == "same" || a == "tickets") pass = pass && v >= 0.85 && v >= tt + 0.10;
+        }
+        std::printf("\n");
+    }
+    std::printf("SPLIT bar: %s\n", pass ? "PASS" : "FAIL");
+    return 0;
+}
+
+// ── SURPRISE — the prefill's own next-word surprisal as a highlighter (probe D) ─
+// NOT attention: full depth, logits at EVERY position (set_slice_prefill_head
+// false), surprisal of token t = -log p(t | prefix). A word's score = the max
+// over its tokens (NEXT readout, secondary: also the next word's first token).
+// Damaged documents, each with a clean twin:
+//   ocr      — rn->m, l->1, o->0, e->c, a word split in two (generated)
+//   typo     — two inner letters swapped or one dropped (generated)
+//   fact     — a planted sentence with a wrong world fact ("Vienna, the capital
+//              of Sweden"); the twin carries the right one
+//   realword — an error that is itself a word (form->from, dass->das), which a
+//              spell-checker cannot catch
+//   number   — an order total that no longer equals quantity x price
+//              (stretch: expected to fail — a well-formed number is not surprising)
+// No parameters are selected, so there is no held-out split. Bar (set before the
+// run): fact AND realword, EN and DE separately: AUC >= 0.90 (damaged word vs
+// every other word of its document) and damaged word in the document's top 3
+// in >= 70%.
+struct SurpItem { std::string arm; bool de; std::string damaged, clean; size_t d0, d1, c0, c1; };
+
+static std::vector<SurpItem> surprise_items() {
+    std::vector<SurpItem> v;
+    std::map<int, std::vector<std::string>> carriers;   // de -> notes
+    for (const QDecide& d : decide_choice_corpus()) carriers[d.de ? 1 : 0].push_back(d.document);
+    // Insert a sentence with one tagged slot after the carrier's first sentence.
+    auto planted = [&](const char* arm, bool de, const std::string& carrier, const std::string& sent,
+                       const std::string& right, const std::string& wrong) {
+        const std::vector<std::string> ss = cmp_sentences(carrier);
+        const size_t slot = sent.find("%s");
+        auto make = [&](const std::string& w, size_t& b0, size_t& b1) {
+            std::string s = ss[0] + " ";
+            b0 = s.size() + slot; b1 = b0 + w.size();
+            s += sent.substr(0, slot) + w + sent.substr(slot + 2);
+            for (size_t i = 1; i < ss.size(); ++i) s += " " + ss[i];
+            return s;
+        };
+        SurpItem it{arm, de, "", "", 0, 0, 0, 0};
+        it.damaged = make(wrong, it.d0, it.d1); it.clean = make(right, it.c0, it.c1);
+        v.push_back(it);
+    };
+    struct T { const char* s; const char* right; const char* wrong; };
+    const std::vector<T> fen = {
+        {"The shipment leaves from Hamburg, the largest port in %s.", "Germany", "Italy"},
+        {"Our office in Vienna, the capital of %s, will handle the paperwork.", "Austria", "Sweden"},
+        {"Pack the samples with ice, since water freezes at %s degrees Celsius.", "0", "40"},
+        {"The parcel goes by air from Paris, the capital of %s.", "France", "Spain"},
+        {"The barge travels down the Rhine into the %s Sea near Rotterdam.", "North", "Black"},
+        {"All invoices are in euros, the currency of %s.", "Germany", "Japan"},
+        {"Our partner in Madrid, the capital of %s, confirmed the dates.", "Spain", "Portugal"},
+        {"The contract falls under German law because our seat is in %s.", "Berlin", "Lisbon"},
+        {"The team flies to Tokyo, the capital of %s, in May.", "Japan", "China"},
+        {"Christmas Day falls on 25 %s, so the office will be closed.", "December", "March"},
+    };
+    const std::vector<T> fde = {
+        {"Die Sendung geht ab Hamburg, dem größten Hafen in %s.", "Deutschland", "Italien"},
+        {"Unser Büro in Wien, der Hauptstadt von %s, erledigt die Unterlagen.", "Österreich", "Schweden"},
+        {"Bitte die Proben mit Eis verpacken, da Wasser bei %s Grad Celsius gefriert.", "0", "40"},
+        {"Das Paket geht per Luftfracht ab Paris, der Hauptstadt von %s.", "Frankreich", "Spanien"},
+        {"Das Schiff fährt den Rhein hinunter in die %s bei Rotterdam.", "Nordsee", "Ostsee"},
+        {"Alle Rechnungen sind in Euro, der Währung von %s.", "Deutschland", "Japan"},
+        {"Unser Partner in Madrid, der Hauptstadt von %s, hat die Termine bestätigt.", "Spanien", "Portugal"},
+        {"Der Vertrag unterliegt deutschem Recht, weil unser Sitz in %s ist.", "Berlin", "Lissabon"},
+        {"Das Team fliegt im Mai nach Tokio, der Hauptstadt von %s.", "Japan", "China"},
+        {"Der erste Weihnachtstag ist der 25. %s, daher bleibt das Büro geschlossen.", "Dezember", "März"},
+    };
+    const std::vector<T> ren = {
+        {"Please fill in the attached %s by Friday.", "form", "from"},
+        {"The %s per unit is 12.50 EUR.", "price", "prize"},
+        {"We will %s the discount if we pay late.", "lose", "loose"},
+        {"Please forward the invoice to our %s service team.", "customer", "costumer"},
+        {"We %s all major credit cards.", "accept", "except"},
+        {"The parcel was left at the front %s.", "desk", "disk"},
+        {"The router and the %s were both replaced last week.", "modem", "modern"},
+        {"%s order was shipped on Monday.", "Their", "There"},
+        {"The goods arrived %s than planned.", "later", "latter"},
+        {"Please %s the delivery date by e-mail.", "confirm", "conform"},
+    };
+    const std::vector<T> rde = {
+        {"Die %s wurde am Montag geliefert.", "Ware", "Wahre"},
+        {"%s Montag ist die Rechnung offen.", "Seit", "Seid"},
+        {"Ich hoffe, %s die Lieferung pünktlich ankommt.", "dass", "das"},
+        {"Der %s pro Stück beträgt 12,50 EUR.", "Preis", "Reis"},
+        {"Die Lieferung kam, %s Erwarten, erst am Freitag.", "wider", "wieder"},
+        {"Wir brauchen die Originale %s der Kopien.", "statt", "Stadt"},
+        {"Das Paket liegt am %s.", "Empfang", "Empfand"},
+        {"Die Rechnung ist seit zwei Wochen %s.", "fällig", "völlig"},
+        {"Der Kunde hat die Mahnung %s.", "erhalten", "enthalten"},
+        {"Die Lieferung erfolgt frei %s.", "Haus", "Maus"},
+    };
+    for (int de = 0; de < 2; ++de) {
+        const std::vector<std::string>& cs = carriers[de];
+        for (int k = 0; k < 2; ++k) {
+            const std::vector<T>& f = de ? fde : fen; const std::vector<T>& r = de ? rde : ren;
+            for (size_t i = 0; i < f.size(); ++i) planted("fact", de, cs[(i + 10 * k) % cs.size()], f[i].s, f[i].right, f[i].wrong);
+            for (size_t i = 0; i < r.size(); ++i) planted("realword", de, cs[(i + 10 * k + 3) % cs.size()], r[i].s, r[i].right, r[i].wrong);
+        }
+        // Generated damage on the carriers themselves.
+        for (size_t i = 0; i < cs.size(); ++i) {
+            const std::string& doc = cs[i];
+            // eligible words: ASCII letters only, length >= 6, not the first word
+            std::vector<std::pair<size_t, size_t>> words;
+            for (size_t p = 0; p < doc.size(); ) {
+                while (p < doc.size() && !std::isalpha((unsigned char)doc[p])) ++p;
+                size_t q = p; while (q < doc.size() && std::isalpha((unsigned char)doc[q])) ++q;
+                const bool clean_edge = q >= doc.size() || !(((unsigned char)doc[q]) & 0x80);
+                if (q - p >= 6 && p > 0 && clean_edge && (p == 0 || !(((unsigned char)doc[p - 1]) & 0x80))) words.push_back({p, q});
+                p = q + (q == p);
+            }
+            if (words.empty()) continue;
+            for (int arm = 0; arm < 2; ++arm) {
+                std::mt19937 rng(0x5E7u + 131u * (uint32_t)i + 17u * (uint32_t)de + 7u * (uint32_t)arm);
+                for (int tries = 0; tries < 20; ++tries) {
+                    const auto w = words[rng() % words.size()];
+                    std::string word = doc.substr(w.first, w.second - w.first), bad;
+                    if (arm == 0) {
+                        const int t = (int)(rng() % 5);
+                        for (int tt = 0; tt < 5 && bad.empty(); ++tt) {
+                            const int ty = (t + tt) % 5; size_t f;
+                            if (ty == 0 && (f = word.find("rn")) != std::string::npos) bad = word.substr(0, f) + "m" + word.substr(f + 2);
+                            else if (ty == 0 && (f = word.find('m', 1)) != std::string::npos) bad = word.substr(0, f) + "rn" + word.substr(f + 1);
+                            else if (ty == 1 && (f = word.find('l', 1)) != std::string::npos) bad = word.substr(0, f) + "1" + word.substr(f + 1);
+                            else if (ty == 2 && (f = word.find('o', 1)) != std::string::npos) bad = word.substr(0, f) + "0" + word.substr(f + 1);
+                            else if (ty == 3 && (f = word.find('e', 1)) != std::string::npos) bad = word.substr(0, f) + "c" + word.substr(f + 1);
+                            else if (ty == 4) bad = word.substr(0, word.size() / 2) + " " + word.substr(word.size() / 2);
+                        }
+                    } else {
+                        const size_t p = 1 + rng() % (word.size() - 3);
+                        if (rng() % 2) { bad = word; std::swap(bad[p], bad[p + 1]); if (bad == word) bad.clear(); }
+                        else bad = word.substr(0, p) + word.substr(p + 1);
+                    }
+                    if (bad.empty() || bad == word) continue;
+                    SurpItem it{arm ? "typo" : "ocr", (bool)de, doc.substr(0, w.first) + bad + doc.substr(w.second), doc,
+                                w.first, w.first + bad.size(), w.first, w.second};
+                    v.push_back(it);
+                    break;
+                }
+            }
+        }
+        // number — a total that no longer equals quantity x price (stretch)
+        struct N { int q; const char* pe; const char* pd; const char* te; const char* td; const char* we; const char* wd; };
+        const std::vector<N> ns = {
+            {240, "12.50", "12,50", "3000.00", "3.000,00", "3100.00", "3.100,00"},
+            {80, "45.00", "45,00", "3600.00", "3.600,00", "3900.00", "3.900,00"},
+            {15, "120.00", "120,00", "1800.00", "1.800,00", "1080.00", "1.080,00"},
+            {500, "2.40", "2,40", "1200.00", "1.200,00", "1250.00", "1.250,00"},
+            {36, "75.00", "75,00", "2700.00", "2.700,00", "2070.00", "2.070,00"},
+            {12, "310.00", "310,00", "3720.00", "3.720,00", "3270.00", "3.270,00"},
+        };
+        for (const N& n : ns) {
+            const std::string head = de ? "Auftragsbestätigung für die Acme GmbH.\nMenge: " + std::to_string(n.q) + " Stück.\nStückpreis: " + n.pd + " EUR.\nGesamtbetrag: "
+                                        : "Order confirmation for Acme GmbH.\nQuantity: " + std::to_string(n.q) + " units.\nUnit price: " + n.pe + " EUR.\nOrder total: ";
+            const std::string tail = de ? " EUR.\nVielen Dank für Ihren Auftrag." : " EUR.\nThank you for your order.";
+            const std::string right = de ? n.td : n.te, wrong = de ? n.wd : n.we;
+            v.push_back({"number", (bool)de, head + wrong + tail, head + right + tail, head.size(), head.size() + wrong.size(), head.size(), head.size() + right.size()});
+        }
+    }
+    return v;
+}
+
+// Per-word surprisal for `doc`: words = maximal runs of non-space bytes.
+// contrast = max over the word's tokens of (surprisal - entropy of the
+// prediction at that position): surprised where the model was SURE (SURPRISE2).
+struct SurpWord { size_t b0, b1; double word, next, contrast; };
+static std::vector<SurpWord> surprise_words(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok, const std::string& doc) {
+    const std::string prompt = qdocs_chat_prompt(doc, "");
+    const size_t base = prompt.find(doc);
+    if (base == std::string::npos) throw std::runtime_error("SURPRISE: document expected verbatim in the prompt");
+    const std::vector<int32_t> toks = tok->encode(prompt);
+    const int P = (int)toks.size();
+    const std::vector<size_t> cum = cum_bytes(tok, toks);
+    fp->set_truncate_after_layer(-1);
+    fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+    fp->set_attention_taps({});
+    fp->set_slice_prefill_head(false);
+    fp->clear_slot(0); fp->set_cache_pos(0, 0);
+    ggml_cgraph* gf = fp->build_prefill_graph(toks, 0, 0, true);
+    ggml_backend_sched_reset(sched); ggml_backend_sched_alloc_graph(sched, gf);
+    fp->set_prefill_inputs(gf, toks, 0);
+    qinf::engine::require_compute_success(ggml_backend_sched_graph_compute(sched, gf), "SURPRISE prefill");
+    const std::vector<float> lg = fp->get_output_logits(gf);
+    fp->set_slice_prefill_head(true); fp->clear_slot(0);
+    if (lg.size() % (size_t)P) throw std::runtime_error("SURPRISE: logits expected as [vocab, P], actual size " + std::to_string(lg.size()));
+    const size_t V = lg.size() / (size_t)P;
+    std::vector<double> sur((size_t)P, 0.0), con((size_t)P, 0.0);
+    for (int t = 1; t < P; ++t) {
+        const float* row = lg.data() + V * (size_t)(t - 1);
+        float mx = row[0]; for (size_t j = 1; j < V; ++j) mx = std::max(mx, row[j]);
+        double se = 0, sx = 0;
+        for (size_t j = 0; j < V; ++j) { const double e = std::exp((double)(row[j] - mx)); se += e; sx += e * (double)(row[j] - mx); }
+        const double lse = std::log(se);
+        const double entropy = lse - sx / se;   // H = log Z - E[x - mx]
+        sur[(size_t)t] = (double)mx + lse - (double)row[(size_t)toks[(size_t)t]];
+        con[(size_t)t] = sur[(size_t)t] - entropy;
+    }
+    std::vector<SurpWord> ws;
+    for (size_t p = 0; p < doc.size(); ) {
+        while (p < doc.size() && std::isspace((unsigned char)doc[p])) ++p;
+        size_t q = p; while (q < doc.size() && !std::isspace((unsigned char)doc[q])) ++q;
+        if (q > p) ws.push_back({p, q, 0, 0, 0});
+        p = q;
+    }
+    auto tok_max = [&](size_t b0, size_t b1, int& last, const std::vector<double>& sc) {
+        double m = -1e30; last = -1;
+        for (int t = 0; t < P; ++t) if (cum[(size_t)t] < base + b1 && cum[(size_t)t + 1] > base + b0) { m = std::max(m, sc[(size_t)t]); last = t; }
+        return m;
+    };
+    for (size_t i = 0; i < ws.size(); ++i) {
+        int last; ws[i].contrast = tok_max(ws[i].b0, ws[i].b1, last, con);
+        ws[i].word = tok_max(ws[i].b0, ws[i].b1, last, sur);
+        ws[i].next = ws[i].word;
+        if (last >= 0 && last + 1 < P && cum[(size_t)last + 1] < base + doc.size()) ws[i].next = std::max(ws[i].word, sur[(size_t)last + 1]);
+    }
+    return ws;
+}
+
+static int run_surprise(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ SURPRISE — next-word surprisal from the prefill's own logits   ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::vector<SurpItem> items = surprise_items();
+    struct Acc { std::vector<std::pair<double, bool>> auc_w, auc_n, auc_c; long n = 0, top1 = 0, top3 = 0, lift = 0, c1 = 0, c3 = 0, clift = 0; };
+    std::map<std::string, Acc> acc;
+    const bool verbose = std::getenv("SURPRISE_VERBOSE") != nullptr;
+    for (const SurpItem& it : items) {
+        const std::vector<SurpWord> dw = surprise_words(fp, sched, tok, it.damaged);
+        const std::vector<SurpWord> cw = surprise_words(fp, sched, tok, it.clean);
+        auto target = [](const std::vector<SurpWord>& ws, size_t b0, size_t b1, bool next) {
+            double m = 0; for (const SurpWord& w : ws) if (w.b0 < b1 && w.b1 > b0) m = std::max(m, next ? w.next : w.word); return m;
+        };
+        auto target_c = [](const std::vector<SurpWord>& ws, size_t b0, size_t b1) {
+            double m = -1e30; for (const SurpWord& w : ws) if (w.b0 < b1 && w.b1 > b0) m = std::max(m, w.contrast); return m;
+        };
+        Acc& a = acc[std::string(it.de ? "DE " : "EN ") + it.arm];
+        const double tw = target(dw, it.d0, it.d1, false), tn = target(dw, it.d0, it.d1, true);
+        const double tc = target_c(dw, it.d0, it.d1);
+        int rank = 1, crank = 1;
+        for (const SurpWord& w : dw) {
+            const bool is_t = w.b0 < it.d1 && w.b1 > it.d0;
+            if (is_t) continue;
+            a.auc_w.push_back({w.word, false}); a.auc_n.push_back({w.next, false}); a.auc_c.push_back({w.contrast, false});
+            if (w.word >= tw) ++rank;
+            if (w.contrast >= tc) ++crank;
+        }
+        a.auc_w.push_back({tw, true}); a.auc_n.push_back({tn, true}); a.auc_c.push_back({tc, true});
+        a.c1 += crank == 1; a.c3 += crank <= 3; a.clift += tc > target_c(cw, it.c0, it.c1);
+        a.n++; a.top1 += rank == 1; a.top3 += rank <= 3; a.lift += tw > target(cw, it.c0, it.c1, false);
+        if (verbose) {
+            std::vector<std::pair<double, std::string>> top;
+            for (const SurpWord& w : dw) top.push_back({w.contrast, it.damaged.substr(w.b0, w.b1 - w.b0)});
+            std::sort(top.rbegin(), top.rend());
+            std::printf("  [%s %s] target '%s' raw %.2f rank %d | contrast %.2f (clean %.2f) rank %d | top: %s %.1f, %s %.1f, %s %.1f\n", it.de ? "DE" : "EN", it.arm.c_str(),
+                        it.damaged.substr(it.d0, it.d1 - it.d0).c_str(), tw, rank, tc, target_c(cw, it.c0, it.c1), crank,
+                        top[0].second.c_str(), top[0].first, top[1].second.c_str(), top[1].first, top[2].second.c_str(), top[2].first);
+        }
+    }
+    std::printf("\n%-12s %4s | %-7s %-7s | %-6s %-6s | %s\n", "arm", "n", "AUC", "AUC+nx", "top1", "top3", "damaged > clean twin");
+    bool pass = true;
+    for (const char* lang : {"EN", "DE"})
+        for (const char* arm : {"ocr", "typo", "fact", "realword", "number"}) {
+            const std::string key = std::string(lang) + " " + arm;
+            if (!acc.count(key)) continue;
+            const Acc& a = acc[key];
+            const double auc = auc_of(a.auc_w), t3 = 100.0 * a.top3 / a.n;
+            std::printf("%-12s %4ld | %.3f   %.3f   | %5.1f%% %5.1f%% | %5.1f%%\n", key.c_str(), a.n, auc, auc_of(a.auc_n),
+                        100.0 * a.top1 / a.n, t3, 100.0 * a.lift / a.n);
+            if (std::string(arm) == "fact" || std::string(arm) == "realword") pass = pass && auc >= 0.90 && t3 >= 70.0;
+        }
+    std::printf("SURPRISE bar (fact + realword, EN and DE: AUC >= 0.90 and top-3 >= 70%%): %s\n", pass ? "PASS" : "FAIL");
+
+    // SURPRISE2 — the pre-registered contrast readout, same bar.
+    std::printf("\nSURPRISE2 — contrast = surprisal - entropy (surprised where the model was sure):\n");
+    std::printf("%-12s %4s | %-7s | %-6s %-6s | %s\n", "arm", "n", "AUC", "top1", "top3", "damaged > clean twin");
+    bool pass2 = true;
+    for (const char* lang : {"EN", "DE"})
+        for (const char* arm : {"ocr", "typo", "fact", "realword", "number"}) {
+            const std::string key = std::string(lang) + " " + arm;
+            if (!acc.count(key)) continue;
+            const Acc& a = acc[key];
+            const double auc = auc_of(a.auc_c), t3 = 100.0 * a.c3 / a.n;
+            std::printf("%-12s %4ld | %.3f   | %5.1f%% %5.1f%% | %5.1f%%\n", key.c_str(), a.n, auc, 100.0 * a.c1 / a.n, t3, 100.0 * a.clift / a.n);
+            if (std::string(arm) == "fact" || std::string(arm) == "realword") pass2 = pass2 && auc >= 0.90 && t3 >= 70.0;
+        }
+    std::printf("SURPRISE2 bar (fact + realword, EN and DE: AUC >= 0.90 and top-3 >= 70%%): %s\n", pass2 ? "PASS" : "FAIL");
+    return 0;
+}
+
+// ── TOTALCHECK — does this invoice's arithmetic look wrong? (probe D, narrow) ──
+// The SURPRISE2 readout restricted to numbers: per number, the max over its
+// tokens of (surprisal - predictive entropy); an invoice is flagged when its
+// highest number score clears a threshold, and the checker points at that
+// number. Generated invoices, 2-4 lines (qty x price = amount), subtotal, 19%
+// VAT, total; EN "1234.50", DE "1.234,50". Damage: exactly ONE number changed
+// (a line amount, the subtotal, the VAT or the total), by one of three kinds:
+// big (+-7-30%), two adjacent digits swapped, cents changed. Each damaged
+// invoice has a clean twin (the false-alarm set). Bar (set before the run):
+// threshold chosen on one language (max detection at <= 10% false alarms),
+// scored on the other: >= 80% of damaged invoices flagged at <= 10% false
+// alarms, both directions; pointer top-1 on the changed number >= 70%, each
+// language.
+struct TotalItem { bool de; std::string pos, kind; std::string damaged, clean; size_t d0, d1; };
+
+static std::string tc_money(long cents, bool de) {
+    const long e = cents / 100, c = cents % 100;
+    std::string s = std::to_string(e);
+    if (de && s.size() > 3) for (int i = (int)s.size() - 3; i > 0; i -= 3) s.insert((size_t)i, ".");
+    char b[8]; std::snprintf(b, sizeof b, "%02ld", c);
+    return s + (de ? "," : ".") + b;
+}
+
+static std::vector<TotalItem> totalcheck_items() {
+    std::vector<TotalItem> v;
+    const char* items_en[] = {"steel bolts M6", "aluminium brackets", "cable ties", "LED panels", "office chairs", "printer toner", "safety gloves", "USB cables"};
+    const char* items_de[] = {"Stahlschrauben M6", "Aluminiumwinkel", "Kabelbinder", "LED-Panels", "Bürostühle", "Druckertoner", "Schutzhandschuhe", "USB-Kabel"};
+    const char* cust[] = {"Borealis AG", "Kestrel GmbH", "Mirador AG", "Halden GmbH", "Corvin AG"};
+    const char* positions[] = {"line", "subtotal", "vat", "total"};
+    const char* kinds[] = {"big", "swap", "cents"};
+    for (int de = 0; de < 2; ++de)
+        for (int p = 0; p < 4; ++p)
+            for (int k = 0; k < 3; ++k)
+                for (int r = 0; r < 5; ++r) {
+                    std::mt19937 rng(0x70Au + 1009u * (uint32_t)(p * 3 + k) + 101u * (uint32_t)r + 7u * (uint32_t)de);
+                    const int nl = 2 + (int)(rng() % 3);
+                    std::vector<long> qty, price, amt;
+                    for (int i = 0; i < nl; ++i) {
+                        qty.push_back(1 + (long)(rng() % 400));
+                        price.push_back(50 + (long)(rng() % 25000));   // 0.50 .. 250.49
+                        amt.push_back(qty.back() * price.back());
+                    }
+                    long sub = 0; for (long a : amt) sub += a;
+                    const long vat = (sub * 19 + 50) / 100, tot = sub + vat;
+                    // which number to damage and its new value
+                    const int li = (int)(rng() % nl);
+                    const long orig = p == 0 ? amt[(size_t)li] : p == 1 ? sub : p == 2 ? vat : tot;
+                    long bad = orig;
+                    for (int tries = 0; tries < 50 && bad == orig; ++tries) {
+                        if (k == 0) { const long pct = 7 + (long)(rng() % 24); bad = orig + (rng() % 2 ? 1 : -1) * orig * pct / 100; }
+                        else if (k == 1) {
+                            std::string s = std::to_string(orig);
+                            if (s.size() < 3) continue;
+                            const size_t i = rng() % (s.size() - 1);
+                            std::swap(s[i], s[i + 1]);
+                            if (s[0] == '0') continue;
+                            bad = std::stol(s);
+                        } else bad = orig / 100 * 100 + (long)(rng() % 100);
+                    }
+                    if (bad == orig || bad <= 0) throw std::runtime_error("TOTALCHECK: damage expected to change the number");
+                    auto render = [&](bool damaged, size_t& b0, size_t& b1) {
+                        std::string s = std::string(de ? "Rechnung 2026-" : "Invoice 2026-") + std::to_string(100 + r * 37 + p * 11 + k) +
+                                        (de ? " der Acme GmbH an die " : " from Acme GmbH to ") + cust[(p + k + r) % 5] + ".\n";
+                        auto num = [&](long val, bool target) {
+                            const long x = damaged && target ? bad : val;
+                            if (target) b0 = s.size();
+                            s += tc_money(x, de);
+                            if (target) b1 = s.size();
+                        };
+                        for (int i = 0; i < nl; ++i) {
+                            s += std::to_string(qty[(size_t)i]) + " x " + (de ? items_de : items_en)[(size_t)((r + i + p) % 8)] + (de ? " zu " : " at ");
+                            s += tc_money(price[(size_t)i], de) + " EUR = ";
+                            num(amt[(size_t)i], p == 0 && i == li);
+                            s += " EUR\n";
+                        }
+                        s += de ? "Zwischensumme: " : "Subtotal: "; num(sub, p == 1); s += " EUR\n";
+                        s += de ? "MwSt. 19 %: " : "VAT 19%: "; num(vat, p == 2); s += " EUR\n";
+                        s += de ? "Gesamtbetrag: " : "Total due: "; num(tot, p == 3); s += " EUR\n";
+                        s += de ? "Zahlbar innerhalb von 30 Tagen." : "Payment within 30 days.";
+                        return s;
+                    };
+                    TotalItem it{(bool)de, positions[p], kinds[k], "", "", 0, 0};
+                    size_t c0 = 0, c1 = 0;
+                    it.damaged = render(true, it.d0, it.d1);
+                    it.clean = render(false, c0, c1);
+                    v.push_back(it);
+                }
+    return v;
+}
+
+static int run_totalcheck(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ TOTALCHECK — surprised-where-sure, numbers only, on invoices   ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::vector<TotalItem> items = totalcheck_items();
+    struct Rec { bool de; std::string pos, kind; double dmax, cmax; bool top1, top2; };
+    std::vector<Rec> recs;
+    auto numbers = [](const std::string& doc, const std::vector<SurpWord>& ws) {
+        std::vector<const SurpWord*> out;
+        for (const SurpWord& w : ws) { bool dig = false; for (size_t i = w.b0; i < w.b1; ++i) dig |= std::isdigit((unsigned char)doc[i]) != 0; if (dig) out.push_back(&w); }
+        return out;
+    };
+    for (const TotalItem& it : items) {
+        const std::vector<SurpWord> dw = surprise_words(fp, sched, tok, it.damaged);
+        const std::vector<SurpWord> cw = surprise_words(fp, sched, tok, it.clean);
+        const auto dn = numbers(it.damaged, dw), cn = numbers(it.clean, cw);
+        double dmax = -1e30, cmax = -1e30, tsc = -1e30;
+        for (const SurpWord* w : dn) { dmax = std::max(dmax, w->contrast); if (w->b0 < it.d1 && w->b1 > it.d0) tsc = std::max(tsc, w->contrast); }
+        for (const SurpWord* w : cn) cmax = std::max(cmax, w->contrast);
+        int rank = 1;
+        for (const SurpWord* w : dn) if (!(w->b0 < it.d1 && w->b1 > it.d0) && w->contrast >= tsc) ++rank;
+        recs.push_back({it.de, it.pos, it.kind, dmax, cmax, rank == 1, rank <= 2});
+        if (std::getenv("TOTALCHECK_VERBOSE") && rank > 1)
+            std::printf("  miss-point [%s %s %s] target %.2f rank %d | doc max %.2f | clean max %.2f\n", it.de ? "DE" : "EN",
+                        it.pos.c_str(), it.kind.c_str(), tsc, rank, dmax, cmax);
+    }
+    std::printf("invoices: %zu damaged + %zu clean twins\n", recs.size(), recs.size());
+
+    // Detection AUC per language (damaged vs clean, doc max over numbers).
+    for (int de = 0; de < 2; ++de) {
+        std::vector<std::pair<double, bool>> a;
+        for (const Rec& r : recs) if (r.de == de) { a.push_back({r.dmax, true}); a.push_back({r.cmax, false}); }
+        std::printf("  %s detection AUC %.3f\n", de ? "DE" : "EN", auc_of(a));
+    }
+    // Threshold: max detection with <= 10% false alarms on the SELECT language.
+    auto pick = [&](bool de) {
+        std::vector<double> c; for (const Rec& r : recs) if (r.de == de) c.push_back(r.cmax);
+        std::sort(c.begin(), c.end());
+        const size_t k = (size_t)std::floor(0.9 * (double)c.size());   // flag strictly above the 90th-percentile clean score
+        return c[std::min(k, c.size() - 1)];
+    };
+    bool pass = true;
+    std::printf("\nHELD OUT — threshold on one language, scored on the other (bar: flagged >= 80%%, false alarms <= 10%%):\n");
+    for (int sel = 0; sel < 2; ++sel) {
+        const double tau = pick(sel);
+        const bool sc = !sel;
+        long n = 0, fl = 0, fa = 0;
+        std::map<std::string, std::pair<long, long>> by;
+        for (const Rec& r : recs) if (r.de == sc) {
+            ++n; fl += r.dmax > tau; fa += r.cmax > tau;
+            by[r.pos].first++; by[r.pos].second += r.dmax > tau;
+            by[r.kind].first++; by[r.kind].second += r.dmax > tau;
+        }
+        const double f = 100.0 * fl / n, a = 100.0 * fa / n;
+        const bool p = f >= 80.0 && a <= 10.0;
+        pass = pass && p;
+        std::printf("  tau %.2f from %s -> %s: flagged %5.1f%%, false alarms %5.1f%% — %s\n     by position/kind:", tau, sel ? "DE" : "EN", sc ? "DE" : "EN", f, a, p ? "PASS" : "FAIL");
+        for (const char* key : {"line", "subtotal", "vat", "total", "big", "swap", "cents"})
+            std::printf(" %s %.0f%%", key, 100.0 * by[key].second / std::max(1L, by[key].first));
+        std::printf("\n");
+    }
+    std::printf("\nPOINTER — the highest-scoring number is the changed one (bar: top-1 >= 70%%):\n");
+    for (int de = 0; de < 2; ++de) {
+        long n = 0, t1 = 0, t2 = 0; std::map<std::string, std::pair<long, long>> by;
+        for (const Rec& r : recs) if (r.de == de) { ++n; t1 += r.top1; t2 += r.top2; by[r.pos].first++; by[r.pos].second += r.top1; by[r.kind].first++; by[r.kind].second += r.top1; }
+        const double p1 = 100.0 * t1 / n;
+        pass = pass && p1 >= 70.0;
+        std::printf("  %s top-1 %5.1f%%  top-2 %5.1f%% |", de ? "DE" : "EN", p1, 100.0 * t2 / n);
+        for (const char* key : {"line", "subtotal", "vat", "total", "big", "swap", "cents"})
+            std::printf(" %s %.0f%%", key, 100.0 * by[key].second / std::max(1L, by[key].first));
+        std::printf("\n");
+    }
+    std::printf("TOTALCHECK bar: %s\n", pass ? "PASS" : "FAIL");
+    return 0;
+}
+
+// ── PLANCOST — what alloc_readback_graph costs per tapped pass ─────────────────
+// Per shape: the plain reset + alloc on a graph the cached plan already fits
+// (today's cheapest case, a reused plan) vs alloc_readback_graph (always a fresh
+// plan). Nothing is computed; build time is shown for scale. Median of 7.
+// Shapes: locate prefill (tap L11 h6, truncated at 11) at 512 / 4096 / 10000
+// tokens, and extract's tapped decode step (full depth, taps {27, 11}, every
+// head) after a 512-token prefill. Also the scheduler's Metal buffer size.
+static int run_plancost(ForwardPassBase* fp, ggml_backend_sched_t sched) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ PLANCOST — plain alloc (reused plan) vs alloc_readback_graph     ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    ggml_backend_t gpu = ggml_backend_sched_get_backend(sched, 0);
+    std::printf("%-28s | %9s | %12s | %14s | %s\n", "shape", "build ms", "plain alloc", "tapped alloc", "sched buffer MB");
+    auto run = [&](const char* name, auto build) {
+        std::vector<double> b, p, t;
+        for (int i = 0; i < 8; ++i) {   // plain: same shape again, so the cached plan fits
+            const auto t0 = clk::now(); ggml_cgraph* gf = build(); fp->mark_attention_taps(gf); const auto t1 = clk::now();
+            ggml_backend_sched_reset(sched); ggml_backend_sched_alloc_graph(sched, gf); const auto t2 = clk::now();
+            if (i) { b.push_back(ms(t1 - t0)); p.push_back(ms(t2 - t1)); }
+        }
+        for (int i = 0; i < 7; ++i) {
+            ggml_cgraph* gf = build(); fp->mark_attention_taps(gf);
+            const auto t1 = clk::now(); fp->alloc_readback_graph(sched, gf); const auto t2 = clk::now();
+            t.push_back(ms(t2 - t1));
+        }
+        ggml_backend_sched_reset(sched);
+        std::printf("%-28s | %9.2f | %9.3f ms | %11.3f ms | %.0f\n", name, med(b), med(p), med(t),
+                    ggml_backend_sched_get_buffer_size(sched, gpu) / 1048576.0);
+    };
+    for (int P : {512, 4096, 10000}) {
+        std::vector<int32_t> toks((size_t)P); for (int i = 0; i < P; ++i) toks[(size_t)i] = 1000 + (i * 7919) % 50000;
+        fp->set_truncate_after_layer(11);
+        fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Materialized);
+        fp->set_attention_taps({11}, {6});
+        char nm[64]; std::snprintf(nm, sizeof nm, "locate prefill %d tok", P);
+        run(nm, [&]() { fp->clear_slot(0); fp->set_cache_pos(0, 0); return fp->build_prefill_graph(toks, 0, 0, false); });
+    }
+    fp->set_truncate_after_layer(-1);
+    fp->set_attention_taps({});
+    {
+        std::vector<int32_t> toks(512); for (int i = 0; i < 512; ++i) toks[(size_t)i] = 1000 + (i * 7919) % 50000;
+        fp->clear_slot(0); fp->set_cache_pos(0, 0);
+        fp->run_prefill(toks, 0, 0, sched);
+        std::vector<int32_t> tk = {toks.back()}; std::vector<uint32_t> sl = {0}; std::vector<int32_t> ps = {(int)fp->get_cache_pos(0)};
+        fp->set_attention_taps({27, 11});
+        run("extract decode step (full)", [&]() { return fp->build_decoding_graph(tk, sl, ps); });
+        fp->set_attention_taps({});
+        fp->clear_slot(0);
+    }
+    return 0;
+}
+
+// ── SCHEDMEM — what the dedicated locate scheduler costs in GPU memory ───────
+// The verify-only server's traffic: /v1/verify on the main scheduler and
+// /v1/locate (split+flash where licensed) on the dedicated one — each keeps a
+// compute buffer sized to the largest graph it ever ran (galloc only grows).
+// Today = two fresh schedulers, one per verb; merged = one scheduler running
+// both. Reported: Metal compute-buffer MB per scheduler after the pair.
+static int run_schedmem(ForwardPassBase* fp, Tokenizer* tok, const ModelMetadata& meta, uint32_t n_ctx,
+                        ggml_backend_t gpu, ggml_backend_t cpu) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ SCHEDMEM — two schedulers (today) vs one (merged)              ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::optional<uint32_t> ft = meta.raw_kv.get_uint32_opt("general.file_type");
+    const qinf::LensCalibration* cal = qinf::lens_calibration_for(meta.architecture, meta.block_count, ft ? *ft : qinf::kLensAnyFileType);
+    if (!cal) throw std::runtime_error("SCHEDMEM: lens calibration expected for the loaded model, actual none");
+    const qinf::LensConstants& k = cal->constants;
+    const std::vector<QMessy> corpus = qdocs_messy_corpus();
+    std::vector<qinf::LensConcept> concepts = {{"customer", "", ""}, {"quantity", "", ""}};
+    auto newsched = [&]() {
+        ggml_backend_t b[] = {gpu, cpu};
+        return ggml_backend_sched_new(b, nullptr, 2, FP_GRAPH_SIZE, true, false);
+    };
+    auto mb = [&](ggml_backend_sched_t s) { return ggml_backend_sched_get_buffer_size(s, gpu) / 1048576.0; };
+    std::printf("locate prefill shape on this row: %s\n", qinf::lens_prefill_shape_name(k.locate_prefill_shape));
+    for (int target : {4096, 10000}) {
+        std::string doc;
+        for (size_t i = 0; i < 1000; ++i) {
+            doc += corpus[i % corpus.size()].document; doc += "\n\n---\n\n";
+            if ((int)tok->encode(doc).size() >= target) break;
+        }
+        auto verify = [&](ggml_backend_sched_t s) {
+            (void)qinf::run_lens_verify(fp, s, tok, meta, n_ctx, doc, "{\"customer\": \"Acme\", \"quantity\": \"240\"}", concepts, {}, k);
+        };
+        auto locate = [&](ggml_backend_sched_t s) {
+            (void)qinf::run_lens_locate(fp, s, tok, meta, n_ctx, doc, concepts, k, 3, qinf::LensKeyAggregation::Max,
+                                        qinf::LensHeadRole::Locate, k.locate_prefill_shape);
+        };
+        ggml_backend_sched_t a = newsched(), b = newsched();
+        verify(a); locate(b);
+        const double ma = mb(a), mb_ = mb(b);
+        ggml_backend_sched_free(a); ggml_backend_sched_free(b);
+        ggml_backend_sched_t c = newsched();
+        verify(c); locate(c);
+        const double mc = mb(c);
+        ggml_backend_sched_free(c);
+        std::printf("~%5d-token document: today main %6.0f MB + locate %6.0f MB = %6.0f MB | merged %6.0f MB | saved %6.0f MB\n",
+                    target, ma, mb_, ma + mb_, mc, ma + mb_ - mc);
+    }
+    return 0;
+}
+
+// ── COMPARE3 — the compare baseline when MOST units are missing ──────────────
+// /v1/compare divides each unit's coverage by the MEDIAN unit's. When more than
+// half the units are missing the median is itself a missing unit and other
+// missing units read ~1.0 (measured live 2026-09-27: 8 units, 5 dropped -> 2
+// missed, 6 dropped -> 3 missed). Summaries drop most of an original, so this is
+// in scope. Runs the SHIPPED driver (coverage = raw / median, so any other
+// baseline is a re-normalization of the same numbers) on COMPARE2's translation
+// trials plus a HEAVY arm (50% and 75% of units dropped), and scores four
+// baselines: median (today), 75th percentile, mean of the top quarter, max.
+// Threshold per baseline chosen on one direction's NORMAL arm (0-2 drops; max
+// recall with <= 10% of complete copies flagged — COMPARE2's rule), scored on
+// the other direction's normal arm and on the heavy arm in both directions.
+// Bar (set before the run): held-out normal >= 80% of drops flagged with <= 10%
+// of complete copies falsely flagged, AND heavy >= 80% of drops flagged with
+// <= 10% of kept units falsely flagged, both selection directions.
+static int run_compare3(ForwardPassBase* fp, ggml_backend_sched_t sched, Tokenizer* tok,
+                        const ModelMetadata& meta, uint32_t n_ctx) {
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║ COMPARE3 — which baseline survives most units missing          ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    const std::optional<uint32_t> ft = meta.raw_kv.get_uint32_opt("general.file_type");
+    const qinf::LensCalibration* cal = qinf::lens_calibration_for(
+        meta.architecture, meta.block_count, ft ? *ft : qinf::kLensAnyFileType);
+    if (!cal || cal->constants.compare_layer < 0) throw std::runtime_error("COMPARE3: a compare head expected on the row");
+    const qinf::LensConstants& k = cal->constants;
+    std::map<std::string, std::string> en, de;
+    for (const QDecide& d : decide_choice_corpus())
+        (d.de ? de : en)[d.tag.substr(0, 1) + d.tag.substr(4)] = d.document;
+    std::vector<std::string> elig;
+    for (const auto& kv : en)
+        if (de.count(kv.first)) {
+            const size_t ne = cmp_sentences(kv.second).size(), nd = cmp_sentences(de.at(kv.first)).size();
+            if (ne == nd && ne >= 2) elig.push_back(kv.first);
+        }
+    struct Trial { int dir; bool heavy; int drops; std::vector<double> cov; std::vector<char> dropped; };
+    std::vector<Trial> trials;
+    // COMPARE3_CONFIRM=1: FRESH trials (another seed) scoring only the candidate
+    // pre-registered 2026-09-27 after the first run — top-quarter mean, tau 0.35.
+    const bool confirm = std::getenv("COMPARE3_CONFIRM") != nullptr;
+    const uint32_t seed0 = confirm ? 0x5EEDC0DEu : 0xC3A0u;
+    for (int dir = 0; dir < 2; ++dir)
+        for (int t = 0; t < 16; ++t)
+            for (int level = 0; level < 5; ++level) {   // 0,1,2 drops; 3 = 50%; 4 = 75%
+                std::mt19937 rng(seed0 + 977u * (uint32_t)t + 31u * (uint32_t)level + 7u * (uint32_t)dir);
+                std::vector<std::string> pick = elig; std::shuffle(pick.begin(), pick.end(), rng);
+                pick.resize(std::min<size_t>(4, pick.size()));
+                std::vector<std::string> units; std::vector<std::vector<std::string>> bs;
+                for (const std::string& id : pick) {
+                    for (const std::string& s : cmp_sentences(dir == 0 ? de.at(id) : en.at(id))) units.push_back(s);
+                    bs.push_back(cmp_sentences(dir == 0 ? en.at(id) : de.at(id)));
+                }
+                const int n = (int)units.size();
+                const int drops = level <= 2 ? level : (level == 3 ? n / 2 : (3 * n) / 4);
+                std::vector<char> dropped((size_t)n, 0);
+                for (int kk = 0; kk < drops; ) { const size_t i = rng() % (size_t)n; if (!dropped[i]) { dropped[i] = 1; ++kk; } }
+                std::string b; size_t flat = 0;
+                for (size_t m = 0; m < bs.size(); ++m) {
+                    std::string para;
+                    for (const std::string& s : bs[m]) { if (!dropped[flat]) para += (para.empty() ? "" : " ") + s; ++flat; }
+                    if (!para.empty()) b += (b.empty() ? "" : "\n\n") + para;
+                }
+                const qinf::LensCompareReport r = qinf::run_lens_compare(fp, sched, tok, meta, n_ctx, units, b, k,
+                                                                          qinf::LensPrefillShape::Split);
+                Trial tr{dir, level >= 3, drops, {}, dropped};
+                for (const auto& u : r.units) tr.cov.push_back(u.coverage);
+                trials.push_back(tr);
+            }
+    std::printf("%zu trials (%d per direction and level)\n", trials.size(), 16);
+
+    const char* bname[4] = {"median (today)", "75th percentile", "top-quarter mean", "max"};
+    auto base = [](int b, std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        if (b == 0) return v[n / 2];
+        if (b == 1) return v[std::min(n - 1, (3 * n) / 4)];
+        if (b == 2) { const size_t q = (n + 3) / 4; double s = 0; for (size_t i = n - q; i < n; ++i) s += v[i]; return s / (double)q; }
+        return v[n - 1];
+    };
+    struct Rates { double recall, fa_copies, fp_kept; };
+    auto eval = [&](int b, double tau, int dir, bool heavy) {
+        long dn = 0, dh = 0, cn = 0, cf = 0, kn = 0, kf = 0;
+        for (const Trial& tr : trials) {
+            if (tr.dir != dir || tr.heavy != heavy) continue;
+            const double B = std::max(base(b, tr.cov), 1e-12);
+            bool any = false;
+            for (size_t i = 0; i < tr.cov.size(); ++i) {
+                const bool flag = tr.cov[i] / B < tau;
+                if (tr.dropped[i]) { ++dn; dh += flag; } else { ++kn; kf += flag; any = any || flag; }
+            }
+            if (tr.drops == 0) { ++cn; cf += any; }
+        }
+        return Rates{dn ? 100.0 * dh / dn : 0, cn ? 100.0 * cf / cn : 0, kn ? 100.0 * kf / kn : 0};
+    };
+    const char* dname[2] = {"DE->EN", "EN->DE"};
+    if (confirm) {
+        std::printf("\nCONFIRMATION (fresh seed) — pre-registered: top-quarter mean, tau 0.35; bar: normal >= 80%% flagged and <= 10%% of complete copies\n"
+                    "flagged, heavy >= 80%% flagged and <= 10%% of kept units flagged, both directions. Shipped (median, 0.50) shown for reference.\n");
+        bool pass = true;
+        for (int b : {2, 0}) {
+            const double tau = b == 2 ? 0.35 : 0.50;
+            for (int d = 0; d < 2; ++d) {
+                const Rates n = eval(b, tau, d, false), h = eval(b, tau, d, true);
+                const bool p = n.recall >= 80 && n.fa_copies <= 10 && h.recall >= 80 && h.fp_kept <= 10;
+                if (b == 2) pass = pass && p;
+                std::printf("  %-17s tau %.2f %s | normal %5.1f%% flagged, %5.1f%% copies FA | heavy %5.1f%% flagged, %4.1f%% kept FP | %s\n",
+                            bname[b], tau, dname[d], n.recall, n.fa_copies, h.recall, h.fp_kept, p ? "PASS" : "FAIL");
+            }
+        }
+        std::printf("COMPARE3 confirmation bar (top-quarter mean, tau 0.35): %s\n", pass ? "PASS" : "FAIL");
+        return 0;
+    }
+    std::printf("\n%-17s sel->scored | tau  | normal held out: flagged / copies FA | heavy (sel dir): flagged / kept FP | heavy (held-out dir): flagged / kept FP | bar\n", "baseline");
+    for (int b = 0; b < 4; ++b) {
+        bool pass_all = true;
+        for (int sel = 0; sel < 2; ++sel) {
+            double bt = 0, br = -1;
+            for (int i = 1; i <= 150; ++i) { const Rates r = eval(b, i * 0.01, sel, false); if (r.fa_copies <= 10.0 && r.recall > br) { br = r.recall; bt = i * 0.01; } }
+            const int sc = 1 - sel;
+            const Rates nh = eval(b, bt, sc, false), hs = eval(b, bt, sel, true), hh = eval(b, bt, sc, true);
+            const bool pass = nh.recall >= 80 && nh.fa_copies <= 10 && hs.recall >= 80 && hs.fp_kept <= 10 && hh.recall >= 80 && hh.fp_kept <= 10;
+            pass_all = pass_all && pass;
+            std::printf("%-17s %s->%s | %.2f | %5.1f%% / %5.1f%%                   | %5.1f%% / %5.1f%%                   | %5.1f%% / %5.1f%%                        | %s\n",
+                        bname[b], dname[sel], dname[sc], bt, nh.recall, nh.fa_copies, hs.recall, hs.fp_kept, hh.recall, hh.fp_kept, pass ? "PASS" : "FAIL");
+        }
+        std::printf("%-17s overall: %s\n", bname[b], pass_all ? "PASS" : "FAIL");
+    }
+    // Diagnostic, not a selection: every baseline at a fixed grid of thresholds.
+    std::printf("\nFIXED-THRESHOLD CURVE (normal: flagged / copies FA; heavy: flagged / kept FP), DE->EN | EN->DE\n");
+    for (int b = 0; b < 4; ++b)
+        for (double tau : {0.30, 0.35, 0.40, 0.45, 0.50, 0.55}) {
+            std::printf("%-17s tau %.2f |", bname[b], tau);
+            for (int d = 0; d < 2; ++d) {
+                const Rates n = eval(b, tau, d, false), h = eval(b, tau, d, true);
+                std::printf(" %s n %5.1f/%5.1f h %5.1f/%4.1f |", dname[d], n.recall, n.fa_copies, h.recall, h.fp_kept);
+            }
+            std::printf("\n");
+        }
+    return 0;
+}
+
 // ── SCOREHEAD — a stable head for the ORDINAL job ───────────────────────────
 //
 // DECIDEHEAD already proved the signal is there: sweeping heads moved the
@@ -11370,8 +12560,7 @@ static int run_score_head_search(ForwardPassBase* fp, ggml_backend_sched_t sched
             {
                 ggml_cgraph* gf = fp->build_prefill_graph(ptoks, 0, 0, false);
                 fp->mark_attention_taps(gf);
-                ggml_backend_sched_reset(sched);
-                ggml_backend_sched_alloc_graph(sched, gf);
+                fp->alloc_readback_graph(sched, gf);
                 fp->set_prefill_inputs(gf, ptoks, 0);
                 qinf::engine::require_compute_success(
                     ggml_backend_sched_graph_compute(sched, gf), "SCOREHEAD");
@@ -14845,7 +16034,7 @@ pin_prefill(ForwardPassBase* fp, ggml_backend_sched_t sched,
         ggml_backend_sched_reset(sched);
         ggml_cgraph* gf = fp->build_prefill_graph(part, pos, 0, want_logits);
         if (record) fp->mark_moe_routing(gf);   // before alloc, like the taps
-        ggml_backend_sched_alloc_graph(sched, gf);
+        fp->alloc_readback_graph(sched, gf);
         fp->set_prefill_inputs(gf, part, pos);
         qinf::engine::require_compute_success(
             ggml_backend_sched_graph_compute(sched, gf), "pin_prefill");
@@ -18412,7 +19601,7 @@ int main() {
     // SS2 threads target up to 8K prompt tokens (the workload-envelope ceiling,
     // CLAUDE.md) plus a 380-token grammar-decode margin.
     // KV *capacity* only — decode uses exact n_kv, so prior paths are byte-inert.
-    const uint32_t CTX = (std::getenv("LOCPERF") || std::getenv("LOCSPLIT") || std::getenv("LOCWARM") || std::getenv("VERDICT2") || std::getenv("VERDICTGATE") || std::getenv("PREFPROF") || std::getenv("ABSBENCH") || std::getenv("COMPARE2") || std::getenv("COMPAREGATE")) ? 11264
+    const uint32_t CTX = (std::getenv("LOCPERF") || std::getenv("LOCSPLIT") || std::getenv("LOCWARM") || std::getenv("VERDICT2") || std::getenv("VERDICTGATE") || std::getenv("PREFPROF") || std::getenv("ABSBENCH") || std::getenv("COMPARE2") || std::getenv("COMPAREGATE") || std::getenv("PLANCOST") || std::getenv("SCHEDMEM")) ? 11264
                         : (std::getenv("SS2") || std::getenv("SS3")) ? 9216
                         : std::getenv("WARMPERF") ? 9216
                         : (std::getenv("QDOCS_D") || std::getenv("QDOCS_S1") || std::getenv("CAND") ||
@@ -18623,6 +19812,27 @@ int main() {
     // COMPAREGATE — the shipped /v1/compare driver, gates G2-G4 (plan-lens-compare).
     if (std::getenv("COMPAREGATE"))
         return run_comparegate(fp.get(), sched, tok, meta, CTX);
+    // COMPARE3 — the compare baseline when most units are missing.
+    if (std::getenv("COMPARE3"))
+        return run_compare3(fp.get(), sched, tok, meta, CTX);
+    // COREF — probe D, coreference: the reference's own row onto earlier mentions.
+    if (std::getenv("COREF"))
+        return run_coref(fp.get(), sched, tok, attn_layers);
+    // SPLIT — probe D, document boundaries: does the next line look back?
+    if (std::getenv("SPLIT"))
+        return run_split(fp.get(), sched, tok, attn_layers);
+    // SURPRISE — probe D, per-word surprisal from the prefill's own logits.
+    if (std::getenv("SURPRISE"))
+        return run_surprise(fp.get(), sched, tok);
+    // TOTALCHECK — probe D narrow mode: does an invoice's arithmetic look wrong?
+    if (std::getenv("TOTALCHECK"))
+        return run_totalcheck(fp.get(), sched, tok);
+    // PLANCOST — what alloc_readback_graph costs per tapped pass.
+    if (std::getenv("PLANCOST"))
+        return run_plancost(fp.get(), sched);
+    // SCHEDMEM — GPU memory of the dedicated locate scheduler vs one merged scheduler.
+    if (std::getenv("SCHEDMEM"))
+        return run_schedmem(fp.get(), tok, meta, CTX, model.get_backend_metal(), model.get_backend_cpu());
     // LOCABSENT — the absence threshold for span-only: does the calibrated
     // locate head know when a key is NOT in the document?
     if (std::getenv("LOCABSENT"))

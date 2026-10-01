@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include "chat.h"
+#include "chat_input.h"
 #include "engine/decode_step.h"
 #include "engine/decode_graph_cache.h"
 #include "engine/multimodal_prefill.h"
@@ -205,20 +206,19 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                         "recipe that exposes its KV cache(s) (snapshot_kv_caches "
                         "non-empty), got: a recipe without L2 snapshot support");
                 // A 2-D image span writes nx*ny KV rows while advancing the
-                // position by only max(nx, ny). The snapshot blob records a row
-                // count and no rope coordinate, so such a slot cannot be
-                // round-tripped (plan §4 decision 3 — VL sessions are declared
-                // non-snapshottable in v1). capture_slot refuses this too, but
-                // that fires only AFTER a full model load and image encode;
-                // refuse here, before either is paid for.
+                // position by only max(nx, ny). Snapshots carry the rope
+                // coordinate since 2026-10-01 (RPOS, docs/plan-image-verdict.md
+                // §4), but this cache path positions the question by KV rows
+                // (img_end_pos below) — porting it is a separate decision.
+                // Refuse here, before a model load and image encode are paid.
                 if (img_recipe->image_span_is_2d())
                     throw std::runtime_error(
                         "run_chat: parameter '--image-prefix-cache': expected a "
                         "recipe whose image span advances one position per KV row, "
                         "got: an M-RoPE recipe, whose image span occupies nx*ny "
-                        "rows but max(nx, ny) positions. The snapshot format "
-                        "carries no rope coordinate, so VL sessions are not "
-                        "prefix-cacheable in v1 — drop --image-prefix-cache");
+                        "rows but max(nx, ny) positions. This image-prefix "
+                        "cache positions the question by KV rows, so it is not "
+                        "M-RoPE-safe — drop --image-prefix-cache");
                 image_prefix_lib = std::make_unique<PrefixLibrary>(
                     args.image_prefix_cache_dir,
                     qinf::snapshot::make_snapshot_header(
@@ -351,27 +351,13 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
 
         while (true) {
             std::cout << "\nUser: ";
-            std::string user_input;
-            std::string line;
-            while (std::getline(std::cin, line)) {
-                if (line.empty()) {
-                    break;
-                }
-                if (line == "exit" || line == "quit") {
-                    user_input = line;
-                    break;
-                }
-                user_input += line + "\n";
-            }
-
-            if (user_input == "exit\n" || user_input == "quit\n" || user_input == "exit" || user_input == "quit") {
+            // exit/quit and end of input both end the conversation; a bare
+            // empty line is never a turn (chat_input.h).
+            const ChatInput input = read_user_turn(std::cin);
+            if (input.kind != ChatInputKind::Turn) {
                 break;
             }
-
-            // Remove the trailing newline for cleaner processing
-            if (!user_input.empty() && user_input.back() == '\n') {
-                user_input.pop_back();
-            }
+            std::string user_input = input.text;
             chat_history.push_back({"user", user_input});
 
             // Guard the whole turn (tokenize → prefill → decode → suffix) so a

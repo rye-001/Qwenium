@@ -29,6 +29,8 @@
 # here as cross-family evidence.
 #
 # SIX GATES:
+#   0. FIRST      — the first extract after start records the same routing as
+#                   the next (a stale memory plan once corrupted it; fixed 2026-09-27).
 #   1. SHAPE      — MoE extract emits routing{digest, per_layer, layers, top_k};
 #                   per_layer has one entry per layer. A DENSE model emits none.
 #   2. OPT-IN     — `include_routing_trace` carries the selections; without it
@@ -107,14 +109,22 @@ def check(ok, gate, detail):
     if not ok:
         fails.append(gate)
 
-# The FIRST request after start routes differently from every later one (a
-# one-time first-build effect, plan §3 Slice 2a). Discard one so the gates below
-# compare steady-state passes rather than rediscovering that every run.
-post("/v1/extract", {"document": DOC, "key_vocabulary": KEYS, "max_tokens": 220})
-
+# The FIRST request after start used to record a different routing digest
+# from every later one. It was not a first-build effect: the captured prompt
+# prefill inherited the memory plan planted at start, in which `moe_idx` was
+# scratch, so the recorded trace was wrong (the model's output was not). Fixed
+# 2026-09-27 by ForwardPassBase::alloc_readback_graph; gate 0 keeps it fixed.
+first, err = post("/v1/extract", {"document": DOC, "key_vocabulary": KEYS, "max_tokens": 220})
+if err:
+    print(f"[setup] FAIL — extract returned HTTP {err[0]}: {err[1][:200]}"); sys.exit(1)
 plain, err = post("/v1/extract", {"document": DOC, "key_vocabulary": KEYS, "max_tokens": 220})
 if err:
     print(f"[setup] FAIL — extract returned HTTP {err[0]}: {err[1][:200]}"); sys.exit(1)
+
+# ── Gate 0: FIRST — the first request after start records what later ones do ─
+if first.get("routing") is not None:
+    check(first["routing"]["digest"] == plain["routing"]["digest"], "first",
+          f"first-request routing {first['routing']['digest']} vs steady state {plain['routing']['digest']}")
 
 # ── Gate 1: SHAPE ────────────────────────────────────────────────────────────
 rt = plain.get("routing")

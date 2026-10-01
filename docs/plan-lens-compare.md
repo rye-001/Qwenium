@@ -1,5 +1,20 @@
 # Plan — the compare route (`POST /v1/compare`): what is missing from a second version
 
+> **Baseline changed 2026-09-27 (COMPARE3, user-approved).** Coverage is now
+> relative to the mean of the best-covered quarter of units, threshold
+> **0.35** (was the median unit, 0.50). The median failed when most of an
+> original was missing (a summary): 51–65% of drops caught. COMPARE3 chose the
+> new pair on one set of translation trials (normal 0–2 drops + heavy 50/75%)
+> and confirmed it, pre-registered, on fresh ones: normal 87.5–95.8% flagged /
+> 0% false on complete copies, heavy 95.6–98.1% / 0% on kept units. It also
+> exposed that the median at 0.50 sat on an edge for EN→DE copies (18.8% and
+> 12.5% false alarms on two fresh samples, 6.2% on the gate's). Re-gated:
+> COMPAREGATE translation 95.8 / 87.5% flagged, 0% false; AbsenceBench numbers
+> 83.2, poetry 76.5; flash still changes flags (4 of 31,807, stays
+> materialized); warm = cold 96/96; other reports byte-identical (LENSDUMP);
+> live 2 / 5 / 6 of 8 dropped all exact on the three server kinds. Numbers in
+> the tables below are the 2026-09-26 median-baseline ones.
+
 Status: **LANDED 2026-09-26 (uncommitted).** The user chose option (a) —
 expose "compare", the seventh prefill-only mode — after AbsenceBench; the gate
 probe that had to come first (COMPARE2) passed both bars, and every build gate

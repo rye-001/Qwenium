@@ -105,7 +105,7 @@ void Model::load_metadata(const std::string &model_path, bool allow_multimodal)
     is_loaded_ = true;
 }
 
-void Model::load_tensors(uint32_t max_blocks)
+void Model::load_tensors(uint32_t max_blocks, bool keep_output_head)
 {
     if (!is_loaded_) {
         throw GGUFLoadError("Metadata must be loaded before loading tensors.");
@@ -181,7 +181,7 @@ void Model::load_tensors(uint32_t max_blocks)
         // when partial -- everything downstream (the copy loop and the mmap
         // wiring loop below both just iterate `tensors`) shrinks for free.
         std::unordered_map<std::string, ggml_tensor *> tensors;
-        loader_->load_tensor_metadata(model_context_, tensors, loaded_blocks);
+        loader_->load_tensor_metadata(model_context_, tensors, loaded_blocks, keep_output_head);
         std::cout << "Loaded metadata for " << tensors.size() << " tensors"
                   << (partial ? " (partial load: " + std::to_string(loaded_blocks) + "/" +
                                 std::to_string(metadata_.block_count) + " blocks)" : "")
@@ -300,6 +300,12 @@ void Model::load_tensors(uint32_t max_blocks)
             // Assign tensor pointers
         }
         assign_tensor_pointers(tensors, loaded_blocks);
+        // keep_output_head asked for the final norm on a partial load; the
+        // optional lookup above must then have found it (the output weight
+        // itself may legitimately be absent — a tied model reads token_embd).
+        if (partial && keep_output_head && !output_norm_weight_)
+            throw GGUFLoadError(metadata_.architecture + ": parameter 'keep_output_head' expected "
+                                "output_norm.weight loaded on the partial load, actual absent");
     }
 
     std::cout << "All tensors loaded and assigned successfully." << std::endl;
