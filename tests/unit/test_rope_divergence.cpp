@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +64,9 @@ public:
         throw std::logic_error("RowCounterRecipe builds no graphs");
     }
 
+    // Lets a test watch what set_decode_inputs hands the typed inputs.
+    void add_input(std::unique_ptr<GraphInput> in) { graph_inputs_.add(std::move(in)); }
+
 private:
     std::unordered_map<uint32_t, uint32_t> rows_;
 };
@@ -79,6 +83,23 @@ void feed_image_turn(RowCounterRecipe& fp, uint32_t slot, uint32_t pre,
     fp.note_span_rows_vs_positions(slot, post, post);
     fp.advance_cache(post, slot);
 }
+
+// Records each row's KV row as the step resolves it, and whether the step
+// carried explicit KV rows at all. Touches no tensor.
+class RowKvProbe : public GraphInput {
+public:
+    explicit RowKvProbe(std::vector<int64_t>& rows, bool& explicit_rows)
+        : rows_(rows), explicit_(explicit_rows) {}
+    void set_input(const StepContext& step) override {
+        rows_.clear();
+        for (size_t r = 0; r < step.n_rows(); ++r) rows_.push_back(step.row_kv(r));
+        explicit_ = step.kv_rows != nullptr;
+    }
+    const char* slot_name() const override { return "row_kv_probe"; }
+private:
+    std::vector<int64_t>& rows_;
+    bool& explicit_;
+};
 
 // An empty model + metadata pair, shared by every case: the base ctor keeps
 // references to them and reads neither, so one file-scope pair is safe.
@@ -235,4 +256,58 @@ TEST(RopeDivergence, SetRopeRecordRefusesAnImpossibleRecord) {
     EXPECT_THROW(fp.set_rope_record(0, 10, 101), std::runtime_error);   // past the rows
     EXPECT_THROW(fp.set_rope_record(0, 60, 50), std::runtime_error);    // rows_after < delta
     EXPECT_FALSE(fp.has_rope_divergence(0));
+}
+
+// Batched decode after an image: set_decode_inputs hands each row its KV row —
+// the rope position plus its slot's delta — so the mask and the KV write index
+// address the slot's real rows. Before the fix the step carried positions only,
+// and a token decoded after an image attended rows 0..position: the head of the
+// prompt and the image's first rows (docs/note-verdict-img-ground.md).
+TEST(RopeDivergence, DecodeInputsCarryEachRowsKvRow) {
+    RowCounterRecipe fp = make_recipe();
+    feed_image_turn(fp, 0, kPre, kImgRows, kImgPos, kPost);   // slot 0: an image turn
+    fp.set_cache_pos(7, 2);                                    // slot 2: text only
+    std::vector<int64_t> rows;
+    bool explicit_rows = false;
+    fp.add_input(std::make_unique<RowKvProbe>(rows, explicit_rows));
+
+    const std::vector<int32_t>  tokens{1, 1};
+    const std::vector<uint32_t> slots{0, 2};
+    const std::vector<int32_t>  positions{fp.get_rope_pos(0), fp.get_rope_pos(2)};
+    fp.set_decode_inputs(nullptr, tokens, slots, positions);
+
+    EXPECT_TRUE(explicit_rows);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0], kRowsAfterTurn);   // the next row, not position kPosAfterTurn
+    EXPECT_EQ(rows[1], 7);
+}
+
+// No diverged slot in the batch ⇒ no explicit rows: the step is exactly what it
+// was, so every text path and every Gemma path keeps its mask byte for byte.
+TEST(RopeDivergence, DecodeInputsWithoutAnImageCarryNoKvRows) {
+    RowCounterRecipe fp = make_recipe();
+    fp.set_cache_pos(40, 0);
+    feed_image_turn(fp, 1, kPre, /*img_rows=*/256, /*img_pos=*/256, kPost);   // scalar span
+    std::vector<int64_t> rows;
+    bool explicit_rows = true;
+    fp.add_input(std::make_unique<RowKvProbe>(rows, explicit_rows));
+
+    const std::vector<int32_t>  tokens{1, 1};
+    const std::vector<uint32_t> slots{0, 1};
+    const std::vector<int32_t>  positions{40, fp.get_rope_pos(1)};
+    fp.set_decode_inputs(nullptr, tokens, slots, positions);
+
+    EXPECT_FALSE(explicit_rows);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0], 40);
+    EXPECT_EQ(rows[1], positions[1]);
+}
+
+// One slot id per row is required; a short list is refused, not read past.
+TEST(RopeDivergence, DecodeInputsRefuseFewerSlotsThanRows) {
+    RowCounterRecipe fp = make_recipe();
+    const std::vector<int32_t>  tokens{1, 1};
+    const std::vector<uint32_t> slots{0};
+    const std::vector<int32_t>  positions{3, 4};
+    EXPECT_THROW(fp.set_decode_inputs(nullptr, tokens, slots, positions), std::runtime_error);
 }

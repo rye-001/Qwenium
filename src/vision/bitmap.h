@@ -40,6 +40,13 @@ struct Bitmap {
     // Set by the chunk-list builder in Phase 6, *not* by VisionEncoder
     // (the encoder is content-blind; it does not hash pixels).
     uint64_t content_id = 0;
+
+    // Where the uploaded picture sits on this canvas, in canvas pixels: the
+    // preprocessing may letterbox (PAD_CEIL), and a position the model reports
+    // is relative to the canvas, not to the picture. Set by the producer
+    // (image/image_loader); content_w == 0 means "the whole canvas". Not part
+    // of content_id. Read by the image verdict's "where" (server/image_verdict).
+    int content_x = 0, content_y = 0, content_w = 0, content_h = 0;
 };
 
 }  // namespace qinf::vision

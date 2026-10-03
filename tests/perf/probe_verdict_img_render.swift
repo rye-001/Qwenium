@@ -17,6 +17,13 @@
 // scan: skew, blur, noise, paper tint, JPEG q=0.45). 150 images, all three
 // questions on each. File name: {c|s}_b{base}_{FAM}_{variant}_s?t?d?.{png|jpg}
 //   .session-results/verdict_img/render .session-results/verdict_img_hard hard
+//
+// GROUND (`render DIR ground`): pages with truth boxes for the model's own
+// boxes (docs/note-verdict-img-ground.md); see the mode below.
+//
+// READ (`render DIR read`): delivery notes and invoices with read_truth.json —
+// what is printed (number, items, amounts, total), for the reading probe
+// (docs/note-verdict-img-read.md).
 
 import AppKit
 import Foundation
@@ -205,8 +212,14 @@ func font(_ name: String, _ size: CGFloat, bold: Bool = false) -> NSFont {
     return bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size)
 }
 
+// Every string drawPage draws, with its box (page px) — the `read` mode's line
+// truth. Recording draws nothing.
+var drawnText: [(String, CGRect)] = []
+
 func text(_ s: String, _ x: CGFloat, _ y: CGFloat, _ f: NSFont, _ c: NSColor = .black) {
-    NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c]).draw(at: NSPoint(x: x, y: y))
+    let a = NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c])
+    a.draw(at: NSPoint(x: x, y: y))
+    drawnText.append((s, CGRect(origin: CGPoint(x: x, y: y), size: a.size())))
 }
 
 func line(_ x0: CGFloat, _ y0: CGFloat, _ x1: CGFloat, _ y1: CGFloat, _ w: CGFloat = 1.5) {
@@ -253,7 +266,38 @@ func scribble(_ rng: inout Rng, from x0: CGFloat, midY: CGFloat, segments: Int) 
     return s
 }
 
-func draw(_ b: Base?, _ m: Marks) -> NSBitmapImageRep {
+// Where drawPage put each mark and lure (page px, top-left origin), for the
+// `ground` mode's truth boxes. Recording draws nothing.
+var groundBoxes: [String: CGRect] = [:]
+
+func textBox(_ s: String, _ x: CGFloat, _ y: CGFloat, _ f: NSFont) -> CGRect {
+    CGRect(origin: CGPoint(x: x, y: y), size: NSAttributedString(string: s, attributes: [.font: f]).size())
+}
+
+// drawStamp's outer outline (plus half its 6 px stroke), rotated, scaled, centred at `at`.
+func stampBox(at: CGPoint, rot: CGFloat, round: Bool, scale: CGFloat) -> CGRect {
+    let hw: CGFloat = round ? 113 : 153, hh: CGFloat = round ? 113 : 73
+    let ex = round ? hw : abs(hw * cos(rot)) + abs(hh * sin(rot))
+    let ey = round ? hh : abs(hw * sin(rot)) + abs(hh * cos(rot))
+    return CGRect(x: at.x - ex * scale, y: at.y - ey * scale, width: 2 * ex * scale, height: 2 * ey * scale)
+}
+
+// A badge the form prints in a stamp's shape (docs/note-stamp-lures.md): upright,
+// 80% of a stamp's size, in the logo's place. Drawn onto a finished page.
+func drawBadge(_ rep: NSBitmapImageRep, _ b: Base, word: String) -> CGRect {
+    let ctx = NSGraphicsContext(bitmapImageRep: rep)!
+    NSGraphicsContext.saveGraphicsState()
+    let cg = ctx.cgContext
+    cg.translateBy(x: 0, y: CGFloat(H)); cg.scaleBy(x: 1, y: -1)
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
+    cg.saveGState(); cg.translateBy(x: b.logoAt.x, y: b.logoAt.y); cg.scaleBy(x: 0.8, y: 0.8)
+    drawStamp(cg, at: .zero, rot: 0, color: b.stampColor, round: b.stampRound, label: word, sub: "")
+    cg.restoreGState()
+    NSGraphicsContext.restoreGraphicsState()
+    return stampBox(at: b.logoAt, rot: 0, round: b.stampRound, scale: 0.8)
+}
+
+func draw(_ b: Base?, _ m: Marks, invoice: Bool = false) -> NSBitmapImageRep {
     let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H, bitsPerSample: 8,
                                samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
@@ -264,7 +308,7 @@ func draw(_ b: Base?, _ m: Marks) -> NSBitmapImageRep {
     let cg = ctx.cgContext
     cg.translateBy(x: 0, y: CGFloat(H)); cg.scaleBy(x: 1, y: -1)
     NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
-    drawPage(b, m, cg)
+    drawPage(b, m, cg, invoice: invoice)
     NSGraphicsContext.restoreGraphicsState()
     return rep
 }
@@ -274,6 +318,8 @@ func draw(_ b: Base?, _ m: Marks) -> NSBitmapImageRep {
 // `invoice` switches the delivery-note layout to a bill; `footer` is the
 // printed sheet number. Both are off for every image of §4, §7 and §8.
 func drawPage(_ b: Base?, _ m: Marks, _ cg: CGContext, invoice: Bool = false, footer: String? = nil) {
+    groundBoxes = [:]
+    drawnText = []
     NSColor.white.setFill(); NSRect(x: 0, y: 0, width: W, height: H).fill()
 
     if let b = b {
@@ -290,6 +336,7 @@ func drawPage(_ b: Base?, _ m: Marks, _ cg: CGContext, invoice: Bool = false, fo
         line(240, 278, 520, 278)
         if m.date == .normal {
             text(b.dateText, 255, 238, font("Bradley Hand", 34), NSColor(red: 0.05, green: 0.1, blue: 0.55, alpha: 1))
+            groundBoxes["DATE"] = textBox(b.dateText, 255, 238, font("Bradley Hand", 34))
         } else if m.date == .faint {
             text(b.dateText, 262, 248, font("Bradley Hand", 22), NSColor(white: 0.62, alpha: 1))
         }
@@ -302,6 +349,8 @@ func drawPage(_ b: Base?, _ m: Marks, _ cg: CGContext, invoice: Bool = false, fo
         }
         if m.stampLure == .printedStatus {
             text(invoice ? "Status: PAID" : "Status: RECEIVED", b.statusAt.x, b.statusAt.y, font("Helvetica-Bold", 26, bold: true), b.stampColor)
+            groundBoxes["STATUS"] = textBox(invoice ? "Status: PAID" : "Status: RECEIVED", b.statusAt.x, b.statusAt.y,
+                                            font("Helvetica-Bold", 26, bold: true))
         }
         if m.sigLure == .issuerSignature {
             text("Issued by:", 600, 250, bold)
@@ -344,6 +393,7 @@ func drawPage(_ b: Base?, _ m: Marks, _ cg: CGContext, invoice: Bool = false, fo
             let sp = scribble(&rng, from: x0, midY: box.midY, segments: 9)
             sp.lineWidth = 3.2; sp.lineCapStyle = .round
             NSColor(red: 0.05, green: 0.1, blue: 0.5, alpha: 1).setStroke(); sp.stroke()
+            groundBoxes["SIG"] = sp.bounds.insetBy(dx: -1.6, dy: -1.6)
         } else if m.sig == .faint {
             let sp = scribble(&rng, from: box.minX + 60, midY: box.midY, segments: 5)
             sp.lineWidth = 1.4; sp.lineCapStyle = .round
@@ -356,6 +406,8 @@ func drawPage(_ b: Base?, _ m: Marks, _ cg: CGContext, invoice: Bool = false, fo
             let rot = CGFloat(-0.25 + rng.next() * 0.5)
             let at = m.stamp == .partial ? CGPoint(x: CGFloat(W) - 30, y: b.partialY) : b.stampAt
             let color = m.stamp == .faint ? b.stampColor.withAlphaComponent(0.28) : b.stampColor
+            groundBoxes["STAMP"] = stampBox(at: at, rot: rot, round: b.stampRound, scale: 1)
+                .intersection(CGRect(x: 0, y: 0, width: W, height: H))
             drawStamp(cg, at: at, rot: rot, color: color, round: b.stampRound, label: invoice ? "PAID" : "RECEIVED",
                       sub: b.company.components(separatedBy: " ").first!.uppercased())
         }
@@ -576,17 +628,13 @@ if CommandLine.arguments.count > 2 && CommandLine.arguments[2] == "stamp3" {
             let stamped = m.stamp != .none
             let tag = "g\(bi)_STAMP_\(v)_s\(m.sig != .none ? 1 : 0)t\(stamped ? 1 : 0)d\(m.date != .none ? 1 : 0)"
             let rep = draw(b, m)
+            if v == "badge" { _ = drawBadge(rep, b, word: words[bi % words.count]) }
             let ctx = NSGraphicsContext(bitmapImageRep: rep)!
             NSGraphicsContext.saveGraphicsState()
             let cg = ctx.cgContext
             cg.translateBy(x: 0, y: CGFloat(H)); cg.scaleBy(x: 1, y: -1)
             NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
-            if v == "badge" {
-                // Printed by the form: upright, 80% of a stamp's size, in the logo's place.
-                cg.saveGState(); cg.translateBy(x: b.logoAt.x, y: b.logoAt.y); cg.scaleBy(x: 0.8, y: 0.8)
-                drawStamp(cg, at: .zero, rot: 0, color: b.stampColor, round: b.stampRound, label: words[bi % words.count], sub: "")
-                cg.restoreGState()
-            } else if v.hasPrefix("ghost") {
+            if v.hasPrefix("ghost") {
                 // A stamp on the back of the sheet: mirrored, faint, where a stamp would sit.
                 let alpha: CGFloat = v == "ghost22" ? 0.22 : 0.12
                 cg.saveGState(); cg.translateBy(x: b.stampAt.x, y: b.stampAt.y); cg.scaleBy(x: -1, y: 1)
@@ -605,6 +653,80 @@ if CommandLine.arguments.count > 2 && CommandLine.arguments[2] == "stamp3" {
     }
     try! manifest.write(toFile: out + "/manifest.tsv", atomically: true, encoding: .utf8)
     print("wrote \(manifest.split(separator: "\n").count / 2) images, \(manifest.split(separator: "\n").count) questions to \(out)")
+    exit(0)
+}
+if CommandLine.arguments.count > 2 && CommandLine.arguments[2] == "ground" {
+    // docs/note-verdict-img-ground.md: does the model put its own box on the mark?
+    // §8's layouts, three variants: "all" (signature, stamp, date), "lures" (signature,
+    // date, no stamp — a stamp-shaped badge and "Status: RECEIVED" printed in colour),
+    // "none" (nothing marked). Writes boxes.tsv, the truth: where each mark and lure
+    // was drawn, in page px (top-left origin). The scan's skew (about ±1.4°) moves a
+    // mark by up to ~15 px against its truth box.
+    let words = ["URGENT", "ORIGINAL", "PRIORITY", "EXPRESS", "COPY"]
+    var boxes = "image\tbase\tvariant\tkind\tx0\ty0\tx1\ty1\n"
+    for (bi, b) in freshBases.enumerated() {
+        for (vi, v) in ["all", "lures", "none"].enumerated() {
+            var m = Marks()
+            if v != "none" { m.sig = .normal; m.date = .normal }
+            if v == "all" { m.stamp = .normal }
+            if v == "lures" { m.stampLure = .printedStatus }
+            let rep = draw(b, m)
+            var kinds = groundBoxes
+            if v == "lures" { kinds["BADGE"] = drawBadge(rep, b, word: words[bi % words.count]) }
+            let tag = "h\(bi)_\(v)"
+            let cname = "c_\(tag).png", sname = "s_\(tag).jpg"
+            try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out + "/" + cname))
+            try! scan(rep, seed: b.seed &* 7901 &+ UInt64(vi)).write(to: URL(fileURLWithPath: out + "/" + sname))
+            for name in [cname, sname] {
+                for (k, r) in kinds.sorted(by: { $0.key < $1.key }) {
+                    boxes += String(format: "%@\t%d\t%@\t%@\t%.0f\t%.0f\t%.0f\t%.0f\n", name, bi, v, k,
+                                    r.minX, r.minY, r.maxX, r.maxY)
+                }
+                if kinds.isEmpty { boxes += "\(name)\t\(bi)\t\(v)\t-\t0\t0\t0\t0\n" }
+            }
+        }
+    }
+    try! boxes.write(toFile: out + "/boxes.tsv", atomically: true, encoding: .utf8)
+    print("wrote \(freshBases.count * 3 * 2) images and boxes.tsv to \(out)")
+    exit(0)
+}
+if CommandLine.arguments.count > 2 && CommandLine.arguments[2] == "read" {
+    // docs/note-verdict-img-read.md: can the model read what is printed? §8's 10
+    // layouts as a delivery note and as an invoice (amount column, total), signed
+    // and dated, clean and scanned. The amounts are drawPage's own formula.
+    var truth: [[String: Any]] = []
+    for (bi, b) in freshBases.enumerated() {
+        for (vi, invoice) in [false, true].enumerated() {
+            var m = Marks(); m.sig = .normal; m.date = .normal
+            let rep = draw(b, m, invoice: invoice)
+            let lines: [[String: Any]] = drawnText.map { (t, r) in
+                ["text": t, "box": [Int(r.minX.rounded()), Int(r.minY.rounded()), Int(r.maxX.rounded()), Int(r.maxY.rounded())]] }
+            var items: [[String: Any]] = []
+            var total = 0.0
+            for (i, it) in b.items.enumerated() {
+                var row: [String: Any] = ["qty": Int(it.0)!, "description": it.1]
+                if invoice {
+                    let amount = (Double(it.0) ?? 1) * (3.5 + Double(i) * 1.25)
+                    total += amount
+                    row["amount"] = String(format: "%.2f", amount)
+                }
+                items.append(row)
+            }
+            let tag = "r\(bi)_\(invoice ? "inv" : "dn")"
+            let cname = "c_\(tag).png", sname = "s_\(tag).jpg"
+            try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out + "/" + cname))
+            try! scan(rep, seed: b.seed &* 7883 &+ UInt64(vi)).write(to: URL(fileURLWithPath: out + "/" + sname))
+            for name in [cname, sname] {
+                var t: [String: Any] = ["image": name, "base": bi, "doc": invoice ? "invoice" : "delivery note",
+                                        "number": b.note, "items": items, "lines": lines]
+                if invoice { t["total"] = String(format: "%.2f", total) }
+                truth.append(t)
+            }
+        }
+    }
+    let data = try! JSONSerialization.data(withJSONObject: truth, options: [.prettyPrinted, .sortedKeys])
+    try! data.write(to: URL(fileURLWithPath: out + "/read_truth.json"))
+    print("wrote \(truth.count) images and read_truth.json to \(out)")
     exit(0)
 }
 if hard {

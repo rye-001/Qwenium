@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -247,6 +248,29 @@ TEST(ImageLoader, Gemma4UvDynSizeBudgetAndPad) {
         else if (std::fabs(b - 1.0f) < 1e-2f) ++content_pixels;  // blue content → 1.0
     }
     EXPECT_GT(pad_pixels, 0) << "expected a horizontal black pad for a 3:1 image";
+}
+
+// The Bitmap records where the picture sits on its canvas (the letterbox), so a
+// position on the canvas can be mapped back to the picture. Here the recorded
+// rect must be exactly the blue (non-pad) pixels of every row and column.
+TEST(ImageLoader, RecordsThePicturesPlaceOnTheCanvas) {
+    const std::string path = write_solid_bmp(1200, 400, 0, 0, 255, tmp_path("g4_rect"));
+    auto bmp = load_image_to_bitmap(path, gemma4uv_preprocess(/*align=*/48));
+    std::remove(path.c_str());
+
+    const size_t plane = static_cast<size_t>(bmp.width) * bmp.height;
+    int x0 = bmp.width, y0 = bmp.height, x1 = -1, y1 = -1;
+    for (int y = 0; y < bmp.height; ++y)
+        for (int x = 0; x < bmp.width; ++x)
+            if (std::fabs(bmp.pixels[2 * plane + static_cast<size_t>(y) * bmp.width + x]) > 0.5f) {
+                x0 = std::min(x0, x); y0 = std::min(y0, y);
+                x1 = std::max(x1, x); y1 = std::max(y1, y);
+            }
+    EXPECT_EQ(bmp.content_x, x0);
+    EXPECT_EQ(bmp.content_y, y0);
+    EXPECT_EQ(bmp.content_w, x1 - x0 + 1);
+    EXPECT_EQ(bmp.content_h, y1 - y0 + 1);
+    EXPECT_LT(bmp.content_w, bmp.width);    // this 3:1 geometry really is letterboxed (side pads)
 }
 
 // ── Differential vs llama.cpp mtmd reference, qwen3vl (P5) ───────────────────

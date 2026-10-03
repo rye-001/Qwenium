@@ -153,6 +153,10 @@ qinf::vision::Bitmap bitmap_from_rgb(const unsigned char* data, int w, int h,
     }
 
     bmp.content_id = content_hash(bmp.pixels);
+    bmp.content_x = off_x;
+    bmp.content_y = off_y;
+    bmp.content_w = new_w;
+    bmp.content_h = new_h;
     return bmp;
 }
 

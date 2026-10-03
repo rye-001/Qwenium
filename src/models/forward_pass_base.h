@@ -335,6 +335,24 @@ public:
         step.slots      = &slots;
         step.sparse_ids = sparse_decode_ids_.empty()
             ? nullptr : &sparse_decode_ids_;
+        // The mask indexes KV ROWS; after an M-RoPE image a slot holds more rows
+        // than positions (get_rope_pos). Each row's KV row is its position plus
+        // its slot's delta. No diverged slot in the batch ⇒ no vector ⇒ the
+        // mask is exactly what it was (every text path, every Gemma path).
+        std::vector<int64_t> kv_rows;
+        for (size_t r = 0; r < positions.size(); ++r) {
+            if (r >= slots.size())
+                throw std::runtime_error(
+                    "set_decode_inputs: slot 'slots': expected one per row (" +
+                    std::to_string(positions.size()) + "), got: " +
+                    std::to_string(slots.size()));
+            const RopeDivergence* rec = live_rope_record(slots[r]);
+            if (rec == nullptr) continue;
+            if (kv_rows.empty())
+                kv_rows.assign(positions.begin(), positions.end());
+            kv_rows[r] = static_cast<int64_t>(positions[r]) + rec->delta;
+        }
+        if (!kv_rows.empty()) step.kv_rows = &kv_rows;
         graph_inputs_.set_input(step);
         if (routing_capture_ && !positions.empty())
             routing_capture_->note_tokens((size_t)positions[0], tokens);

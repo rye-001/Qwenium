@@ -288,3 +288,16 @@ saturated p of 1.0 included. cut_no stays 0.5. No p changed, only the band.
   show-through all came back `unclear`, with p values identical to before the
   change. COPY stayed `unclear` and the logo page stayed `no`. The wire shows
   `"cut": {"yes": 1.0, "no": 0.5}`.
+
+### 2026-10-02 — engine fixes, gates re-run, "where" (user: "go with 1", then "go with 2, then 1")
+Asking the model for a box (`docs/note-verdict-img-ground.md`) found two engine
+faults in image generation (decode masked KV rows by the rope position; block
+instead of interleaved M-RoPE). Both fixed. The verdict gates were re-run under
+the fixes (1053 synthetic questions): no served decision changed (§6 of that
+note). New end-to-end gate `test-image-ground`.
+* **`"where": true`** on the image verdict: the model's own box for each yes /
+  unclear answer on a mark with a locate wording (a new column of the
+  calibration row: the probe's measured wordings). Generated from the kept
+  post-image state, mapped onto the uploaded picture through the letterbox the
+  `Bitmap` now records. Answers unchanged by it. Unit tests: image-verdict
+  16/16, image-loader 11/11.

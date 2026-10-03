@@ -1025,7 +1025,7 @@ public:
     // discipline; run_image_verdict leaves slot 0 clean. Throws on bad input.
     std::string image_verdict_json(const std::vector<uint8_t>& image_bytes,
                                    const std::vector<qinf::ImageVerdictQuestion>& questions,
-                                   const std::string& image_id) {
+                                   const std::string& image_id, bool where) {
         const std::string unserved = image_verdict_unserved_reason();
         if (!unserved.empty()) throw std::runtime_error(unserved);
         const qinf::ImageVerdictVision v = image_verdict_vision();
@@ -1037,7 +1037,7 @@ public:
         const qinf::ImageVerdictReport rep = qinf::run_image_verdict(
             forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
             (uint32_t)max_ctx_per_slot_, v, image, cal, questions,
-            image_id.empty() ? nullptr : &image_verdicts_, image_id);
+            image_id.empty() ? nullptr : &image_verdicts_, image_id, where);
         return qinf::image_verdict_to_json(rep);
     }
 
@@ -1889,6 +1889,7 @@ bool handle_image_verdict(const httplib::Request& req, httplib::Response& res,
     std::vector<uint8_t> image_bytes;
     std::vector<qinf::ImageVerdictQuestion> questions;
     std::string image_id;
+    bool where = false;
     try {
         for (const char* k : {"document", "document_id", "language"})
             if (body.contains(k))
@@ -1901,6 +1902,12 @@ bool handle_image_verdict(const httplib::Request& req, httplib::Response& res,
             if (image_id.empty() || image_id.size() > 256)
                 throw std::runtime_error("\"image_id\": expected 1..256 bytes, actual " +
                                          std::to_string(image_id.size()));
+        }
+        if (body.contains("where")) {
+            if (!body.at("where").is_boolean())
+                throw std::runtime_error("\"where\": expected true or false, actual " +
+                                         std::string(body.at("where").type_name()));
+            where = body.at("where").get<bool>();
         }
         if (!body.at("image").is_string())
             throw std::runtime_error("\"image\": expected a data: URI string, actual " +
@@ -1927,12 +1934,13 @@ bool handle_image_verdict(const httplib::Request& req, httplib::Response& res,
     } catch (const std::exception& e) {
         res.status = 400;
         res.set_content(json({{"error", std::string("bad request — expected {\"image\": \"data:…\", \"questions\": "
-            "[{\"id\", \"mark\", <params…>} | {\"id\", \"question\"}, …], \"image_id\"?: string}: ") + e.what()},
+            "[{\"id\", \"mark\", <params…>} | {\"id\", \"question\"}, …], \"image_id\"?: string, "
+            "\"where\"?: bool}: ") + e.what()},
             {"code", "bad_request"}}).dump(), "application/json");
         return true;
     }
     try {
-        res.set_content(integration.image_verdict_json(image_bytes, questions, image_id), "application/json");
+        res.set_content(integration.image_verdict_json(image_bytes, questions, image_id, where), "application/json");
     } catch (const std::exception& e) {
         res.status = 400;
         res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");

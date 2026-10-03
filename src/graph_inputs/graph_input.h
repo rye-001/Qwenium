@@ -45,6 +45,14 @@ struct StepContext {
     // which after an image is most of the image.
     int kv_base = -1;
 
+    // Batched decode's per-row counterpart of kv_base: the KV row each query
+    // row occupies, explicit because every row may belong to a different slot.
+    // Set only when some slot in the batch has hosted an M-RoPE image (rows ≠
+    // positions there); null ⇒ the row is its position, the old behaviour.
+    // Without it a decode step after an image sees only KV rows 0..position —
+    // the first few rows of the image (docs/note-verdict-img-ground.md).
+    const std::vector<int64_t>* kv_rows = nullptr;
+
     // n_tokens == n_batch: the number of query rows this step computes.
     size_t n_rows() const { return tokens ? tokens->size() : 0; }
 
@@ -55,6 +63,7 @@ struct StepContext {
     // The KV row this batch's row r occupies. Equals row_pos(r) unless an
     // image span has made rows and positions diverge (see kv_base).
     int64_t row_kv(size_t r) const {
+        if (kv_rows) return (*kv_rows)[r];
         // kv_base < 0 must reproduce the OLD behaviour exactly, which means
         // deferring to row_pos — not to `pos + r`. Batched decode leaves `pos`
         // at 0 and supplies an explicit per-row positions vector, so `pos + r`
