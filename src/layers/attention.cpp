@@ -136,7 +136,8 @@ static ggml_tensor* build_rope_gated(
     // Every scaling parameter is identical to the NEOX branch above; the ONLY
     // difference is the kernel and the shape of inp_pos.
     return ggml_rope_multi(ctx, x, inp_pos, /*freq_factors=*/nullptr,
-                           n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                           n_rot, sections,
+                           mrope.interleaved ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE,
                            context_length, freq_base,
                            1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 }

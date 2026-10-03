@@ -118,3 +118,7 @@ qemmi.config.*
 
 .session-results/
 claude-memory
+!docs/note-verdict-img-ground.md
+!docs/note-verdict-img-read.md
+!docs/note-research-readouts-2026-10.md
+!docs/note-repo-split.md

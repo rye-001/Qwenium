@@ -970,7 +970,8 @@ POST /v1/verdict
     {"id": "stamp", "mark": "stamp",     "subject": "invoice"},
     {"id": "date",  "mark": "date",      "field": "'Date paid' field"},
     {"id": "qr",    "question": "Is there a QR code on the page?"} ],
-  "image_id": "inv-77" }       // optional, 1..256 bytes: keep the image pass
+  "image_id": "inv-77",        // optional, 1..256 bytes: keep the image pass
+  "where": true }              // optional: the model's box for each yes / unclear mark
 ```
 
 ```json
@@ -980,7 +981,8 @@ POST /v1/verdict
   "answers": [
     {"id": "stamp", "answer": "unclear", "p": {"yes": 0.86, "no": 0.14},
      "mark": "stamp", "question": "Does the invoice carry a stamp?",
-     "cut": {"yes": 1.0, "no": 0.5}, "calibrated": true, "prompt_len": 1561},
+     "cut": {"yes": 1.0, "no": 0.5}, "calibrated": true, "prompt_len": 1561,
+     "where": {"box": [0.052, 0.625, 0.23, 0.758]}},
     {"id": "qr", "answer": "no", "p": {"yes": 0.003, "no": 0.997},
      "question": "Is there a QR code on the page?",
      "cut": {"yes": 0.5, "no": 0.5}, "calibrated": false, "prompt_len": 1560} ] }
@@ -1014,6 +1016,23 @@ POST /v1/verdict
   (pen and pencil marks): every calibrated mark right at its cut, 36/36 on real
   paper — the stamp by a margin under 0.1. Printed stamps only (no rubber-stamp
   ink was available).
+  Re-run on the synthetic sets after the 2026-10-02 engine fixes (interleaved
+  M-RoPE): every mark keeps its result at its cut, no real stamp below 0.5;
+  single lures moved (net: 2 fewer stamp lures at or above 0.5). Details in
+  docs/note-verdict-img-ground.md §6; the real-paper photos were not re-run.
+* **`"where": true`** adds the model's own box to every **yes** or
+  **unclear** answer on a calibrated mark: `"where": {"box": [x0, y0, x1,
+  y1]}`, fractions (0..1) of the uploaded picture, origin top-left. For an
+  unclear stamp it shows which stamp-like mark to look at. `"box": null`: the
+  model gave no box. No `"where"` on a **no** (on an empty field the model
+  still draws a box, on the field) or on a free question. The box is the
+  model's pointer, not evidence, and reads no attention: it is generated
+  (the model is asked "Locate … in the image, output its bbox coordinates
+  using JSON format." from the same post-image state). Answers and p are the
+  same with or without it. Measured on synthetic pages: 59/60 boxes overlap
+  the drawn mark (IoU ≥ 0.5); covering the box drops the answer below 0.5
+  59/60, a same-size box elsewhere 0/60 (docs/note-verdict-img-ground.md).
+  Cost: about 1.5 s per box on top of the answers.
 * **`image_id`** keeps the post-image state (4 images, least recently used
   out, 15 minutes idle): a later request with the same id **and the same
   image** skips the encode and the image pass — answers identical to cold.

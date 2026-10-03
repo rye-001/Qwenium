@@ -174,6 +174,16 @@ struct MRopeSections {
     // checkpoint), not a missing required input — so it is a flag, not a throw.
     bool active = false;
 
+    // Which dimensions read which component: interleaved (ggml IMROPE — t h w
+    // t h w … across the rotated pairs) or in contiguous blocks (MROPE — all t,
+    // then all h, then all w). The GGUF does not say; the recipe does. The
+    // Qwen 3.5 family is interleaved (llama.cpp: qwen35 / qwen35moe → IMROPE).
+    // Text cannot tell the two apart (all components equal); an image can — in
+    // blocks, the row and column positions rotate the wrong dimensions and the
+    // model loses the page's layout while still seeing its content
+    // (docs/note-verdict-img-ground.md).
+    bool interleaved = false;
+
     // Build from a GGUF `rope.dimension_sections` array, validating what ggml
     // and the rotation maths actually require. Shared by every recipe that
     // reads the key so the checks cannot drift between them.

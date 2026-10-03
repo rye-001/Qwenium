@@ -64,6 +64,10 @@ struct ImageVerdictMark {
     double      cut_yes;
     double      cut_no;
     const char* provenance;
+    // What to ask the model to locate for "where" ("Locate {locate} in the
+    // image, …"), with the same {placeholders} as `wording` (a subset is fine).
+    // nullptr ⇒ this mark gets no box.
+    const char* locate = nullptr;
 };
 
 // Keyed like the lens rows — {architecture, block_count, general.file_type} —
@@ -99,6 +103,7 @@ struct ImageVerdictQuestion {
 // A question made ready: the text the model sees and the cuts that apply.
 struct ImageVerdictPlanned {
     std::string id, mark, text;
+    std::string locate;           // the filled locate wording; empty ⇒ no box
     double      cut_yes = 0.5, cut_no = 0.5;
     bool        calibrated = false;
 };
@@ -121,6 +126,13 @@ struct ImageVerdictResult {
     double cut_yes = 0.5, cut_no = 0.5;
     bool   calibrated = false;
     int    prompt_tokens = 0;
+    // "where" (asked only for a yes / unclear answer on a mark with a locate
+    // wording): the model's own box for the mark, as fractions [x0, y0, x1, y1]
+    // of the uploaded picture. A pointer, not evidence — on an empty field the
+    // model still draws a box (docs/note-verdict-img-ground.md).
+    bool   where_asked = false;
+    bool   has_box = false;          // false: the model's answer held no box
+    double box[4] = {0, 0, 0, 0};
 };
 
 struct ImageVerdictReport {
@@ -176,7 +188,24 @@ private:
 
 // The driver. Slot 0, EXCLUSIVE: the caller holds the model lock. Leaves slot 0
 // cleared and the engine's prefill attention mode as it found it. With a store
-// and an image_id (both or neither), the image pass is kept / resumed.
+// and an image_id (both or neither), the image pass is kept / resumed. With
+// `where`, every yes / unclear answer on a mark with a locate wording also gets
+// the model's box: the post-image state restored, the locate prompt prefilled,
+// a short greedy generation (~1 s), the box parsed. Nothing else changes: the
+// answers and p values are the same with or without it.
+// The model's box: the first [x0, y0, x1, y1] in `text`, Qwen-VL's 0..1000
+// coordinates of the canvas the encoder saw. False when there is none or it is
+// not a box (x1 <= x0 or y1 <= y0).
+bool parse_image_verdict_box(const std::string& text, double rel[4]);
+
+// Map a 0..1000 canvas box onto the uploaded picture (the Bitmap's content
+// rect, i.e. without the letterbox), as fractions clamped to [0, 1].
+void image_verdict_box_on_picture(const double rel[4], const qinf::vision::Bitmap& canvas, double out[4]);
+
+// The prompt that asks for a box ("Locate … in the image, output its bbox
+// coordinates using JSON format." — docs/note-verdict-img-ground.md §1).
+std::string image_verdict_locate_prompt(const std::string& locate);
+
 ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t sched,
                                      ::Tokenizer* tok, const ::ModelMetadata& meta,
                                      uint32_t n_ctx_max, const ImageVerdictVision& vision,
@@ -184,7 +213,8 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
                                      const ImageVerdictCalibration& cal,
                                      const std::vector<ImageVerdictQuestion>& questions,
                                      ImageVerdictStore* store = nullptr,
-                                     const std::string& image_id = std::string());
+                                     const std::string& image_id = std::string(),
+                                     bool where = false);
 
 std::string image_verdict_to_json(const ImageVerdictReport& report);
 

@@ -24,14 +24,16 @@ void KvWriteIndicesInput::set_input(const StepContext& step) {
 
     std::vector<int64_t> indices(n_rows);
     for (size_t r = 0; r < n_rows; ++r) {
-        const int32_t pos = step.row_pos(r);
-        if (pos < 0 || static_cast<uint32_t>(pos) >= n_ctx_max_)
+        // The KV ROW, not the rope position: after an M-RoPE image they differ,
+        // and writing at the position overwrites a row of the image.
+        const int64_t row = step.row_kv(r);
+        if (row < 0 || row >= static_cast<int64_t>(n_ctx_max_))
             throw std::runtime_error(
                 "KvWriteIndicesInput: slot 'kv_write_indices': expected "
-                "position in [0, " + std::to_string(n_ctx_max_) +
-                "), got: " + std::to_string(pos) + " (batch row " +
+                "KV row in [0, " + std::to_string(n_ctx_max_) +
+                "), got: " + std::to_string(row) + " (batch row " +
                 std::to_string(r) + ")");
-        indices[r] = static_cast<int64_t>((*step.slots)[r]) * n_ctx_max_ + pos;
+        indices[r] = static_cast<int64_t>((*step.slots)[r]) * n_ctx_max_ + row;
     }
     ggml_backend_tensor_set(t, indices.data(), 0,
                             indices.size() * sizeof(int64_t));

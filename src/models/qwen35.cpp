@@ -61,6 +61,8 @@ Qwen35Config Qwen35Config::from_metadata(const ModelMetadata& meta) {
                 : static_cast<int>(meta.attention_key_length);
             mrope_sections =
                 MRopeSections::from_widths(*widths, sections_key.c_str(), n_rot);
+            // Interleaved, as trained (Qwen3-VL lineage; llama.cpp → IMROPE).
+            mrope_sections.interleaved = true;
         }
     }
 

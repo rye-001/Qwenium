@@ -6,6 +6,11 @@ the existing `build-metal` binaries (flash-attention encoder). Synthetic images
 only. The options in §5 were the user's decision. **Option 4 was chosen and
 applied the same day** (stamp: never yes, see §5).
 
+**2026-10-02 re-run.** These numbers predate two engine fixes (interleaved
+M-RoPE; decode KV rows). Re-run on the synthetic sets: same conclusion, no
+real stamp below 0.5 (min 0.959), no cut separates stamps from lures
+(lures up to 0.997). See docs/note-verdict-img-ground.md §6.
+
 **Bottom line.** The client's finding holds, and it applies to the lure *kind*,
 not just to five pages. A printed badge drawn like a stamp (a ring around one
 word) and a stamp showing through from the back of the sheet score the same as

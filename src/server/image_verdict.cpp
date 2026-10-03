@@ -3,18 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <regex>
 #include <set>
 #include <stdexcept>
 
 #include "nlohmann/json.hpp"
 
 #include "engine/model.h"
+#include "engine/decode_step.h"
 #include "engine/multimodal_prefill.h"
 #include "image/image_prompt.h"
 #include "loader/chat_template.h"
 #include "loader/tokenizer.h"
 #include "models/forward_pass_base.h"
 #include "models/model_registry.h"   // lookup_chat_template
+#include "sampling/sampling.h"
 #include "session/slot_snapshot.h"
 #include "vision/bitmap.h"
 #include "vision/i_vision_encoder.h"
@@ -27,21 +30,27 @@ const std::vector<ImageVerdictCalibration>& image_verdict_calibrations() {
     // One row per measured {model file, mmproj}. Wordings are the probe's
     // exact strings with the varying parts as {params}; cuts are the measured
     // ones (docs/note-verdict-img-probe.md). Measured on the flash-attention
-    // encoder (§11) with a materialized LLM prefill (run_image_verdict pins it).
+    // encoder (§11) with a materialized LLM prefill (run_image_verdict pins it);
+    // re-run after the 2026-10-02 engine fixes, no decision changed
+    // (docs/note-verdict-img-ground.md §6). The locate wordings are the
+    // grounding probe's (same note, §1): boxes IoU >= 0.5 on 59/60 marks.
     static const std::vector<ImageVerdictCalibration> kRows = {
         {"qwen35moe", 40, 12, "qwen3vl-merger", 2048,
          "Qwen3.6-35B-A3B (UD-Q3_K_XL) + Qwen3.6 mmproj",
          {
              {"signature", "Is the {subject} signed by hand in the '{box}' box?", 0.5, 0.5,
-              "note §7 (lures + scans 100%), §9 real paper 12/12"},
+              "note §7 (lures + scans 100%), §9 real paper 12/12",
+              "the handwritten signature in the '{box}' box"},
              // Never yes (user decision 2026-10-01): printed stamp-shaped badges and
              // show-through score like real stamps (up to 0.995) and no cut separates
              // them; no real stamp ever scored below 0.5, so no / unclear both hold.
              {"stamp", "Does the {subject} carry a stamp?", kImageVerdictNeverYes, 0.5,
               "note-stamp-lures.md (all sets: real stamps >= 0.934, 0/207 below 0.5; "
-              "lures up to 0.995, badge + show-through 0/60 below 0.5), §9 real paper stamps >= 0.959"},
+              "lures up to 0.995, badge + show-through 0/60 below 0.5), §9 real paper stamps >= 0.959",
+              "the stamp"},
              {"date", "Is the {field} filled in?", 0.5, 0.5,
-              "note §7 (lures + scans 100%), §9 real paper 12/12"},
+              "note §7 (lures + scans 100%), §9 real paper 12/12",
+              "the handwritten {field}"},
          }},
     };
     return kRows;
@@ -139,6 +148,22 @@ std::vector<ImageVerdictPlanned> plan_image_verdict_questions(
             if (!used.count(kv.first))
                 throw std::runtime_error(at + ".params." + kv.first + ": expected only the params of mark '" +
                                          q.mark + "' (\"" + m->wording + "\"), actual an unused one");
+        if (m->locate) {
+            // The locate wording's placeholders are a subset of the wording's,
+            // so every one has a validated, non-empty, one-line param.
+            std::string loc = m->locate;
+            for (size_t a = loc.find('{'); a != std::string::npos; a = loc.find('{', a)) {
+                const size_t b = loc.find('}', a);
+                const std::string key = loc.substr(a + 1, b - a - 1);
+                if (!used.count(key))
+                    throw std::runtime_error(at + ": mark '" + q.mark + "' locate wording expected only the "
+                                             "wording's {params}, actual {" + key + "}");
+                const std::string& v = q.params.at(key);
+                loc.replace(a, b - a + 1, v);
+                a += v.size();
+            }
+            p.locate = loc;
+        }
         p.mark = q.mark;
         p.text = text;
         p.cut_yes = m->cut_yes;
@@ -154,6 +179,36 @@ ImageVerdictAnswer image_verdict_band(double p_yes, double cut_yes, double cut_n
     if (cut_yes < kImageVerdictNeverYes && p_yes >= cut_yes) return ImageVerdictAnswer::Yes;
     if (p_yes < cut_no) return ImageVerdictAnswer::No;
     return ImageVerdictAnswer::Unclear;
+}
+
+// ── "where": the model's own box ─────────────────────────────────────────────
+
+bool parse_image_verdict_box(const std::string& text, double rel[4]) {
+    static const std::regex kBox(
+        R"(\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\])");
+    std::smatch m;
+    if (!std::regex_search(text, m, kBox)) return false;
+    for (int k = 0; k < 4; ++k) rel[k] = std::stod(m[k + 1].str());
+    return rel[2] > rel[0] && rel[3] > rel[1];
+}
+
+void image_verdict_box_on_picture(const double rel[4], const qinf::vision::Bitmap& canvas, double out[4]) {
+    if (canvas.width <= 0 || canvas.height <= 0)
+        throw std::runtime_error("image_verdict_box_on_picture: canvas expected positive size, actual " +
+                                 std::to_string(canvas.width) + "x" + std::to_string(canvas.height));
+    const bool whole = canvas.content_w <= 0 || canvas.content_h <= 0;
+    const double cx = whole ? 0 : canvas.content_x, cy = whole ? 0 : canvas.content_y;
+    const double cw = whole ? canvas.width : canvas.content_w, ch = whole ? canvas.height : canvas.content_h;
+    for (int k = 0; k < 4; ++k) {
+        const bool x = (k % 2 == 0);
+        const double px = rel[k] / 1000.0 * (x ? canvas.width : canvas.height);   // canvas pixels
+        const double f = (px - (x ? cx : cy)) / (x ? cw : ch);
+        out[k] = std::min(1.0, std::max(0.0, f));
+    }
+}
+
+std::string image_verdict_locate_prompt(const std::string& locate) {
+    return "Locate " + locate + " in the image, output its bbox coordinates using JSON format.";
 }
 
 const char* image_verdict_answer_name(ImageVerdictAnswer a) {
@@ -210,7 +265,8 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
                                      const qinf::vision::Bitmap& image,
                                      const ImageVerdictCalibration& cal,
                                      const std::vector<ImageVerdictQuestion>& questions,
-                                     ImageVerdictStore* store, const std::string& image_id) {
+                                     ImageVerdictStore* store, const std::string& image_id,
+                                     bool where) {
     if ((store == nullptr) != image_id.empty())
         throw std::runtime_error(std::string("run_image_verdict: a store and an image_id expected together, actual ") +
                                  (store ? "a store without an id" : "an id without a store"));
@@ -246,9 +302,10 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
     const uint32_t n_img = vision.encoder->mm_tokens_for(image);
     uint32_t grid_w = 0, grid_h = 0;
     vision.encoder->mm_grid_for(image, grid_w, grid_h);
-    auto build = [&](const std::string& question, int& span_start) {
-        std::vector<ChatMessage> turn = {
-            {"user", vision.marker_prefix + "Question: " + question + "\nAnswer with yes or no only."}};
+    // One user turn: the image, then `user_text`. Questions and "where" share it,
+    // so both resume from the same post-image state.
+    auto build_turn = [&](const std::string& user_text, int& span_start) {
+        std::vector<ChatMessage> turn = {{"user", vision.marker_prefix + user_text}};
         const std::string prompt = tmpl.render(turn, /*add_assistant_prompt=*/true, /*enable_thinking=*/false);
         qinf::image::ExpandedImagePrompt built = qinf::image::expand_image_markers(
             tok->encode(prompt), vision.boi_id, vision.soft_id, vision.eoi_id, n_img);
@@ -259,6 +316,9 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
             throw std::runtime_error("run_image_verdict: prompt tokens expected < n_ctx_max=" +
                                      std::to_string(n_ctx_max) + ", actual " + std::to_string(tokens.size()));
         return tokens;
+    };
+    auto build = [&](const std::string& question, int& span_start) {
+        return build_turn("Question: " + question + "\nAnswer with yes or no only.", span_start);
     };
     std::vector<std::vector<int32_t>> prompts(planned.size());
     int span_start = 0;
@@ -315,7 +375,7 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
         // first question overwrites the recurrent state) and for the store. The
         // blob carries the rope position (RPOS), so get_rope_pos is exact after
         // each restore.
-        if (planned.size() > 1 || store)
+        if (planned.size() > 1 || store || where)
             blob = std::make_shared<const std::vector<uint8_t>>(qinf::snapshot::capture_slot(*fp, 0, header));
         if (store) {
             ImageVerdictStore::Entry e;
@@ -371,6 +431,56 @@ ImageVerdictReport run_image_verdict(::ForwardPassBase* fp, ggml_backend_sched_t
         r.prompt_tokens = (int)prompts[i].size();
         rep.answers.push_back(r);
     }
+
+    // "where": the model's own box for each yes / unclear answer on a mark with a
+    // locate wording (docs/note-verdict-img-ground.md). The answers above are
+    // final; this only adds the box. Each locate prompt resumes from the
+    // post-image state like a question, then a short greedy generation.
+    if (where) {
+        constexpr int kWhereMaxTokens = 64;   // a box answer is ~30 tokens
+        const std::vector<std::string>& vocab = tok->get_vocabulary();
+        const int32_t eos = tok->get_eos_token_id();
+        const std::vector<int32_t> im_end = tok->encode("<|im_end|>");
+        for (size_t i = 0; i < planned.size(); ++i) {
+            ImageVerdictResult& r = rep.answers[i];
+            if (planned[i].locate.empty() || r.answer == ImageVerdictAnswer::No) continue;
+            int s = 0;
+            const std::vector<int32_t> lp = build_turn(image_verdict_locate_prompt(planned[i].locate), s);
+            if (s != span_start || lp.size() <= img_end ||
+                !std::equal(image_inclusive.begin(), image_inclusive.end(), lp.begin()))
+                throw std::runtime_error("run_image_verdict: the locate prompt of '" + planned[i].id +
+                                         "' expected to share the image-inclusive prefix, actual differs");
+            if (lp.size() + kWhereMaxTokens >= n_ctx_max)
+                throw std::runtime_error("run_image_verdict: locate prompt + " + std::to_string(kWhereMaxTokens) +
+                                         " tokens expected < n_ctx_max=" + std::to_string(n_ctx_max) +
+                                         ", actual " + std::to_string(lp.size() + kWhereMaxTokens));
+            qinf::snapshot::restore_slot(*fp, 0, *blob, header);
+            const std::vector<int32_t> suffix(lp.begin() + img_end, lp.end());
+            const int l_pos = fp->get_rope_pos(0);
+            fp->note_span_rows_vs_positions(0, (uint32_t)suffix.size(), (uint32_t)suffix.size());
+            std::vector<float> logits = fp->run_prefill(suffix, l_pos, 0, sched);
+            if (logits.size() < n_vocab)
+                throw std::runtime_error("run_image_verdict: locate logits expected >= one row of " +
+                                         std::to_string(n_vocab) + ", actual " + std::to_string(logits.size()));
+            std::vector<float> tail(logits.end() - n_vocab, logits.end());
+            qinf::GreedySampler sampler(/*repetition_penalty=*/1.0f);
+            std::vector<int32_t> history = lp;
+            int32_t next = static_cast<int32_t>(sampler.sample(tail, history, vocab));
+            std::string text;
+            for (int k = 0; k < kWhereMaxTokens; ++k) {
+                if (next == eos || (im_end.size() == 1 && next == im_end[0])) break;
+                text += tok->decode(next);
+                history.push_back(next);
+                if (text.find("bbox") != std::string::npos &&
+                    text.find(']', text.find("bbox")) != std::string::npos) break;   // the box is closed
+                next = decode_step(fp, sched, &sampler, next, /*slot=*/0, history, vocab, (uint32_t)n_vocab);
+            }
+            double rel[4];
+            r.where_asked = true;
+            r.has_box = parse_image_verdict_box(text, rel);
+            if (r.has_box) image_verdict_box_on_picture(rel, image, r.box);
+        }
+    }
     return rep;
 }
 
@@ -389,6 +499,15 @@ std::string image_verdict_to_json(const ImageVerdictReport& rep) {
             {"prompt_len", r.prompt_tokens},
         };
         if (!r.mark.empty()) a["mark"] = r.mark;
+        if (r.where_asked) {
+            if (r.has_box) {
+                nlohmann::json b = nlohmann::json::array();
+                for (double v : r.box) b.push_back(std::round(v * 10000.0) / 10000.0);
+                a["where"] = {{"box", b}};
+            } else {
+                a["where"] = {{"box", nullptr}};
+            }
+        }
         answers.push_back(a);
     }
     const nlohmann::json out = {

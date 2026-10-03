@@ -16,6 +16,7 @@
 
 #include "engine/model.h"
 #include "image_verdict.h"
+#include "vision/bitmap.h"
 
 using namespace qinf;
 
@@ -203,6 +204,69 @@ TEST(ImageVerdictJson, CarriesTheAnswerCutsAndCalibrationFlag) {
     EXPECT_DOUBLE_EQ(a["cut"]["yes"].get<double>(), 1.0);
     EXPECT_NEAR(a["p"]["no"].get<double>(), 0.14, 1e-12);
     EXPECT_TRUE(a["calibrated"].get<bool>());
+}
+
+// ── "where": the model's own box (docs/note-verdict-img-ground.md) ─────────────
+
+// The locate wordings are the grounding probe's exact strings, filled from the
+// mark's own params; a free question gets none (no box).
+TEST(ImageVerdictWhere, MarksCarryTheProbesLocateWording) {
+    const auto p = plan_image_verdict_questions(row35(), {
+        mark("s", "signature", {{"subject", "delivery note"}, {"box", "Received by"}}),
+        mark("t", "stamp", {{"subject", "delivery note"}}),
+        mark("d", "date", {{"field", "delivery date"}}),
+        free_q("q", "Is there a QR code on the page?"),
+    });
+    EXPECT_EQ(p[0].locate, "the handwritten signature in the 'Received by' box");
+    EXPECT_EQ(p[1].locate, "the stamp");
+    EXPECT_EQ(p[2].locate, "the handwritten delivery date");
+    EXPECT_TRUE(p[3].locate.empty());
+    EXPECT_EQ(image_verdict_locate_prompt(p[1].locate),
+              "Locate the stamp in the image, output its bbox coordinates using JSON format.");
+}
+
+TEST(ImageVerdictWhere, ParsesTheFirstBoxAndRefusesNonBoxes) {
+    double r[4];
+    ASSERT_TRUE(parse_image_verdict_box(
+        "```json\n[\n\t{\"bbox_2d\": [611, 336, 832, 498], \"label\": \"stamp\"}\n]\n```", r));
+    EXPECT_DOUBLE_EQ(r[0], 611); EXPECT_DOUBLE_EQ(r[3], 498);
+    EXPECT_FALSE(parse_image_verdict_box("I cannot see a stamp.", r));
+    EXPECT_FALSE(parse_image_verdict_box("[44, 92, 901, 91]", r));   // y1 < y0: the pre-fix engine's output
+}
+
+// A 0..1000 box on the canvas maps onto the uploaded picture: through the
+// letterbox when there is one, the whole canvas otherwise; clamped to [0, 1].
+TEST(ImageVerdictWhere, MapsTheCanvasBoxOntoThePicture) {
+    qinf::vision::Bitmap c;
+    c.width = 1000; c.height = 800;
+    const double rel[4] = {250, 125, 750, 875};
+    double out[4];
+    image_verdict_box_on_picture(rel, c, out);                     // no letterbox recorded
+    EXPECT_DOUBLE_EQ(out[0], 0.25); EXPECT_DOUBLE_EQ(out[1], 0.125);
+    EXPECT_DOUBLE_EQ(out[2], 0.75); EXPECT_DOUBLE_EQ(out[3], 0.875);
+    c.content_x = 0; c.content_y = 100; c.content_w = 1000; c.content_h = 600;   // pad top and bottom
+    image_verdict_box_on_picture(rel, c, out);
+    EXPECT_DOUBLE_EQ(out[0], 0.25);
+    EXPECT_DOUBLE_EQ(out[1], 0.0);                                  // 100 px - 100 pad = 0
+    EXPECT_DOUBLE_EQ(out[3], 1.0);                                  // 700 - 100 = 600 of 600
+    const double outside[4] = {-50, 0, 1200, 1000};
+    image_verdict_box_on_picture(outside, c, out);
+    EXPECT_DOUBLE_EQ(out[0], 0.0); EXPECT_DOUBLE_EQ(out[2], 1.0);   // clamped
+}
+
+TEST(ImageVerdictWhere, JsonCarriesTheBoxOnlyWhereAsked) {
+    ImageVerdictReport rep;
+    rep.model = "m";
+    ImageVerdictResult with, none, unasked;
+    with.id = "s"; with.where_asked = true; with.has_box = true;
+    with.box[0] = 0.123456; with.box[1] = 0.2; with.box[2] = 0.5; with.box[3] = 0.9;
+    none.id = "t"; none.where_asked = true;                         // the model gave no box
+    unasked.id = "d";                                               // a "no", or where not asked
+    rep.answers = {with, none, unasked};
+    const nlohmann::json j = nlohmann::json::parse(image_verdict_to_json(rep));
+    EXPECT_DOUBLE_EQ(j["answers"][0]["where"]["box"][0].get<double>(), 0.1235);
+    EXPECT_TRUE(j["answers"][1]["where"]["box"].is_null());
+    EXPECT_FALSE(j["answers"][2].contains("where"));
 }
 
 // ── The store (image_id) ─────────────────────────────────────────────────────

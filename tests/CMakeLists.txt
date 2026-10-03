@@ -382,6 +382,23 @@ target_link_libraries(test-image-prefix-roundtrip PRIVATE
 )
 target_compile_features(test-image-prefix-roundtrip PRIVATE cxx_std_17)
 
+# Generation after an image (Qwen-VL): the model's own box vs the drawn shape.
+# docs/note-verdict-img-ground.md. Usage: test-image-ground <model> <mmproj>
+add_executable(test-image-ground
+    integration/test_image_ground.cpp
+)
+target_link_libraries(test-image-ground PRIVATE
+    qinf-orchestration
+    qinf-image
+    qinf-models
+    qinf-vision
+    qinf-state
+    qinf-engine
+    sampling
+    ggml
+)
+target_compile_features(test-image-ground PRIVATE cxx_std_17)
+
 # Grammar regression tests (non-GTest standalone executables)
 add_subdirectory(grammar)
 

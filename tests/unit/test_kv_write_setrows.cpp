@@ -76,6 +76,28 @@ TEST(KvWriteIndicesInput, SlotStrideTimesCtxPlusPosition) {
         EXPECT_EQ(got[b], (int64_t)slots[b]*n_ctx_max + positions[b]);
 }
 
+// After an M-RoPE image the write goes to the slot's next KV ROW, not to its
+// rope position — that row is inside the image and writing there overwrites it.
+TEST(KvWriteIndicesInput, WritesAtTheKvRowAfterAnImage) {
+    const uint32_t n_batch = 2, n_ctx_max = 2048;
+    std::vector<int32_t>  toks(n_batch, 0);
+    std::vector<uint32_t> slots{1, 0};
+    std::vector<int32_t>  positions{80, 5};
+    std::vector<int64_t>  kv_rows{1500, 5};
+    H h(n_batch);
+    StepContext step;
+    step.gf = h.gf; step.tokens = &toks; step.slots = &slots;
+    step.positions = &positions; step.kv_rows = &kv_rows;
+
+    KvWriteIndicesInput in(n_ctx_max);
+    in.set_input(step);
+
+    std::vector<int64_t> got(n_batch);
+    ggml_backend_tensor_get(h.t, got.data(), 0, got.size()*sizeof(int64_t));
+    EXPECT_EQ(got[0], (int64_t)1 * n_ctx_max + 1500);
+    EXPECT_EQ(got[1], (int64_t)0 * n_ctx_max + 5);
+}
+
 TEST(KvWriteIndicesInput, FailLoudWhenPositionOutOfRange) {
     const uint32_t n_batch = 1, n_ctx_max = 8;
     std::vector<int32_t>  toks(n_batch, 0);

@@ -124,6 +124,38 @@ TEST(AttnMaskInput, BatchedExplicitPositions) {
             EXPECT_FLOAT_EQ(got[r * n_kv + j], ref(positions[r], j, 0));
 }
 
+// After an M-RoPE image a slot holds more KV rows than rope positions, so
+// batched decode carries each row's KV row (StepContext::kv_rows) and the causal
+// test must use it. Row 0 sits at position 80 but KV row 1500: it must see all
+// 1501 rows. Before the fix it saw rows 0..80 — the prompt's head and the
+// image's first rows, never the question or its own earlier tokens
+// (docs/note-verdict-img-ground.md). Row 1 is an undiverged slot.
+TEST(AttnMaskInput, BatchedDecodeAfterImageMasksByKvRow) {
+    const uint32_t n_kv = 1600, n_rows = 2;
+    Harness h(n_kv, n_rows, "kq_mask_b");
+
+    std::vector<int32_t> toks(n_rows, 0);
+    std::vector<int32_t> positions{80, 5};
+    std::vector<int64_t> kv_rows{1500, 5};
+    StepContext step;
+    step.gf = h.gf;
+    step.tokens = &toks;
+    step.positions = &positions;
+    step.kv_rows = &kv_rows;
+
+    AttnMaskInput in("kq_mask_b", 0u);
+    in.set_input(step);
+
+    std::vector<float> got(n_kv * n_rows);
+    ggml_backend_tensor_get(h.mask, got.data(), 0, got.size() * sizeof(float));
+    for (uint32_t r = 0; r < n_rows; ++r)
+        for (uint32_t j = 0; j < n_kv; ++j)
+            EXPECT_FLOAT_EQ(got[r * n_kv + j], ref(kv_rows[r], j, 0));
+    EXPECT_FLOAT_EQ(got[0 * n_kv + 81], 0.0f);      // beyond its position
+    EXPECT_FLOAT_EQ(got[0 * n_kv + 1500], 0.0f);    // its own row
+    EXPECT_EQ(got[0 * n_kv + 1501], -INFINITY);     // still causal
+}
+
 // ── Phase 4 (Gemma 3 vision): image-span bidirectional mask ──────────────────
 //
 // Sequence of 12 positions, image span [4, 8) (positions 4,5,6,7). Three
