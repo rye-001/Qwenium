@@ -37,7 +37,7 @@ add_library(qinf-snapshot STATIC
 )
 
 target_include_directories(qinf-snapshot PUBLIC
-    ${CMAKE_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src
 )
 
 target_link_libraries(qinf-snapshot PUBLIC

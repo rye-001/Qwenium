@@ -27,8 +27,7 @@ one engine:
   chat/completion, with vision,
   grammar-constrained output, speculative decoding, an opt-in persistent
   decode graph (`--persistent-graph`, §5), opt-in flash attention
-  (`--flash-attn`, §5 — on the CLI this is both phases, which the lens
-  excludes; the server scopes it to prefill when the lens is on), a
+  (`--flash-attn`, §5), a
   selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), opt-in
   mmap-backed weights (`--mmap-weights`, §5), and session snapshots;
 - an **HTTP server** (`qwenium-server` binary, CMake target `qwenium-server`;
@@ -102,18 +101,16 @@ figures elsewhere in this document that name "ctx 4096" (§KV element type) are
 historical measurements, not envelope statements; they stay as recorded until
 re-measured.
 
-**The receipts identity (2026-07-19).** Beyond serving answers, the engine
-treats its own computation as a product surface — *"where it looked, what
-decided it, and proof it happened"*: **attention** (materialized decode rows,
-tapped and calibrated into citations/coverage — the lens, §6), **determinism**
-(byte-reproducible greedy decode with forkable state — counterfactual re-runs),
-and **integrity** (weights-hash, version-gated snapshots, fail-loud replay).
-This is a doctrine-level commitment with named engineering constraints — see
-§11's *receipts constraints* bullet before optimizing anything on these paths.
-Receipts are **per-model calibrated capabilities** (like vision or MTP), not a
-blanket property; the claim boundary is fixed by measurement: receipts show
-what the model *consulted*, never why it *chose* (consideration, not
-commitment — the non-claims contract in [`lens-format.md`](lens-format.md)).
+**Receipts are built from engine primitives (2026-07-19; client split
+2026-10-03).** Beyond serving answers, the engine exposes its own computation —
+*"where it looked, what decided it, and proof it happened"*: **attention**
+(materialized decode rows, tappable by name, `kq_soft.<il>`, §12), **determinism**
+(byte-reproducible greedy decode with forkable state) and **integrity**
+(weights-hash, version-gated snapshots, fail-loud replay). Calibrating those rows
+into citations, coverage and verdicts is a client's job: the Qemmi-Lens server
+(`qemmi-lens-server`, a separate repo since 2026-10-03, §6). The engine's
+obligation to such clients is the **client contract** in §11 — read it before
+optimizing anything on these paths.
 
 Supported architectures (registered in
 [`src/models/model_registry.cpp`](../src/models/model_registry.cpp)):
@@ -237,7 +234,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision`, `image_verdict` (`/v1/verdict` with an **image** — yes / no / unclear about visible marks from the answer logits after one image pass, questions resumed from a snapshot; optional `"where"`: the model's generated box per yes / unclear mark; its own calibration table and gates: `--mmproj`, a full model, a measured row; NOT the lens, reads no attention), `server_lens` (opt-in `--attention-lens`: `/v1/extract` — document → audited key-value JSON on the attention trust layer; `/v1/verify` — teacher-forces a known extraction to reproduce the same report without generating; `/v1/locate` — document + keys → byte ranges, nothing generated and nothing audited, on its own calibrated head; `/v1/verdict` — document + yes/no questions → yes / no / unclear read off the prefill's last row, full lens server or verify-only with `--lens-verdict`; `/v1/compare` — an original's units + a second version → which units are missing, every lens server; pure lens computation + single-slot tapped-decode/tapped-prefill drivers), `image_data_uri` |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -415,64 +412,16 @@ and one flag on `Qwen35LayerCommon`. On the MoE hybrid only the 9 attention
 layers change; the 36 MoE routers keep their own `SOFT_MAX` and the experts
 their `MUL_MAT_ID`, untouched.
 
-**Flash attention and the receipts identity are mutually exclusive IN A
-PHASE**, and this is enforced, not documented-and-hoped: the flash kernel never
-materializes `kq_soft`, which is precisely the tensor the attention lens taps
-(§1, §11). `DecodePolicy::is_attn_impl_coherent()` states the pairing for a
-tapped **decode** (`/v1/extract`); a tapped **prefill** (`/v1/verify`, §6) is
-protected structurally instead — `run_lens_verify` sets its own tapped pass
-materialized, and `mark_attention_taps` fails loud on the missing `kq_soft`
-node if that is ever lost.
-
-**Whether the flag may join `--attention-lens` is a PER-MODEL question**, and
-since 2026-09-13 the calibration table answers it
-(`LensConstants::flash_prefill_ok`, `server_lens.h`). `DecodePolicy` scopes the
-implementation per phase, so the lens can run a flash **prefill** (which
-`extract` never taps) over a materialized **decode** (which it does) — on a
-model that has earned it through the drift gate
-(`tests/perf/attn_provenance.cpp`, `BANDDRIFT=1 DRIFT_ARM=flash DRIFT_LANG=all`;
-`tests/smoke/lens_drift_gate.sh`). The calibrated models answer differently, and
-the split is **dense vs MoE** — not size, not family:
-
-| model | decision margin | max \|Δpeak\| under flash prefill | verdict |
-|---|---|---|---|
-| Qwen3.8-9B-Q8_0 (dense) | 0.00126 (DE-bound) | 0.00084 | **PASS** — enabled, 8.4% off the prefill |
-| Qwen3.8-27B-Q3_K_M (dense) | 0.00099 (EN-bound) | 0.00054 | **PASS** — enabled, 1.8× headroom (thin) |
-| **Qwen3.6-35B-A3B (MoE)** | 0.0237 | **0.0242** | **FAIL** — refused |
-
-Both dense models are **15/15 token-identical** under a prefill-shape change;
-both MoE models change one extraction in fifteen. Note also that **which
-language binds is per-model** — German on the 9B, English on the 27B — so both
-halves must be run on every entry rather than assuming German is always the
-tighter one.
-
-On the 35B the sibling arm fails harder: a chunked prefill changes **one
-extraction in fifteen outright** (82 generated tokens against 109). That is MoE
-routing, demonstrated rather than inferred (`MOEROUTE=1`): **2.32% of routing
-decisions on the 35B and 6.37% on Gemma 4-26B-A4B select a different expert
-set**, first flip in both landing in the last slot of the top-8 — the expert
-nearest a tie. Two dense models under the same perturbation change nothing.
-**Expert selection is a top-k argmax**, so on an MoE the perturbation is not
-small, it is *discrete*, and no decision-margin argument applies to it at all.
-A `flash_prefill_ok` of `true` on an MoE entry would therefore be unsound even
-with a small measured drift, and the field **defaults to false** so an
-unmeasured model is refused rather than inheriting another model's permission.
-
-Three consequences worth naming. (a) The pairing check moved **after** the model
-load, which the rest of that block deliberately avoids — the answer depends on
-which model is loaded, and that is the price of it being per-model.
-(b) `--attention-lens` with a quantized `--kv-type` is now refused **directly**
-(`http_server.cpp`): it used to fall out of the blanket lens/flash refusal, and
-phase-scoping opened the hole, since the KV cache is read by the materialized
-decode where a quantized V would take ggml's silent CPU fallback (§9).
-(c) Every lens report now carries a `config` stamp — weights hash, attention
-implementation, KV type — because a licensed configuration is only safe if a
-report says which one it ran under (`lens-format.md`).
-
-This was the first place where a speed lever and the receipts doctrine were in
-direct conflict; the resolution is a parameter on one operation with two
-implementations (llama's own `-fa on/off` split), scoped per phase, not two
-attention modules.
+**Flash attention never materializes `kq_soft`**, the tensor the attention
+taps read (§11). `DecodePolicy` scopes the implementation per phase
+(`attn_impl` for decode, `prefill_attn_impl` for prefill), so a client can run
+a flash prefill over a materialized decode; `DecodePolicy::is_attn_impl_coherent()`
+states the pairing for a tapped decode, and `mark_attention_taps` fails loud on a
+missing `kq_soft` node. Whether a client may use a flash prefill is that client's
+decision, gated by its own data: the lens licenses it per model through its
+drift gate (dense Qwen3.8 9B/27B pass, the MoE Qwen3.6-35B-A3B fails — expert
+routing flips; see `qemmi-lens-server` `docs/architecture.md` §3). This server's
+`--flash-attn` means flash in both phases.
 
 **Speculative decoding** (CLI `--speculative [pld|mtp|suffix]`): drafts come
 from an `IDraftSource` (`sampling/draft_source.h`) and are verified in one
@@ -688,664 +637,29 @@ way (the batched path also discards one computed-but-undelivered token on
 the same check); a speculative step just widens how much can be thrown away
 per check, not how often the check runs.
 
-**`--speculative` is refused together with `--attention-lens` at server
-startup**, which used to mirror the `--flash-attn`/`--attention-lens` refusal.
-That one is now phase-scoped (§5) and this one is **not**, deliberately: flash
-moved because prefill is a phase the lens does not tap, whereas speculation
-changes the decode the lens reads. Same class of reason as before (§11's
-receipts constraints): receipts-grade
-determinism is single-slot and byte-identical, and speculative decoding is
-token-stable, **not** byte-identical — and, today, only ever engages on a
-single slot in the first place, which would be whichever slot the lens is
-mid-extraction on.
+**Clients of the attention primitives.** The lens server (Qemmi-Lens:
+`/v1/extract`, `/v1/verify`, `/v1/locate`, `/v1/verdict`, `/v1/compare`, and the
+image verdict on `/v1/verdict`) was served from this binary until 2026-10-03.
+It moved to its own repo, **qemmi-lens-server** (`../Qemmi-lens-server`,
+private), which builds this engine as a CMake subproject and calls the engine
+primitives directly (§11 client contract; its own `docs/architecture.md` is the
+map of the routes, modes and calibration tables). What it uses from here and
+what stays here as client-facing primitives, each with its engine test:
 
-**Attention Lens (opt-in `--attention-lens`, `POST /v1/extract`).** A dedicated
-endpoint — separate from the OpenAI surface by design (its inputs are a
-document + a complete key vocabulary of `{key, gloss}` concepts, not chat
-messages; its output is the lens format, not a completion).
+| primitive | where | engine test |
+|---|---|---|
+| attention taps (`set_attention_taps(layers, heads)`, `mark_attention_taps`, `get_attention_taps`) | `models/forward_pass_base`, `decode_policy` | `ForwardPassTapTest`, 14 cases × 5 recipes |
+| read-back plan `alloc_readback_graph` | `models/forward_pass_base` | `ForwardPassTapTest` (SameShapeDifferentTapLayer…, TapReadOffAnyOtherAlloc…) |
+| layer truncation `truncate_after_layer` | `models/decode_policy` | DecodePolicy truncation ×3 |
+| partial load `load_tensors(max_blocks, keep_output_head)` | `engine/model`, `loader/gguf_loader` | ModelPartialLoad ×6 |
+| per-phase attention (`prefill_attn_impl`) | `models/decode_policy` | DecodePolicy (policy value only — see §12) |
+| MoE routing capture / replay | `layers/routing_trace`, `graph_inputs/routing_replay_input`, `layers/moe` | RoutingTrace ×17, RoutingReplayInput ×7, RoutingCaptureAfterSameShapePass… (replay through a recipe: see §12) |
+| slot snapshots incl. RPOS | `session/slot_snapshot` | rope-divergence tests, `test-image-prefix-roundtrip` |
+| `Bitmap` content rect | `vision/bitmap`, `image/image_loader` | image-loader tests |
+| `ServerVision` accessors (`prepare_image`, `encoder()`, marker ids, `projector_tag`, `projection_dim`) | `server/server_vision` | none (§12) |
 
-**The unit is a document OR an ordered thread** (additive, 2026-09-05). A request
-carries **exactly one** of `document` or `messages` — both or neither is a
-fail-loud 400, because boundaries cannot be recovered from concatenated text and
-a precedence rule would be a silent fallback. With `messages`, the server joins
-them with one blank line (the text a caller would otherwise have concatenated, so
-the validated prompt regime is unchanged) and every citation reports the message
-index it landed in; fields carry `citation_messages` and the report `n_messages`.
-This buys **attribution** — *"read from message 23 of 24"* — and deliberately
-**not** a staleness alarm. The alarm was built and measured first: the predicate
-a server can actually compute fired on 7 of 9 correctly-handled corrections and
-stayed silent on the real failure, because a later message routinely restates an
-old value, so **turn order does not identify supersession**
-([`note-ss3-matched-pairs.md`](note-ss3-matched-pairs.md)). The receipts are
-additive, so the format stays `qemmi-lens/v2`. It runs **one free
-tapped decode, in one prefill** (`run_lens_extract` → `run_lens_tapped_decode`):
-argmax over the full vocabulary with the P1 attention tap armed on the two frozen
-lens layers, then `compute_lens_report` derives citations (L3H13, N3), the
-grounded/ungrounded badge (body_mass, N3b), the tier (A5.3) and the coverage
-report (COV1). All signals are document-relative. A pure `apply_absent_by_omission`
-orders fields by the hinted concepts and marks the ones the model did not state
-`value:null`/`badge:"absent"`.
-
-**No grammar.** The lens once constrained this decode with ONE fixed KV grammar,
-and ran a two-pass grounded presence gate on top of it. Both are **gone** (Stage 2,
-2026-07-17). The grammar was refuted by measurement: on the Leg C corpus it lost
-on every axis *including* the guaranteed parse it existed for (14/15 vs free's
-15/15), and its `value ::= (…)+` forced a non-empty value for every hinted key —
-the sole cause of the absent-concept collapse, and therefore of the presence gate
-built to contain it. Freed of it the model declines natively (absent handled 30/30
-vs the grammar's 10/30) — so the gate had nothing left to do, and its **N+1
-prefills collapsed to 1**. `lens_grammar_gbnf()` survives *only* as the QDOCS_S1
-probe's control arm (`run_lens_extract`'s `control_arm_grammar`, a probe-only
-seam), so the comparison stays reproducible on shipped code; it is unreachable
-from the endpoint. **This says nothing about the engine's GBNF machinery or the
-per-request `grammar` field on `/v1/completions` and `/v1/chat/completions`** —
-that is a separate, shipped, unaffected feature.
-
-**The shape contract** replaces the grammar's (false) parse guarantee: *tolerant*
-on shape — `lens_find_json_object` skips a ``` fence and takes the outermost
-object by string-aware brace depth — and *loud* on failure —
-`LensUnparseableError` ⇒ **`422 unparseable_extraction`**, split from `400
-bad_request` and carrying the model's `raw`. Never a partial extraction: a refusal
-and "the document has none of these concepts" are different facts.
-
-**Repeated keys are all reported** (v3, 2026-09-05). A flat schema over a
-repeating document — an invoice with three line items — makes the model emit the
-key several times. v2 read the first occurrence and kept one field, dropping the
-rest with no error, no badge, and **no coverage flag**: measured, the
-un-extracted lines were *not* reported as un-consulted, because the model does
-read them. Each occurrence now carries its own value, byte span and citations
-(`LensField::occurrence`), which the per-value-span trust math supports
-unchanged. Structural change ⇒ format bump to `qemmi-lens/v3`; the first entry
-per key keeps its v2 value and position. It does **not** group repeated keys into
-records — that is the leaf-path design, gated on measuring a repeating-group hint.
-
-**Values are scalars or arrays of scalars; deeper nesting is refused**
-(2026-09-05). An array of scalars expands to one occurrence per element, since an
-element is locatable and gets its own citations — the same treatment as a
-repeated key. The two are one answer in two encodings: on a three-line invoice
-Qwen 3.8-9B repeats the key and Qwen 3.6-35B emits `[7, 19, 43]`, so refusing
-either would make the contract depend on the loaded model. `lens_value_of` reads
-scalars only and `lens_keys` is depth-blind, so before this guard a nested value
-did not fail — it produced a truncated fragment shipped as a real field, and a
-nested key could answer a top-level lookup with the wrong value and citations
-pointing at a span the model never read (both measured, `LensNestedOutput`).
-Refused rather than summarized, because a faithful record cannot be claimed for a
-value that was not read. Supporting arrays properly is a *leaf-path* design —
-the per-value-span trust math already generalizes to any depth — gated on a
-Leg-B-style measurement of a repeating-group hint, since `line_items[0..N]`
-cannot be enumerated in a complete hint up front.
-
-**The candidate set** (v4, 2026-09-06, architect-approved,
-[`plan-candidate-set.md`](plan-candidate-set.md)). Alongside the value `fields`
-already returns, a request that opts into the (currently internal-only,
-`LensExtractOptions::want_candidates`) candidate-set producer also gets **every
-span in the document that answers a key** — not just the one the model
-returned — via a **second, cold, taps-disarmed decode** over the same document
-with a different instruction (`run_cand_pass2`); pass 1 is byte-untouched.
-`lens_report_to_json` emits this as a new top-level `key_candidates`: an object
-keyed by the **complete request vocabulary** (every key present, `[]` included
-— `[]` and absent-from-the-map are different facts), each candidate a
-byte-exact `{value, byte_lo, byte_hi, anchor, returned_as}`, array order
-**document order (`byte_lo` ascending) and load-bearing** — not mass, not a
-ranking (CF1 forbids a verdict). `anchor` and `returned_as` are derived at
-serialize time from `document` and the sibling `fields` entries, not stored on
-`LensCandidate` — `returned_as` links a candidate to the `fields` occurrence it
-answers by **bidirectional containment** on whitespace-normalized text
-(tiebreak: tightest containment, then earliest `byte_lo`), because pass 2
-legitimately returns spans wider or narrower than the field's own value.
-**Three distinguishable top-level states**, the reason the format bumps rather
-than riding in place: `key_candidates` present ⇒ the finder ran; absent +
-`candidates_error` ⇒ the finder **failed** on this document (never rendered as
-an empty set — the exact confusion this feature exists to prevent, one level
-down from `fields`' own `422`); absent + no error ⇒ candidates were not
-requested. `fields` — taps, calibration, coverage — is completely unchanged.
-Format bump: `qemmi-lens/v3` → **`qemmi-lens/v4`**, additive
-([`lens-format.md`](lens-format.md)). No server/CLI flag exposes
-`want_candidates` yet; that remains a separate, unapproved decision. **Action
-item on `../qemmi-lens`: its `ACCEPTED_FORMAT_VERSIONS` must add
-`"qemmi-lens/v4"` or every extract call fails its own fail-loud version gate.**
-
-**Single-slot and exclusive**: `extract_lens_json` holds the model lock for the
-whole tapped decode and uses slot 0 (the only correct qwen36 decode KV gather,
-§12); do not drive concurrent OpenAI traffic on slot 0 while extracting.
-Fail-loud on empty concepts or an oversized document.
-Off ⇒ the route 404s and no lens code runs.
-
-**Per-model calibration, keyed `{architecture, block_count, file_type}`**
-(decided 2026-09-05; `file_type` added 2026-09-18, see the collision note below). `LensConstants` is not one frozen struct: `kLensCalibrations` in
-`server_lens.h` is a table of calibration entries, and `--attention-lens` is
-**refused at startup on any model with no entry** (`lens_calibration_for` /
-`lens_calibration_refusal`, resolved once in `enable_attention_lens()` and
-carried on the integration; `run_lens_extract` takes the constants with **no
-default argument**, so no call site can silently fall back to someone else's
-coordinates). Three models are calibrated today, all Qwen: **Qwen 3.6-35B-A3B**
-(`qwen35moe`/40 and /41, citation **L3H13**), **Qwen 3.8-9B** (`qwen35`/33,
-citation **L27H13** — 98% vs 84% top-3 and 0% vs 7% ungrounded false alarm on
-the same messy corpus, `note-lens-qwen38-probe.md` §5.3) and **Qwen 3.8-27B**
-(`qwen35`/65, citation **L19H20**, coverage **L11 @ 0.705** — added 2026-09-15,
-`note-lens-qwen38-27b-probe.md`). A fourth entry, **Ternary-Bonsai-27B** (prism-ml, ternary Q2_0
-group-64), was added 2026-09-18 and **reverted 2026-09-19** when the model was
-de-scoped; its measurements are kept in `note-lens-bonsai-27b-probe.md` and the
-`file_type` key field it motivated stayed (see below). The 9B's locate pair
-(**L11 h=6**, 96.0% top-3 / 88.0% top-1 EN 95.0 / DE 97.1 **on Q8_0**, and
-93.3 / 84.0 on Q4_K_M — the row is unpinned so it serves both, and its
-provenance names both rates) was added
-2026-09-19 and is *free*: it equals the coverage layer, so the cut stays 28 of
-33 blocks. The 27B's locate pair (**L27 h=10**, 94.7% top-3 / 81.3% top-1,
-EN 97.5 / DE 91.4) was added the same day and is **not** free — it is deeper
-than both other constants and moves that model's cut from 20 to **28 of 65**.
-The +8 blocks were accepted because the free zone is empty: the best candidate
-at or below the citation layer, L15 h=17, reads 90.7% pooled and **fails German
-at 88.6%**. The best head overall, L35 h=16, scores a perfect 100.0/100.0/100.0
-and was declined on depth (36 of 65). `note-lens-qwen38-27b-probe.md` §8.
-
-The `--lens-verify-only` cut is `max(citation_layer, coverage_layer,
-locate_layer) + 1`. **Locate joined that max on 2026-09-18**, when an entry
-first carried both a locate pair and a citation layer deeper than it: the
-process serves `/v1/locate`, locate taps its own layer, and a calibration whose
-locate layer sat deeper than the other two would tap a block the cut never
-loaded. It was written down before it could bite, while both calibrated locate
-pairs still sat at L11 equal to coverage. **It bites as of 2026-09-19**:
-Qwen3.8-27B's locate 27 against citation 19 and coverage 11 is what makes that
-model's cut 28 of 65 rather than 20, and it is the only entry where removing
-locate from the max would still leave every other model working while silently
-serving `/v1/locate` a block this mode never loaded.
-
-*Three constants, three different provenances.* The 27B is the first model to
-clear **every** arm of leg C (citation 91% top-3, coverage 97% used-clear, 0/75
-ungrounded false alarms, bilingual) — the 9B that ships has never passed it, its
-coverage arm scoring 87% and 83% on German. It is also the model that falsified
-the *selection method*: the N3 leg picks a citation head on three synthetic
-prompts, and on the 27B that head (L11H22) ranks **14 of 384** on real
-documents. Heads are now selected on the corpus that judges them (`LEGCSEARCH`)
-and confirmed on prompts they did not see. Two caveats travel with the entry:
-German citation is 90.4% against a 90% bar, and every number is measured at
-Q3_K_M where the 9B's are Q8_0 — which is what the report's `config.weights`
-stamp exists to record.
-
-*Why the key is the model and not the architecture.* An architecture string is a
-family: `qwen35` alone hosts Qwen3.5-0.8B (24), Qwen3.5-9B (32), Qwen3.8-9B (33),
-Qwen3.6-27B (64) and Qwen3.8-27B (65). An arch-keyed allowlist would admit all
-five under coordinates measured on one of them — the exact false receipt the
-refusal exists to prevent. The key is the **raw GGUF `block_count`**, not the
-decode-stack depth: depth collides Qwen3.5-9B with Qwen3.8-9B at 32 and
-Qwen3.6-27B with Qwen3.8-27B at 64, each pairing a calibrated model with an
-uncalibrated one. Calibrating Qwen3.8-27B (2026-09-15) sharpened
-this rather than easing it: two of the five `qwen35` models are calibrated now,
-with **different** coordinates (L27H13 and L19H20), so an arch-keyed allowlist
-has no winner to pick; and the depth collision at 64 now pairs a genuinely
-calibrated model (Qwen3.8-27B) with an uncalibrated one (Qwen3.6-27B), whose
-coordinates score 7.1% on the model that owns them. A future collision is
-resolved by **adding a field to the key, never by widening an entry to a model
-nobody measured** — and on 2026-09-18 that future arrived. Ternary-Bonsai-27B
-was `qwen35` with `block_count` 64, the *same key* as the uncalibrated
-Qwen3.6-27B, so admitting one would have admitted both. The added field is GGUF
-`general.file_type`, and it is the principled field rather than a convenient
-one: that run measured the calibration to **be** quant-sensitive —
-Qwen3.8-27B's own L19H20 survives ternary at rank 5 of 384 but falls from
-DE 90.4% to **89.8%**, crossing the 90% bar. **The field outlived the row that
-motivated it**, deliberately: the Bonsai entry was reverted on 2026-09-19, but
-a plain non-MTP build of Qwen3.8-27B also keys as `{qwen35, 64}` (65 = 64
-decode + 1 NextN) and would silently inherit the MTP row's coordinates without
-it. No row pins a quantization today; a row may set `kLensAnyFileType` to
-accept any, which is what all four carry so the field cannot refuse a model
-that worked before it landed, and a row that **pins** one beats a row that does
-not. That "any" is a preserved looseness, not an endorsement: `models/` holds
-Qwen3.8-9B at both Q8_0 and Q4_K_M under the one `{qwen35, 33}` entry, and only
-the Q8_0 was ever measured. Tightening that is a separate decision. `coverage_used_peak`
-stays 0.705 on every entry, and since 2026-09-15 that is measured rather than
-inherited. The old "weak arm at 87%/84%" reading came from a control group that
-was itself wrong: `OMISSION1` ablated all 133 leg C spans per model and found
-53% (9B) / 38% (27B) of spans labelled "filler" to be **causally used**. Scored
-against causal labels, coverage separates used from unused at **AUC 0.912 /
-0.955**. 0.705 is kept because `skipped[]` is a recall-first screen (97% / 90%
-recall) and the accuracy-optimal ~0.30 would trade that away; `COVCAUSAL` found
-better-precision layers (L7 on the 9B, L15 on the 27B) at identical recall, but
-they disagree across models and buy a shorter list, not a stronger claim. See
-`plan-lens-only-engine.md` §4.
-
-*The lens is a Qwen-family capability by measurement, not by neglect.* CLAUDE.md
-makes Gemma the falsifier for anything touching the forward pass, and Gemma was
-run properly: **0 of 768 candidate heads** clear even a 70% bar against the 90%
-requirement, topping out at 63% (L7H13), and the norm-weighted metric is *inert
-by construction* there — `gemma4.cpp:447` RMS-norms V with no learned weight, so
-Spearman(rankA, rankB) = 1.0000 over all 768 candidates. The refusal is the
-mechanism that keeps that honest; it is not an untested-family placeholder.
-[`note-lens-gemma4-probe.md`](note-lens-gemma4-probe.md),
-[`note-lens-gemma-norm-weighted.md`](note-lens-gemma-norm-weighted.md),
-[`note-lens-norm-weighted-metric.md`](note-lens-norm-weighted-metric.md).
-[`plan-qemmi-lens.md`](plan-qemmi-lens.md), [`lens-format.md`](lens-format.md),
-[`note-nogrammar-refutation.md`](note-nogrammar-refutation.md),
-[`note-lens-absent-attempt.md`](note-lens-absent-attempt.md); gates
-`tests/smoke/server_extract_smoke.sh` + `QDOCS_S1=1 bin/attn-provenance`.
-
-**Verify (opt-in `--attention-lens`, same flag; `POST /v1/verify`; Movement 1 of
-[`plan-lens-server-shape.md`](plan-lens-server-shape.md)).** The other half of
-the lens surface: `verify(document, key_vocabulary, extraction)` teacher-forces
-a KNOWN extraction — the exact text a prior `/v1/extract` report's `raw` field
-carried — instead of generating one, and reproduces the same report without a
-decode loop or sampling. Request shape mirrors `/v1/extract`'s
-(`document`|`messages`, `key_vocabulary`) plus the required `extraction`
-string; same 404-when-off, 400-bad-request, and 422-`unparseable_extraction`
-(the shape contract applied to the teacher-forced text). Driver:
-`run_lens_verify` (`server_lens.{h,cpp}`), wired via
-`QweniumServerIntegration::verify_lens_json`.
-
-**Locate (opt-in `--attention-lens`, same flag; `POST /v1/locate`; approved
-2026-09-18, [`plan-lens-only-engine.md`](plan-lens-only-engine.md) §5 and
-`../qemmi-lens/docs/plan-locate-and-cut.md`).** The THIRD verb and the weakest
-of the three claims. `locate(document, key_vocabulary, top_k)` returns, per key,
-up to `top_k` DOCUMENT byte ranges — where those key tokens look. Nothing is
-generated and nothing is audited, so the response deliberately carries **no
-`extraction_origin`**: it is not an extraction of either origin, and a consumer
-that reads it as one is reading a claim never made. Driver: `run_lens_locate`,
-wired via `QweniumServerIntegration::locate_lens_json`. One head-less tapped
-prefill over the ordinary lens prompt; each key owns a token span in the
-instruction, and that span's rows over the document are the readout (causally
-available because the document precedes the instruction).
-
-Two facts about it are load-bearing:
-
-- **It reads its OWN calibrated pair, `LensConstants::{locate_layer,
-  locate_head}`, not the citation pair.** The route shipped for one day reading
-  the citation head on the assumption that a retrieval head is a retrieval head;
-  the LOCHEAD sweep put that head at rank 107 of 160 for this regime. The
-  generated→source head is not the key→source head. `locate_provenance` names
-  the run, same discipline as `flash_prefill_provenance`. **Default -1 = not
-  measured, and such a model is REFUSED** rather than served another model's
-  coordinates.
-- **It runs on the main scheduler, like every verb (2026-09-27).** Every
-  read-back pass allocates through `ForwardPassBase::alloc_readback_graph`
-  (§12, the tap seam), which plans memory from the graph being run, so verbs
-  share one scheduler whatever layers they tap. Locate, `/v1/verdict` and
-  `/v1/compare` ran on a dedicated `locate_scheduler()` until then; merging it
-  saved **1.39 GB** on a verify-only server and **1.83 GB** on a full one
-  (physical footprint after a ~9.6K-token verify + locate: 9,342 → 7,954 MB and
-  11,264 → 9,434 MB), responses byte-identical, chat byte-identical with lens
-  traffic in between. Safe because every model operation holds
-  `model_mutex_`, so no two passes ever use the scheduler at once. What
-  follows is the 2026-09-18 defect the dedicated scheduler once fixed — found
-  by a client. Locate taps
-  ONE layer; extract and verify tap TWO. `ggml_gallocr_needs_realloc` keys on
-  node count and node SIZES, **never on `GGML_TENSOR_FLAG_OUTPUT`**, and
-  locate's graph has the same node count as verify's tapped pass with strictly
-  larger tensors. So after a locate over a longer document, verify's smaller
-  graph "fits" the cached plan, galloc skips re-planning, and verify inherits a
-  plan in which `kq_soft.<citation_layer>` is not protected — DeltaNet layers 4
-  and 6 write over the tap and every later `/v1/verify` returns a confident
-  FALSE receipt (negative `body_mass`, badges flipped, no error) for the life of
-  the process. It reproduced only under `--lens-verify-only`, where
-  `reserve_max_batch` is skipped and no large stable plan is planted first.
-  The rule it rested on until 2026-09-27 — every verb sharing a scheduler
-  marks the same tap set — is retired: `alloc_readback_graph` removes the need.
-  `ForwardPassBase::get_attention_taps` still range-checks every tap against
-  `[0, 1]` — a post-softmax weight cannot fall outside it, so bytes that do are
-  not this pass's attention, and the lens refuses rather than reports — but
-  that check cannot see another layer's softmax in the slot, which is why the
-  fix is the plan, not the check. Gate: `tests/smoke/server_locate_smoke.sh`
-  gate 8, `VERIFY_ONLY=1` (the gate cannot run under `--lens-locate-only`,
-  which refuses `/v1/verify`; that leg runs gates 1–7 plus an explicit
-  refusal check and says so rather than reporting a full pass). Precedents:
-  the MTP head's dedicated scheduler and `server-image-multirequest-bug.md`.
-- **It takes an optional `key_aggregation`** (`"max"` default, `"mean"` opt-in;
-  2026-09-20). Not a tuning knob — a property of the KEY KIND. `max` is the
-  reduction LOCHEAD measured and is correct for the 1-4 token field names it
-  swept; on SENTENCE-length keys it inverts into a defect, letting one filler
-  token spike so the wordiest key wins (`an` against ` agreement`, 0.507, with
-  the same key's next span at 0.047). `mean` was worth **+17.5 points** on a
-  4-way routing task at identical latency (DECIDE1,
-  `note-lens-qwen38-probe.md`). Default is byte-identical to the behaviour that
-  predates the field, and `mean` sets `uncalibrated` because the shipped
-  provenance rates were all measured under `max`.
-- **It takes an optional `head`** (`"locate"` default, plus `"choice"`,
-  `"absent"` and `"score"` opt-in; 2026-09-20; `"inject"` 2026-09-24), selecting which calibrated
-  job's pair to read. **Four jobs now read four different heads** on the 9B —
-  locate L11 h=6, choice L11 h=3, absent L19 h=10, score L19 h=11 — two pairs
-  sharing layer 11 and two sharing layer 19. A layer is not a job: on Qwen3.8-9B choice sits at the **same layer** as locate (11) on a
-  different head (3 vs 6), measured 92.5% on 4-way routing — identical on Q8_0
-  and Q4_K_M — so choice is free on a `--lens-locate-only` server. Refused
-  fail-loud where DECIDEHEAD has not run; reading choice off the locate pair
-  measured 87.5%, and off the citation pair far worse. The two jobs have
-  opposite recipes (`max` for locate, `mean` for choice) and `uncalibrated`
-  follows whichever applies. A third value, `"absent"` (2026-09-20), reads the
-  `noul` pair — **L19 h=10** on the 9B, AUC 0.9948/0.9953 across quants, rank 1
-  of 128 on both. It is the first head that is **not** free: absence has no
-  quant-stable shallow alternative, so a `--lens-locate-only` server's cut
-  became `max(locate, choice, absent) + 1` and moved from 12 to **20 of 33
-  blocks** (2055 MB → 3038 MB on Q4_K_M). Verify-only is unchanged at 28, where
-  citation still dominates. A fourth value, `"score"` (2026-09-20), reads the
-  ordinal pair — **L19 h=11**, the head *next to* absence's h=10 on the layer
-  absence already paid for, so the cut is unmoved at 20 and score is free. It
-  is also the first pair not selected by accuracy: an ordinal's argmax flips
-  between the two adjacent levels a document sits between, so the sweep ranked
-  heads by ordinal concordance (1.0000, rank 1 of 128 and unique on **both**
-  quants) and tie-broke on how far apart adjacent levels are pushed. Its
-  fractional output is deliberately **uncalibrated in scale** — four true
-  levels read 0.62/1.02/1.49/2.13 — so callers read the fraction and the
-  masses; an affine correction would be the first *fitted* constant in the
-  table and none is landed. Adjacency is not interchangeability: h=10 reads
-  the ordinal job at 0.9861 and separates at 1.97 SD against h=11's 3.48.
-  **The 27B carries three** — locate L27 h=10, absent L31 h=23, choice L39 h=7
-  — and they put its locate-only cut at **40 of 65** against the 9B's 20 of 33.
-  Which pairs are free is a property of the model, not of the job: choice
-  shares locate's layer on the 9B and costs 8 blocks over absence here, which
-  is why the cut is computed from the constants rather than written per mode.
-  The 27B's choice pair was also landed *against* the better pooled head
-  (L47 h=13, 100% pooled but 90% worst-case held out, +8 blocks) — a pooled
-  maximum is not a rate. Its score pair was swept and **refused**: no held-out
-  agreement on any of three axes. A `-1` therefore means one of two different
-  things, and the provenance string is what distinguishes "measured and
-  refused" from "never measured" — both are refused at the route either way.
-  A fifth value, `"inject"` (2026-09-24, `note-lens-injection-probe.md`), is
-  the first role that **reads no key**: it averages the *template-tail* rows
-  (everything after the instruction) of **L11 h=0** over the document, after
-  Attention Tracker's "distraction effect", and returns ONE `hits` entry named
-  `instruction_like` instead of one per key; `key_aggregation` does not apply
-  and only a key-mode prompt sets `uncalibrated`. It is a **highlighter, not a
-  detector**: the injected sentence is the top segment 90.3% of the time
-  (chance 1.8%), but a single threshold across documents reads only
-  0.83–0.90 AUC. It always points somewhere, so a clean document still gets
-  a span. Free on the 9B (locate's layer; the cut stays 20) and folded into
-  both cut expressions so a model where it sits deeper pays honestly.
-- **It truncates after `locate_layer` alone**, so the constant IS the route's
-  cost. On Qwen 3.6-35B that layer is 11, which is exactly
-  `max(citation_layer, coverage_layer)` — so `/v1/locate` costs a
-  `--lens-verify-only` server **not one additional block**, which is why it is
-  served there and `/v1/extract` is not. That equality is a property of this
-  model's calibration, not a general fact: a model whose sweep lands deeper
-  makes the locate slice bigger than the verify slice — which Qwen3.8-27B then
-  did (locate 27 vs citation 19). Because the constant IS the cost, it is also
-  what `--lens-locate-only` loads to (see below): 12 of 33 blocks on the 9B.
-
-Two things had to generalize, both **recipe-agnostic and byte-inert when
-unarmed** — the same discipline the P1 tap seam already keeps:
-
-- **Truncated prefill** (`DecodePolicy::truncate_after_layer` /
-  `effective_layer_count()`, `models/decode_policy.h`; setter
-  `ForwardPassBase::set_truncate_after_layer`). Causality is what makes this
-  *exact*, not an approximation: an attention layer cannot depend on a layer
-  above it, so a prefill stopped after `max(citation_layer, coverage_layer)`
-  produces identical tapped rows to the untruncated pass, cheaper because the
-  omitted layers' matmuls (and any MoE/DeltaNet dispatch inside them) never
-  run. Default `-1` (full stack) keeps `is_default_byte_reproducible()` true
-  and every recipe's default path node-for-node unchanged. **Every recipe
-  bounds its prefill layer loop(s) with `effective_layer_count()`** —
-  `qwen3`, `qwen35`, `qwen36`, `gemma1`, `gemma2`, `gemma3`, `gemma4` — which
-  is the cross-family proof this is a plain iteration-count parameter, not a
-  Qwen-shaped kernel capability requiring a `supports_*` gate the way
-  `--flash-attn`/`--persistent-graph` do. Verify is the only caller; decode
-  graphs never read the field, and Gemma carries no lens *claim* (still no
-  calibration entry, §12), only the interface proof.
-- **`get_attention_taps` learned the prefill shape** (`forward_pass_base.{h,cpp}`).
-  `kq_soft.<il>` is `[n_kv, 1, n_head]` at decode (one query row per step) and
-  `[n_kv, n_q, n_head]` at a tapped prefill (every query position the graph
-  processed in one pass). `AttentionTap` gained an `n_q` field (default 1,
-  decode's shape byte-for-byte unchanged) and the reader now sizes off the
-  tensor's own `ne[1]` instead of assuming 1 — no new method, since the tap
-  tensor is named identically either way. `server_lens.cpp`'s
-  `slice_prefill_tap_row` translates one query row of that block into the
-  same decode-shaped `[n_head][n_kv]` layout a `LensStep` already carries, so
-  `compute_lens_report` needed **zero changes** — it never learns there are
-  two shapes; the translation lives entirely in the new driver.
-
-**Correctness gate (§3.4.5 of the plan): not bit-for-bit, decision-for-decision.**
-The batch-vs-single-token numerical fork (§11, "…except where the hardware
-forbids it") applies here too — a teacher-forced multi-row prefill and a
-token-by-token decode take different Metal kernels. Measured drift 5.6e-4
-against a 0.019 decision margin (plan §2.1). The gate is self-checking (no
-corpus): `tests/smoke/server_verify_smoke.sh` extracts a document once, feeds
-that exact extraction back through `/v1/verify`, and diffs the two reports
-field-for-field — same values, same badges, same tiers, same top-1 citation by
-real-source membership (not exact mass), same `skipped[]` membership. **Passed
-on both calibrated entries** (Qwen 3.8-9B-Q8_0 and Qwen 3.6-35B-A3B-UD-Q3_K_XL).
-
-**Verify-only server mode (`--lens-verify-only`, same flag family, 2026-09-15).**
-Verify's own truncated-prefill argument — causality means a pass stopped after
-`max(citation_layer, coverage_layer)` is *exact*, not approximate, because a
-layer cannot depend on one above it — applies just as well to *loading* as to
-*computing*: a block above that cutoff is never read by any `/v1/verify` call
-this process will ever serve, so there is no reason to load its weights either.
-**It also serves `/v1/locate`** (2026-09-18). Sharing a scheduler with
-`/v1/verify` once corrupted every later verify here (§6), because
-`reserve_max_batch` is skipped in this mode; locate ran on its own scheduler
-until 2026-09-27 and shares the main one again now that each read-back pass
-gets its own plan (`server_locate_smoke.sh` gate 8, `VERIFY_ONLY=1`, is the
-regression test on exactly this sharing). The block
-count is safe **by intent, not by arithmetic** — and that changed. It was once
-safe by coincidence: locate truncates after `locate_layer`, which on every model
-swept up to 2026-09-18 was 11, exactly the `max(citation_layer, coverage_layer)`
-cutoff this mode already loaded to. Qwen3.8-27B's sweep (2026-09-19) landed
-locate at **27**, deeper than that cutoff, which is the case this paragraph was
-written to anticipate. The resolution was the first of the two options it named:
-`needed` is `max(citation_layer, coverage_layer, locate_layer) + 1`, so the 27B
-loads 28 of 65 instead of 20. `/v1/locate` was **not** refused here. Any future
-row is covered by the same arithmetic; no third option is needed.
-
-`--lens-verify-only` (requires `--attention-lens`; refused fail-loud alone)
-resolves the calibration entry from GGUF **metadata** (`{architecture,
-block_count}`, readable before any tensor is touched) at the same point
-`enable_attention_lens()` would, computes `needed = max(citation_layer,
-coverage_layer) + 1`, and calls `Model::load_tensors(needed)` instead of the
-default full load. `GGUFLoader::load_tensor_metadata` gained an optional
-`max_blocks` filter (default: every block, byte-identical to before the
-parameter existed) that skips `output.weight`, `output_norm.weight`, and every
-`blk.<i>.*` for `i >= max_blocks` — the exact tensor set a forward pass
-truncated at `max_blocks - 1` can never read — so the SSD read and the
-Metal-buffer copy both shrink with it; `Model::assign_tensor_pointers` leaves
-those blocks default-constructed (every pointer null) instead of `require()`-
-ing tensors that were never asked for. Measured on Qwen 3.8-9B-Q8_0 (calibration
-L27H13, cutoff layer 27 ⇒ 28 of 33 blocks loaded, 372 of 442 tensors): Metal
-weights buffer **9322 MB → 7168 MB** (−23.1%, 2154 MB). KV cache size is
-UNCHANGED (256 MB either way at this ctx) — the recurrent/attention state is
-sized off `n_main_layers_` from GGUF metadata, not off which blocks actually
-loaded, so this flag saves weight bytes only; sizing the state to match is a
-further optimization this change does not attempt. This is the smallest
-saving of the three calibrated entries (9B skips 5/33 blocks); the 35B-A3B
-entry (12 of 40) and the 27B entry (20 of 65) skip a much larger fraction.
-
-**Split locate prefill — a per-model licence (2026-09-25).** `run_lens_locate`
-takes a `LensPrefillShape`: `OneShot` (the pass every constant was measured
-on), `Split` (the document prefilled untapped, then the instruction + keys +
-template tail tapped at their real positions) or `SplitFlash` (the same with
-flash on the document pass). Every row a mode reads sits after the document
-and attention is causal, so only chunk-boundary and flash rounding differ;
-the route fails loud if a read row would fall inside the document pass.
-**Which shape a model uses is a field of its calibration row**
-(`LensConstants::locate_prefill_shape` + `locate_prefill_provenance`, default
-`OneShot`), the same pattern as `flash_prefill_ok`: licensed per model by the
-LOCSPLIT drift gate (`tests/perf/attn_provenance.cpp`), never inherited — and
-per QUANTIZATION: Qwen3.8-9B at Q4_K_M passed and Q8_0 failed (absent on long
-documents changed 2 of 12 top-1 spans), so the licence lives on the table's
-first `file_type`-pinned row (`kGgufFileTypeQ4_K_M`, 15). Both 9B rows are built
-by one function (`qwen38_9b_constants()`), so the pinned row cannot drift from
-the any-quant row in anything but the licence; the any-quant row, and so Q8_0,
-stays `OneShot`. The report names the shape (`prefill`)
-and a split+flash locate is stamped `config.attention = "flash-prefill"` by
-route (`RoutePrefill::DocumentPassFlash`), because its document pass ran flash
-by licence rather than by server flag. Measured at a 10K prompt: locate
-27.5 → 23.4 s, absent 45.5 → 37.4 s, GPU compute buffer 8.2 → 2.9 GB; split
-without flash is slightly slower and exists as the base for keeping a
-document between requests ([`note-lens-prefill-only-engine.md`](note-lens-prefill-only-engine.md)).
-
-**The kept document (`document_id` on `/v1/locate`, 2026-09-26).** Built on the
-split: pass 1 depends on the document alone, so `run_lens_locate` can store slot
-0 right after it (`qinf::snapshot::capture_slot` — KV **and** DeltaNet state,
-which a position rewind cannot restore) and later restore it and run pass 2
-only. The store is `LensDocumentStore` (`server_lens.h`), owned by the server
-beside the slot it restores into and guarded by `model_mutex_`; `qinf-server`
-now links `qinf-snapshot` for it. The only hit test is exact equality of pass
-1's tokens; the document hash only turns an id reused for other text into a
-400. A pass 1 serves any read at or below the layer it was computed to
-(truncation is causal in depth). One-shot rows refuse an id. RAM only: at
-most **`--lens-kept-documents`** entries (default 4, 2026-09-27) keyed (route, id) — extract, locate (verdict shares it), compare — so
-one document kept on all three fills 3; LRU across routes; 15-minute idle TTL
-checked on every extract/locate/verdict/compare call; ids are 1–256 bytes on
-every route. The TTL is a fixed default, not a flag (`kLensDocumentStoreTtl`);
-the size flag exists because the store, not the GPU, sets how many users stay
-warm: users who take turns past the size all go cold (0/15 warm at 5 users on
-4 entries, 24/24 at 8 users on 8 — docs/note-lens-concurrency.md). An entry is
-~64 KB per document token + ~48 MB DeltaNet state on the 9B (F32 KV). Gated
-by LOCWARM: warm bit-identical to cold on 115/115 reports; 10K locate 22.4 s →
-0.30 s. **`/v1/extract` uses the same store** (2026-09-26): its older warm path
-(`LensWarmDocument` — keep slot 0, rewind the position) is deleted, because a
-position rewind restores KV but not DeltaNet state, and EXTWARM measured it
-NOT warm == cold on the hybrid 9B (edit loop 0/6; with a locate in between the
-output changed 6/6). Extract's document pass is now kept and restored as a
-snapshot (`LensDocPass`), and the candidates pass resumes from the same
-snapshot instead of rewinding. Entries are keyed per route
-(`LensKeptRoute`), because the two routes compute the document pass
-differently (truncated tapped graph vs full `run_prefill`); one store of 4
-serves both. EXTWARM: 15/15 identical to cold, both sequences, candidates on.
-
-**The verdict (`POST /v1/verdict`, 2026-09-26, docs/plan-lens-verdict.md).** A
-new lens route that reads **logits**, not attention: per question, one answer
-(yes / no / unclear) off the prefill's last row, after `verdict_layer` (logit
-lens; 27 → 28 of 33 blocks on the 9B), plus a receipt from the locate head. A
-new driver, `run_lens_verdict` — locate, extract and verify are untouched
-(gate G1: 90 reports byte-identical before and after). One document pass per
-request, truncated at the verdict layer and computed as locate's pass 1 (the
-row's `locate_prefill_shape`); each question resumes from its snapshot. With a
-`document_id` that pass is kept under `LensKeptRoute::Locate`, so it serves a
-later locate too. Served on the full lens server, and on a verify-only server
-started with **`--lens-verdict`** (2026-09-27; requires `--lens-verify-only`,
-refused anywhere else and on a row without `verdict_layer`): truncated servers
-load `token_embd` and the blocks but not the output head, which on the 9B is
-untied (`output.weight` 4096 × 248320 Q6_K, ~834 MB = +796 MiB measured), and
-the flag loads it — `Model::load_tensors(max_blocks, keep_output_head)` /
-`GGUFLoader::load_tensor_metadata(..., keep_output_head)` — and folds
-`verdict_layer` into the verify-only cut (no change on the 9B, 28/33). Answers
-are byte-identical to the full server's (7/7 responses, 22 questions). Licensed per model and quant by
-`LensConstants::verdict_layer` / `verdict_provenance` / `verdict_envelope_tokens`
-(appended last; −1 = refused) — set only on the 9B Q4_K_M row. Every pass is a
-truncated prefill, on the main scheduler like every verb.
-
-**The image verdict (`POST /v1/verdict` with `"image"`, 2026-10-01,
-docs/plan-image-verdict.md).** A different concern that only shares the URL:
-`handle_image_verdict` (http_server.cpp) claims a body carrying `"image"` and
-returns before any lens gate; a document body reaches the lens handler
-unchanged (G0: 11 responses, valid and refused, byte-identical with and
-without the dispatch). The logic is `src/server/image_verdict` (in
-`qinf-server`): encode + prefill up to the end of the image span **once**,
-`capture_slot` (the RPOS section carries the M-RoPE position, §12), then per
-question `restore_slot` and a prefill of the question alone from
-`get_rope_pos`; P(yes) vs P(no) with `run_lens_verdict`'s token sets; the LLM
-prefill pinned **materialized** (how the cuts were measured). Questions are a
-calibrated **mark** (the server words it exactly as measured: signature,
-stamp, date) or a free question (0.5, `calibrated: false`); answer = yes if
-p ≥ cut_yes, no if p < cut_no, else unclear (stamp 1.0 / 0.5: never yes —
-lookalikes score like real stamps, docs/note-stamp-lures.md). Gates of its
-own — `--mmproj`, a full model (a truncated lens server is refused), and an
-`ImageVerdictCalibration` row keyed `{arch, block_count, file_type,
-projector, projection_dim}` (one row: Qwen3.6-35B-A3B UD-Q3_K_XL + its
-mmproj) — reported at startup. `ServerVision` gained only plain accessors and
-`prepare_image`; `server_lens` is untouched. Slot 0, exclusive, under the
-model lock like the lens verbs; the slot is left clean (a chat request after
-it answers normally). Reproduces the probe bit for bit (G2, 166/166). Format
-`qemmi-verdict-image/v1`. **`image_id`** (1..256 bytes) keeps the post-image
-snapshot in the image verdict's own `ImageVerdictStore` (not the lens's): a hit
-needs the same id, the same image (preprocessed pixels' content id) and the
-same image-inclusive tokens; the same id for another image is a 400; 4 entries,
-LRU, 15-minute TTL, fixed (no flag). Warm answers are the cold ones exactly on
-the 35B-A3B (G4), 3 questions 11.1 s → 0.7 s. **`"where": true`** (2026-10-02,
-docs/note-verdict-img-ground.md) adds, for each yes / unclear answer on a mark
-with a locate wording (a column of the calibration row), the model's own box:
-the post-image snapshot restored once more, "Locate … in the image, output its
-bbox coordinates using JSON format." prefilled, a greedy `decode_step` run of
-≤ 64 tokens, the first `[x0, y0, x1, y1]` (Qwen-VL 0..1000 of the canvas)
-mapped onto the uploaded picture through the letterbox the `Bitmap` now
-records (`content_x/y/w/h`, set by `image_loader`, not in `content_id`).
-Generated, not read from attention: a pointer, not a receipt. The answers are
-untouched by it. ~1.5 s per box.
-
-**Compare (`POST /v1/compare`, 2026-09-26, docs/plan-lens-compare.md).** The
-seventh mode, the first read ACROSS two documents: the original (the caller's
-units, one per line) and a second version (free text — a translation, a
-rewrite); per unit, the compare head's attention from the second version's
-rows (max over rows, mean over the unit's tokens, relative to the mean of the
-best-covered quarter of units — `lens_compare_baseline`; the median until
-2026-09-27, which missed 35–49% of drops when most units were missing),
-and `missing` below the row's `compare_threshold`. A new driver,
-`run_lens_compare`; split prefill (pass 1 = instruction + original, pass 2 =
-the second version, compare head tapped), truncated after `compare_layer` (15
-→ 16 of 33 blocks). The compare layer is folded into every lens server's cut
-(it changes no cut on the 9B), and the readout is attention, not logits, so
-**every** lens server serves it — locate-only included. With a `document_id`
-the original's pass is kept under `LensKeptRoute::Compare`, so many revisions
-resume from one original. Licensed by `compare_layer` / `compare_head` /
-`compare_threshold` / `compare_provenance` / `compare_min_units` /
-`compare_envelope_tokens`, appended last, set only on the 9B Q4_K_M row.
-The original's pass is always materialized: unlike locate and verdict it does
-not follow the row's split+flash licence (flash changed 6 of 31,807 flags at
-COMPAREGATE G3).
-
-**Locate-only server mode (`--lens-locate-only`, 2026-09-19).** The same
-argument taken to its floor. `/v1/locate` reads ONE layer and generates
-nothing, so a process that serves locate *alone* needs `locate_layer + 1`
-blocks — citation and coverage are deliberately **not** in this cut, because
-this mode refuses `/v1/verify`, and folding them in would load blocks solely to
-keep a route that is switched off. Requires `--attention-lens`, is **mutually
-exclusive** with `--lens-verify-only` (they set different cuts and serve
-different route sets, so silently preferring one would either waste weights or
-withdraw a route the operator asked for), and is **refused fail-loud on a model
-whose calibration row carries no measured locate head** rather than falling
-back to the verify-only cut.
-
-Measured on Qwen3.8-9B-Q8_0 (`locate_layer` 11 ⇒ **12 of 33 blocks**, 160 of 442
-tensors): Metal weights buffer **3661 MB**, against verify-only's 7168 MB on the
-same model — a **1.96×** reduction. Latency is unchanged by the mode and always
-was: `/v1/locate` sets `truncate_after_layer` per request, so it computed 12
-blocks even on a full server. What the flag buys is **residency, not speed** —
-which is exactly what makes it the replication unit. One process still serves
-one request at a time (every lens route holds `model_mutex_` exclusively, and
-the lens's global engine state — `attention_taps`, `truncate_after_layer`,
-`prefill_attn_impl` — lives on the one shared `ForwardPassBase`), so concurrency
-for span-only comes from running N of these, not from batching. Measured
-locate latency on the 9B: 367 ms at 326 chars, 733 ms at 1430, 1750 ms at 4006,
-4116 ms at 8606 — slightly superlinear, and nearly flat in key count (+6.7%
-from 1 key to 15). Against 1810 ms for `/v1/verify` on the same document,
-locate is 2.59× cheaper.
-
-The three modes are one `LensServerMode` enum (`Full` / `VerifyOnly` /
-`LocateOnly`), not a pair of booleans: the cut, the block counters and the
-refusal text all derive from that single value, so a server cannot disagree
-with itself about which blocks it holds. Route gating reads `lens_truncated()`
-(any cut) except for `/v1/verify`, which is legal under `VerifyOnly` and
-refused under `LocateOnly` — a per-route fact, not a property of being cut.
-
-Three things keep this from becoming a second, cheaper way to lie:
-
-- **The output head and final norm are never needed.** `run_lens_verify`
-  already calls `build_prefill_graph(..., want_logits=false)` on both its
-  passes — verify never decodes, so `output_norm.weight`/`output.weight` were
-  dead weight (literally) even before this flag existed; skipping them is not
-  a new omission, just a load that finally matches the read pattern.
-- **`config.weights` is unaffected.** `ModelMetadata::weights_hash` is computed
-  once in `GGUFLoader::load_model`, from the *full* parsed tensor inventory,
-  before `load_tensors`/`load_tensor_metadata` (partial or not) ever runs — so
-  a verify-only report and a full-server report of the same file stamp the
-  identical hash and stay comparable (`lens-format.md`: "two reports are only
-  comparable when this matches"). Hashing the loaded subset instead would have
-  made every verify-only report incomparable with every full-server one —
-  exactly the failure mode the stamp exists to prevent. Pinned by
-  `tests/unit/test_model.cpp`.
-- **Every other route is refused fail-loud, not silently degraded.**
-  `/v1/extract`, `/v1/completions` and `/v1/chat/completions` all 404 by name
-  (endpoint, mode, alternative) before touching the engine — a truncated model
-  cannot generate, and there is no partial-credit response to give. The
-  startup banner states blocks loaded vs total and which calibration constants
-  set the cut, so an operator reading the log sees the same fact the refusal
-  text states. Reservation (`reserve_max_batch`, §10) is skipped in this mode:
-  it exists to pre-size the largest graph *decode* will ever build so galloc
-  never reallocates mid-generation, and this mode never decodes — every
-  `/v1/verify` call already resets the scheduler and allocates its own graph
-  fresh, same as `/v1/extract` does today with no reservation help. Reserving
-  anyway would additionally be unsafe: reservation builds a full-depth decode
-  graph, and this process's blocks past `needed` are unloaded.
-
-Metal-only: the copy-avoiding filter lives in the backend-buffer load path:
-Path A (CPU-only) has no filter, so `Model::load_tensors` refuses a partial
-request fail-loud rather than silently loading (and paying to copy) every
-tensor while claiming a saving that never happened.
+The lens server compiles `server/server_vision.cpp` by path and links
+`qinf-server` for `image_data_uri`.
 
 ---
 
@@ -1516,15 +830,10 @@ position, and Metal's `CPY`/`CONT` has no quantized *source* case, so the node
 would take ggml's silent CPU fallback (§3) rather than fail. Both front ends
 therefore refuse `q8_0`/`q4_0` without `--flash-attn`, fail-loud, before any
 weights load (`kv_type_requires_flash_refusal`, `state/kv_cache_simple.h`).
-**The attention lens is excluded by a second, direct refusal** (`http_server.cpp`,
-2026-09-13). It used to fall out transitively from the flash/lens refusal; once
-that became phase-scoped, a quantized cache could have slipped through on
-`--attention-lens --flash-attn`. It must not: the cache is written by prefill
-and **read by decode**, and the lens decode is materialized by construction, so
-the V transpose above would meet a quantized source on exactly the path the
-receipts are read from. Phase-scoped flash therefore does **not** unblock a
-quantized KV cache for the lens, and cannot while the tap needs a materialized
-decode — the one place `plan-lens-server-shape.md` §4.2 guessed wrong. Measured KV bytes on Qwen3-0.6B at ctx 2048: **896 / 448 / 238 /
+A client that reads attention rows off the decode (the lens) must therefore
+not run on a quantized cache at all — `qemmi-lens-server` refuses
+`--attention-lens` with a quantized `--kv-type` directly — because the
+materialized decode the tap reads would meet a quantized V on exactly that path.
 126 MB** for f32 / f16 / q8_0 / q4_0. This is a **capacity** lever on the
 `ctx × slots` axis, not a speed one: KV is ~1% of decode bandwidth against the
 weights, so the decode ceiling is ~1% (§10, Amdahl). Note the ggml b10582
@@ -1728,41 +1037,42 @@ used only for the output-head matmul, overlapping with the next token's body.
   The success metric for hosting a new variant: zero logic edits to modules
   other recipes depend on — if it needed them, that's an interface defect to
   fix, not a feature to celebrate.
-- **The receipts constraints (§1 identity — check before optimizing these
-  paths).** (a) The attention module's **`kq_soft.<il>` tensor names are a
-  public seam** — the lens tap locates rows by name; renaming is a breaking
-  change (§13 trigger). (b) **Materialized decode attention is load-bearing on
-  tapped layers**: any future fused/flash-style attention must keep tapped
-  layers materialized or export their rows (decode is one query row × ≤10K
-  keys, so fusion buys nothing there — the conflict is theoretical inside the
-  envelope, named so it stays theoretical). (c) **Receipts-grade determinism
-  is per-config AND single-slot**: the batch-shape fork (above) means a
-  generation that ran batched cannot be byte-replayed without its batch;
-  byte-replay claims (witnesses, counterfactual diffs) hold at B=1 — the lens
-  path is single-slot for this reason too, not only the qwen36 gather bug
-  (§12). **What that leaves for a customer is a DECISION claim, and since
-  2026-09-13 it is measured rather than implied** (`lens-format.md`, honest
-  limits): identical bits within a config, and across configs a report whose
-  decisions are stable with measured room — **on the 9B**. The room there is
-  1.5× (margin 0.00126 against 0.00084 of observed movement, EN+DE; 25× on the
-  flattering English-only arm). **On the 35B the same gate FAILS**: drift 0.0242
-  against a 0.0237 margin, and a chunked-prefill control changes one extraction
-  in fifteen. Expert routing is a top-k argmax, so an MoE hybrid does not
-  perturb smoothly and the cross-configuration claim is not currently available
-  on the model the lens was calibrated on (`lens-format.md`, honest limits).
-  Which language binds is model-dependent too: German on the 9B, English on the
-  35B. Byte-identity was always both too strong (it forbids changes that
-  provably move no decision — phase-scoped flash, §5) and too weak (it does not
-  survive a driver, a GPU or a ggml bump, none of which this repo pins). The
-  drift gate is where a candidate change earns the claim:
-  `tests/perf/attn_provenance.cpp`, `BANDDRIFT=1 DRIFT_ARM=<arm>`, exit code 0
-  = PASS. **KV element type is part of "config"**: an F16-cache generation
-  replays byte-identically only under F16, and the lens calibration numbers
-  were measured under F32, so F16 is not a calibrated receipts path until
-  re-measured. This is why `--kv-f16` is opt-in and F32 stays the default. (d) **Nondeterministic kernels are inadmissible on the receipts
-  path** — a Metal kernel using atomics/async reduction ordering may be fast,
-  but it forfeits every replay claim; it needs an explicit decision, not a
-  benchmark win.
+- **The client contract (replaces the "receipts constraints", 2026-10-03).**
+  The engine serves several clients; it may change freely except where a change
+  can move a client's result. The engine owns the list of **client-affecting
+  change classes**; each client owns its gate and its data. An engine change in
+  a listed class lands only when every registered client gate passes, or the
+  client records an explicit OK (the lens's per-model `flash_prefill_ok` is the
+  existing example of a recorded OK). A client without a gate accepts what the
+  engine does. Gates check decisions, not bytes — a byte gate would freeze the
+  engine — and each client is one command the engine can run without knowing
+  the client (`docs/note-repo-split.md` §5; the runner itself is a later task).
+
+  Client-affecting change classes:
+  (a) **attention numerics and the tap seam** — the `kq_soft.<il>` tensor names
+  are a public seam (renaming is a breaking change, §13 trigger); materialized
+  decode attention on tapped layers (any fused/flash attention must keep tapped
+  layers materialized or export their rows); `get_attention_taps` /
+  head-selected taps / `alloc_readback_graph`;
+  (b) **default KV element type** (F32; a quantized cache is flash-only, §9);
+  (c) **prefill shape** — chunking, flash in prefill, warm-vs-cold boundaries,
+  layer truncation (`truncate_after_layer`) and partial load (`max_blocks`,
+  `keep_output_head`);
+  (d) **kernels** — no nondeterministic kernels (atomics, async reduction
+  order) on these paths without an explicit decision; batch-shape forks (above);
+  (e) **ggml bumps and patches**;
+  (f) **MoE routing** — the top-k is an argmax, so any perturbation can change
+  the expert set (§10; capture/replay is the client's tool against it);
+  (g) **slot snapshots** (incl. the RPOS section), multimodal prefill, M-RoPE.
+
+  Registered clients: **qemmi-lens-server** (`../Qemmi-lens-server`, private) —
+  gate = its drift gate (BANDDRIFT: chunk / flash / warm arms) + LENSDUMP
+  before/after + its unit tests; heads, corpus and margins live there. What it
+  measured that bounds this engine's claims: identical bits within a config,
+  single-slot (the batch-shape fork above means byte-replay holds at B=1); a
+  decision claim across configs holds on dense models (Qwen3.8-9B margin
+  0.00126 vs 0.00084 drift) and FAILS on the MoE Qwen3.6-35B-A3B (0.0242 vs
+  0.0237) because expert routing is discrete.
 
 ---
 
@@ -1948,9 +1258,17 @@ Current, verified against the tree at time of writing:
   once the persistent path is the default — which awaits a decision, since
   bucketing makes it token-stable-not-identical (a deliberate opt-in, §5/§11),
   not a soft spot to silently fix.
+- **Two client-facing primitives have no end-to-end engine test, and
+  `ServerVision` has none at all (since 2026-10-03).** When the lens moved out,
+  its end-to-end checks left with it: MoE **routing replay** through a recipe
+  (PINREPLAY, cross-family incl. Gemma 4, and the routing-replay server smoke —
+  including the `ggml_set_output(logits)` invariant on the Replay path, §10)
+  and a **flash prefill under a materialized decode** (the lens drift gate).
+  The engine keeps the unit tests listed in §6; the `ServerVision` accessors the
+  image verdict reads have no unit test. Not deleted, not yet re-gated.
 - The Qemmi-Lens attention tap (`forward_pass_base`
   `set_attention_taps`/`mark_attention_taps`/`get_attention_taps`,
-  [`plan-qemmi-lens.md`](plan-qemmi-lens.md) P1/A1) reads the frozen
+  `plan-qemmi-lens.md` (qemmi-lens-server) P1/A1) reads the frozen
   `kq_soft.<il>` rows on the qwen36 decode path. V1 serves single-slot — now by
   choice (receipts-grade determinism is B=1, §11) rather than because the gather
   was broken: qwen36's decode KV gather used `Stride::NKvLen`
@@ -1967,6 +1285,9 @@ Current, verified against the tree at time of writing:
   for Gemma — and as of 2026-09-04 that is a **settled measurement, not an
   unprobed gap**: 0 of 768 candidate heads clear a 70% bar (§6). The seam hosts
   the probe on any recipe; only Qwen models have a calibration entry.
+  (The lens callers named in this bullet — extract, `/v1/verify`, `/v1/locate`,
+  the probes — live in qemmi-lens-server since 2026-10-03; "§6" in this bullet
+  meant the lens routes that section described until then.)
   **As of Movement 1 (`/v1/verify`, §6) `get_attention_taps` also reads a
   tapped PREFILL block** — `kq_soft.<il>` at `[n_kv, n_q, n_head]`, one row per
   query position processed in that pass, vs decode's `n_q==1` — via the same
@@ -1985,7 +1306,7 @@ Current, verified against the tree at time of writing:
   consecutive blocks with `AttentionTap::heads` (and `block_of(h)`) saying
   which model head each block is. Why: a lens job reads one head, and the full
   tap is `16 x P x P` floats — 6.2 GB of host copy and 5.8 s of readback at a
-  10K prompt ([`note-lens-locate-baseline.md`](note-lens-locate-baseline.md)).
+  10K prompt (`note-lens-locate-baseline.md` (qemmi-lens-server)).
   The copies are the same softmax, so values are byte-identical to the full
   tap's (`HeadSelectedTapEqualsFullTap{Decode,Prefill}`, run per recipe, Qwen
   and Gemma); `/v1/locate` is the one caller that sets it (`{use_head}`);
@@ -2076,7 +1397,9 @@ Update triggers — if your PR does any of these, touch this file in the same PR
   flag, or a state kind;
 - changes a seam named here (the server callback set, Seam A/B, the snapshot
   header contract);
-- settles a §12 item (delete the bullet) or adds a new known soft spot.
+- settles a §12 item (delete the bullet) or adds a new known soft spot;
+- adds, removes or changes a client-affecting change class or a registered
+  client (§11 client contract).
 
 Numbers in §10 are point-in-time measurements with named provenance; don't
 update them casually — re-measure or leave them, never interpolate.

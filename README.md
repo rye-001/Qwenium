@@ -36,57 +36,42 @@ Gemma recipe without bending.
 
 **Auditable.** The part below.
 
-## Answers, with receipts
+## Built for receipts
 
-Hand a contract to an assistant and ask: *"What's the penalty if we cancel
-late?"*
-
-A normal engine gives you an answer. It sounds confident. You have no idea
-whether it actually read page 7, where the exception is buried.
-
-Qwenium gives you the answer **plus the three things a careful assistant would
-volunteer:**
-
-1. **"Here's where I got it."** The exact spans the answer drew on, as
-   per-value source citations.
-2. **"Here's what I never read."** Page 7 was never consulted. *This is the one
-   nobody else hands you, and it is the difference between trusting an answer
-   and trusting a guess.*
-3. **"Check me if you like."** Ask again and get the identical answer, byte for
-   byte. It cannot quietly change its story.
-
-This is a **calibrated capability, not a blanket property of every model
-here** — the same status as vision or MTP. The attention tap is
-recipe-agnostic (any recipe naming its `kq_soft` tensor can host it), but the
-citation/coverage calibration behind it is per-model, and today only Qwen 3.6
-has been calibrated; there are no lens claims for Gemma yet.
-
-### How that is actually done
+An engine that wants to show its work needs three things from the forward
+pass, and Qwenium exposes all three as engine primitives:
 
 - **Where it looked — attention.** By default every decode step's attention is
-  materialized in the graph (not fused away) and tappable at zero extra
-  compute. Calibrated, it becomes receipts: per-value **source citations**, a
-  whole-document **coverage audit** ("this line was never consulted"), and an
-  **ungrounded-value flag** — served via `/v1/extract` with
-  `--attention-lens`, **Qwen 3.6-pinned and single-slot today**. This is the
-  one place where speed and auditability genuinely conflict: `--flash-attn`
-  fuses the attention softmax into a single kernel that never writes those
-  rows down, so the two flags are mutually exclusive and the server refuses
-  them together at startup rather than silently dropping the receipts.
+  materialized in the graph (not fused away) and tappable by name
+  (`kq_soft.<il>`) at zero extra compute, on every recipe, Qwen and Gemma alike.
+  Taps can select single heads, read whole prefill blocks, and run on a
+  truncated stack (`truncate_after_layer`) or a partially loaded model
+  (`max_blocks`), so a reader pays only for the layers it reads. `--flash-attn`
+  fuses the softmax into one kernel that never writes those rows down; the
+  attention implementation is a per-phase setting, so a client can keep the
+  tapped phase materialized and still run a flash prefill.
 - **What decided it — determinism.** Greedy decode is byte-deterministic, with
   forkable state (warm prefix restore + recurrent-state checkpoints). Remove
-  one line of the input, re-run, and the diff is fact, not sampling noise —
-  counterfactual "prove it" experiments per field.
+  one line of the input, re-run, and the diff is fact, not sampling noise. On
+  MoE models the expert selection can be captured and replayed, so a
+  re-run routes exactly as the original did.
 - **Proof it happened — integrity.** A weights hash computed at load,
   version-gated snapshots, kernel-path tags, and fail-loud replay refusal: a
   generation can carry a kilobyte witness and re-run byte-identical on demand.
+
+Turning attention rows into calibrated citations, coverage audits and verdicts
+is per-model work and lives in a separate client, the Qemmi-Lens server, which
+builds this engine as a library. The engine's side of that relationship is a
+written contract: the change classes that can move a client's results, and the
+rule that such changes land only when the client's gate passes
+([`docs/architecture.md`](docs/architecture.md) §11).
 
 
 ## What it does
 
 - **Multi-family support** — Qwen 2/2.5/3/3.5/3.6/3.8 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
 - **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5/3.8, one recipe), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
-- **Attention Lens (`/v1/extract`, `--attention-lens`)** — extraction with receipts: per-value source citations, a document coverage/omission audit, and an ungrounded-value flag, all read from the same forward pass at no extra compute. Qwen 3.6-pinned and single-slot today; see [Answers, with receipts](#answers-with-receipts).
+- **Attention taps** — the post-softmax attention rows of any layer and head, read from the same forward pass at no extra compute, on every recipe; with layer truncation, partial model load and MoE routing capture/replay for readers that need only part of the stack. See [Built for receipts](#built-for-receipts).
 - **Vision (multimodal)** — Image input for Gemma 3 (SigLIP encoder), Gemma 4 (`gemma4uv` projector), and the Qwen 3.5/3.6/3.8 family (`qwen3vl` encoder + merger, in-ViT M-RoPE) via a `--mmproj` GGUF, in both the CLI (`--image`) and the server (OpenAI `image_url` content).
 - **Batched inference** — Slot-based KV cache with batched decode, up to 10 concurrent slots; the Qwen DeltaNet hybrids enforce that ceiling with a fail-loud guard rather than a silent degradation (aborts at 11 slots on Qwen 3.6, 15 on Qwen 3.5/3.8). Throughput gain is strongly model-dependent — ~4× measured on Qwen 2.5 Coder 14B Q4 (dense transformer), only a ~1.6× ceiling on the Qwen 3.6 hybrid; see [Performance](#performance).
 - **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.
@@ -94,7 +79,7 @@ has been calibrated; there are no lens claims for Gemma yet.
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding; the valid-token set also drives a sparse LM head (skip logits for illegal tokens).
 - **Session snapshots** — Save a mid-generation session to a portable file and resume it (`--save-session` / `--load-session`), byte-faithful across processes.
 - **Speculative decoding** — Two draft sources: prompt-lookup (`--speculative` / `--speculative pld`, no draft model needed) and a trained MTP/NextN head (`--speculative mtp`, `--mtp-max-draft`, Qwen 3.6 only). MTP is experimental: 74–92% acceptance, ~3.3 tokens/step, but end-to-end throughput is only ~baseline on M1 Pro until the per-head dispatch overhead is addressed.
-- **Flash attention (`--flash-attn`)** — opt-in, on prefill *and* decode, every recipe. One fused kernel replaces the materialized `kq → softmax → kqv` chain and the V transpose. Worth 5–32% of a decode step depending on the model, and it grows with prompt length on prefill (~7% at 756 tokens, ~55% at 3000) because materialized attention is O(n²) and this is not. Token-stable, not byte-identical — so it stays opt-in, and it is mutually exclusive with `--attention-lens`.
+- **Flash attention (`--flash-attn`)** — opt-in, on prefill *and* decode, every recipe. One fused kernel replaces the materialized `kq → softmax → kqv` chain and the V transpose. Worth 5–32% of a decode step depending on the model, and it grows with prompt length on prefill (~7% at 756 tokens, ~55% at 3000) because materialized attention is O(n²) and this is not. Token-stable, not byte-identical — so it stays opt-in; it never writes the attention rows the taps read.
 - **Metal acceleration** — Apple Silicon via ggml's Metal backend, with custom fused DeltaNet kernels (`patches/`) for Qwen 3.5 / 3.6 decode.
 
 ## Supported Models
@@ -131,7 +116,7 @@ make -j$(nproc)
 ./bin/qwenium-server --model path/to/model.gguf --port 8080
 # optional: --mmproj vision.gguf (image input) · --slots N · --ctx N
 #           --prefix-cache DIR | --chat-prefix-cache | --conversational
-#           --flash-attn (faster; excludes --attention-lens)
+#           --flash-attn (faster)
 ```
 
 ```bash

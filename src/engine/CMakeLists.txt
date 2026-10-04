@@ -11,13 +11,13 @@ add_library(qinf-engine STATIC
     # unit-testable in isolation, and persistent_image_embedding_store needs
     # graph_inputs/ — which already links qinf-session, so folding it in would
     # be a cycle. Directory = concept; target = layering.
-    ${CMAKE_SOURCE_DIR}/src/session/persistent_image_embedding_store.cpp
-    ${CMAKE_SOURCE_DIR}/src/session/prefix_library.cpp
+    ${PROJECT_SOURCE_DIR}/src/session/persistent_image_embedding_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/session/prefix_library.cpp
 )
 
 target_include_directories(qinf-engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
@@ -61,7 +61,7 @@ add_library(qinf-orchestration STATIC
 
 target_include_directories(qinf-orchestration PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src
 )
 
 target_link_libraries(qinf-orchestration PUBLIC
