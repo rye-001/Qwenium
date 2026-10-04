@@ -652,11 +652,11 @@ what stays here as client-facing primitives, each with its engine test:
 | read-back plan `alloc_readback_graph` | `models/forward_pass_base` | `ForwardPassTapTest` (SameShapeDifferentTapLayer…, TapReadOffAnyOtherAlloc…) |
 | layer truncation `truncate_after_layer` | `models/decode_policy` | DecodePolicy truncation ×3 |
 | partial load `load_tensors(max_blocks, keep_output_head)` | `engine/model`, `loader/gguf_loader` | ModelPartialLoad ×6 |
-| per-phase attention (`prefill_attn_impl`) | `models/decode_policy` | DecodePolicy (policy value only — see §12) |
-| MoE routing capture / replay | `layers/routing_trace`, `graph_inputs/routing_replay_input`, `layers/moe` | RoutingTrace ×17, RoutingReplayInput ×7, RoutingCaptureAfterSameShapePass… (replay through a recipe: see §12) |
+| per-phase attention (`prefill_attn_impl`) | `models/decode_policy` | `ForwardPassTapTest` FlashPrefillUnderMaterializedDecodeKeepsTheTap, FlashDecodeWithATapFailsLoud (5 recipes) |
+| MoE routing capture / replay | `layers/routing_trace`, `graph_inputs/routing_replay_input`, `layers/moe` | RoutingTrace ×17, RoutingReplayInput ×7, RoutingCaptureAfterSameShapePass…, `ForwardPassRoutingReplayTest` ×4 (Qwen3.6-35B-A3B, Gemma 4-26B-A4B; see §12) |
 | slot snapshots incl. RPOS | `session/slot_snapshot` | rope-divergence tests, `test-image-prefix-roundtrip` |
 | `Bitmap` content rect | `vision/bitmap`, `image/image_loader` | image-loader tests |
-| `ServerVision` accessors (`prepare_image`, `encoder()`, marker ids, `projector_tag`, `projection_dim`) | `server/server_vision` | none (§12) |
+| `ServerVision` accessors (`prepare_image`, `encoder()`, marker ids, `projector_tag`, `projection_dim`) | `server/server_vision` | `server-vision-tests` ×3 (qwen3vl, gemma3, gemma4uv) |
 
 The lens server compiles `server/server_vision.cpp` by path and links
 `qinf-server` for `image_data_uri`.
@@ -1258,14 +1258,16 @@ Current, verified against the tree at time of writing:
   once the persistent path is the default — which awaits a decision, since
   bucketing makes it token-stable-not-identical (a deliberate opt-in, §5/§11),
   not a soft spot to silently fix.
-- **Two client-facing primitives have no end-to-end engine test, and
-  `ServerVision` has none at all (since 2026-10-03).** When the lens moved out,
-  its end-to-end checks left with it: MoE **routing replay** through a recipe
-  (PINREPLAY, cross-family incl. Gemma 4, and the routing-replay server smoke —
-  including the `ggml_set_output(logits)` invariant on the Replay path, §10)
-  and a **flash prefill under a materialized decode** (the lens drift gate).
-  The engine keeps the unit tests listed in §6; the `ServerVision` accessors the
-  image verdict reads have no unit test. Not deleted, not yet re-gated.
+- **The Replay-path `ggml_set_output(logits)` invariant (§10) has no test that
+  fails without it.** When the lens moved out (2026-10-03) its end-to-end checks
+  were replaced by engine tests (§6 table): routing replay through a recipe,
+  flash prefill under a materialized decode, the `ServerVision` accessors. But
+  removing that line from `layers/moe.cpp` leaves every replay test passing —
+  checked 2026-10-04 on Qwen3.6-35B-A3B and gemma-4-26B-A4B (Q2_K and
+  UD-Q4_K_XL), at 12 and 300 tokens and on a 278+22 split, ggml b10964. The
+  2026-09-16 failure it fixed does not reproduce, so the line stays on the
+  strength of that measurement; a test that bites needs the original failing
+  configuration first.
 - The Qemmi-Lens attention tap (`forward_pass_base`
   `set_attention_taps`/`mark_attention_taps`/`get_attention_taps`,
   `plan-qemmi-lens.md` (qemmi-lens-server) P1/A1) reads the frozen

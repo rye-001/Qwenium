@@ -249,6 +249,34 @@ target_link_libraries(image-data-uri-tests PRIVATE
 target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-data-uri-tests)
 
+# ServerVision's accessors (prepare_image, encoder, marker ids, projector_tag,
+# projection_dim) on one (model, mmproj) pair per projector family; each leg
+# self-skips without its files. server_vision.cpp is in no library (only the
+# server executable compiles it), so it is compiled here directly.
+add_executable(server-vision-tests
+    unit/test_server_vision.cpp
+    ${PROJECT_SOURCE_DIR}/src/server/server_vision.cpp
+)
+target_compile_definitions(server-vision-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_include_directories(server-vision-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/server)
+target_link_libraries(server-vision-tests PRIVATE
+    GTest::gtest_main
+    inference_server
+    qinf-snapshot
+    qinf-orchestration
+    qinf-image
+    qinf-vision
+    qinf-models
+    qinf-loader
+    qinf-engine
+    qinf-state
+    sampling
+    ggml
+)
+target_compile_features(server-vision-tests PRIVATE cxx_std_17)
+gtest_discover_tests(server-vision-tests)
+
 # Session snapshot seams (Phase 0). Model-free — links only qinf-session.
 add_executable(session-tests
     unit/test_session_manifest.cpp
