@@ -14,8 +14,8 @@ add_library(qinf-image STATIC
 
 target_include_directories(qinf-image PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/third_party
 )
 
 set_target_properties(qinf-image PROPERTIES

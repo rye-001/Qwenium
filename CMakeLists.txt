@@ -61,7 +61,7 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 # See: docs/plan-deltanet-fusion.md for context on why we patch downstream
 # rather than fork or upstream.
 #
-file(GLOB QINF_GGML_PATCH_FILES "${CMAKE_SOURCE_DIR}/patches/*.patch")
+file(GLOB QINF_GGML_PATCH_FILES "${PROJECT_SOURCE_DIR}/patches/*.patch")
 if(QINF_GGML_PATCH_FILES)
     message(STATUS "qinf: ggml patches detected: ${QINF_GGML_PATCH_FILES}")
 endif()
@@ -71,7 +71,7 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
   GIT_TAG        b10964
   SOURCE_SUBDIR  ggml
-  PATCH_COMMAND  bash "${CMAKE_SOURCE_DIR}/patches/apply-all.sh" "${CMAKE_SOURCE_DIR}/patches"
+  PATCH_COMMAND  bash "${PROJECT_SOURCE_DIR}/patches/apply-all.sh" "${PROJECT_SOURCE_DIR}/patches"
 )
 
 # Set GGML options to minimal configuration
@@ -91,7 +91,7 @@ FetchContent_MakeAvailable(ggml)
 target_compile_options(ggml PRIVATE -fno-finite-math-only -funroll-loops)
 
 # Include directories
-include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components

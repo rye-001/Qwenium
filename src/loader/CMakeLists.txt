@@ -10,7 +10,7 @@ add_library(qinf-loader STATIC
 
 target_include_directories(qinf-loader PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 

@@ -32,7 +32,7 @@ add_executable(unit-tests
 # default checkout-local model instead of a relative path that never resolves
 # from ctest's working directory. Env vars (QWEN3_MODEL_PATH, ...) still win.
 target_compile_definitions(unit-tests PRIVATE
-    QINF_MODELS_DIR="${CMAKE_SOURCE_DIR}/models")
+    QINF_MODELS_DIR="${PROJECT_SOURCE_DIR}/models")
 
 # Link libraries for unit tests
 target_link_libraries(unit-tests PRIVATE
@@ -519,41 +519,6 @@ target_link_libraries(forward-pass-base-tests PRIVATE
 
 target_compile_features(forward-pass-base-tests PRIVATE cxx_std_17)
 gtest_discover_tests(forward-pass-base-tests)
-
-# Qemmi-Lens pure computation (docs/plan-qemmi-lens.md P2) — compute_lens_report
-# / lens_report_to_json exercised with synthetic tap rows (no model). Compiles
-# server_lens.cpp directly; the driver half links the model/grammar libs.
-# The image verdict's model-free parts: table, wording, refusals, bands, JSON
-# (src/server/image_verdict.cpp, in qinf-server). The driver is gated against
-# the probe on the real model — docs/plan-image-verdict.md §7, G2.
-add_executable(image-verdict-tests
-    unit/test_image_verdict.cpp
-)
-target_link_libraries(image-verdict-tests PRIVATE
-    qinf-server
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-)
-target_compile_features(image-verdict-tests PRIVATE cxx_std_17)
-gtest_discover_tests(image-verdict-tests)
-
-add_executable(server-lens-tests
-    unit/test_server_lens.cpp
-)
-
-target_link_libraries(server-lens-tests PRIVATE
-    qinf-server
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
-    qinf-models
-    qinf-loader
-    sampling
-    qinf-engine
-    ggml
-)
-
-target_compile_features(server-lens-tests PRIVATE cxx_std_17)
-gtest_discover_tests(server-lens-tests)
 
 # feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
 # differential (docs/plan-feed-tokens.md). Self-skips when model absent.
@@ -1135,7 +1100,7 @@ gtest_discover_tests(multimodal-prefill-tests)
 # src/cli/ sources directly (the cli builds an executable, not a lib).
 add_executable(image-loader-tests
     unit/test_image_loader.cpp
-    ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
+    ${PROJECT_SOURCE_DIR}/src/vision/image_preprocess.cpp
 )
 target_link_libraries(image-loader-tests PRIVATE GTest::gtest_main qinf-image)
 target_compile_features(image-loader-tests PRIVATE cxx_std_17)
@@ -1145,7 +1110,7 @@ gtest_discover_tests(image-loader-tests)
 # cli builds an executable, not a lib). No model: pure stream logic.
 add_executable(chat-input-tests
     unit/test_chat_input.cpp
-    ${CMAKE_SOURCE_DIR}/src/cli/chat_input.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/chat_input.cpp
 )
 target_link_libraries(chat-input-tests PRIVATE GTest::gtest_main)
 target_compile_features(chat-input-tests PRIVATE cxx_std_17)
@@ -1170,7 +1135,7 @@ gtest_discover_tests(rope-divergence-tests)
 # Preprocessing recipes (pure data — no ggml, no IO, no model file).
 add_executable(image-preprocess-tests
     unit/test_image_preprocess.cpp
-    ${CMAKE_SOURCE_DIR}/src/vision/image_preprocess.cpp
+    ${PROJECT_SOURCE_DIR}/src/vision/image_preprocess.cpp
 )
 target_link_libraries(image-preprocess-tests PRIVATE GTest::gtest_main)
 target_compile_features(image-preprocess-tests PRIVATE cxx_std_17)
@@ -1441,7 +1406,7 @@ add_executable(perf-baseline
 )
 
 target_compile_definitions(perf-baseline PRIVATE
-    CANARY_PROMPTS_DEFAULT="${CMAKE_SOURCE_DIR}/tests/fixtures/canary_prompts_gemma.txt"
+    CANARY_PROMPTS_DEFAULT="${PROJECT_SOURCE_DIR}/tests/fixtures/canary_prompts_gemma.txt"
 )
 
 target_link_libraries(perf-baseline PRIVATE
@@ -1537,65 +1502,6 @@ target_link_libraries(alloc-reuse PRIVATE
     ggml
 )
 target_compile_features(alloc-reuse PRIVATE cxx_std_17)
-
-# Attention-provenance probe (N3) — does the decode attention row point at the
-# value's source span? Reads back the post-softmax kq_soft.<il> tensors.
-# Compiles server_lens.cpp so the QDOCS_S1 Stage 1 gate measures the SHIPPED
-# lens math (run_lens_extract / compute_lens_report / the A5.4 predicates),
-# not this file's older inline copy — the gate would be worthless against a
-# lookalike. Same source-in-target pattern as server-lens-tests, same libs.
-add_executable(attn-provenance
-    perf/attn_provenance.cpp
-)
-target_link_libraries(attn-provenance PRIVATE
-    qinf-server
-    nlohmann_json::nlohmann_json   # server_lens.cpp: the shape contract's real parse
-    qinf-models
-    qinf-loader
-    qinf-engine
-    sampling
-    ggml
-)
-target_compile_features(attn-provenance PRIVATE cxx_std_17)
-
-# Prefill image-lens depth-sweep probe — docs/note-image-lens-probe.md's one
-# open branch: does prefill attention (vs. the decode tap) reach past image
-# rows the decode tap never visits? Manually drives the chunked image-prefill
-# sequence (mirrors multimodal_prefill.cpp) so kq_soft.<il> can be tapped on
-# the image chunk and the suffix chunk separately. See probe_image_prefill_lens.cpp.
-add_executable(probe-image-prefill-lens
-    perf/probe_image_prefill_lens.cpp
-)
-target_link_libraries(probe-image-prefill-lens PRIVATE
-    qinf-image
-    qinf-vision
-    qinf-models
-    qinf-loader
-    qinf-engine
-    sampling
-    ggml
-)
-target_compile_features(probe-image-prefill-lens PRIVATE cxx_std_17)
-
-# VERDICT-IMG: the verdict readout (P(yes) vs P(no) off the prefill's last row)
-# on images, through the production prefill_multimodal path. Logits only, no
-# attention taps. Images: perf/probe_verdict_img_render.swift. COST mode
-# times image-once + per-question resume (capture/restore_slot).
-add_executable(probe-verdict-img
-    perf/probe_verdict_img.cpp
-)
-target_link_libraries(probe-verdict-img PRIVATE
-    qinf-server          # DRIVER mode: run_image_verdict (G2)
-    qinf-snapshot
-    qinf-orchestration
-    qinf-image
-    qinf-vision
-    qinf-models
-    qinf-loader
-    qinf-engine
-    ggml
-)
-target_compile_features(probe-verdict-img PRIVATE cxx_std_17)
 
 # ENCODER cost: one Qwen3-VL vision layer at a page's shape, dense vs
 # materialized attention vs flash attention (F32 / F16 K/V), on Metal.

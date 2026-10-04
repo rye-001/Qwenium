@@ -36,14 +36,6 @@
 // decode + capability gate it needs to route an image request.
 #include "image_data_uri.h"
 #include "server_vision.h"
-#include "image_verdict.h"   // POST /v1/verdict with an image (docs/plan-image-verdict.md)
-
-// Attention Lens extraction (--attention-lens): the dedicated /v1/extract
-// endpoint. Document + complete key vocabulary → audited key-value JSON on the
-// attention trust layer. Inert unless the flag is set; the OpenAI endpoints are
-// untouched (docs/plan-qemmi-lens.md P2/A2).
-#include "server_lens.h"
-
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
@@ -150,68 +142,9 @@ std::string normalize_output(const std::string& output) {
     return normalized;
 }
 
-// GGUF general.file_type, the third field of the lens calibration key
-// (src/server/server_lens.h). ABSENT is not an error and not a default
-// quantization: returning kLensAnyFileType means the model matches no PINNED
-// row, which is the safe direction — a missing key must never let a file in
-// under some other quantization's coordinates.
-static uint32_t lens_file_type_of(const ModelMetadata& meta) {
-    const std::optional<uint32_t> ft = meta.raw_kv.get_uint32_opt("general.file_type");
-    return ft ? *ft : qinf::kLensAnyFileType;
-}
-
 // =============================================================================
 // Integration layer: Wire up InferenceServer to your Qwen implementation
 // =============================================================================
-// ── How much of the model this process loaded, and therefore what it serves ──
-//
-// One mode, not a bag of booleans. Each non-Full value is a CUT: a promise that
-// some suffix of the blocks is provably unreachable, so it is never loaded. The
-// cut, the block counters and the refusal text all derive from this single
-// value — two parallel flags would be two places for a server to disagree with
-// itself about which blocks it holds.
-//
-// Causality is what makes every cut exact rather than approximate
-// (architecture.md §6): an attention layer cannot depend on a layer above it,
-// so a pass truncated after layer L produces IDENTICAL tapped rows to an
-// untruncated one.
-enum class LensServerMode {
-    Full,        // every route; all blocks loaded
-    VerifyOnly,  // --lens-verify-only: /v1/verify + /v1/locate + /v1/compare
-                 //   (+ /v1/verdict with --lens-verdict).
-                 //   cut = the deepest lens layer on the row (citation, coverage,
-                 //   the locate heads, compare; verdict with --lens-verdict) + 1
-    LocateOnly,  // --lens-locate-only:  /v1/locate + /v1/compare only.
-                 //   cut = the deepest locate head (locate, choice, absent, score,
-                 //   inject) or compare + 1 — the cheapest lens server, because
-                 //   citation and coverage are left out. On Qwen3.8-9B: 20/33
-                 //   blocks (absent L19) against verify-only's 28/33. It was
-                 //   12/33 before the absent head landed (docs/architecture.md §6).
-};
-
-inline const char* lens_mode_flag(LensServerMode m) {
-    switch (m) {
-        case LensServerMode::VerifyOnly: return "--lens-verify-only";
-        case LensServerMode::LocateOnly: return "--lens-locate-only";
-        case LensServerMode::Full:       break;
-    }
-    return "(no lens cut)";
-}
-
-// Which routes a mode serves, for refusals and banners — written once so a new
-// mode cannot advertise one set and enforce another. `verdict` = --lens-verdict
-// (verify-only with the output head loaded).
-inline const char* lens_mode_serves(LensServerMode m, bool verdict = false) {
-    switch (m) {
-        case LensServerMode::VerifyOnly:
-            return verdict ? "POST /v1/verify, POST /v1/locate, POST /v1/compare and POST /v1/verdict"
-                           : "POST /v1/verify, POST /v1/locate and POST /v1/compare";
-        case LensServerMode::LocateOnly: return "POST /v1/locate and POST /v1/compare only";
-        case LensServerMode::Full:       break;
-    }
-    return "every route";
-}
-
 class QweniumServerIntegration {
     static constexpr int MAX_SLOTS = 10;
 
@@ -222,16 +155,10 @@ public:
                           const std::string& image_embed_cache_dir = "",
                           const std::string& image_prefix_cache_dir = "",
                           const std::string& prefix_cache_dir = "",
-                          ggml_type kv_type = GGML_TYPE_F32,
-                          LensServerMode lens_mode = LensServerMode::Full,
-                          bool lens_verdict = false,
-                          size_t lens_kept_documents = qinf::kLensDocumentStoreMax)
+                          ggml_type kv_type = GGML_TYPE_F32)
         : max_ctx_per_slot_(max_ctx_per_slot),
           max_slots_(max_slots < 1 ? 1 : (max_slots > MAX_SLOTS ? MAX_SLOTS : max_slots)),
-          kv_type_(kv_type),
-          lens_documents_(lens_kept_documents, qinf::kLensDocumentStoreTtl) {
-        lens_mode_ = lens_mode;
-        lens_verdict_ = lens_verdict;
+          kv_type_(kv_type) {
 
         std::cout << "Loading model from: " << model_path << std::endl;
         // Register architectures BEFORE load_metadata: the GGUF loader validates
@@ -244,158 +171,7 @@ public:
         // (mirrors the CLI; harmless for a text export, which still loads as text).
         model_.load_metadata(model_path, /*allow_multimodal=*/!mmproj_path.empty());
 
-        // ── --lens-verify-only ────────────────────────────────────────────
-        // Resolve the calibration entry from METADATA ALONE (architecture +
-        // block_count are populated by load_metadata; no tensor has been read
-        // yet) and load only the blocks a truncated /v1/verify pass can ever
-        // reach. Causality is the same argument run_lens_verify's
-        // DecodePolicy::truncate_after_layer already relies on (architecture.md
-        // §6): an attention layer cannot depend on one above it, so a pass
-        // truncated after max(citation_layer, coverage_layer) produces
-        // IDENTICAL tapped rows to an untruncated one — the omitted blocks are
-        // provably unreachable, not an approximation. One more block loaded
-        // than this would be pure waste; one fewer would silently corrupt
-        // every report this process ever serves.
-        //
-        // This duplicates enable_attention_lens()'s calibration lookup rather
-        // than threading a resolved pointer through the constructor: the two
-        // call sites want different failure timing on the same miss (main()
-        // parses --lens-verify-only before --attention-lens is enabled, and a
-        // wrong load-time decision here cannot be undone after the copy has
-        // run), and lens_calibration_for is a pure table lookup, so a second
-        // call cannot disagree with the first.
-        if (lens_mode_ != LensServerMode::Full) {
-            const ModelMetadata& meta_for_cut = model_.get_metadata();
-            const uint32_t ft_for_cut = lens_file_type_of(meta_for_cut);
-            const qinf::LensCalibration* cal =
-                qinf::lens_calibration_for(meta_for_cut.architecture,
-                                           meta_for_cut.block_count, ft_for_cut);
-            if (!cal) {
-                throw std::runtime_error(
-                    std::string(lens_mode_flag(lens_mode_)) + ": " +
-                    qinf::lens_calibration_refusal(meta_for_cut.architecture,
-                                                    meta_for_cut.block_count, ft_for_cut));
-            }
-            // LOCATE BELONGS IN THIS MAX. This process serves /v1/locate too, and
-            // locate taps its OWN layer — a calibration whose locate_layer sits
-            // deeper than both of the others would tap a block this cut never
-            // loaded.
-            //
-            // THIS NOW BITES. It was written when it did not: the 35B and the 9B
-            // both sit at L11, equal to coverage, so the max was inert and the
-            // line was pure anticipation. Qwen3.8-27B (2026-09-19) is the case it
-            // was waiting for — locate 27 against citation 19 and coverage 11, so
-            // this max is what makes the cut 28 of 65 instead of 20, and deleting
-            // it would serve /v1/locate a layer that was never loaded. Do not
-            // "simplify" it back to two terms.
-            //
-            // -1 means "not swept" and must not
-            // drag the max down, so it is only folded in when it is real.
-            // Every head this process can SERVE must be inside the cut, or a
-            // request for it taps a block that was never loaded. Folded in
-            // here rather than at each route because the load happens once.
-            auto fold = [](int c, int layer) { return layer >= 0 ? std::max(c, layer) : c; };
-            int cutoff;
-            if (lens_mode_ == LensServerMode::LocateOnly) {
-                // LOCATE-ONLY cuts at the locate heads and compare. citation and coverage are
-                // deliberately NOT in this max: this process refuses /v1/verify,
-                // so nothing will ever read them, and folding them in would load
-                // blocks purely to keep a route that is switched off.
-                //
-                // Refused fail-loud on an unswept model rather than falling back
-                // to the verify-only cut: a silent fallback would load 28/33 for
-                // an operator who asked for the narrow cut and told them nothing.
-                if (cal->constants.locate_layer < 0) {
-                    throw std::runtime_error(
-                        "--lens-locate-only: expected calibration '" +
-                        std::string(cal->model) + "' to carry a measured locate head, "
-                        "actual locate_layer=-1 (not swept by LOCHEAD). This mode is built "
-                        "around POST /v1/locate (it serves only that and POST /v1/compare), "
-                        "so a model without a locate pair has no reason to run it. Provenance: " +
-                        std::string(cal->constants.locate_provenance) +
-                        ". Use --lens-verify-only for /v1/verify on this model.");
-                }
-                // LOCATE-ONLY serves /v1/locate, and that route can read the
-                // choice and absence pairs too (head=choice|absent), so they
-                // are part of this mode's surface and part of its cut. On the
-                // 9B that is what takes it from 12 blocks to 20: absence sits
-                // at L19 and, unlike choice, has no stable shallow head. The
-                // SCORE pair rides along free — it is the neighbouring head on
-                // absence's own layer, so it widens the surface without moving
-                // the cut. INJECT rides free the same way on the 9B (L11 h=0,
-                // locate's layer); folded in so a model where it is deeper
-                // pays honestly rather than refusing at request time.
-                cutoff = cal->constants.locate_layer;
-                cutoff = fold(cutoff, cal->constants.choice_layer);
-                cutoff = fold(cutoff, cal->constants.absent_layer);
-                cutoff = fold(cutoff, cal->constants.score_layer);
-                cutoff = fold(cutoff, cal->constants.inject_layer);
-                cutoff = fold(cutoff, cal->constants.compare_layer);
-            } else {
-                cutoff =
-                    std::max(cal->constants.citation_layer, cal->constants.coverage_layer);
-                cutoff = fold(cutoff, cal->constants.locate_layer);
-                cutoff = fold(cutoff, cal->constants.choice_layer);
-                cutoff = fold(cutoff, cal->constants.absent_layer);
-                cutoff = fold(cutoff, cal->constants.score_layer);
-                cutoff = fold(cutoff, cal->constants.inject_layer);
-                cutoff = fold(cutoff, cal->constants.compare_layer);
-                // --lens-verdict: /v1/verdict reads logits after verdict_layer,
-                // so that layer joins the cut (on the 9B it is already inside:
-                // citation L27 = verdict L27) and the output head is loaded.
-                // Refused on a row with no measured verdict layer rather than
-                // loading a head for a route that would refuse every request.
-                if (lens_verdict_) {
-                    if (cal->constants.verdict_layer < 0)
-                        throw std::runtime_error(
-                            "--lens-verdict: expected a measured verdict_layer on the calibration row for " +
-                            std::string(cal->model) + ", actual none (" + cal->constants.verdict_provenance +
-                            ") — /v1/verdict is not served for this model or quantization.");
-                    cutoff = fold(cutoff, cal->constants.verdict_layer);
-                }
-            }
-            lens_blocks_needed_ = static_cast<uint32_t>(cutoff) + 1;
-            lens_total_blocks_  = meta_for_cut.block_count;
-            lens_calibration_model_ = cal->model;
-            model_.load_tensors(lens_blocks_needed_, /*keep_output_head=*/lens_verdict_);
-            // The banner requirement (docs/architecture.md §6): blocks loaded
-            // vs total, and which constant set the cut.
-            // The cut EXPRESSION differs by mode and is printed as computed,
-            // never as a generic "max(...)": an operator must be able to read
-            // the banner and reproduce the block count by hand.
-            const std::string cut_expr =
-                lens_mode_ == LensServerMode::LocateOnly
-                    ? "max(locate_layer=" + std::to_string(cal->constants.locate_layer) +
-                      ", choice_layer=" + std::to_string(cal->constants.choice_layer) +
-                      ", absent_layer=" + std::to_string(cal->constants.absent_layer) +
-                      ", score_layer=" + std::to_string(cal->constants.score_layer) +
-                      ", inject_layer=" + std::to_string(cal->constants.inject_layer) +
-                      ", compare_layer=" + std::to_string(cal->constants.compare_layer) + ")"
-                    : "max(citation_layer=" + std::to_string(cal->constants.citation_layer) +
-                      ", coverage_layer=" + std::to_string(cal->constants.coverage_layer) +
-                      (cal->constants.locate_layer >= 0
-                           ? ", locate_layer=" + std::to_string(cal->constants.locate_layer)
-                           : std::string(", locate_layer=not-swept")) +
-                      (lens_verdict_ ? ", verdict_layer=" + std::to_string(cal->constants.verdict_layer)
-                                     : std::string()) + ")";
-            std::cout << lens_mode_flag(lens_mode_) << " ON: loaded " << lens_blocks_needed_
-                      << "/" << lens_total_blocks_ << " blocks — cut at "
-                      << cut_expr << " + 1, "
-                      << "calibration " << cal->model << " [" << cal->architecture << "/"
-                      << cal->block_count << "], " << cal->provenance << ". Serving "
-                      << lens_mode_serves(lens_mode_, lens_verdict_)
-                      << (lens_verdict_ ? " (+ the output head for /v1/verdict)" : "")
-                      << (lens_mode_ == LensServerMode::LocateOnly
-                              ? " — /v1/verify, /v1/extract, /v1/completions and "
-                                "/v1/chat/completions are ALL refused (this process loaded "
-                                "only the blocks locate reads; it cannot audit and cannot "
-                                "generate)."
-                              : " — /v1/extract, /v1/completions and /v1/chat/completions "
-                                "are refused (a truncated model cannot generate).")
-                      << std::endl;
-        } else {
-            model_.load_tensors();
-        }
+        model_.load_tensors();
 
         // F6: build the tokenizer with the architecture's registered
         // TokenizerConfig (NOT a config-less default). For Gemma this carries the
@@ -443,20 +219,8 @@ public:
         scheduler_ = model_.get_scheduler();
 
         // Reserve memory for the maximum batch size to prevent reallocation
-        // errors. Skipped under --lens-verify-only: reserve_max_batch builds a
-        // FULL-DEPTH decode graph (reservation needs the largest graph decode
-        // will ever build, architecture.md §5/§10) and this process's model has
-        // blocks past lens_blocks_needed_ left unloaded (nullptr
-        // weight pointers) — walking into one would segfault, not degrade. It
-        // is also unnecessary here: reservation exists to stop galloc
-        // reallocation from corrupting scratch MID-GENERATION (architecture.md
-        // §6's reserve_max_batch comment), and this mode never decodes at all —
-        // every /v1/verify call already resets the scheduler and allocates its
-        // own graph fresh (server_lens.cpp's run_lens_verify), the same as
-        // /v1/extract does today without any reservation help.
-        if (lens_mode_ == LensServerMode::Full) {
-            reserve_max_batch();
-        }
+        // errors.
+        reserve_max_batch();
 
         // Vision projector (image input). Stays null for a text-only server; a
         // successful construction is what `vision_enabled()` reports. Fail-loud
@@ -466,15 +230,6 @@ public:
                 model_, *forward_pass_, *tokenizer_, model_mutex_,
                 max_ctx_per_slot_, mmproj_path, image_embed_cache_dir,
                 image_prefix_cache_dir);
-            // The image verdict (POST /v1/verdict with "image") is served when
-            // its own gates pass — say which, at startup, not on the first request.
-            const std::string unserved = image_verdict_unserved_reason();
-            if (unserved.empty())
-                std::cout << "Image verdict: served on POST /v1/verdict with \"image\" (calibration "
-                          << qinf::image_verdict_calibration_for(model_.get_metadata(), image_verdict_vision())->model
-                          << ")" << std::endl;
-            else
-                std::cout << "Image verdict: not served — " << unserved << std::endl;
         }
 
         // Text prefix cache (--prefix-cache): opt-in, version-gated, transparent.
@@ -586,140 +341,11 @@ public:
         std::cout << "Memory reservation complete." << std::endl;
     }
 
-    // ── Attention Lens (--attention-lens) ────────────────────────────────────
-    // Opt-in; arms the /v1/extract route. Inert otherwise — no lens code runs and
-    // the engine is byte-inert. Builds NO grammar: the lens decodes free (Stage 2,
-    // docs/note-nogrammar-refutation.md). This does not touch the per-request
-    // `grammar` field on /v1/completions and /v1/chat/completions, which is a
-    // separate shipped feature and still works exactly as before.
-    //
-    // Refused fail-loud on any model that has no calibration entry
-    // (server_lens.h kLensCalibrations, keyed {architecture, block_count}).
-    // Same shape and same reason class as enable_flash_attn: accepting the flag
-    // on an uncalibrated model would not degrade the lens, it would make it lie
-    // — a shaped report whose citations and badges come from coordinates
-    // measured on a different model. Note the key is the MODEL, not the
-    // architecture: `qwen35` alone spans 0.8B through 27B. Returns false with a
-    // printed reason so main() can just `return 1`.
-    //
-    // The resolved entry is stored, not re-looked-up per request: which
-    // coordinates a report was computed from is fixed for the process lifetime.
-    bool enable_attention_lens() {
-        const ModelMetadata& meta = model_.get_metadata();
-        const uint32_t ft = lens_file_type_of(meta);
-        const qinf::LensCalibration* cal =
-            qinf::lens_calibration_for(meta.architecture, meta.block_count, ft);
-        if (!cal) {
-            std::cerr << qinf::lens_calibration_refusal(meta.architecture, meta.block_count, ft)
-                      << std::endl;
-            return false;
-        }
-        lens_constants_ = cal->constants;
-        attention_lens_enabled_ = true;
-        // Two readings, because --lens-verify-only removes a route this line
-        // would otherwise advertise. One banner for both would offer
-        // /v1/extract here and refuse it in the endpoint list printed a few
-        // lines below, so an operator reading the startup top-down is told
-        // both things about the same route.
-        if (lens_mode_ == LensServerMode::LocateOnly) {
-            std::cout << "Attention Lens ON (--attention-lens with --lens-locate-only): POST "
-                         "/v1/locate (single-slot; document + keys \u2192 byte ranges; "
-                         "nothing generated, nothing audited) and POST /v1/compare (original "
-                         "units + a second version \u2192 which units are missing). This process "
-                         "serves no other lens route: it loaded only the blocks those read, so "
-                         "/v1/verify and /v1/verdict are refused here as well as /v1/extract." << std::endl;
-        } else if (lens_mode_ == LensServerMode::VerifyOnly) {
-            std::cout << "Attention Lens ON (--attention-lens with --lens-verify-only): POST "
-                         "/v1/verify (single-slot; document + extraction → an audited "
-                         "report, teacher-forced, no decode loop) and POST /v1/locate "
-                         "(document + keys → byte ranges; nothing generated, nothing audited) "
-                         "and POST /v1/compare (original units + a second version → which units "
-                         "are missing)"
-                      << (lens_verdict_
-                              ? " and POST /v1/verdict (document + yes/no questions → yes / no / "
-                                "unclear; --lens-verdict loaded the output head for it). This "
-                                "process does NOT serve POST /v1/extract — it cannot generate."
-                              : ". This process does NOT serve POST /v1/extract or POST /v1/verdict "
-                                "— it has not loaded the output head those need (--lens-verdict "
-                                "adds it for /v1/verdict).")
-                      << std::endl;
-        } else {
-            std::cout << "Attention Lens ON (--attention-lens): POST /v1/extract "
-                         "(single-slot; document → audited key-value JSON; free decode, "
-                         "tolerant parse, 422 on unparseable output) and POST /v1/verify "
-                         "(single-slot; document + extraction → the same report, teacher-"
-                         "forced, no decode loop) and POST /v1/locate (document + keys → "
-                         "byte ranges; nothing generated, nothing audited, uncalibrated) and "
-                         "POST /v1/verdict (document + yes/no questions → yes / no / unclear "
-                         "read off the prefill; per-model) and POST /v1/compare (original units "
-                         "+ a second version → which units are missing; per-model)"
-                      << std::endl;
-        }
-        std::cout << "  lens calibration: " << cal->model << " [" << cal->architecture << "/"
-                  << cal->block_count << "] citation L" << lens_constants_.citation_layer
-                  << "H" << lens_constants_.citation_head << ", coverage layer "
-                  << lens_constants_.coverage_layer << " @ " << lens_constants_.coverage_used_peak
-                  << " — " << cal->provenance << std::endl;
-        // The whole calibrated set, not just the row that matched. An operator
-        // on a calibrated model never sees the refusal, so this is the only
-        // place the closed set is stated.
-        //
-        // "not calibrated", deliberately — NOT "by measurement". Refusal has
-        // two causes and they are not the same claim: Gemma was searched and
-        // failed (0 of 768 candidate heads clear even a 70% bar), while
-        // Qwen3.8-27B (qwen35/65) has simply never been probed. Both are
-        // refused, only one is a verdict, and a banner that called them both
-        // measured would be the same false confidence the refusal exists to
-        // prevent.
-        std::cout << "  calibrated models: " << qinf::lens_calibration_list()
-                  << " — every other model is refused fail-loud as not calibrated"
-                  << std::endl;
-        return true;
-    }
-    bool attention_lens_enabled() const { return attention_lens_enabled_; }
-
-    // Which cut, if any, this process was started with. Routes that need
-    // blocks past the cut refuse fail-loud rather than running over missing
-    // (nullptr) weights. Read `lens_truncated()` for "is there a cut at all";
-    // read the mode itself only where the ROUTES differ, which today is
-    // /v1/verify (legal under VerifyOnly, refused under LocateOnly).
-    LensServerMode lens_mode() const { return lens_mode_; }
-    // True for ANY cut. Routes that need blocks past the cut read this, so a
-    // new mode is refused correctly by default instead of silently allowed.
-    bool lens_truncated() const { return lens_mode_ != LensServerMode::Full; }
-    // /v1/verdict needs the output head and verdict_layer + 1 blocks: every
-    // full server, and a verify-only one started with --lens-verdict (its cut
-    // folds verdict_layer in and it loads the head).
-    bool lens_serves_verdict() const {
-        return lens_mode_ == LensServerMode::Full ||
-               (lens_mode_ == LensServerMode::VerifyOnly && lens_verdict_);
-    }
-    bool lens_verdict() const { return lens_verdict_; }
-    size_t lens_kept_documents() const { return lens_documents_.max_documents(); }
-    uint32_t lens_blocks_needed() const { return lens_blocks_needed_; }
-    uint32_t lens_total_blocks() const { return lens_total_blocks_; }
-    const std::string& lens_calibration_model() const { return lens_calibration_model_; }
-
     // ── Flash attention (--flash-attn) ───────────────────────────────────────
     // Refused fail-loud on a recipe that does not thread it through, rather
     // than accepting the flag and silently running the materialized path the
     // operator asked to replace.
-    //
-    // `lens_active` splits the flag by PHASE, and whether that split is allowed
-    // is a PER-MODEL question answered by the calibration table
-    // (LensConstants::flash_prefill_ok, server_lens.h — read its comment for
-    // the measurements). Without the lens the flag means what it always meant:
-    // flash everywhere. With the lens it can only ever mean flash in PREFILL,
-    // because a flash decode writes no kq_soft and the lens reads exactly that
-    // — and it means even that only on a model whose entry has been through
-    // the drift gate.
-    //
-    // This check cannot happen with the other flag validation in main(), which
-    // deliberately runs BEFORE the multi-GB model load. The answer depends on
-    // which model is loaded, so it necessarily costs the operator the load
-    // first. That is the price of the answer being per-model rather than a
-    // blanket refusal, and it is stated here so nobody "fixes" it back.
-    bool enable_flash_attn(bool lens_active) {
+    bool enable_flash_attn() {
         if (!forward_pass_->supports_flash_attn()) {
             std::cerr << "--flash-attn: architecture '"
                       << model_.get_metadata().architecture
@@ -727,63 +353,12 @@ public:
                       << "(supported: qwen2/qwen3/qwen35/qwen36/gemma1/gemma2/gemma3/gemma4)" << std::endl;
             return false;
         }
-        if (lens_active) {
-            if (!lens_constants_.flash_prefill_ok) {
-                std::cerr << "expected at most one of --attention-lens / --flash-attn on "
-                             "this model, got: both. A flash PREFILL under the lens's "
-                             "materialized decode is buildable, but this model's "
-                             "calibration entry has not earned it: "
-                          << lens_constants_.flash_prefill_provenance
-                          << ". Re-run tests/smoke/lens_drift_gate.sh and set "
-                             "flash_prefill_ok in server_lens.h if it passes. "
-                             "(It FAILS on Qwen3.6-35B-A3B: expert routing is a top-k "
-                             "argmax, so the perturbation is discrete and no decision "
-                             "margin applies to it.)" << std::endl;
-                return false;
-            }
-            forward_pass_->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Flash);
-            std::cout << "Flash attention ON (--flash-attn) for PREFILL only: "
-                         "--attention-lens keeps the decode materialized, because "
-                         "flash never writes kq_soft and that is the tensor the lens "
-                         "reads. Token-stable, NOT byte-identical — reports carry "
-                         "config.attention=\"flash-prefill\" so they are not silently "
-                         "compared against materialized ones.\n"
-                         "  gate: " << lens_constants_.flash_prefill_provenance << std::endl;
-            return true;
-        }
         forward_pass_->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
         std::cout << "Flash attention ON (--flash-attn): prefill and decode, one "
                      "fused kernel per attention layer. Token-stable, NOT "
                      "byte-identical; attention receipts unavailable."
                   << std::endl;
         return true;
-    }
-
-    // ── The configuration stamp every lens report carries ────────────────────
-    // Derived in ONE place from the server's own state, never assembled at a
-    // call site: two builders is a place for two reports to disagree about one
-    // server. See LensReport::RuntimeConfig for why the report needs it at all.
-    // `route` is REQUIRED, not defaulted: a default would silently give a new
-    // endpoint the wrong label, which is exactly the defect this parameter was
-    // added to fix (a locate report on a --flash-attn server stamped
-    // "flash-prefill" although its only pass is materialized). The rule itself
-    // lives in qinf::lens_attention_label so it can be unit-tested.
-    qinf::LensReport::RuntimeConfig lens_config_stamp(
-            qinf::LensReport::RoutePrefill route) const {
-        qinf::LensReport::RuntimeConfig c;
-        char hex[32];
-        std::snprintf(hex, sizeof(hex), "%016llx",
-                      (unsigned long long)model_.get_metadata().weights_hash);
-        // The weights hash, not the file name: it folds arch + shape + QUANT +
-        // layout, which is the axis `model` misses entirely — a Q8_0 and a
-        // Q4_K_M of one model share a calibration entry and do not share
-        // numerics.
-        c.weights   = hex;
-        c.attention = qinf::lens_attention_label(
-            route, forward_pass_->use_flash_attn(),
-            forward_pass_->use_flash_attn_prefill());
-        c.kv_type   = kv_type_name(kv_type_);
-        return c;
     }
 
     // ── Speculative decoding (--speculative [pld|mtp|suffix]) ───────────────
@@ -885,211 +460,6 @@ public:
         return true;
     }
     bool speculative_enabled() const { return spec_ != nullptr; }
-
-    // Run one extraction and return the lens-format JSON. EXCLUSIVE: holds the
-    // model lock for the whole tapped decode and uses slot 0 (the only slot with
-    // a correct qwen36 decode KV gather — architecture.md §12 / plan A3), so it
-    // serializes against the inference thread's batched steps. Single-slot V1:
-    // do not drive concurrent OpenAI traffic on slot 0 while extracting.
-    //
-    // Throws std::runtime_error on bad input (empty concepts, oversized doc) ⇒ the
-    // route maps that to 400; qinf::LensUnparseableError when the MODEL's output
-    // holds no parseable object ⇒ 422. Those are different events and the route
-    // must keep them apart (docs/lens-format.md §"The shape contract").
-    std::string extract_lens_json(const std::string& document,
-                                  const std::vector<qinf::LensConcept>& concepts,
-                                  int max_new_tokens,
-                                  const std::vector<size_t>& message_offsets,
-                                  bool want_candidates,
-                                  const std::string& document_id,
-                                  bool include_routing_trace) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        qinf::LensExtractOptions opts;
-        opts.max_new_tokens  = max_new_tokens;
-        opts.include_routing_trace = include_routing_trace;
-        opts.message_offsets = message_offsets;
-        // Kept document (docs/plan-lens-warm-document.md). Opt-in: an empty id
-        // is today's behaviour exactly. The store holds snapshots, not slot 0
-        // itself, so a locate or verify in between cannot corrupt it; the
-        // mutex above serializes it with the slot it restores into.
-        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
-        opts.document_id = document_id;
-        opts.store       = &lens_documents_;
-        // Opt-in per request. TRUE COSTS A SECOND COLD INFERENCE over the same
-        // document (docs/plan-candidate-set.md), so it is never implied by
-        // anything else and never defaulted on: the caller pays only when it
-        // asks. False is byte-inert — pass 1 is unchanged and no second pass
-        // runs. `format_version` is qemmi-lens/v4 either way: the version
-        // states what this server SPEAKS, not what one response happens to
-        // carry, so a caller that never sets this still needs v4 accepted.
-        opts.want_candidates = want_candidates;
-        // One prefill, one pass, no grammar. Absent concepts come back
-        // value:null/badge:"absent" by omission — the model declines natively
-        // (30/30 on Leg C) once nothing forces it to fill every key.
-        qinf::LensReport rep = qinf::run_lens_extract(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)vocab_.size(), (uint32_t)max_ctx_per_slot_, document, concepts, opts,
-            lens_constants_);
-        // extract taps the DECODE; its prompt prefill honours --flash-attn.
-        rep.config = lens_config_stamp(qinf::LensReport::RoutePrefill::HonoursServerFlag);
-        return qinf::lens_report_to_json(rep);
-    }
-
-    // Run one verification and return the lens-format JSON — the /v1/verify
-    // driver (docs/plan-lens-server-shape.md §3). Same locking/slot discipline
-    // as extract_lens_json: EXCLUSIVE, holds the model lock for the whole
-    // teacher-forced tapped prefill, uses slot 0.
-    //
-    // Throws std::runtime_error on bad input (empty concepts/document/
-    // extraction, an oversized prompt) ⇒ the route maps that to 400;
-    // qinf::LensUnparseableError when `extraction` holds no parseable object
-    // ⇒ 422, same shape contract as extract.
-    std::string verify_lens_json(const std::string& document,
-                                 const std::string& extraction,
-                                 const std::vector<qinf::LensConcept>& concepts,
-                                 const std::vector<size_t>& message_offsets,
-                                 const qinf::LensReport::RoutingDigest* expected_routing = nullptr) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        qinf::LensReport rep = qinf::run_lens_verify(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)max_ctx_per_slot_, document, extraction, concepts,
-            message_offsets, lens_constants_, expected_routing);
-        // verify has TWO prefills: the untapped prompt pass over the document
-        // honours --flash-attn; only its second pass over the extraction
-        // tokens is forced materialized.
-        rep.config = lens_config_stamp(qinf::LensReport::RoutePrefill::HonoursServerFlag);
-        return qinf::lens_report_to_json(rep);
-    }
-
-    // Run one locate and return its JSON — the /v1/locate driver
-    // (../qemmi-lens/docs/plan-locate-and-cut.md §3). Same locking/slot
-    // discipline as the other two verbs: EXCLUSIVE, model lock held for the
-    // whole tapped prefill, slot 0.
-    //
-    // Cheaper than verify and deliberately so: no decode, no output head, and
-    // truncated after the CITATION layer alone. That is why this route is NOT
-    // refused on a --lens-verify-only server — such a server has loaded
-    // max(citation, coverage)+1 blocks, which is by construction at least the
-    // citation_layer+1 this needs.
-    std::string locate_lens_json(const std::string& document,
-                                 const std::vector<qinf::LensConcept>& concepts,
-                                 int top_k,
-                                 qinf::LensKeyAggregation key_agg,
-                                 qinf::LensHeadRole head_role,
-                                 const std::string& document_id) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        // Every locate ages the kept documents out, with or without an id, so a
-        // document idle past the TTL is dropped at the next call of any kind.
-        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
-        // The main scheduler, like every verb: each read-back pass gets a
-        // memory plan made for it (ForwardPassBase::alloc_readback_graph), so
-        // no verb can inherit another's plan. Until 2026-09-27 locate ran on
-        // its own scheduler because sharing once corrupted every later
-        // /v1/verify (2026-09-18); docs/architecture.md §6.
-        qinf::LensLocateReport rep = qinf::run_lens_locate(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)max_ctx_per_slot_, document, concepts, lens_constants_, top_k,
-            key_agg, head_role, lens_constants_.locate_prefill_shape,
-            document_id.empty() ? nullptr : &lens_documents_, document_id);
-        // The prefill shape is the MODEL's licence (its calibration row, gated
-        // by LOCSPLIT), not a server flag. One-shot and split are materialized
-        // throughout — byte-comparable with a server started without
-        // --flash-attn, and stamped so. Split+flash ran its document pass under
-        // flash by licence, and is stamped "flash-prefill" by route.
-        rep.config = lens_config_stamp(
-            lens_constants_.locate_prefill_shape == qinf::LensPrefillShape::SplitFlash
-                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
-                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
-        return qinf::lens_locate_to_json(rep);
-    }
-
-    // ── The image verdict (POST /v1/verdict with "image") ────────────────────
-    // A separate concern that only shares the URL (docs/plan-image-verdict.md):
-    // the logic is src/server/image_verdict; this layer gates, locks and wires.
-    // "" when served, else why not: it needs --mmproj, a FULL model (a truncated
-    // lens server has neither all blocks nor the output head), and a measured
-    // calibration row for this model + mmproj.
-    std::string image_verdict_unserved_reason() const {
-        if (!vision_)
-            return "the image verdict needs a vision projector — start the server with --mmproj";
-        if (lens_mode_ != LensServerMode::Full)
-            return std::string("the image verdict needs the full model, actual a truncated lens server "
-                               "serving only ") + lens_mode_serves(lens_mode_, lens_verdict_);
-        const qinf::ImageVerdictVision v = image_verdict_vision();
-        if (!qinf::image_verdict_calibration_for(model_.get_metadata(), v))
-            return qinf::image_verdict_refusal(model_.get_metadata(), v);
-        return "";
-    }
-
-    // Slot 0, EXCLUSIVE, the model lock held throughout — the lens verbs'
-    // discipline; run_image_verdict leaves slot 0 clean. Throws on bad input.
-    std::string image_verdict_json(const std::vector<uint8_t>& image_bytes,
-                                   const std::vector<qinf::ImageVerdictQuestion>& questions,
-                                   const std::string& image_id, bool where) {
-        const std::string unserved = image_verdict_unserved_reason();
-        if (!unserved.empty()) throw std::runtime_error(unserved);
-        const qinf::ImageVerdictVision v = image_verdict_vision();
-        const qinf::ImageVerdictCalibration& cal =
-            *qinf::image_verdict_calibration_for(model_.get_metadata(), v);
-        const qinf::vision::Bitmap image = vision_->prepare_image(image_bytes);
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        image_verdicts_.expire(qinf::ImageVerdictStore::Clock::now());
-        const qinf::ImageVerdictReport rep = qinf::run_image_verdict(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)max_ctx_per_slot_, v, image, cal, questions,
-            image_id.empty() ? nullptr : &image_verdicts_, image_id, where);
-        return qinf::image_verdict_to_json(rep);
-    }
-
-    // Run one verdict and return its JSON — the /v1/verdict driver
-    // (docs/plan-lens-verdict.md). Same slot discipline as the other lens
-    // verbs: EXCLUSIVE, model lock held throughout, slot 0. A full lens
-    // server, or a verify-only one started with --lens-verdict; the route
-    // refuses every other cut (lens_serves_verdict).
-    std::string verdict_lens_json(const std::string& document,
-                                  const std::vector<qinf::LensVerdictQuestion>& questions,
-                                  qinf::LensVerdictLanguage language,
-                                  const std::string& document_id) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
-        qinf::LensVerdictReport rep = qinf::run_lens_verdict(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)max_ctx_per_slot_, document, questions, lens_constants_, language,
-            lens_constants_.locate_prefill_shape,
-            document_id.empty() ? nullptr : &lens_documents_, document_id);
-        // The document pass follows the row's locate licence (it is the pass
-        // locate keeps); the question passes are always materialized.
-        rep.config = lens_config_stamp(
-            rep.prefill_shape == qinf::LensPrefillShape::SplitFlash
-                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
-                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
-        return qinf::lens_verdict_to_json(rep);
-    }
-
-    // Run one compare and return its JSON — the /v1/compare driver
-    // (docs/plan-lens-compare.md). Same slot discipline as every lens verb.
-    // Served on EVERY lens server: the compare head sits inside every cut (it
-    // is folded into the cut above) and the readout is attention — no output
-    // head.
-    std::string compare_lens_json(const std::vector<std::string>& original_units,
-                                  const std::string& revised,
-                                  const std::string& document_id) {
-        std::lock_guard<std::mutex> lock(model_mutex_);
-        lens_documents_.expire(qinf::LensDocumentStore::Clock::now());
-        qinf::LensCompareReport rep = qinf::run_lens_compare(
-            forward_pass_.get(), scheduler_, tokenizer_.get(), model_.get_metadata(),
-            (uint32_t)max_ctx_per_slot_, original_units, revised, lens_constants_,
-            // Not the row's locate licence: flash on the original's pass
-            // changed 6 of 31807 flags (COMPAREGATE G3), so it stays
-            // materialized.
-            qinf::LensPrefillShape::Split,
-            document_id.empty() ? nullptr : &lens_documents_, document_id);
-        rep.config = lens_config_stamp(
-            rep.prefill_shape == qinf::LensPrefillShape::SplitFlash
-                ? qinf::LensReport::RoutePrefill::DocumentPassFlash
-                : qinf::LensReport::RoutePrefill::AlwaysMaterialized);
-        return qinf::lens_compare_to_json(rep);
-    }
 
     void configure_server(qinf::InferenceServer& server) {
         server.set_tokenize([this](const std::string& text) {
@@ -1318,9 +688,10 @@ private:
         // is silent: the decode runs with an inflated n_kv and attends over the
         // previous occupant's KV, giving a plausible but different answer.
         //
-        // Not hypothetical — it shipped: /v1/extract drove slot 0 directly and
-        // left cache_pos at 138, so the next 24-token request decoded at n_kv 162
-        // (ledger D8, fixed in server_lens.cpp). This makes the class loud.
+        // Not hypothetical — it shipped: the lens's /v1/extract (then served
+        // here, now in qemmi-lens-server) drove slot 0 directly and left
+        // cache_pos at 138, so the next 24-token request decoded at n_kv 162
+        // (ledger D8). This makes the class loud.
         // Safe to throw only because the caller now wraps this: the stateless
         // prefill_ call in inference_server.h had NO try/catch until 2026-09-02,
         // and an escaping throw hung the client on pop_blocking instead of
@@ -1554,10 +925,9 @@ private:
     // iteration speculative block exactly: feed last_token, sample the
     // fallback/first-token-guard candidate `y`, checkpoint recurrent state on
     // hybrids, draft + verify, then restore + feed_tokens on a partial reject.
-    // Locked like every other model-touching call on this integration —
-    // extract_lens_json runs the same tapped-decode-under-lock pattern from
-    // an HTTP thread, and this runs from the inference thread, so the lock is
-    // what keeps them from ever overlapping.
+    // Locked like every other model-touching call on this integration
+    // (ServerVision takes the same model_mutex_), so no two model operations
+    // ever overlap.
     qinf::InferenceServer::SpeculativeStepResult run_speculative_step(
             int slot_id, int32_t last_token,
             const std::vector<int32_t>& prompt_tokens,
@@ -1665,51 +1035,15 @@ private:
     int max_ctx_per_slot_;
     int max_slots_;
 
-    // ── --lens-verify-only ───────────────────────────────────────────────
-    // Set from the constructor's `lens_mode` parameter, before the
-    // calibration lookup that decides how many blocks to load (see the
-    // constructor body). The three "_blocks_/_model_" fields are valid only
-    // when this is true; they exist purely to word the endpoint refusals and
-    // the startup banner without re-deriving them.
-    LensServerMode lens_mode_ = LensServerMode::Full;
-    bool lens_verdict_ = false;   // --lens-verdict (verify-only + output head)
-    uint32_t lens_blocks_needed_ = 0;
-    uint32_t lens_total_blocks_  = 0;
-    std::string lens_calibration_model_;
-
     // Vision (image input). Null for a text-only server; non-null after a
     // successful --mmproj load. Owns the entire image pipeline + image caches.
-    // The image verdict's vision handles, read off ServerVision (which knows
-    // nothing about verdicts). Only called with vision_ set.
-    qinf::ImageVerdictVision image_verdict_vision() const {
-        qinf::ImageVerdictVision v;
-        v.encoder = &vision_->encoder();
-        v.marker_prefix = vision_->image_marker_prefix();
-        v.boi_id = vision_->boi_id();
-        v.soft_id = vision_->soft_id();
-        v.eoi_id = vision_->eoi_id();
-        v.projector = vision_->projector_tag();
-        v.projection_dim = vision_->projection_dim();
-        return v;
-    }
     std::unique_ptr<ServerVision> vision_;
-    // Image passes kept under an image_id (the image verdict's own store; not
-    // the lens's). Fixed size and TTL — no flag yet (plan-image-verdict.md §6).
-    qinf::ImageVerdictStore image_verdicts_{qinf::kImageVerdictStoreMax, qinf::kImageVerdictStoreTtl};
 
     // Text prefix cache (--prefix-cache). Null unless wired. Opt-in, version-
     // gated, transparent: a recurring system-prompt block skips its prefill on a
     // HIT (content-keyed by the prefix tokens). §1 decision A follow-on.
     std::unique_ptr<PrefixLibrary> text_prefix_lib_;
 
-    // Attention Lens (--attention-lens). Drives /v1/extract only; free decode.
-    // Stage 2 deleted both GrammarVocabs that used to live here — the fixed KV
-    // extraction grammar and the yes/no presence grammar — with the presence gate.
-    // The lens holds no grammar state at all now.
-    bool attention_lens_enabled_ = false;
-    // Resolved once by enable_attention_lens() from the loaded model's
-    // calibration entry; only read while attention_lens_enabled_ is true.
-    qinf::LensConstants lens_constants_{};
     ggml_type kv_type_ = GGML_TYPE_F32;  // --kv-type / --kv-f16 select otherwise
 
     // Speculative decoding (--speculative [pld|mtp|suffix]). Null (default)
@@ -1719,12 +1053,6 @@ private:
     std::string speculative_mode_;  // "pld" | "mtp" | "suffix"; empty if off
     // MTP's dedicated scheduler (--speculative mtp only); freed in ~QweniumServerIntegration.
     ggml_backend_sched_t mtp_sched_ = nullptr;
-    // The lens's kept documents (`document_id` on /v1/extract, /v1/locate,
-    // /v1/verdict and /v1/compare; one store, entries keyed per route): RAM only, guarded by model_mutex_
-    // like the slot it restores into. Size = --lens-kept-documents (default
-    // kLensDocumentStoreMax); the idle TTL is a fixed default, not a flag.
-    qinf::LensDocumentStore lens_documents_{qinf::kLensDocumentStoreMax,
-                                            qinf::kLensDocumentStoreTtl};
 };
 
 // =============================================================================
@@ -1821,133 +1149,6 @@ static std::string chat_finish_reason(const std::string& engine_reason) {
     return engine_reason == "length" ? "length" : "stop";
 }
 
-// ── --lens-verify-only refusal ───────────────────────────────────────────────
-// Named endpoint, named mode, named alternative — the fail-loud contract
-// (CLAUDE.md). Shared by every route this mode cannot serve: the loaded model
-// is missing every block past lens_blocks_needed()
-// (Model::assign_tensor_pointers left them null-pointer), so a route that
-// would decode (a completion) or run an untruncated pass (/v1/extract) cannot
-// run correctly — there is no partial-credit response to give, only a wrong
-// one, so 404 rather than attempting and corrupting.
-//
-// A FREE FUNCTION, deliberately, not a setup_routes()-local lambda captured
-// by the route handlers: setup_routes() registers every route and returns —
-// http.listen() (main()) only starts accepting connections after it returns —
-// so a route lambda holding so much as a reference to a setup_routes-local
-// variable is holding a reference into an already-destroyed stack frame by
-// the time the first real request arrives. That is exactly the bug a first
-// version of this had: `[&integration, &refuse_lens_truncated]` compiled
-// clean and crashed SIGSEGV on the first request that reached it, because the
-// capture is syntactically fine and only wrong at RUN time. `integration`
-// itself is safe to take by reference (owned by main()'s try block, alive for
-// the server's whole life, exactly like every other route's use of it); the
-// bug was capturing a helper that dies when setup_routes returns, not
-// referencing integration.
-void refuse_lens_truncated(httplib::Response& res, const char* endpoint,
-                           const QweniumServerIntegration& integration) {
-    const char* flag = lens_mode_flag(integration.lens_mode());
-    res.status = 404;
-    res.set_content(
-        json({{"error", std::string(endpoint) + ": refused — this server is running " +
-                        flag + " (" +
-                        std::to_string(integration.lens_blocks_needed()) + "/" +
-                        std::to_string(integration.lens_total_blocks()) +
-                        " blocks loaded, calibration " +
-                        integration.lens_calibration_model() +
-                        "), which serves " + lens_mode_serves(integration.lens_mode(), integration.lens_verdict()) +
-                        " — a truncated model has not loaded the weights an untruncated "
-                        "pass would need. Use a server started without " + flag +
-                        " for " + endpoint + "."}})
-            .dump(),
-        "application/json");
-}
-
-// POST /v1/verdict with an IMAGE — a separate concern that shares the URL with
-// the document verdict (docs/plan-image-verdict.md §2). Returns false (touching
-// nothing) unless the body is a JSON object carrying "image", so a document
-// request — well-formed or not — reaches the lens handler exactly as before.
-// Its own gates (--mmproj, a full model, a calibration row); the lens gates
-// (--attention-lens, verdict_layer) never apply to it.
-//
-// Body: {"image": "data:image/…;base64,…", "questions": [{"id", "mark",
-// <the mark's params…>} | {"id", "question"}, …], "image_id"?: string}. A
-// calibrated mark's params are its other string members (e.g. "subject", "box",
-// "field"). image_id (1..256 bytes) keeps the image pass for later requests.
-bool handle_image_verdict(const httplib::Request& req, httplib::Response& res,
-                          QweniumServerIntegration& integration) {
-    json body;
-    try { body = json::parse(req.body); } catch (const std::exception&) { return false; }
-    if (!body.is_object() || !body.contains("image")) return false;
-
-    const std::string unserved = integration.image_verdict_unserved_reason();
-    if (!unserved.empty()) {
-        res.status = 404;
-        res.set_content(json({{"error", "/v1/verdict with \"image\": not served — " + unserved},
-                              {"code", "not_served"}}).dump(), "application/json");
-        return true;
-    }
-    std::vector<uint8_t> image_bytes;
-    std::vector<qinf::ImageVerdictQuestion> questions;
-    std::string image_id;
-    bool where = false;
-    try {
-        for (const char* k : {"document", "document_id", "language"})
-            if (body.contains(k))
-                throw std::runtime_error(std::string("\"") + k + "\": expected absent with \"image\", actual present");
-        if (body.contains("image_id")) {
-            if (!body.at("image_id").is_string())
-                throw std::runtime_error("\"image_id\": expected a string, actual " +
-                                         std::string(body.at("image_id").type_name()));
-            image_id = body.at("image_id").get<std::string>();
-            if (image_id.empty() || image_id.size() > 256)
-                throw std::runtime_error("\"image_id\": expected 1..256 bytes, actual " +
-                                         std::to_string(image_id.size()));
-        }
-        if (body.contains("where")) {
-            if (!body.at("where").is_boolean())
-                throw std::runtime_error("\"where\": expected true or false, actual " +
-                                         std::string(body.at("where").type_name()));
-            where = body.at("where").get<bool>();
-        }
-        if (!body.at("image").is_string())
-            throw std::runtime_error("\"image\": expected a data: URI string, actual " +
-                                     std::string(body.at("image").type_name()));
-        image_bytes = qinf::decode_image_data_uri(body.at("image").get<std::string>()).bytes;
-        if (!body.contains("questions") || !body.at("questions").is_array())
-            throw std::runtime_error("expected a \"questions\" array, actual absent or not an array");
-        for (const auto& q : body.at("questions")) {
-            if (!q.is_object())
-                throw std::runtime_error("questions element: expected an object, actual " + std::string(q.type_name()));
-            qinf::ImageVerdictQuestion iq;
-            for (auto it = q.begin(); it != q.end(); ++it) {
-                if (!it.value().is_string())
-                    throw std::runtime_error("questions element \"" + it.key() + "\": expected a string, actual " +
-                                             std::string(it.value().type_name()));
-                const std::string v = it.value().get<std::string>();
-                if      (it.key() == "id")       iq.id = v;
-                else if (it.key() == "mark")     iq.mark = v;
-                else if (it.key() == "question") iq.question = v;
-                else                             iq.params[it.key()] = v;
-            }
-            questions.push_back(std::move(iq));
-        }
-    } catch (const std::exception& e) {
-        res.status = 400;
-        res.set_content(json({{"error", std::string("bad request — expected {\"image\": \"data:…\", \"questions\": "
-            "[{\"id\", \"mark\", <params…>} | {\"id\", \"question\"}, …], \"image_id\"?: string, "
-            "\"where\"?: bool}: ") + e.what()},
-            {"code", "bad_request"}}).dump(), "application/json");
-        return true;
-    }
-    try {
-        res.set_content(integration.image_verdict_json(image_bytes, questions, image_id, where), "application/json");
-    } catch (const std::exception& e) {
-        res.status = 400;
-        res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");
-    }
-    return true;
-}
-
 // =============================================================================
 // HTTP Routes
 // =============================================================================
@@ -1967,7 +1168,6 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
 
     // OpenAI-compatible completions endpoint
     http.Post("/v1/completions", [&](const httplib::Request& req, httplib::Response& res) {
-        if (integration.lens_truncated()) { refuse_lens_truncated(res, "/v1/completions", integration); return; }
         json body;
         try {
             body = json::parse(req.body);
@@ -2147,7 +1347,6 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
     // the OpenAI chat.completion (non-stream) and chat.completion.chunk (SSE)
     // response shapes so standard chat clients (e.g. Qwen Code) can connect.
     http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
-        if (integration.lens_truncated()) { refuse_lens_truncated(res, "/v1/chat/completions", integration); return; }
         json body;
         try {
             body = json::parse(req.body);
@@ -2452,631 +1651,6 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         });
     });
 
-    // Attention Lens extraction endpoint (--attention-lens). Dedicated shape:
-    // inputs are (document, key_vocabulary), not chat messages; output is the
-    // lens format, not a completion. The OpenAI endpoints are untouched (A2).
-    // Single-slot, exclusive (integration.extract_lens_json holds the model
-    // lock). Returns 404 when the feature is off, 400 on bad input (fail-loud).
-    http.Post("/v1/extract", [&integration](const httplib::Request& req, httplib::Response& res) {
-        if (!integration.attention_lens_enabled()) {
-            res.status = 404;
-            res.set_content(json({{"error", "attention lens disabled — start the "
-                                            "server with --attention-lens"}}).dump(),
-                            "application/json");
-            return;
-        }
-        // Checked AFTER the disabled check above (a different fact: the lens
-        // exists but is scoped to /v1/verify), and named as "refused" rather
-        // than merged into the same message, so an operator reading logs can
-        // tell "lens is off" from "lens is on but this server can't extract"
-        // apart without parsing prose.
-        if (integration.lens_truncated()) { refuse_lens_truncated(res, "/v1/extract", integration); return; }
-        std::string document;
-        std::vector<size_t> message_offsets;
-        std::vector<qinf::LensConcept> concepts;
-        int max_tokens = 512;
-        bool want_candidates = false;   // opt-in; see extract_lens_json
-        std::string document_id;        // opt-in warm handle; empty ⇒ cold
-        // Opt-in: carry the expert SELECTIONS so a later /v1/verify can replay
-        // them. Off by default — the payload is ~100s of KB.
-        bool include_routing_trace = false;
-        try {
-            json body = json::parse(req.body);
-            // The unit is EITHER a flat `document` OR an ordered `messages`
-            // array — exactly one, never both, never neither. Boundaries cannot
-            // be recovered from concatenated text, and picking a precedence
-            // between the two would be a silent fallback at a module boundary.
-            //
-            // What `messages` buys is ATTRIBUTION: every citation reports which
-            // message it landed in, so a value reads "from message 23 of 24".
-            // It deliberately does NOT arm a staleness alarm — measured, a
-            // later-message rule cried wolf on 7 of 9 correctly-handled
-            // corrections and stayed silent on the one real failure, because a
-            // later message routinely restates an old value
-            // (docs/note-ss3-matched-pairs.md §3).
-            const bool has_doc  = body.contains("document");
-            const bool has_msgs = body.contains("messages");
-            if (has_doc == has_msgs)
-                throw std::runtime_error(
-                    std::string("expected exactly one of \"document\" or \"messages\", actual ") +
-                    (has_doc ? "both" : "neither"));
-            if (has_doc) {
-                document = body.at("document").get<std::string>();
-            } else {
-                const json& msgs = body.at("messages");
-                if (!msgs.is_array() || msgs.empty())
-                    throw std::runtime_error(
-                        std::string("\"messages\" expected a non-empty array, actual ") +
-                        (msgs.is_array() ? "empty array" : msgs.type_name()));
-                // Joined with one blank line — the same shape a caller who
-                // concatenated the thread themselves would have sent, so the
-                // prompt regime the free path was validated on is unchanged.
-                // Offsets are recorded against the JOINED text, which is what
-                // the report echoes as `document`, so byte spans line up.
-                for (size_t i = 0; i < msgs.size(); ++i) {
-                    const json& m = msgs[i];
-                    std::string text;
-                    if (m.is_string()) {
-                        text = m.get<std::string>();
-                    } else if (m.is_object() && m.contains("text")) {
-                        text = m.at("text").get<std::string>();
-                    } else {
-                        throw std::runtime_error(
-                            "messages[" + std::to_string(i) +
-                            "] expected a string or {\"text\": string} object, actual " +
-                            std::string(m.type_name()));
-                    }
-                    if (text.empty())
-                        throw std::runtime_error("messages[" + std::to_string(i) +
-                                                 "].text expected non-empty, actual empty");
-                    if (i) document += "\n\n";
-                    message_offsets.push_back(document.size());
-                    document += text;
-                }
-            }
-            // key_vocabulary is an array of {key, gloss} objects. `gloss` is
-            // accepted but CURRENTLY UNUSED — its consumer, the presence gate,
-            // was deleted in Stage 2 (see LensConcept in server_lens.h). A bare
-            // string element is tolerated as {key, gloss:""} so string-array
-            // callers still work; the object form is canonical.
-            for (const auto& kv : body.at("key_vocabulary")) {
-                if (kv.is_string()) {
-                    concepts.push_back({kv.get<std::string>(), ""});
-                } else if (kv.is_object()) {
-                    qinf::LensConcept c;
-                    // `id` is the question form's join key and is exactly `key`
-                    // under another name — accept either, require one. The
-                    // sentence is NEVER the map key (plan-question-keys.md §5).
-                    if (kv.contains("key"))      c.key = kv.at("key").get<std::string>();
-                    else if (kv.contains("id"))  c.key = kv.at("id").get<std::string>();
-                    else throw std::runtime_error(
-                        "key_vocabulary object expected a \"key\" or \"id\" member, "
-                        "actual neither");
-                    c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
-                    // Optional question form. Empty string is rejected rather
-                    // than treated as absent: a caller that sent the member
-                    // meant to ask something.
-                    if (kv.contains("question")) {
-                        c.question = kv.at("question").get<std::string>();
-                        if (c.question.empty())
-                            throw std::runtime_error(
-                                "key_vocabulary \"question\" expected non-empty for key '" +
-                                c.key + "', actual empty string");
-                    }
-                    concepts.push_back(std::move(c));
-                } else {
-                    throw std::runtime_error("key_vocabulary element expected a "
-                                             "string, {\"key\",\"gloss\"} or "
-                                             "{\"id\",\"question\"} object");
-                }
-            }
-            if (body.contains("max_tokens")) max_tokens = body.at("max_tokens").get<int>();
-            // "candidates": true asks for the candidate set (qemmi-lens/v4).
-            // Opt-in and default false because it costs a SECOND cold inference
-            // over the same document. Fail loud on a non-boolean rather than
-            // coercing — a silent fallback here would bill the caller for a pass
-            // they did not ask for.
-            if (body.contains("candidates")) {
-                if (!body.at("candidates").is_boolean())
-                    throw std::runtime_error(
-                        "\"candidates\": expected boolean, actual " +
-                        std::string(body.at("candidates").type_name()));
-                want_candidates = body.at("candidates").get<bool>();
-            }
-            // Opt-in warm handle. A caller that omits it gets today's behaviour.
-            if (body.contains("include_routing_trace"))
-                include_routing_trace = body.at("include_routing_trace").get<bool>();
-            // Same bound as /v1/locate, /v1/verdict and /v1/compare: one
-            // store, so one rule for what may name an entry in it.
-            if (body.contains("document_id")) {
-                if (!body.at("document_id").is_string())
-                    throw std::runtime_error(
-                        "\"document_id\": expected a string, actual " +
-                        std::string(body.at("document_id").type_name()));
-                document_id = body.at("document_id").get<std::string>();
-                if (document_id.empty())
-                    throw std::runtime_error(
-                        "\"document_id\": expected non-empty string when present, "
-                        "actual empty — omit the member to run cold");
-                if (document_id.size() > 256)
-                    throw std::runtime_error(
-                        "\"document_id\": expected 1..256 bytes, actual " +
-                        std::to_string(document_id.size()));
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", std::string("bad request — expected "
-                "{(\"document\": string | \"messages\": [string|{\"text\": string},...]), "
-                "\"key_vocabulary\": [{\"key\",\"gloss\"}|string,...], "
-                "\"max_tokens\"?: int, \"candidates\"?: bool, "
-                "\"document_id\"?: string}: ") + e.what()},
-                {"code", "bad_request"}}).dump(), "application/json");
-            return;
-        }
-        try {
-            std::string lens_json =
-                integration.extract_lens_json(document, concepts, max_tokens,
-                                              message_offsets, want_candidates,
-                                              document_id, include_routing_trace);
-            res.set_content(lens_json, "application/json");
-        } catch (const qinf::LensUnparseableError& e) {
-            // The shape contract (docs/lens-format.md): the REQUEST was fine —
-            // the model's output for THIS document could not be parsed. That is
-            // not a bad request, and an importer must be able to tell the two
-            // apart without string-matching a message: 400 means "fix your
-            // call", 422 means "route this document to a human". Carries `raw`
-            // so the failure is inspectable. Never a partial extraction, never
-            // an empty one — a refusal and "the document has none of these
-            // concepts" are different facts, and collapsing them would
-            // re-introduce the silent data loss the grammar used to cause, one
-            // layer up.
-            res.status = 422;
-            res.set_content(json({{"error", e.what()},
-                                  {"code", "unparseable_extraction"},
-                                  {"raw", e.raw}}).dump(), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", e.what()},
-                                  {"code", "bad_request"}}).dump(), "application/json");
-        }
-    });
-
-    // Attention Lens verification endpoint (--attention-lens, same flag as
-    // /v1/extract — this is not a second feature, it is the other half of the
-    // one lens surface: docs/plan-lens-server-shape.md §3). Teacher-forces a
-    // KNOWN extraction instead of generating one: one prefill over the prompt,
-    // one head-less TAPPED prefill over the extraction text, no decode loop, no
-    // sampling. Same request shape as /v1/extract for (document|messages,
-    // key_vocabulary) plus the new required `extraction` — the exact text a
-    // prior report's `raw` field carried. Returns 404 when the feature is off,
-    // 400 on bad input, 422 when `extraction` holds no parseable JSON object
-    // (same shape contract as extract).
-    http.Post("/v1/verify", [&integration](const httplib::Request& req, httplib::Response& res) {
-        if (!integration.attention_lens_enabled()) {
-            res.status = 404;
-            res.set_content(json({{"error", "attention lens disabled — start the "
-                                            "server with --attention-lens"}}).dump(),
-                            "application/json");
-            return;
-        }
-        // --lens-locate-only cuts BELOW the citation layer, so verify's tapped
-        // pass would read a block this process never loaded. Refused here and
-        // not at the cut: verify is legal under every other mode, so this is a
-        // per-route fact about LocateOnly, not a property of being truncated.
-        if (integration.lens_mode() == LensServerMode::LocateOnly) {
-            refuse_lens_truncated(res, "/v1/verify", integration);
-            return;
-        }
-        std::string document;
-        std::string extraction;
-        std::vector<size_t> message_offsets;
-        // Optional: `routing` lifted straight out of an earlier report, so this
-        // pass can report how far its own expert selection sits from that one.
-        // Absent => no comparison, and the response is exactly what it was.
-        qinf::LensReport::RoutingDigest expected_routing;
-        std::vector<qinf::LensConcept> concepts;
-        try {
-            json body = json::parse(req.body);
-            // No kept document on this route. Verify prefills its whole prompt in
-            // one pass; reusing a kept document would split that pass, which is
-            // not bit-identical on Metal and has no drift gate or licence here
-            // (locate's split prefill needed both). Accepting the member and
-            // running cold would imply a reuse that never happened, so it is a
-            // 400, as on a /v1/locate row without a split licence.
-            if (body.contains("document_id"))
-                throw std::runtime_error(
-                    "\"document_id\": expected absent on /v1/verify, actual present — verify "
-                    "keeps no document (its prompt pass is one-shot and ungated for reuse); "
-                    "send the request without it. /v1/extract, /v1/locate, /v1/verdict and "
-                    "/v1/compare accept it.");
-            if (body.contains("routing") && body["routing"].is_object()) {
-                const json& rt = body["routing"];
-                if (rt.contains("digest") && rt["digest"].is_string())
-                    expected_routing.digest = rt["digest"].get<std::string>();
-                if (rt.contains("trace") && rt["trace"].is_string())
-                    expected_routing.trace = rt["trace"].get<std::string>();
-                if (rt.contains("per_layer") && rt["per_layer"].is_array())
-                    for (const auto& h : rt["per_layer"])
-                        if (h.is_string())
-                            expected_routing.per_layer.push_back(h.get<std::string>());
-            }
-            // Same EITHER/OR unit as /v1/extract — see that route for the
-            // reasoning (boundaries cannot be recovered from concatenated text).
-            const bool has_doc  = body.contains("document");
-            const bool has_msgs = body.contains("messages");
-            if (has_doc == has_msgs)
-                throw std::runtime_error(
-                    std::string("expected exactly one of \"document\" or \"messages\", actual ") +
-                    (has_doc ? "both" : "neither"));
-            if (has_doc) {
-                document = body.at("document").get<std::string>();
-            } else {
-                const json& msgs = body.at("messages");
-                if (!msgs.is_array() || msgs.empty())
-                    throw std::runtime_error(
-                        std::string("\"messages\" expected a non-empty array, actual ") +
-                        (msgs.is_array() ? "empty array" : msgs.type_name()));
-                for (size_t i = 0; i < msgs.size(); ++i) {
-                    const json& m = msgs[i];
-                    std::string text;
-                    if (m.is_string()) {
-                        text = m.get<std::string>();
-                    } else if (m.is_object() && m.contains("text")) {
-                        text = m.at("text").get<std::string>();
-                    } else {
-                        throw std::runtime_error(
-                            "messages[" + std::to_string(i) +
-                            "] expected a string or {\"text\": string} object, actual " +
-                            std::string(m.type_name()));
-                    }
-                    if (text.empty())
-                        throw std::runtime_error("messages[" + std::to_string(i) +
-                                                 "].text expected non-empty, actual empty");
-                    if (i) document += "\n\n";
-                    message_offsets.push_back(document.size());
-                    document += text;
-                }
-            }
-            // The exact text a prior /v1/extract report's `raw` field carried —
-            // teacher-forced verbatim (docs/plan-lens-server-shape.md §3.4). Not
-            // re-derived from `fields`: reconstructing JSON from parsed values
-            // does not promise the same token boundaries the original run had.
-            if (!body.contains("extraction"))
-                throw std::runtime_error(
-                    "expected an \"extraction\" member (the text a prior report's "
-                    "\"raw\" field carried), actual absent");
-            extraction = body.at("extraction").get<std::string>();
-            // key_vocabulary: identical shape/parse to /v1/extract's, because the
-            // report's field order and absent-by-omission marking both depend on
-            // it — verifying an extraction requires the SAME hint it was produced
-            // with, not just the document and the answer.
-            for (const auto& kv : body.at("key_vocabulary")) {
-                if (kv.is_string()) {
-                    concepts.push_back({kv.get<std::string>(), ""});
-                } else if (kv.is_object()) {
-                    qinf::LensConcept c;
-                    if (kv.contains("key"))      c.key = kv.at("key").get<std::string>();
-                    else if (kv.contains("id"))  c.key = kv.at("id").get<std::string>();
-                    else throw std::runtime_error(
-                        "key_vocabulary object expected a \"key\" or \"id\" member, "
-                        "actual neither");
-                    c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
-                    if (kv.contains("question")) {
-                        c.question = kv.at("question").get<std::string>();
-                        if (c.question.empty())
-                            throw std::runtime_error(
-                                "key_vocabulary \"question\" expected non-empty for key '" +
-                                c.key + "', actual empty string");
-                    }
-                    concepts.push_back(std::move(c));
-                } else {
-                    throw std::runtime_error("key_vocabulary element expected a "
-                                             "string, {\"key\",\"gloss\"} or "
-                                             "{\"id\",\"question\"} object");
-                }
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", std::string("bad request — expected "
-                "{(\"document\": string | \"messages\": [string|{\"text\": string},...]), "
-                "\"extraction\": string, "
-                "\"key_vocabulary\": [{\"key\",\"gloss\"}|string,...]}: ") + e.what()},
-                {"code", "bad_request"}}).dump(), "application/json");
-            return;
-        }
-        try {
-            std::string lens_json =
-                integration.verify_lens_json(document, extraction, concepts, message_offsets,
-                                             expected_routing.empty() ? nullptr
-                                                                      : &expected_routing);
-            res.set_content(lens_json, "application/json");
-        } catch (const qinf::LensUnparseableError& e) {
-            res.status = 422;
-            res.set_content(json({{"error", e.what()},
-                                  {"code", "unparseable_extraction"},
-                                  {"raw", e.raw}}).dump(), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", e.what()},
-                                  {"code", "bad_request"}}).dump(), "application/json");
-        }
-    });
-
-    // Attention Lens LOCATE endpoint (--attention-lens, the same flag as the
-    // other two verbs — one lens surface, three claims). Document + key
-    // vocabulary in, per-key DOCUMENT BYTE RANGES out. Nothing is generated and
-    // nothing is audited: this reports only where those key tokens look
-    // (../qemmi-lens/docs/plan-locate-and-cut.md §3).
-    //
-    // Deliberately NOT refused on a --lens-verify-only server. That is the
-    // point of the route: it truncates after the citation layer alone, which a
-    // verify-only server has always loaded, so the cheap server can do the
-    // narrowing pass and the expensive one need never see the whole document.
-    //
-    // `document_id` (2026-09-26): keeps the split's document pass in RAM
-    // (LensDocumentStore) and restores it on the next request for the same id —
-    // a snapshot, not /v1/extract's position rewind. Refused on a one-shot row.
-    http.Post("/v1/locate", [&integration](const httplib::Request& req, httplib::Response& res) {
-        if (!integration.attention_lens_enabled()) {
-            res.status = 404;
-            res.set_content(json({{"error", "attention lens disabled — start the "
-                                            "server with --attention-lens"}}).dump(),
-                            "application/json");
-            return;
-        }
-        std::string document;
-        std::vector<qinf::LensConcept> concepts;
-        int top_k = 3;   // see run_lens_locate's declaration: twins, not preference
-        qinf::LensKeyAggregation key_agg = qinf::LensKeyAggregation::Max;
-        qinf::LensHeadRole head_role = qinf::LensHeadRole::Locate;
-        std::string document_id;
-        try {
-            json body = json::parse(req.body);
-            // Locate has no message ATTRIBUTION to report (there are no
-            // citations and no fields), so it takes the flat document only —
-            // one shape, not a shape with an inert half.
-            if (!body.contains("document"))
-                throw std::runtime_error("expected a \"document\" member, actual absent");
-            document = body.at("document").get<std::string>();
-            if (body.contains("messages"))
-                throw std::runtime_error(
-                    "\"messages\" is not accepted here — locate reports byte ranges into "
-                    "one document and has no per-message attribution to carry; join the "
-                    "thread and send it as \"document\"");
-            // Opt-in: keep this document's pass 1 in RAM for later requests
-            // (LensDocumentStore). Refused on a model row without a split licence.
-            if (body.contains("document_id")) {
-                if (!body.at("document_id").is_string())
-                    throw std::runtime_error(
-                        "\"document_id\": expected a string, actual " +
-                        std::string(body.at("document_id").type_name()));
-                document_id = body.at("document_id").get<std::string>();
-                if (document_id.empty() || document_id.size() > 256)
-                    throw std::runtime_error(
-                        "\"document_id\": expected 1..256 bytes, actual " +
-                        std::to_string(document_id.size()));
-            }
-            // Same vocabulary shapes as /v1/extract and /v1/verify.
-            for (const auto& kv : body.at("key_vocabulary")) {
-                if (kv.is_string()) {
-                    concepts.push_back({kv.get<std::string>(), ""});
-                } else if (kv.is_object()) {
-                    qinf::LensConcept c;
-                    if (kv.contains("key"))      c.key = kv.at("key").get<std::string>();
-                    else if (kv.contains("id"))  c.key = kv.at("id").get<std::string>();
-                    else throw std::runtime_error(
-                        "key_vocabulary object expected a \"key\" or \"id\" member, "
-                        "actual neither");
-                    c.gloss = kv.contains("gloss") ? kv.at("gloss").get<std::string>() : "";
-                    if (kv.contains("question")) {
-                        c.question = kv.at("question").get<std::string>();
-                        if (c.question.empty())
-                            throw std::runtime_error(
-                                "key_vocabulary \"question\" expected non-empty for key '" +
-                                c.key + "', actual empty string");
-                    }
-                    concepts.push_back(std::move(c));
-                } else {
-                    throw std::runtime_error("key_vocabulary element expected a "
-                                             "string, {\"key\",\"gloss\"} or "
-                                             "{\"id\",\"question\"} object");
-                }
-            }
-            if (body.contains("top_k")) {
-                if (!body.at("top_k").is_number_integer())
-                    throw std::runtime_error(
-                        "\"top_k\": expected an integer, actual " +
-                        std::string(body.at("top_k").type_name()));
-                top_k = body.at("top_k").get<int>();
-                if (top_k <= 0 || top_k > 64)
-                    throw std::runtime_error(
-                        "\"top_k\": expected within [1, 64], actual " + std::to_string(top_k));
-            }
-            // Opt-in, default "max" = the behaviour that predates this field.
-            // Spelled out rather than a boolean so a third reduction can be
-            // added without the wire format having to lie about what it means.
-            // Which calibrated job to read. Default "locate" = the behaviour
-            // that predates this field. "choice" reads a DIFFERENT head — on
-            // the 9B the same layer, h=3 instead of h=6 — and is refused
-            // fail-loud on a model whose DECIDEHEAD sweep never ran, rather
-            // than silently falling back to the locate pair.
-            if (body.contains("head")) {
-                if (!body.at("head").is_string())
-                    throw std::runtime_error(
-                        "\"head\": expected a string, actual " +
-                        std::string(body.at("head").type_name()));
-                const std::string hv = body.at("head").get<std::string>();
-                if      (hv == "locate") head_role = qinf::LensHeadRole::Locate;
-                else if (hv == "choice") head_role = qinf::LensHeadRole::Choice;
-                else if (hv == "absent") head_role = qinf::LensHeadRole::Absent;
-                else if (hv == "score")  head_role = qinf::LensHeadRole::Score;
-                else if (hv == "inject") head_role = qinf::LensHeadRole::Inject;
-                else throw std::runtime_error(
-                        "\"head\": expected \"locate\", \"choice\", \"absent\", "
-                        "\"score\" or \"inject\", actual \"" +
-                        hv + "\" (locate = where a key's answer sits; choice = which of "
-                        "the supplied option descriptions fits the document; absent = "
-                        "whether the key's evidence is in the document at all; score = "
-                        "where the document sits on an ORDERED scale, whose levels are "
-                        "supplied low-to-high and whose masses are meant to be read as a "
-                        "fraction, not rounded to the top one; inject = which sentence "
-                        "of the document addresses the MODEL — a highlighter that always "
-                        "points somewhere, never a yes/no attack detector)");
-            }
-            if (body.contains("key_aggregation")) {
-                if (!body.at("key_aggregation").is_string())
-                    throw std::runtime_error(
-                        "\"key_aggregation\": expected a string, actual " +
-                        std::string(body.at("key_aggregation").type_name()));
-                const std::string a = body.at("key_aggregation").get<std::string>();
-                if      (a == "max")  key_agg = qinf::LensKeyAggregation::Max;
-                else if (a == "mean") key_agg = qinf::LensKeyAggregation::Mean;
-                else throw std::runtime_error(
-                        "\"key_aggregation\": expected \"max\" or \"mean\", actual \"" +
-                        a + "\" (max = calibrated, for short field-name keys; mean = "
-                        "opt-in for sentence-length keys, sets uncalibrated)");
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", std::string("bad request — expected "
-                "{\"document\": string, "
-                "\"key_vocabulary\": [{\"key\",\"gloss\"}|{\"id\",\"question\"}|string,...], "
-                "\"top_k\"?: int, \"key_aggregation\"?: \"max\"|\"mean\", "
-                "\"head\"?: \"locate\"|\"choice\"|\"absent\"|\"score\"|\"inject\", "
-                "\"document_id\"?: string}: ") + e.what()},
-                {"code", "bad_request"}}).dump(), "application/json");
-            return;
-        }
-        try {
-            res.set_content(integration.locate_lens_json(document, concepts, top_k, key_agg, head_role,
-                                                         document_id),
-                            "application/json");
-        } catch (const std::exception& e) {
-            // No 422 here: locate parses nothing, so there is no shape contract
-            // to violate. Every failure on this route is either a bad request or
-            // an engine error, and both are the caller's 400.
-            res.status = 400;
-            res.set_content(json({{"error", e.what()},
-                                  {"code", "bad_request"}}).dump(), "application/json");
-        }
-    });
-
-    // POST /v1/verdict (docs/plan-lens-verdict.md): a document and yes/no
-    // questions → per question yes / no / unclear, read off the prefill's last
-    // row, plus a receipt. Full lens server only: a truncated server has not
-    // loaded the output head (on the 9B an untied 834 MB matrix).
-    http.Post("/v1/verdict", [&integration](const httplib::Request& req, httplib::Response& res) {
-        // An image request is its own concern (its own gates, module and JSON);
-        // everything below is the document verdict, unchanged.
-        if (handle_image_verdict(req, res, integration)) return;
-        if (!integration.attention_lens_enabled()) {
-            res.status = 404;
-            res.set_content(json({{"error", "attention lens disabled — start the "
-                                            "server with --attention-lens"}}).dump(),
-                            "application/json");
-            return;
-        }
-        if (!integration.lens_serves_verdict()) { refuse_lens_truncated(res, "/v1/verdict", integration); return; }
-        std::string document, document_id;
-        std::vector<qinf::LensVerdictQuestion> questions;
-        qinf::LensVerdictLanguage language = qinf::LensVerdictLanguage::En;
-        try {
-            json body = json::parse(req.body);
-            if (!body.contains("document") || !body.at("document").is_string())
-                throw std::runtime_error("expected a string \"document\" member, actual absent or not a string");
-            document = body.at("document").get<std::string>();
-            if (!body.contains("questions") || !body.at("questions").is_array())
-                throw std::runtime_error("expected a \"questions\" array, actual absent or not an array");
-            for (const auto& q : body.at("questions")) {
-                if (!q.is_object() || !q.contains("id") || !q.contains("question") ||
-                    !q.at("id").is_string() || !q.at("question").is_string())
-                    throw std::runtime_error("questions element expected {\"id\": string, \"question\": string}");
-                questions.push_back({q.at("id").get<std::string>(), q.at("question").get<std::string>()});
-            }
-            if (body.contains("language")) {
-                if (!body.at("language").is_string())
-                    throw std::runtime_error("\"language\": expected a string, actual " +
-                                             std::string(body.at("language").type_name()));
-                const std::string l = body.at("language").get<std::string>();
-                if      (l == "en") language = qinf::LensVerdictLanguage::En;
-                else if (l == "de") language = qinf::LensVerdictLanguage::De;
-                else throw std::runtime_error("\"language\": expected \"en\" or \"de\" (the instruction's "
-                                              "language; both measured), actual \"" + l + "\"");
-            }
-            if (body.contains("document_id")) {
-                if (!body.at("document_id").is_string())
-                    throw std::runtime_error("\"document_id\": expected a string, actual " +
-                                             std::string(body.at("document_id").type_name()));
-                document_id = body.at("document_id").get<std::string>();
-                if (document_id.empty() || document_id.size() > 256)
-                    throw std::runtime_error("\"document_id\": expected 1..256 bytes, actual " +
-                                             std::to_string(document_id.size()));
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", std::string("bad request — expected {\"document\": string, "
-                "\"questions\": [{\"id\": string, \"question\": string}, ...], \"language\"?: \"en\"|\"de\", "
-                "\"document_id\"?: string}: ") + e.what()}, {"code", "bad_request"}}).dump(),
-                "application/json");
-            return;
-        }
-        try {
-            res.set_content(integration.verdict_lens_json(document, questions, language, document_id),
-                            "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");
-        }
-    });
-
-    // POST /v1/compare (docs/plan-lens-compare.md): an original as units and a
-    // second version as text → per unit, still covered or missing. Served on
-    // every lens server (the compare head is inside every cut).
-    http.Post("/v1/compare", [&integration](const httplib::Request& req, httplib::Response& res) {
-        if (!integration.attention_lens_enabled()) {
-            res.status = 404;
-            res.set_content(json({{"error", "attention lens disabled — start the "
-                                            "server with --attention-lens"}}).dump(),
-                            "application/json");
-            return;
-        }
-        std::vector<std::string> units;
-        std::string revised, document_id;
-        try {
-            json body = json::parse(req.body);
-            if (!body.contains("original_units") || !body.at("original_units").is_array())
-                throw std::runtime_error("expected an \"original_units\" array of strings, actual absent or not an array");
-            for (const auto& u : body.at("original_units")) {
-                if (!u.is_string()) throw std::runtime_error("original_units element expected a string");
-                units.push_back(u.get<std::string>());
-            }
-            if (!body.contains("revised") || !body.at("revised").is_string())
-                throw std::runtime_error("expected a string \"revised\" member, actual absent or not a string");
-            revised = body.at("revised").get<std::string>();
-            if (body.contains("document_id")) {
-                if (!body.at("document_id").is_string())
-                    throw std::runtime_error("\"document_id\": expected a string, actual " +
-                                             std::string(body.at("document_id").type_name()));
-                document_id = body.at("document_id").get<std::string>();
-                if (document_id.empty() || document_id.size() > 256)
-                    throw std::runtime_error("\"document_id\": expected 1..256 bytes, actual " +
-                                             std::to_string(document_id.size()));
-            }
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", std::string("bad request — expected {\"original_units\": [string, ...], "
-                "\"revised\": string, \"document_id\"?: string}: ") + e.what()}, {"code", "bad_request"}}).dump(),
-                "application/json");
-            return;
-        }
-        try {
-            res.set_content(integration.compare_lens_json(units, revised, document_id), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(json({{"error", e.what()}, {"code", "bad_request"}}).dump(), "application/json");
-        }
-    });
-
     // Models endpoint (for compatibility)
     http.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json response = {
@@ -3133,16 +1707,7 @@ int main(int argc, char* argv[]) {
     bool chat_prefix_cache = false;      // text: opt-in warm per-slot KV reuse (chat)
     bool conversational = false;         // text: opt-in warm conversational server (explicit handle)
     std::string token_log_path;          // --token-log: append token ids per completed request (off by default)
-    bool attention_lens = false;         // opt-in: enable POST /v1/extract (Qemmi-Lens)
-    // opt-in: load only the blocks a truncated pass can reach and serve
-    // /v1/verify AND /v1/locate (refuses /v1/extract + both OpenAI endpoints).
-    // Requires --attention-lens; see the refusal below.
-    bool lens_verify_only = false;
-    bool lens_locate_only = false;
-    bool lens_verdict = false;
-    size_t lens_kept_documents = qinf::kLensDocumentStoreMax;  // --lens-kept-documents
-    bool lens_kept_documents_set = false;
-    bool flash_attn = false;             // opt-in: flash attention on decode (excludes --attention-lens)
+    bool flash_attn = false;             // opt-in: flash attention on prefill and decode
     // --kv-type <f32|f16|q8_0|q4_0> (--kv-f16 is the kept alias). Quantized
     // types are flash-only; see state/kv_cache_simple.h.
     ggml_type kv_type = GGML_TYPE_F32;
@@ -3203,27 +1768,6 @@ int main(int argc, char* argv[]) {
             token_log_path = argv[++i];
         } else if (arg == "--conversational") {
             conversational = true;
-        } else if (arg == "--attention-lens") {
-            attention_lens = true;
-        } else if (arg == "--lens-verify-only") {
-            lens_verify_only = true;
-        } else if (arg == "--lens-locate-only") {
-            lens_locate_only = true;
-        } else if (arg == "--lens-verdict") {
-            lens_verdict = true;
-        } else if (arg == "--lens-kept-documents") {
-            if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
-            const std::string v = argv[++i];
-            size_t used = 0;
-            long n = -1;
-            try { n = std::stol(v, &used); } catch (const std::exception&) { used = 0; }
-            if (used != v.size() || n < 1) {
-                std::cerr << "--lens-kept-documents: expected a whole number >= 1, actual '"
-                          << v << "'" << std::endl;
-                return 1;
-            }
-            lens_kept_documents = static_cast<size_t>(n);
-            lens_kept_documents_set = true;
         } else if (arg == "--flash-attn") {
             flash_attn = true;
         } else if (arg == "--kv-f16") {
@@ -3273,10 +1817,7 @@ int main(int argc, char* argv[]) {
                       << "  --model,  -m PATH  Path to model file\n"
                       << "  --mmproj, -j PATH  Vision projector GGUF (Gemma 3 / "
                          "Gemma 4 / Qwen 3.5-family); enables image input on "
-                         "/v1/chat/completions, and the image verdict (POST "
-                         "/v1/verdict with \"image\": yes / no / unclear about "
-                         "visible marks) on a full model with a measured "
-                         "calibration row\n"
+                         "/v1/chat/completions\n"
                       << "  --ctx,    -c N     Per-slot context ceiling in tokens "
                          "(default: 2048)\n"
                       << "  --slots,  -s N     Concurrent slots, 1..10 (default: 10). "
@@ -3301,68 +1842,14 @@ int main(int argc, char* argv[]) {
                          "warm != cold). Excludes --chat-prefix-cache; text path\n"
                       << "  --flash-attn              Opt-in: flash attention "
                          "(one fused kernel per attention layer) on prefill and "
-                         "decode. Token-stable, not byte-identical; refused "
-                         "together with --attention-lens. Every recipe.\n"
-                      << "  --attention-lens          Opt-in: enable the lens "
-                         "surface (single-slot; calibrated models only, see the "
-                         "startup banner for the list). FIVE routes — see "
-                         "--lens-verify-only and --lens-locate-only to serve a "
-                         "subset on a cheaper truncated process: POST /v1/extract "
-                         "— document + complete key vocabulary → audited "
-                         "key-value JSON on the attention trust layer; POST "
-                         "/v1/verify, which teacher-forces a known extraction "
-                         "(document + key vocabulary + extraction) to reproduce "
-                         "the same report without generating; POST /v1/locate "
-                         "— document + key vocabulary → document byte ranges, "
-                         "nothing generated and nothing audited; POST /v1/verdict "
-                         "— document + yes/no questions → yes / no / unclear read "
-                         "off the prefill (per-model: refused on a row without a "
-                         "verdict layer); and POST /v1/compare — original units + "
-                         "a second version → which units it covers (per-model: "
-                         "refused on a row without a compare head). OpenAI "
-                         "endpoints untouched\n"
-                      << "  --lens-verify-only        Opt-in, requires --attention-lens: "
-                         "load only the blocks a truncated pass can reach — the "
-                         "deepest lens layer on the model's calibration row (citation, "
-                         "coverage, locate, choice, absent, score, inject, compare) + 1; "
-                         "the startup banner prints the expression — and serve the "
-                         "routes that need no generation: POST /v1/verify, POST "
-                         "/v1/locate and POST /v1/compare (POST /v1/verdict too with "
-                         "--lens-verdict). /v1/extract, /v1/completions and "
-                         "/v1/chat/completions are refused (a truncated model cannot "
-                         "generate). For a cheap verify-only deployment split from a "
-                         "full extract server.\n"
-                      << "  --lens-verdict            Opt-in, requires --lens-verify-only: also "
-                         "load the output head (Qwen3.8-9B: ~834 MB, no extra blocks — verdict "
-                         "reads after layer 27, inside the verify-only cut) and serve POST "
-                         "/v1/verdict. Refused on a model whose calibration row has no measured "
-                         "verdict layer.\n"
-                      << "  --lens-kept-documents N   Requires --attention-lens: how many "
-                         "document passes the lens keeps in RAM for document_id reuse (default "
-                         "4). Entries are per route (extract; locate, which verdict shares; "
-                         "compare), least recently used dropped first, so users who take turns "
-                         "stay warm only while their entries fit: past N, every turn is cold "
-                         "(measured on Qwen3.8-9B: 0.43 s warm vs 6.8 s cold at ~2K tokens). "
-                         "Each entry costs RAM, ~674 MB at 10K tokens on Qwen3.8-9B.\n"
-                      << "  --lens-locate-only       Opt-in, requires --attention-lens; "
-                         "mutually exclusive with --lens-verify-only: the narrowest lens "
-                         "server. Loads the deepest of the /v1/locate heads (locate, "
-                         "choice, absent, score, inject) and the compare head, + 1 — "
-                         "citation and coverage are NOT in this cut, because /v1/verify "
-                         "is refused here — and serves POST /v1/locate and POST "
-                         "/v1/compare only. Refused fail-loud on a model whose "
-                         "calibration row has no measured locate head. On Qwen3.8-9B: "
-                         "20/33 blocks (absent L19 sets it) vs verify-only's 28/33. This "
-                         "is the mode to REPLICATE for concurrent span-only users (one "
-                         "process still serves one request at a time).\n"
+                         "decode. Token-stable, not byte-identical. Every recipe.\n"
                       << "  --speculative [pld|mtp|suffix]  Opt-in: speculative "
                          "decoding; bare/pld = Prompt Lookup, mtp = trained "
                          "NextN head (MTP GGUFs only), suffix = session-scoped "
                          "adaptive-length lookup. Engages only when exactly one "
                          "slot is active (falls back to batched decode otherwise, "
                          "logged once) and never on a slot running a per-request "
-                         "grammar. Token-stable, not byte-identical; mutually "
-                         "exclusive with --attention-lens.\n"
+                         "grammar. Token-stable, not byte-identical.\n"
                       << "  --pld-ngram N             PLD n-gram match size "
                          "(default: 3)\n"
                       << "  --pld-max-draft K         PLD max draft tokens "
@@ -3388,150 +1875,17 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // The lens taps kq_soft; flash attention never materializes it. Refuse the
-    // pair BEFORE the model load — this is pure argument validation, and making
-    // the operator wait out a multi-GB load to be told their flags conflict is
-    // the kind of late failure the fail-loud contract is meant to prevent.
     // A quantized KV cache is readable ONLY by the flash attention kernel. The
     // materialized path transposes V (ggml_permute + ggml_cont), which moves the
     // block dimension of a quantized type out of position; Metal's CPY/CONT has
     // no quantized source case, so that node would take ggml's SILENT CPU
-    // fallback (architecture.md section 3) rather than fail. Refuse before load.
-    // Note this also excludes --attention-lens transitively, via --flash-attn.
+    // fallback (architecture.md section 3) rather than fail. Refuse before load —
+    // making the operator wait out a multi-GB load to be told their flags
+    // conflict is the kind of late failure the fail-loud contract prevents.
     if (kv_type_is_quantized(kv_type) && !flash_attn) {
         std::cerr << kv_type_requires_flash_refusal(kv_type) << std::endl;
         return 1;
     }
-
-    // --attention-lens + --flash-attn is NOT decided here, and deliberately so.
-    // Whether a flash prefill is admissible under the lens is a PER-MODEL
-    // question — Qwen3.8-9B passes the drift gate, Qwen3.6-35B-A3B fails it —
-    // and the answer lives in the calibration entry, which needs the model
-    // loaded. enable_flash_attn(lens_active) makes the call after the load.
-    // Everything else in this block stays pre-load: it is the flag pairing that
-    // became model-dependent, not the principle that argument errors should be
-    // cheap.
-    //
-    // A quantized KV cache is readable ONLY by the flash attention kernel. The
-    // materialized path transposes V (ggml_permute + ggml_cont), which moves the
-    // block dimension of a quantized type out of position; Metal's CPY/CONT has
-    // no quantized source case, so that node would take ggml's SILENT CPU
-    // fallback (architecture.md section 3) rather than fail. Refuse before load.
-    if (kv_type_is_quantized(kv_type) && !flash_attn) {
-        std::cerr << kv_type_requires_flash_refusal(kv_type) << std::endl;
-        return 1;
-    }
-
-    // --attention-lens + --flash-attn is NOT decided here, and deliberately so.
-    // Whether a flash prefill is admissible under the lens is a PER-MODEL
-    // question — Qwen3.8-9B passes the drift gate, Qwen3.6-35B-A3B fails it —
-    // so the answer lives in the calibration entry and needs the model loaded.
-    // enable_flash_attn(lens_active) makes the call after the load. It is the
-    // flag PAIRING that became model-dependent, not the principle that argument
-    // errors should be cheap; everything else in this block stays pre-load.
-    //
-    // A quantized KV cache does not come along for the ride, and that DOES stay
-    // here because it depends on nothing but the flags. The KV cache is written
-    // by prefill and READ BY DECODE, and the lens's decode is materialized by
-    // construction. The materialized path transposes V (ggml_permute +
-    // ggml_cont), which moves a quantized type's block dimension out of
-    // position; Metal's CPY/CONT has no quantized source case, so that node
-    // would take ggml's SILENT CPU fallback rather than fail.
-    //
-    // The refusal above (quantized ⇒ --flash-attn) used to exclude the lens
-    // transitively, through a blanket lens/flash refusal that no longer exists.
-    // plan-lens-server-shape.md §4.2.2 proposed that phase-scoped flash would
-    // UNBLOCK quantized KV for the lens: it does not, and cannot while the tap
-    // requires a materialized decode.
-    //
-    // This is LOAD-BEARING, not a standing guard. On a model whose entry allows
-    // a flash prefill, `--attention-lens --flash-attn --kv-type q8_0` satisfies
-    // the quantized⇒flash refusal above and would then meet a quantized V in
-    // the lens's materialized decode — the silent CPU fallback, on precisely
-    // the path the receipts come from. This line is the only thing stopping it,
-    // and unlike the pairing above it stays pre-load because it depends on
-    // nothing but the flags.
-    if (attention_lens && kv_type_is_quantized(kv_type)) {
-        std::cerr << "expected --attention-lens without a quantized --kv-type, got: "
-                     "--kv-type " << kv_type_name(kv_type) << ". A quantized KV cache "
-                     "is readable only by the flash kernel, and the lens decode must "
-                     "stay materialized to write kq_soft — the tensor the lens reads. "
-                     "Run the lens on an f32 or f16 cache." << std::endl;
-        return 1;
-    }
-    // Same refusal shape as the pair above, same reason class: the lens is
-    // single-slot and receipts-grade determinism is B=1 (docs/architecture.md
-    // §1/§11), while speculative decoding is token-stable-not-byte-identical
-    // and (v1) only ever engages on exactly one slot -- which would be
-    // whichever slot the lens is mid-extraction on.
-    if (attention_lens && speculative) {
-        std::cerr << "expected at most one of --attention-lens / --speculative, "
-                     "got: both. The lens is single-slot and receipts-grade "
-                     "determinism is B=1; speculative decoding is token-stable, "
-                     "not byte-identical." << std::endl;
-        return 1;
-    }
-    // --lens-verify-only's whole mechanism is "load fewer blocks because
-    // /v1/verify is the only thing that will ever run" — that claim is
-    // meaningless without --attention-lens armed, and the calibration lookup
-    // it depends on (server_lens.h's kLensCalibrations) is the same table
-    // --attention-lens itself refuses against. Pure flag validation, so it
-    // stays pre-load like the checks above it.
-    if (lens_verify_only && !attention_lens) {
-        std::cerr << "expected --attention-lens together with --lens-verify-only, "
-                     "got: --lens-verify-only without --attention-lens. Verify-only "
-                     "mode has nothing to serve without the lens: it loads a subset of "
-                     "blocks computed from the model's lens calibration entry and serves "
-                     "POST /v1/verify, POST /v1/locate and POST /v1/compare. Add "
-                     "--attention-lens." << std::endl;
-        return 1;
-    }
-    if (lens_locate_only && !attention_lens) {
-        std::cerr << "expected --attention-lens together with --lens-locate-only, "
-                     "got: --lens-locate-only without --attention-lens. Locate-only "
-                     "mode has nothing to serve without the lens: it loads the blocks its "
-                     "heads need from the model's lens calibration entry and serves "
-                     "POST /v1/locate and POST /v1/compare. Add --attention-lens." << std::endl;
-        return 1;
-    }
-    // Two cuts cannot both be in force. They are not a refinement of one
-    // another in a safe direction either — locate-only loads FEWER blocks and
-    // refuses /v1/verify, so silently picking one would either waste weights or
-    // withdraw a route the operator asked for.
-    if (lens_verify_only && lens_locate_only) {
-        std::cerr << "expected at most one of --lens-verify-only / --lens-locate-only, "
-                     "got: both. They set different cuts and serve different routes — "
-                     "verify-only reaches the deepest lens layer, citation and coverage "
-                     "included, and serves POST /v1/verify, POST /v1/locate and POST "
-                     "/v1/compare; locate-only reaches only the locate heads and compare "
-                     "and serves POST /v1/locate and POST /v1/compare. Pick the "
-                     "one matching the routes this process must answer." << std::endl;
-        return 1;
-    }
-    // --lens-verdict adds the output head to a VERIFY-ONLY cut. Anywhere else it
-    // is either redundant (a full server already serves /v1/verdict) or wrong
-    // (locate-only would need 8 more blocks and the head, defeating its purpose),
-    // so it is refused rather than ignored.
-    // The kept-document store belongs to the lens routes; without the lens
-    // there is nothing to keep, so the flag is refused rather than ignored.
-    if (lens_kept_documents_set && !attention_lens) {
-        std::cerr << "expected --attention-lens together with --lens-kept-documents, got: "
-                     "--lens-kept-documents without --attention-lens. The store keeps lens "
-                     "document passes (document_id on /v1/extract, /v1/locate, /v1/verdict, "
-                     "/v1/compare); without the lens it has nothing to hold." << std::endl;
-        return 1;
-    }
-    if (lens_verdict && !lens_verify_only) {
-        std::cerr << "expected --lens-verify-only together with --lens-verdict, got: --lens-verdict "
-                  << (lens_locate_only ? "with --lens-locate-only" : "on a full server")
-                  << ". --lens-verdict loads the output head on a verify-only server so it can "
-                     "serve POST /v1/verdict; a full lens server already serves it, and a "
-                     "locate-only one would need the blocks up to verdict_layer as well." << std::endl;
-        return 1;
-    }
-    const LensServerMode lens_mode = lens_locate_only ? LensServerMode::LocateOnly
-                                   : lens_verify_only ? LensServerMode::VerifyOnly
-                                                      : LensServerMode::Full;
 
     // Setup signal handling
     std::signal(SIGINT, signal_handler);
@@ -3541,18 +1895,8 @@ int main(int argc, char* argv[]) {
         // Initialize model integration
         QweniumServerIntegration integration(model_path, max_ctx, max_slots, mmproj_path,
                                           image_embed_cache_dir, image_prefix_cache_dir,
-                                          prefix_cache_dir, kv_type, lens_mode, lens_verdict,
-                                          lens_kept_documents);
-        // Order is load-bearing: enable_attention_lens resolves the calibration
-        // entry, and enable_flash_attn reads flash_prefill_ok off it.
-        if (attention_lens && !integration.enable_attention_lens()) return 1;
-        if (attention_lens)
-            std::cout << "Lens kept documents: at most " << integration.lens_kept_documents()
-                      << " entries (--lens-kept-documents; keyed per route — extract, locate "
-                         "incl. verdict, compare — least recently used dropped first, 15-minute "
-                         "idle TTL). RAM only: each entry is a snapshot of slot 0 after the "
-                         "document, ~674 MB at 10K tokens on Qwen3.8-9B." << std::endl;
-        if (flash_attn && !integration.enable_flash_attn(attention_lens)) return 1;
+                                          prefix_cache_dir, kv_type);
+        if (flash_attn && !integration.enable_flash_attn()) return 1;
         if (speculative && !integration.enable_speculative(
                 speculative_mode, pld_ngram_size, pld_max_draft,
                 suffix_max_match_len, suffix_min_match_len, suffix_max_draft,
@@ -3617,85 +1961,12 @@ int main(int argc, char* argv[]) {
         std::cout << "Server starting on http://0.0.0.0:" << port << std::endl;
         std::cout << "Endpoints:" << std::endl;
         std::cout << "  GET  /health" << std::endl;
-        if (integration.lens_mode() == LensServerMode::LocateOnly) {
-            // The narrowest server this binary can start: ONE route. Every
-            // other lens route is listed as refused rather than omitted, for
-            // the same reason the verify-only list names /v1/locate — a list
-            // an operator reads top-down must be exhaustive or it misleads.
-            std::cout << "  POST /v1/locate            (lens-locate-only: "
-                      << integration.lens_blocks_needed() << "/"
-                      << integration.lens_total_blocks() << " blocks loaded)"
-                      << std::endl;
-            std::cout << "  POST /v1/verify            refused (--lens-locate-only; "
-                         "the citation layer is above this cut)" << std::endl;
-            std::cout << "  POST /v1/completions       refused (--lens-locate-only)"
-                      << std::endl;
-            std::cout << "  POST /v1/chat/completions  refused (--lens-locate-only)"
-                      << std::endl;
-            std::cout << "  POST /v1/extract           refused (--lens-locate-only)"
-                      << std::endl;
-            std::cout << "  POST /v1/verdict           refused (--lens-locate-only; no output head)"
-                      << std::endl;
-            std::cout << "  POST /v1/compare           (lens-locate-only; per-model — refused on a model "
-                         "whose calibration row carries no compare head)"
-                      << std::endl;
-        } else if (integration.lens_mode() == LensServerMode::VerifyOnly) {
-            // A truncated model cannot generate — see the constructor banner
-            // for which blocks are loaded and why. Everything else 404/400s.
-            //
-            // /v1/locate is listed because this process SERVES it. Leaving it
-            // out was the same defect the constructor banner carries a
-            // two-reading split to avoid: an operator reading the startup
-            // top-down was told about a route in prose and then handed a
-            // four-line list that did not have it, so the list read as
-            // exhaustive and was not.
-            std::cout << "  POST /v1/verify            (lens-verify-only: "
-                      << integration.lens_blocks_needed() << "/"
-                      << integration.lens_total_blocks() << " blocks loaded)"
-                      << std::endl;
-            std::cout << "  POST /v1/locate            (lens-verify-only; per-model — "
-                         "refused on a model whose calibration row carries no measured "
-                         "locate head)"
-                      << std::endl;
-            std::cout << "  POST /v1/completions       refused (--lens-verify-only)"
-                      << std::endl;
-            std::cout << "  POST /v1/chat/completions  refused (--lens-verify-only)"
-                      << std::endl;
-            std::cout << "  POST /v1/extract           refused (--lens-verify-only)"
-                      << std::endl;
-            if (integration.lens_verdict())
-                std::cout << "  POST /v1/verdict           (--lens-verdict; output head loaded)" << std::endl;
-            else
-                std::cout << "  POST /v1/verdict           refused (--lens-verify-only; no output head — "
-                             "add --lens-verdict)" << std::endl;
-            std::cout << "  POST /v1/compare           (lens-verify-only; per-model — refused on a model "
-                         "whose calibration row carries no compare head)"
-                      << std::endl;
-        } else {
-            std::cout << "  POST /v1/completions       (text-only)" << std::endl;
-            std::cout << "  POST /v1/chat/completions"
-                      << (integration.vision_enabled()
-                              ? "  (text + image_url image input)"
-                              : "  (text-only; start with --mmproj for images)")
-                      << std::endl;
-            // The full server serves the lens routes too, and listed none of
-            // them. Same omission as above, other branch.
-            if (integration.attention_lens_enabled()) {
-                std::cout << "  POST /v1/extract           (--attention-lens)" << std::endl;
-                std::cout << "  POST /v1/verify            (--attention-lens)" << std::endl;
-                std::cout << "  POST /v1/locate            (--attention-lens; per-model — "
-                             "refused on a model whose calibration row carries no measured "
-                             "locate head)"
-                          << std::endl;
-                std::cout << "  POST /v1/verdict           (--attention-lens; per-model — "
-                             "refused on a model whose calibration row carries no measured "
-                             "verdict layer)"
-                          << std::endl;
-                std::cout << "  POST /v1/compare           (--attention-lens; per-model — "
-                             "refused on a model whose calibration row carries no compare head)"
-                          << std::endl;
-            }
-        }
+        std::cout << "  POST /v1/completions       (text-only)" << std::endl;
+        std::cout << "  POST /v1/chat/completions"
+                  << (integration.vision_enabled()
+                          ? "  (text + image_url image input)"
+                          : "  (text-only; start with --mmproj for images)")
+                  << std::endl;
         std::cout << "  GET  /v1/models" << std::endl;
         std::cout << "Press Ctrl+C to stop" << std::endl;
 
