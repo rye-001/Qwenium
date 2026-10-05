@@ -142,6 +142,7 @@ Qwen and one Gemma recipe before it counts as done.
                        │    backend, scheduler, the forward pass      │
                        │  src/engine/decode_plan / decode_step        │
                        │  src/engine/multimodal_prefill               │
+                       │  src/engine/readout (client read-back step)  │
                        └──────┬───────────────┬───────────────────────┘
                               │               │
               ┌───────────────▼──┐   ┌────────▼─────────────────────┐
@@ -231,7 +232,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD) + `suffix_decoding` (SuffixDecoding: session-scoped, adaptive-length lookup, §5), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the three fail-loud gates: tensor **type** — is every ggml type id one this build knows, checked at parse because `ggml_type_size`'s own bounds check is a plain `assert` that Release removes; **architecture** — is `general.architecture` in the registry allow-list; **inventory** — does the file carry every tensor the recipe needs, correctly shaped), `tokenizer`, `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
-| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
+| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
@@ -648,6 +649,7 @@ what stays here as client-facing primitives, each with its engine test:
 
 | primitive | where | engine test |
 |---|---|---|
+| **readout API** (`readout::prefill` / `readout::decode` with a per-call `Spec`: layer cut, taps, logits, routing capture / replay, prefill attention, sparse ids — restored after the call, also on throw). **The seam a client uses** (docs/plan-readout-api.md, approved 2026-10-05); the rows below are what it wraps, kept public for the probes | `engine/readout` | `readout-tests` ×5 × 6 legs (Qwen3, Qwen3.5, Qwen3.6-35B-A3B, Gemma 3, Gemma 4, Gemma 4-26B-A4B) + routing ×2 MoE legs — bitwise against the hand-written sequence |
 | attention taps (`set_attention_taps(layers, heads)`, `mark_attention_taps`, `get_attention_taps`) | `models/forward_pass_base`, `decode_policy` | `ForwardPassTapTest`, 14 cases × 5 recipes |
 | read-back plan `alloc_readback_graph` | `models/forward_pass_base` | `ForwardPassTapTest` (SameShapeDifferentTapLayer…, TapReadOffAnyOtherAlloc…) |
 | layer truncation `truncate_after_layer` | `models/decode_policy` | DecodePolicy truncation ×3 |
@@ -1049,7 +1051,9 @@ used only for the output-head matmul, overlapping with the next token's body.
   the client (`docs/note-repo-split.md` §5; the runner itself is a later task).
 
   Client-affecting change classes:
-  (a) **attention numerics and the tap seam** — the `kq_soft.<il>` tensor names
+  (a) **attention numerics and the tap seam** — served client code reaches it
+  through `engine/readout` (plan-readout-api.md; probes may still call the
+  primitives below directly); the `kq_soft.<il>` tensor names
   are a public seam (renaming is a breaking change, §13 trigger); materialized
   decode attention on tapped layers (any fused/flash attention must keep tapped
   layers materialized or export their rows); `get_attention_taps` /

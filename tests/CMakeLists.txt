@@ -548,6 +548,24 @@ target_link_libraries(forward-pass-base-tests PRIVATE
 target_compile_features(forward-pass-base-tests PRIVATE cxx_std_17)
 gtest_discover_tests(forward-pass-base-tests)
 
+# readout (src/engine/readout.cpp): one step with what a client reads back —
+# bitwise against the hand-written sequence, per recipe leg (Qwen + Gemma), and
+# every override restored after return and after throw. Model legs self-skip.
+add_executable(readout-tests
+    unit/test_readout.cpp
+)
+
+target_link_libraries(readout-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+
+target_compile_features(readout-tests PRIVATE cxx_std_17)
+gtest_discover_tests(readout-tests)
+
 # feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
 # differential (docs/plan-feed-tokens.md). Self-skips when model absent.
 add_executable(feed-tokens-tests-qwen36
