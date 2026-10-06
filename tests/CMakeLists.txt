@@ -566,6 +566,21 @@ target_link_libraries(readout-tests PRIVATE
 target_compile_features(readout-tests PRIVATE cxx_std_17)
 gtest_discover_tests(readout-tests)
 
+# worst_case_reserve (src/engine/worst_case_reserve.cpp): slots empty after the
+# reservation, and a later step bitwise-identical to an unreserved pass.
+add_executable(worst-case-reserve-tests
+    unit/test_worst_case_reserve.cpp
+)
+target_link_libraries(worst-case-reserve-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+target_compile_features(worst-case-reserve-tests PRIVATE cxx_std_17)
+gtest_discover_tests(worst-case-reserve-tests)
+
 # feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
 # differential (docs/plan-feed-tokens.md). Self-skips when model absent.
 add_executable(feed-tokens-tests-qwen36

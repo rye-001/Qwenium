@@ -46,8 +46,9 @@ endif()
 
 # ── Orchestration: driving a built forward pass ─────────────────────────────
 # decode_plan (which kind of step), decode_step (run one), multimodal_prefill
-# (run an image prefill), readout (one step with what a client reads back).
-# All four take a ForwardPassBase, so they sit ABOVE
+# (run an image prefill), readout (one step with what a client reads back),
+# worst_case_reserve (size the scheduler once for the largest step).
+# All five take a ForwardPassBase, so they sit ABOVE
 # qinf-models and cannot join qinf-engine — qinf-models links qinf-engine, and
 # folding them in would close a cycle. Same rule the two session sources above
 # follow: directory = concept, target = layering.
@@ -59,6 +60,7 @@ add_library(qinf-orchestration STATIC
     decode_step.cpp
     multimodal_prefill.cpp
     readout.cpp
+    worst_case_reserve.cpp
 )
 
 target_include_directories(qinf-orchestration PUBLIC
