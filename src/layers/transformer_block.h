@@ -109,7 +109,9 @@ struct TransformerBlockWeights {
 //                When the input is all-zeros the non-null path is also
 //                bit-identical to the null path, by construction
 //                (ggml_add of zeros is the identity).
-//                Used by Gemma 4 PLE (G4.3); inactive in 26B-A4B.
+//                Built for G4.3's block-entry PLE, which no real model has:
+//                PLE injects after the FFN (layers/ple.h, 2026-10-07). No
+//                caller passes it — a dormant hook (architecture.md §12).
 //
 // Returns the updated hidden state tensor after the full layer.
 ggml_tensor* build_transformer_layer(

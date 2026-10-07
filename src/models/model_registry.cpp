@@ -7,6 +7,7 @@
 #include "gemma2.h"
 #include "gemma3.h"
 #include "gemma4.h"
+#include "gemma_embedding2.h"
 
 #include <map>
 #include <mutex>
@@ -118,6 +119,12 @@ const ChatTemplate* lookup_chat_template(const std::string& architecture)
             "lookup_chat_template: expected one of: " + registered +
             ", got '" + architecture + "'");
     }
+    // An encoder (gemma-embedding2) registers no template: it has no turns to
+    // render. Refuse here rather than hand a caller a null to dereference.
+    if (!it->second.chat_template)
+        throw std::runtime_error(
+            "lookup_chat_template: architecture '" + architecture +
+            "' chat template: expected one, got none (an embedding model has no chat)");
     return it->second.chat_template.get();
 }
 
@@ -212,4 +219,15 @@ void register_builtin_models()
         // <tool_call|> because the prompt structure doesn't match its
         // training distribution.
         std::make_unique<Gemma4ChatTemplate>());
+
+    // EmbeddingGemma-2 — an encoder (2026-10-07). No chat template; batch size
+    // and KV type have nothing to size (no slots, no cache). Driven through
+    // engine/embed, never through prefill/decode.
+    register_model("gemma-embedding2",
+        [](const Model& m, const ModelMetadata* meta, uint32_t ctx, uint32_t, ggml_type) {
+            return std::make_unique<GemmaEmbedding2ForwardPass>(m, meta, ctx);
+        },
+        validate_gemma_embedding2_inventory,
+        gemma_embedding2_tokenizer_config(),
+        nullptr);
 }

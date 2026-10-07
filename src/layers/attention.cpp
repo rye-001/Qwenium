@@ -347,6 +347,35 @@ ggml_tensor* build_attention(
     return build_attn_mha(ctx, gf, q, k, v, mha_mask, nullptr, kq_scale, pos, il, softcap, use_flash);
 }
 
+// ── build_uncached_attention ─────────────────────────────────────────────────
+
+ggml_tensor* build_uncached_attention(
+    ggml_context* ctx,
+    ggml_cgraph*  gf,
+    ggml_tensor*  q,
+    ggml_tensor*  k,
+    ggml_tensor*  v,
+    ggml_tensor*  kq_mask,
+    float         kq_scale,
+    int           il,
+    float         softcap,
+    bool          use_flash)
+{
+    const int64_t n_tokens = q->ne[2];
+    if (k->ne[2] != n_tokens || v->ne[2] != n_tokens)
+        throw std::runtime_error(
+            "build_uncached_attention: layer " + std::to_string(il) +
+            " 'k/v ne[2]': expected n_tokens=" + std::to_string(n_tokens) +
+            ", got: k=" + std::to_string(k->ne[2]) + " v=" + std::to_string(v->ne[2]));
+    if (!kq_mask || kq_mask->ne[0] != n_tokens || kq_mask->ne[1] != n_tokens)
+        throw std::runtime_error(
+            "build_uncached_attention: layer " + std::to_string(il) +
+            " 'kq_mask': expected [" + std::to_string(n_tokens) + ", " + std::to_string(n_tokens) +
+            "], got: " + (kq_mask ? "[" + std::to_string(kq_mask->ne[0]) + ", " +
+                                    std::to_string(kq_mask->ne[1]) + "]" : std::string("null")));
+    return build_attn_mha(ctx, gf, q, k, v, kq_mask, nullptr, kq_scale, /*pos=*/0, il, softcap, use_flash);
+}
+
 // ── build_batched_attention ──────────────────────────────────────────────────
 // Extracted from Qwen3ForwardPass::_build_batched_attention_layer (forward-pass.cpp).
 // Logic is identical — ctx_ → ctx, kv_cache_ → kv_cache parameter.

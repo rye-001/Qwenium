@@ -61,6 +61,17 @@ target_link_libraries(attn-mask-input-tests PRIVATE
 target_compile_features(attn-mask-input-tests PRIVATE cxx_std_17)
 gtest_discover_tests(attn-mask-input-tests)
 
+add_executable(bidirectional-mask-input-tests
+    unit/test_bidirectional_mask_input.cpp
+)
+target_link_libraries(bidirectional-mask-input-tests PRIVATE
+    GTest::gtest_main
+    qinf-graph-inputs
+    ggml
+)
+target_compile_features(bidirectional-mask-input-tests PRIVATE cxx_std_17)
+gtest_discover_tests(bidirectional-mask-input-tests)
+
 # GrammarVocab — standalone non-GTest harness. test_grammar_vocab.cpp defines
 # its own int main() (g_pass/g_fail counters, no RUN_ALL_TESTS). It lived in the
 # unit-tests aggregate, where its main() hijacked the linker and silently
@@ -566,6 +577,24 @@ target_link_libraries(readout-tests PRIVATE
 target_compile_features(readout-tests PRIVATE cxx_std_17)
 gtest_discover_tests(readout-tests)
 
+# embed (src/engine/embed.cpp): framing, pooling, normalisation (always), and
+# the gemma-embedding2 gate — token ids and cosine >= 0.9999 against llama.cpp's
+# embeddings (tests/fixtures/embed/) — when EMBEDDINGGEMMA2_MODEL_PATH is set.
+add_executable(embed-tests
+    unit/test_embed.cpp
+)
+target_compile_definitions(embed-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embed-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+target_compile_features(embed-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embed-tests)
+
 # worst_case_reserve (src/engine/worst_case_reserve.cpp): slots empty after the
 # reservation, and a later step bitwise-identical to an unreserved pass.
 add_executable(worst-case-reserve-tests
@@ -956,6 +985,8 @@ target_link_libraries(gemma4-tokenizer-tests PRIVATE
     qinf-loader
     qinf-models
 )
+target_compile_definitions(gemma4-tokenizer-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
 target_compile_features(gemma4-tokenizer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma4-tokenizer-tests)
 
@@ -1321,9 +1352,8 @@ target_compile_features(gemma4-final-softcap-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma4-final-softcap-tests)
 
 # PLE (per-layer embedding) op tests ─────────────────────────────────
-# Covers: build_ple lookup + projection against a synthetic oracle.  PLE is
-# inactive in the 26B-A4B checkpoint (embedding_length_per_layer_input=0);
-# this is the synthetic-config gate the dense 31B follow-up will promote.
+# Covers: build_ple_inputs + build_ple_inject against the formula in doubles.
+# The real-model gate is EmbeddingGemma-2 vs llama.cpp (embed-tests).
 # No model file required.
 add_executable(ple-tests
     unit/test_ple.cpp
