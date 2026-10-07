@@ -75,6 +75,7 @@ set_target_properties(qinf-server PROPERTIES
 add_executable(qwenium-server
     http_server.cpp
     server_vision.cpp
+    embedding_service.cpp
 )
 
 target_link_libraries(qwenium-server PRIVATE

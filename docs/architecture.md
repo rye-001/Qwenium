@@ -35,7 +35,8 @@ one engine:
   source `src/server/http_server.cpp`, which keeps the generic file name):
   OpenAI-compatible `/v1/completions` and
   `/v1/chat/completions`, serving up to ~10 concurrent requests by batching
-  them into one forward pass.
+  them into one forward pass. Started with `--embed` on an embedding model it
+  is instead an embeddings server: `/v1/embeddings` only (§6 *Text embeddings*).
 
 **"~10 concurrent" is a slot count, not a throughput promise, and what it buys
 is family-dependent (measured 2026-08-30).** Batching B requests into one pass
@@ -239,7 +240,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `worst_case_reserve` (size the scheduler once for the deepest decode batch and the largest prefill — one copy for every server), `embed` (one text embedding: frame BOS/EOS, run an `IEmbeddingOutput` recipe, pool, L2-normalise — §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -700,8 +701,26 @@ the model loads; `--flash-attn` and `--ctx-size` (the longest text, in tokens)
 apply. A generation model under `--embed` is refused by architecture name, and
 the encoder under generation names `--embed` in its refusal. Gate:
 `embed-mode-tests` (end to end against the llama.cpp fixture, cosine ≥ 0.9999)
-and three `cli-embed-*` argument tests. A server `/v1/embeddings` is a later,
-separate decision.
+and three `cli-embed-*` argument tests.
+
+**Server `--embed`** (`server/embedding_service`, 2026-10-07):
+`qwenium-server --embed -m MODEL` serves `POST /v1/embeddings` in the OpenAI
+shape — `input` a string or an array of up to 2048 strings, `encoding_format`
+`float` or `base64` (little-endian float32; the OpenAI Python client's
+default), `usage.prompt_tokens` — plus `/health` and `/v1/models` (id = the
+file name). The generation routes are not registered, and every generation-only
+flag (`--mmproj`, caches, `--conversational`, `--speculative`, `--kv-type`,
+`--slots`, `--token-log`) is refused before the load. Refused requests: token-id
+input, empty texts, `dimensions` other than the model's width (400); a text over
+`--ctx` tokens, named by index, or too many texts (413) — all validated and
+tokenized before anything is embedded. It does not use `InferenceServer` (no
+slots, queue or decode loop): requests serialise on one mutex and each text is
+one pass, measured 0.05 s for an 18-token text on M1 Pro; batching texts into
+one pass is a later optimisation. A generation model under `--embed` fails at
+startup by name; an embedding model without it names `--embed`. Gate:
+`embedding-service-tests` (the contract through fake callbacks; the model end
+to end against the llama.cpp fixture, base64 decoded bit-for-bit) and
+`server-embed-rejects-generation-flag`.
 
 | gate | test |
 |---|---|

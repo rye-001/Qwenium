@@ -229,6 +229,22 @@ target_link_libraries(parallel-grammar-test PRIVATE
     ggml
 )
 
+# POST /v1/embeddings (src/server/embedding_service.cpp compiled directly, as
+# the server executable does). Handler contract always; the loaded model end to
+# end with EMBEDDINGGEMMA2_MODEL_PATH.
+add_executable(embedding-service-tests
+    unit/test_embedding_service.cpp
+    ${PROJECT_SOURCE_DIR}/src/server/embedding_service.cpp
+)
+target_include_directories(embedding-service-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/server)
+target_compile_definitions(embedding-service-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embedding-service-tests PRIVATE
+    GTest::gtest_main nlohmann_json::nlohmann_json
+    qinf-orchestration qinf-models qinf-engine ggml)
+target_compile_features(embedding-service-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embedding-service-tests)
+
 # HTTP Server Integration Test (GTest)
 add_executable(http-server-test
     integration/test_http_server.cpp
@@ -1775,6 +1791,11 @@ add_test(NAME cli-embed-in-needs-embed
          COMMAND qwenium-cli /nonexistent-model.gguf --embed-in texts.txt)
 set_tests_properties(cli-embed-in-needs-embed PROPERTIES
     PASS_REGULAR_EXPRESSION "--embed-in: expected together with --embed")
+
+add_test(NAME server-embed-rejects-generation-flag
+         COMMAND qwenium-server --embed -m /nonexistent-model.gguf --conversational)
+set_tests_properties(server-embed-rejects-generation-flag PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected no --conversational")
 
 add_test(NAME server-rejects-unknown-flag COMMAND qwenium-server --no-such-flag)
 set_tests_properties(server-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)

@@ -37,6 +37,7 @@
 // decode + capability gate it needs to route an image request.
 #include "image_data_uri.h"
 #include "server_vision.h"
+#include "embedding_service.h"
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
@@ -1593,6 +1594,35 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
     });
 }
 
+// --embed: an embedding model's server. Only these routes exist; the generation
+// routes are not registered (404), because the encoder has no generation path.
+void setup_embedding_routes(httplib::Server& http, qinf::server::EmbeddingService& service) {
+    http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+        json response = {
+            {"status", "ok"},
+            {"mode", "embedding"},
+            {"requests_completed", service.requests_served()},
+        };
+        res.set_content(response.dump(), "application/json");
+    });
+    http.Post("/v1/embeddings", [&](const httplib::Request& req, httplib::Response& res) {
+        const qinf::server::HttpReply reply = service.handle(req.body);
+        res.status = reply.status;
+        res.set_content(reply.body.dump(), "application/json");
+    });
+    http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+        json response = {
+            {"object", "list"},
+            {"data", {{
+                {"id", service.model_id()},
+                {"object", "model"},
+                {"owned_by", "local"}
+            }}}
+        };
+        res.set_content(response.dump(), "application/json");
+    });
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -1662,6 +1692,8 @@ int main(int argc, char* argv[]) {
     int suffix_min_match_len = 2;
     int suffix_max_draft = 4;
     size_t suffix_max_indexed_tokens = 8192;
+    bool embed = false;      // --embed: serve /v1/embeddings for an embedding model
+    bool slots_set = false;  // --slots given explicitly (refused with --embed)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -1680,6 +1712,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--slots" || arg == "-s") {
             if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             max_slots = std::stoi(argv[++i]);
+            slots_set = true;
+        } else if (arg == "--embed") {
+            embed = true;
         } else if (arg == "--image-embed-cache") {
             if (i + 1 >= argc) { print_missing_value(arg, argv[0]); return 1; }
             image_embed_cache_dir = argv[++i];
@@ -1792,6 +1827,11 @@ int main(int argc, char* argv[]) {
                          "(default: 4; wider measured worse)\n"
                       << "  --suffix-max-indexed N    Suffix: cap on indexed "
                          "session tokens (default: 8192)\n"
+                      << "  --embed                   Serve an embedding model "
+                         "(e.g. EmbeddingGemma-2): POST /v1/embeddings (OpenAI shape, "
+                         "float or base64), GET /health, GET /v1/models only. --ctx "
+                         "bounds one text in tokens; --flash-attn applies; "
+                         "generation flags are refused\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
         } else {
@@ -1815,9 +1855,64 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // --embed: refuse every generation-only flag before the load — the
+    // embedding server would silently ignore it.
+    if (embed) {
+        struct Conflict { bool set; const char* flag; };
+        const Conflict conflicts[] = {
+            {!mmproj_path.empty(),            "--mmproj"},
+            {!image_embed_cache_dir.empty(),  "--image-embed-cache"},
+            {!image_prefix_cache_dir.empty(), "--image-prefix-cache"},
+            {!prefix_cache_dir.empty(),       "--prefix-cache"},
+            {chat_prefix_cache,               "--chat-prefix-cache"},
+            {conversational,                  "--conversational"},
+            {!token_log_path.empty(),         "--token-log"},
+            {speculative,                     "--speculative"},
+            {kv_type != GGML_TYPE_F32,        "--kv-type / --kv-f16"},
+            {slots_set,                       "--slots"},
+        };
+        for (const Conflict& c : conflicts)
+            if (c.set) {
+                std::cerr << "--embed: expected no " << c.flag
+                          << " (the embedding server has no generation path), actual: "
+                          << c.flag << " given" << std::endl;
+                return 1;
+            }
+    }
+
     // Setup signal handling
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+
+    if (embed) {
+        try {
+            qinf::server::EmbeddingService service(model_path, static_cast<uint32_t>(max_ctx),
+                                                   flash_attn);
+            httplib::Server http;
+            setup_embedding_routes(http, service);
+            std::thread shutdown_thread([&http]() {
+                while (!g_shutdown_requested)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::cout << "\nShutdown requested (signal "
+                          << static_cast<int>(g_shutdown_signal) << "), stopping server..."
+                          << std::endl;
+                http.stop();
+            });
+            std::cout << "Embedding server (" << service.model_id() << ", dim "
+                      << service.dim() << ", up to " << service.max_tokens()
+                      << " tokens per text) on http://0.0.0.0:" << port << std::endl;
+            std::cout << "Endpoints:\n  GET  /health\n  POST /v1/embeddings\n  GET  /v1/models"
+                      << std::endl;
+            http.listen("0.0.0.0", port);
+            g_shutdown_requested = true;
+            if (shutdown_thread.joinable()) shutdown_thread.join();
+            std::cout << "Server stopped" << std::endl;
+            return 0;
+        } catch (const std::exception& e) {
+            std::cerr << "Fatal error: " << e.what() << std::endl;
+            return 1;
+        }
+    }
 
     try {
         // Initialize model integration

@@ -124,7 +124,8 @@ const ChatTemplate* lookup_chat_template(const std::string& architecture)
     if (!it->second.chat_template)
         throw std::runtime_error(
             "lookup_chat_template: architecture '" + architecture +
-            "' chat template: expected one, got none (an embedding model has no chat)");
+            "' chat template: expected one, got none (an embedding model has no chat; "
+            "serve it with qwenium-server --embed, or run qwenium --embed)");
     return it->second.chat_template.get();
 }
 
