@@ -217,7 +217,8 @@ void GemmaEmbedding2ForwardPass::refuse(const char* what) const
     throw std::runtime_error(
         std::string("gemma-embedding2: '") + what +
         "': expected a call this recipe supports, got one it does not — it is an "
-        "encoder (no logits, no KV cache, no decode); embed through engine/embed");
+        "encoder (no logits, no KV cache, no decode); embed through engine/embed "
+        "(CLI: --embed)");
 }
 
 ggml_cgraph* GemmaEmbedding2ForwardPass::build_prefill_graph(

@@ -1208,6 +1208,21 @@ target_link_libraries(chat-input-tests PRIVATE GTest::gtest_main)
 target_compile_features(chat-input-tests PRIVATE cxx_std_17)
 gtest_discover_tests(chat-input-tests)
 
+# The CLI's --embed path (src/cli/embed_mode.cpp compiled directly). Pure
+# helpers always; end to end against the llama.cpp fixture with
+# EMBEDDINGGEMMA2_MODEL_PATH.
+add_executable(embed-mode-tests
+    unit/test_embed_mode.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/embed_mode.cpp
+)
+target_include_directories(embed-mode-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/cli)
+target_compile_definitions(embed-mode-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embed-mode-tests PRIVATE
+    GTest::gtest_main qinf-orchestration qinf-models qinf-engine ggml)
+target_compile_features(embed-mode-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embed-mode-tests)
+
 # Per-slot rows-vs-positions bookkeeping on ForwardPassBase (pure arithmetic —
 # a stub recipe that only counts KV rows; no ggml graph, no model file).
 add_executable(rope-divergence-tests
@@ -1746,6 +1761,20 @@ set_tests_properties(cli-rejects-temp-typo PROPERTIES
 add_test(NAME cli-rejects-flag-without-value COMMAND qwenium-cli --kv-type)
 set_tests_properties(cli-rejects-flag-without-value PROPERTIES
     PASS_REGULAR_EXPRESSION "--kv-type: expected a value")
+
+# --embed refuses before load: a flag the embedding would ignore, a missing
+# input, and the file flags without --embed.
+add_test(NAME cli-embed-rejects-chat
+         COMMAND qwenium-cli /nonexistent-model.gguf --embed -p hi --chat)
+set_tests_properties(cli-embed-rejects-chat PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected no --chat")
+add_test(NAME cli-embed-rejects-no-input COMMAND qwenium-cli /nonexistent-model.gguf --embed)
+set_tests_properties(cli-embed-rejects-no-input PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected exactly one input.*neither")
+add_test(NAME cli-embed-in-needs-embed
+         COMMAND qwenium-cli /nonexistent-model.gguf --embed-in texts.txt)
+set_tests_properties(cli-embed-in-needs-embed PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed-in: expected together with --embed")
 
 add_test(NAME server-rejects-unknown-flag COMMAND qwenium-server --no-such-flag)
 set_tests_properties(server-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)

@@ -29,7 +29,8 @@ one engine:
   decode graph (`--persistent-graph`, §5), opt-in flash attention
   (`--flash-attn`, §5), a
   selectable KV element type (`--kv-type f32|f16|q8_0|q4_0`, §9), opt-in
-  mmap-backed weights (`--mmap-weights`, §5), and session snapshots;
+  mmap-backed weights (`--mmap-weights`, §5), session snapshots, and text
+  embeddings from an embedding model (`--embed`, §6 *Text embeddings*);
 - an **HTTP server** (`qwenium-server` binary, CMake target `qwenium-server`;
   source `src/server/http_server.cpp`, which keeps the generic file name):
   OpenAI-compatible `/v1/completions` and
@@ -687,8 +688,20 @@ mask memory is 2·n² and not 24·n²), `layers/attention`'s cache-free
 `layers/ple`. It has no KV cache, decode or chat template; every
 `ForwardPassBase` cache/decode method and `lookup_chat_template` refuse it by
 name. The engine stops at the vector: indexes, chunking and ranking are the
-client's. No front end exposes it yet (CLI `--embed` and a server
-`/v1/embeddings` are later, separate decisions).
+client's.
+
+**CLI `--embed`** (`cli/embed_mode`, 2026-10-07): `qwenium MODEL --embed`
+with `-p TEXT` or `--embed-in FILE` (one text per line; a blank line is refused
+by number) writes one JSONL record per text — `{"index","n_tokens","dim",
+"embedding"}`, floats at 9 significant digits — to stdout or `--embed-out FILE`.
+Flags an embedding would silently ignore (chat, image, grammar, speculative,
+sessions, caches, persistent graph, KV type, system prompt) are refused before
+the model loads; `--flash-attn` and `--ctx-size` (the longest text, in tokens)
+apply. A generation model under `--embed` is refused by architecture name, and
+the encoder under generation names `--embed` in its refusal. Gate:
+`embed-mode-tests` (end to end against the llama.cpp fixture, cosine ≥ 0.9999)
+and three `cli-embed-*` argument tests. A server `/v1/embeddings` is a later,
+separate decision.
 
 | gate | test |
 |---|---|
