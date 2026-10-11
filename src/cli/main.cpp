@@ -14,6 +14,7 @@
 #include "complete.h"
 #include "chat.h"
 #include "session_mode.h"
+#include "embed_mode.h"
 
 #include "engine/model.h"
 #include "../loader/gguf_loader.h"
@@ -81,12 +82,18 @@ void print_usage(const char* program_name) {
     std::cout << "  --save-session-at N     Write the snapshot after N generated tokens instead\n";
     std::cout << "  --load-session FILE     Resume from a snapshot (refused fail-loud on a\n";
     std::cout << "                          model/quant/kernel-path or KV-dtype mismatch)\n";
+    std::cout << "  --embed                 Embedding model (e.g. EmbeddingGemma-2): print one L2-normalised\n";
+    std::cout << "                          vector per text as JSONL instead of generating; input -p TEXT\n";
+    std::cout << "                          or --embed-in FILE; works with --flash-attn, --ctx-size\n";
+    std::cout << "  --embed-in FILE         (embed) One text per line\n";
+    std::cout << "  --embed-out FILE        (embed) Write the JSONL here instead of stdout\n";
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " model.gguf -p \"Hello, how are you?\"\n";
     std::cout << "  " << program_name << " model.gguf --chat\n";
     std::cout << "  " << program_name << " model.gguf --chat --speculative\n";
     std::cout << "  " << program_name << " -v -n 50 -p \"Explain quantum computing\" model.gguf\n";
+    std::cout << "  " << program_name << " embeddinggemma-2.gguf --embed --embed-in texts.txt --embed-out vectors.jsonl\n";
 }
 
 // Fail-loud argument errors.  The CLI's argument loop is a module boundary:
@@ -243,6 +250,14 @@ bool parse_args(int argc, char** argv, CliArgs& args) {
         } else if (arg == "--save-session-at") {
             if (i + 1 >= argc) return missing_value(arg, argv[0]);
             args.save_session_at = std::stoi(argv[++i]);
+        } else if (arg == "--embed") {
+            args.embed = true;
+        } else if (arg == "--embed-in") {
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
+            args.embed_in_path = argv[++i];
+        } else if (arg == "--embed-out") {
+            if (i + 1 >= argc) return missing_value(arg, argv[0]);
+            args.embed_out_path = argv[++i];
         } else if (!arg.empty() && arg[0] == '-') {
             // Anything flag-shaped that matched nothing above is a typo or a
             // flag this build does not have.  Checked BEFORE the positional
@@ -314,6 +329,20 @@ int main(int argc, char** argv) {
     // before any weights are loaded, rather than degrade quietly.
     if (kv_type_is_quantized(args.kv_type) && !args.flash_attn) {
         std::cerr << kv_type_requires_flash_refusal(args.kv_type) << std::endl;
+        return 1;
+    }
+
+    // --embed: refuse a flag the embedding would silently ignore, and an
+    // --embed-in / --embed-out without --embed, before any weights load.
+    if (args.embed) {
+        const std::string refusal = embed_mode_refusal(args);
+        if (!refusal.empty()) {
+            std::cerr << refusal << std::endl;
+            return 1;
+        }
+    } else if (!args.embed_in_path.empty() || !args.embed_out_path.empty()) {
+        std::cerr << (args.embed_in_path.empty() ? "--embed-out" : "--embed-in")
+                  << ": expected together with --embed, actual: --embed absent" << std::endl;
         return 1;
     }
 
@@ -445,6 +474,9 @@ int main(int argc, char** argv) {
     // from a short one.
     try {
         // --- L1 portable session: save or resume a snapshot (Phase 2) ---
+        if (args.embed) {
+            return run_embed(model, args);
+        }
         if (!args.load_session_path.empty() || !args.save_session_path.empty()) {
             return run_session(model, args, grammar, log_token);
         }

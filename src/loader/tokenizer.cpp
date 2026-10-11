@@ -28,6 +28,20 @@ Tokenizer::Tokenizer(const ModelMetadata* metadata, const TokenizerConfig& confi
         // SentencePiece-derived BPE with byte fallback.
         // Uses score-based BPE merge for encode and ▁→space + byte-fallback decode.
         scores_ = metadata_->scores;
+        // Gemma 4 vocabularies (12B, 26B-A4B, EmbeddingGemma-2) ship every
+        // score as -1000 and carry the real merge order as a merges list, the
+        // way llama.cpp reads them (llama-vocab.cpp, tokenizer_model "gemma4":
+        // BPE by rank). Merging by score there picked an arbitrary order —
+        // " result" came out as " re" + "su" + "lt".
+        if (metadata_->tokenizer_type == "gemma4") {
+            if (metadata_->merges.empty())
+                throw std::runtime_error(
+                    "Tokenizer: 'tokenizer.ggml.merges': expected present for tokenizer model "
+                    "'gemma4' (rank-ordered BPE), got: empty");
+            bpe_ranks_.reserve(metadata_->merges.size());
+            for (size_t i = 0; i < metadata_->merges.size(); ++i)
+                bpe_ranks_.emplace(metadata_->merges[i], static_cast<int32_t>(i));
+        }
         initialize_special_tokens();
 
         unk_token_id_ = (metadata_->unknown_token_id >= 0)
@@ -743,7 +757,7 @@ std::vector<int32_t> Tokenizer::encode_llama(const std::string& text) const {
     //    match verbatim and Viterbi-encoding the gaps in between. Special
     //    tokens like <start_of_turn> must appear as a single id, not be
     //    decomposed into pieces.
-    auto encode_segment = [&](const std::string& seg) -> std::vector<int32_t> {
+    auto encode_piece = [&](const std::string& seg) -> std::vector<int32_t> {
         if (seg.empty()) return {};
 
         // 2. Normalize: replace each space with U+2581 (▁) per SentencePiece.
@@ -805,13 +819,23 @@ std::vector<int32_t> Tokenizer::encode_llama(const std::string& text) const {
             next[i] = (i + 1 < N) ? i + 1 : -1;
         }
 
+        // Two priorities, one queue. Score mode (Gemma 1/2/3): highest score
+        // first, ties as std::priority_queue leaves them — unchanged. Rank mode
+        // (gemma4): lowest merge rank first, ties leftmost, as llama.cpp's
+        // llm_bigram_bpe orders them; a pair absent from the merges list never
+        // merges, even when its concatenation is a token.
+        const bool by_rank = !bpe_ranks_.empty();
         struct PQEntry {
             float       score;     // higher = better (max-heap)
             int         pos;       // left node index
             int         right_pos; // right node index — used to validate staleness
             int32_t     merged_id;
             std::string merged_text;
-            bool operator<(const PQEntry& o) const { return score < o.score; }
+            bool        by_rank;   // rank mode: score = -rank, ties → leftmost
+            bool operator<(const PQEntry& o) const {
+                if (by_rank && score == o.score) return pos > o.pos;
+                return score < o.score;
+            }
         };
         std::priority_queue<PQEntry> pq;
 
@@ -824,8 +848,15 @@ std::vector<int32_t> Tokenizer::encode_llama(const std::string& text) const {
             if (it == token_to_id_.end()) return;
             // Skip special tokens — they're emitted by the outer loop only.
             if (special_token_ids_.count(it->second)) return;
-            pq.push({score_or_zero(scores_, it->second),
-                     left, right, it->second, std::move(s)});
+            float priority;
+            if (by_rank) {
+                auto r = bpe_ranks_.find(nodes[left].text + " " + nodes[right].text);
+                if (r == bpe_ranks_.end()) return;
+                priority = -static_cast<float>(r->second);
+            } else {
+                priority = score_or_zero(scores_, it->second);
+            }
+            pq.push({priority, left, right, it->second, std::move(s), by_rank});
         };
 
         for (int i = 0; i < N; ++i) try_enqueue(i);
@@ -863,6 +894,31 @@ std::vector<int32_t> Tokenizer::encode_llama(const std::string& text) const {
             if (nodes[i].id < 0) continue;
             out.push_back(nodes[i].id);
             if (next[i] < 0) break;
+        }
+        return out;
+    };
+
+    // Rank mode (gemma4) pre-splits like llama.cpp's GEMMA4 pre-tokenizer,
+    // "[^\n]+|[\n]+": merges never cross a newline boundary, and a run of
+    // newlines that is itself a token is emitted whole. Score mode encodes the
+    // segment in one piece, as before.
+    auto encode_segment = [&](const std::string& seg) -> std::vector<int32_t> {
+        if (bpe_ranks_.empty()) return encode_piece(seg);
+        std::vector<int32_t> out;
+        size_t i = 0;
+        while (i < seg.size()) {
+            const bool nl = seg[i] == '\n';
+            size_t j = i;
+            while (j < seg.size() && (seg[j] == '\n') == nl) ++j;
+            const std::string run = seg.substr(i, j - i);
+            auto whole = nl ? token_to_id_.find(run) : token_to_id_.end();
+            if (whole != token_to_id_.end()) {
+                out.push_back(whole->second);
+            } else {
+                const std::vector<int32_t> ids = encode_piece(run);
+                out.insert(out.end(), ids.begin(), ids.end());
+            }
+            i = j;
         }
         return out;
     };

@@ -115,6 +115,12 @@ struct CliArgs {
     std::string save_session_path;  // --save-session: write an L1 snapshot mid-decode
     std::string load_session_path;  // --load-session: resume a saved L1 snapshot
     int save_session_at = 4;        // --save-session-at: generated-token index to snapshot
+    // Text embeddings (cli/embed_mode.h). --embed switches the run from
+    // generation to embedding; the input is -p TEXT or --embed-in FILE (one
+    // text per line), the output JSONL on stdout or in --embed-out FILE.
+    bool embed = false;             // --embed
+    std::string embed_in_path;      // --embed-in FILE
+    std::string embed_out_path;     // --embed-out FILE
 };
 
 inline std::string make_readable(std::string str) {

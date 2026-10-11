@@ -9,8 +9,11 @@
 // rope.dimension_sections through it). The attention free functions the recipes
 // actually call have no direct unit test; they are covered at recipe level by
 // test_qwen35_forward_attn, test_qwen36_forward and the bitwise recipe gates.
+// The exception is build_uncached_attention (2026-10-07, the encoder path):
+// checked below against a plain C++ softmax(QK^T)V, GQA included.
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -19,6 +22,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include "../../src/layers/attention.h"
 #include "../../src/layers/layer.h"
@@ -222,4 +226,131 @@ TEST(MRopeLayout, AnImageTellsTheLayoutsApart) {
 TEST(MRopeSections, LayoutDefaultsToBlocks) {
     EXPECT_FALSE(MRopeSections{}.interleaved);
     EXPECT_FALSE(MRopeSections::from_widths({11, 11, 10, 0}, "k", 64).interleaved);
+}
+
+// ── build_uncached_attention (encoder path) ──────────────────────────────────
+//
+// One pass, no cache: out[t, h] = softmax_j(scale * q[t,h]·k[j,g] + mask[t,j]) v[j,g]
+// with g = h / (n_head / n_head_kv) — ggml's broadcast grouping. The reference
+// is that formula in doubles; the graph runs on the CPU backend.
+namespace {
+
+struct UncachedCase {
+    int head_dim = 4, n_head = 4, n_head_kv = 2, n_tok = 5;
+    float scale = 0.5f;
+};
+
+std::vector<float> fill(size_t n, float seed) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = std::sin(seed + 0.37f * (float)i);
+    return v;
+}
+
+// mask[t * n_tok + j]; 0 or -inf.
+std::vector<float> uncached_graph(const UncachedCase& c, const std::vector<float>& q,
+                                  const std::vector<float>& k, const std::vector<float>& v,
+                                  const std::vector<float>& mask) {
+    ggml_init_params p{ 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context* ctx = ggml_init(p);
+    ggml_tensor* tq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.head_dim, c.n_head,    c.n_tok);
+    ggml_tensor* tk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.head_dim, c.n_head_kv, c.n_tok);
+    ggml_tensor* tv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.head_dim, c.n_head_kv, c.n_tok);
+    ggml_tensor* tm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n_tok, c.n_tok);
+    ggml_set_input(tq); ggml_set_input(tk); ggml_set_input(tv); ggml_set_input(tm);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* out = build_uncached_attention(ctx, gf, tq, tk, tv, tm, c.scale, /*il=*/0);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_t be = ggml_backend_cpu_init();
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    ggml_backend_tensor_set(tq, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(tk, k.data(), 0, k.size() * sizeof(float));
+    ggml_backend_tensor_set(tv, v.data(), 0, v.size() * sizeof(float));
+    ggml_backend_tensor_set(tm, mask.data(), 0, mask.size() * sizeof(float));
+    EXPECT_EQ(ggml_backend_graph_compute(be, gf), GGML_STATUS_SUCCESS);
+    std::vector<float> got(ggml_nelements(out));
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(be);
+    ggml_free(ctx);
+    return got;
+}
+
+// Reference, laid out like the graph's output: [head_dim * n_head, n_tok].
+std::vector<float> uncached_ref(const UncachedCase& c, const std::vector<float>& q,
+                                const std::vector<float>& k, const std::vector<float>& v,
+                                const std::vector<float>& mask) {
+    const int d = c.head_dim, group = c.n_head / c.n_head_kv;
+    std::vector<float> out((size_t)d * c.n_head * c.n_tok);
+    for (int t = 0; t < c.n_tok; ++t)
+        for (int h = 0; h < c.n_head; ++h) {
+            const int g = h / group;
+            std::vector<double> s(c.n_tok);
+            double mx = -INFINITY;
+            for (int j = 0; j < c.n_tok; ++j) {
+                double dot = 0;
+                for (int e = 0; e < d; ++e)
+                    dot += (double)q[(size_t)(t * c.n_head + h) * d + e] *
+                           (double)k[(size_t)(j * c.n_head_kv + g) * d + e];
+                s[j] = c.scale * dot + mask[(size_t)t * c.n_tok + j];
+                mx = std::max(mx, s[j]);
+            }
+            double z = 0;
+            for (int j = 0; j < c.n_tok; ++j) { s[j] = std::exp(s[j] - mx); z += s[j]; }
+            for (int e = 0; e < d; ++e) {
+                double acc = 0;
+                for (int j = 0; j < c.n_tok; ++j)
+                    acc += s[j] / z * (double)v[(size_t)(j * c.n_head_kv + g) * d + e];
+                out[(size_t)t * d * c.n_head + (size_t)h * d + e] = (float)acc;
+            }
+        }
+    return out;
+}
+
+}  // namespace
+
+TEST(UncachedAttention, BidirectionalMatchesReference) {
+    UncachedCase c;
+    const auto q = fill((size_t)c.head_dim * c.n_head * c.n_tok, 0.1f);
+    const auto k = fill((size_t)c.head_dim * c.n_head_kv * c.n_tok, 1.3f);
+    const auto v = fill((size_t)c.head_dim * c.n_head_kv * c.n_tok, 2.7f);
+    const std::vector<float> mask((size_t)c.n_tok * c.n_tok, 0.0f);   // both directions
+    const auto got = uncached_graph(c, q, k, v, mask);
+    const auto want = uncached_ref(c, q, k, v, mask);
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < got.size(); ++i) EXPECT_NEAR(got[i], want[i], 1e-5f) << "i=" << i;
+}
+
+// The mask is read, not assumed: a banded mask changes the answer and the
+// graph follows it.
+TEST(UncachedAttention, HonoursAWindowedMask) {
+    UncachedCase c;
+    const auto q = fill((size_t)c.head_dim * c.n_head * c.n_tok, 0.4f);
+    const auto k = fill((size_t)c.head_dim * c.n_head_kv * c.n_tok, 1.9f);
+    const auto v = fill((size_t)c.head_dim * c.n_head_kv * c.n_tok, 3.1f);
+    std::vector<float> mask((size_t)c.n_tok * c.n_tok);
+    for (int t = 0; t < c.n_tok; ++t)
+        for (int j = 0; j < c.n_tok; ++j)
+            mask[(size_t)t * c.n_tok + j] = std::abs(t - j) <= 1 ? 0.0f : -INFINITY;
+    const auto got = uncached_graph(c, q, k, v, mask);
+    const auto want = uncached_ref(c, q, k, v, mask);
+    for (size_t i = 0; i < got.size(); ++i) EXPECT_NEAR(got[i], want[i], 1e-5f) << "i=" << i;
+    const std::vector<float> open((size_t)c.n_tok * c.n_tok, 0.0f);
+    EXPECT_NE(uncached_graph(c, q, k, v, open), got);
+}
+
+TEST(UncachedAttention, RefusesKvShorterThanTheSequenceOrAWrongMask) {
+    ggml_init_params p{ 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context* ctx = ggml_init(p);
+    ggml_tensor* q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 5);
+    ggml_tensor* k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 4);
+    ggml_tensor* v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 4);
+    ggml_tensor* m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 5);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    EXPECT_THROW(build_uncached_attention(ctx, gf, q, k, v, m, 1.0f, 0), std::runtime_error);
+    ggml_tensor* k5 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 5);
+    ggml_tensor* v5 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 5);
+    ggml_tensor* m4 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 5);
+    EXPECT_THROW(build_uncached_attention(ctx, gf, q, k5, v5, m4, 1.0f, 0), std::runtime_error);
+    EXPECT_THROW(build_uncached_attention(ctx, gf, q, k5, v5, nullptr, 1.0f, 0), std::runtime_error);
+    ggml_free(ctx);
 }

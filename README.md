@@ -59,11 +59,16 @@ pass, and Qwenium exposes all three as engine primitives:
   version-gated snapshots, kernel-path tags, and fail-loud replay refusal: a
   generation can carry a kilobyte witness and re-run byte-identical on demand.
 
-Turning attention rows into calibrated citations, coverage audits and verdicts
-is per-model work and lives in a separate client, the Qemmi-Lens server, which
-builds this engine as a library. The engine's side of that relationship is a
-written contract: the change classes that can move a client's results, and the
-rule that such changes land only when the client's gate passes
+What a reader does with these primitives — and whatever per-model calibration
+that takes — is the client's business, not the engine's. Clients build this
+engine as a library and read the forward pass through one narrow API,
+`engine/readout`: `readout::prefill` / `readout::decode` with a per-call spec
+(layer cut, attention taps, logits, MoE routing capture / replay), every
+override scoped to the call and restored even when it throws
+([`src/engine/readout.h`](src/engine/readout.h)). The engine's side of the
+relationship is a written contract: the change classes that can move a
+client's results, and the rule that such changes land only when every
+registered client's gate passes
 ([`docs/architecture.md`](docs/architecture.md) §11).
 
 
@@ -71,7 +76,7 @@ rule that such changes land only when the client's gate passes
 
 - **Multi-family support** — Qwen 2/2.5/3/3.5/3.6/3.8 and Gemma 1/2/3/4, sharing the same layer modules and serving stack.
 - **Hybrid architectures** — Pure transformer (Qwen3, Gemma), attention + SSM/GatedDeltaNet (Qwen3.5/3.8, one recipe), DeltaNet + attention + MoE (Qwen3.6), and per-layer embeddings + sliding-window attention (Gemma 3/4).
-- **Attention taps** — the post-softmax attention rows of any layer and head, read from the same forward pass at no extra compute, on every recipe; with layer truncation, partial model load and MoE routing capture/replay for readers that need only part of the stack. See [Built for receipts](#built-for-receipts).
+- **Attention taps** — the post-softmax attention rows of any layer and head, read from the same forward pass at no extra compute, on every recipe; with layer truncation, partial model load and MoE routing capture/replay for readers that need only part of the stack; clients read them through the `engine/readout` API. See [Built for receipts](#built-for-receipts).
 - **Vision (multimodal)** — Image input for Gemma 3 (SigLIP encoder), Gemma 4 (`gemma4uv` projector), and the Qwen 3.5/3.6/3.8 family (`qwen3vl` encoder + merger, in-ViT M-RoPE) via a `--mmproj` GGUF, in both the CLI (`--image`) and the server (OpenAI `image_url` content).
 - **Batched inference** — Slot-based KV cache with batched decode, up to 10 concurrent slots; the Qwen DeltaNet hybrids enforce that ceiling with a fail-loud guard rather than a silent degradation (aborts at 11 slots on Qwen 3.6, 15 on Qwen 3.5/3.8). Throughput gain is strongly model-dependent — ~4× measured on Qwen 2.5 Coder 14B Q4 (dense transformer), only a ~1.6× ceiling on the Qwen 3.6 hybrid; see [Performance](#performance).
 - **KV caching, three opt-in tiers** — `--prefix-cache` (disk-backed warm KV for a recurring system prompt, survives restarts), `--chat-prefix-cache` (transparent reuse of a slot's KV when a chat history re-arrives as a strict prefix; measured 2.4× per-turn at 4K context), and `--conversational` (explicit `conversation_id` handle: the server keeps the conversation's KV warm and clients send only the new turn). Image variants: `--image-embed-cache`, `--image-prefix-cache`.

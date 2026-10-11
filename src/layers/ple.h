@@ -1,54 +1,73 @@
 #pragma once
-// ple.h — Per-Layer Embedding (PLE) lookup + projection.
+// ple.h — Per-Layer Embeddings (PLE), the Gemma 4 family's second signal path.
 //
-// PLE is a Gemma 4 feature: each transformer block owns its own
-// low-dimensional embedding table.  At runtime, the per-layer entry for
-// each input token is looked up, projected into hidden_dim, and added to
-// the residual stream at the block-entry injection point (the second
-// residual slot G4.2 added to build_transformer_layer).
+// Every layer gets its own small input vector per token, and after the layer's
+// FFN residual that vector gates a low-rank update of the residual stream:
+//
+//   once per pass:  ple_in = rms_norm(model_proj · x_scaled / sqrt(n_embd),
+//                                     proj_norm)            → [ple_dim, n_tokens, n_layers]
+//   per layer il:   cur += post_norm(proj · (gelu(inp_gate · cur) ⊙ ple_in[il]))
+//
+// It is its own module, not a knob on the FFN or the embedding, because it is a
+// different signal flow: one projection of the input feeds every layer, and each
+// layer injects it at the END of the block.
 //
 // Public surface:
-//   build_ple(ctx, gf, token_ids, ple_table, ple_proj, il)
-//     → [hidden_dim, n_tokens] residual contribution.
+//   build_ple_inputs — the once-per-pass per-layer inputs
+//   build_ple_inject — one layer's gated injection; returns the new residual
 //
-// State owned: none — all weight tensors are borrowed references.
-// Invariants: appends to the caller's ggml_cgraph; creates no ggml_context.
+// State owned: none — weights are borrowed. Appends to the caller's graph;
+// creates no ggml_context.
 //
-// Status in 26B-A4B: INACTIVE.  embedding_length_per_layer_input == 0 in the
-// 26B-A4B GGUF, so the recipe never wires PLE through.  The interface ships
-// in G4 and is exercised by a synthetic-config unit test (test_ple.cpp).
-// The dense 31B follow-up will exercise it end-to-end.
+// History (2026-10-07). This file used to hold build_ple: a per-layer TOKEN
+// table looked up, projected to hidden_dim and added at block ENTRY. It was
+// designed in G4 against synthetic configs, never ran on a real model, and
+// matches neither EmbeddingGemma-2 (this flow, the first real PLE model we
+// host) nor llama.cpp's Gemma 4 E2B/E4B. It had no production caller and was
+// replaced, not kept beside this. The E-models ALSO add a per-layer token
+// table to ple_in (scaled by sqrt(ple_dim), then the sum scaled by 1/sqrt(2));
+// that term is not here because no model we host carries it — add it with the
+// model that gates it.
 //
-// Reference: docs/plan-gemma-impl.md → Phase G4 → "Per-Layer Embeddings (PLE)"
+// Reference: llama.cpp src/models/gemma-embedding2.cpp (build_inp_per_layer
+//   and the per-layer block), f498f864f.
 // Unit test:  tests/unit/test_ple.cpp
+
+#include <cstdint>
 
 struct ggml_context;
 struct ggml_cgraph;
 struct ggml_tensor;
 
-// Build the PLE residual contribution for one transformer layer.
-//
-// Inputs:
-//   token_ids : [n_tokens] I32 — same token-id vector used by the input
-//               embedding lookup.  This module does not own it; the recipe
-//               passes the same tensor it routed into ggml_get_rows for
-//               the main embedding.
-//   ple_table : [ple_dim, vocab_size] — the per-layer embedding table.
-//               Each layer's table is independent; the recipe selects the
-//               correct one before this call.
-//   ple_proj  : [hidden_dim, ple_dim] — projection from the low-dim space
-//               into the residual-stream width.
-//   il        : physical layer index (used only for tensor naming so debug
-//               graph dumps remain unambiguous).
-//
-// Returns: [hidden_dim, n_tokens] — pass directly as ple_residual to
-// build_transformer_layer.  Caller is responsible for adding it to the
-// residual stream (the block does the add internally at the injection
-// point — do not pre-add here).
-ggml_tensor* build_ple(
+// x_scaled   : [n_embd, n_tokens] — the token embeddings AFTER the sqrt(n_embd)
+//              embed scale (the same tensor the first block reads).
+// model_proj : [n_embd, ple_dim * n_layers] (per_layer_model_proj.weight)
+// proj_norm  : [ple_dim]                    (per_layer_proj_norm.weight)
+// Returns [ple_dim, n_tokens, n_layers], contiguous, so a layer's slice is a
+// plain 2-D view. Fail-loud if model_proj's width is not ple_dim * n_layers.
+ggml_tensor* build_ple_inputs(
     ggml_context* ctx,
     ggml_cgraph*  gf,
-    ggml_tensor*  token_ids,
-    ggml_tensor*  ple_table,
-    ggml_tensor*  ple_proj,
+    ggml_tensor*  x_scaled,
+    ggml_tensor*  model_proj,
+    ggml_tensor*  proj_norm,
+    int64_t       ple_dim,
+    int64_t       n_layers,
+    float         eps);
+
+// cur        : [n_embd, n_tokens] — the residual after the layer's FFN add
+// ple_inputs : build_ple_inputs' result
+// inp_gate   : [n_embd, ple_dim]   (blk.il.inp_gate.weight)
+// proj       : [ple_dim, n_embd]   (blk.il.proj.weight)
+// post_norm  : [n_embd]            (blk.il.post_norm.weight)
+// Returns cur + post_norm(proj · (gelu(inp_gate · cur) ⊙ ple_inputs[il])).
+ggml_tensor* build_ple_inject(
+    ggml_context* ctx,
+    ggml_cgraph*  gf,
+    ggml_tensor*  cur,
+    ggml_tensor*  ple_inputs,
+    ggml_tensor*  inp_gate,
+    ggml_tensor*  proj,
+    ggml_tensor*  post_norm,
+    float         eps,
     int           il);

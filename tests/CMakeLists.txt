@@ -61,6 +61,17 @@ target_link_libraries(attn-mask-input-tests PRIVATE
 target_compile_features(attn-mask-input-tests PRIVATE cxx_std_17)
 gtest_discover_tests(attn-mask-input-tests)
 
+add_executable(bidirectional-mask-input-tests
+    unit/test_bidirectional_mask_input.cpp
+)
+target_link_libraries(bidirectional-mask-input-tests PRIVATE
+    GTest::gtest_main
+    qinf-graph-inputs
+    ggml
+)
+target_compile_features(bidirectional-mask-input-tests PRIVATE cxx_std_17)
+gtest_discover_tests(bidirectional-mask-input-tests)
+
 # GrammarVocab — standalone non-GTest harness. test_grammar_vocab.cpp defines
 # its own int main() (g_pass/g_fail counters, no RUN_ALL_TESTS). It lived in the
 # unit-tests aggregate, where its main() hijacked the linker and silently
@@ -218,6 +229,22 @@ target_link_libraries(parallel-grammar-test PRIVATE
     ggml
 )
 
+# POST /v1/embeddings (src/server/embedding_service.cpp compiled directly, as
+# the server executable does). Handler contract always; the loaded model end to
+# end with EMBEDDINGGEMMA2_MODEL_PATH.
+add_executable(embedding-service-tests
+    unit/test_embedding_service.cpp
+    ${PROJECT_SOURCE_DIR}/src/server/embedding_service.cpp
+)
+target_include_directories(embedding-service-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/server)
+target_compile_definitions(embedding-service-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embedding-service-tests PRIVATE
+    GTest::gtest_main nlohmann_json::nlohmann_json
+    qinf-orchestration qinf-models qinf-engine ggml)
+target_compile_features(embedding-service-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embedding-service-tests)
+
 # HTTP Server Integration Test (GTest)
 add_executable(http-server-test
     integration/test_http_server.cpp
@@ -248,6 +275,34 @@ target_link_libraries(image-data-uri-tests PRIVATE
 )
 target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-data-uri-tests)
+
+# ServerVision's accessors (prepare_image, encoder, marker ids, projector_tag,
+# projection_dim) on one (model, mmproj) pair per projector family; each leg
+# self-skips without its files. server_vision.cpp is in no library (only the
+# server executable compiles it), so it is compiled here directly.
+add_executable(server-vision-tests
+    unit/test_server_vision.cpp
+    ${PROJECT_SOURCE_DIR}/src/server/server_vision.cpp
+)
+target_compile_definitions(server-vision-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_include_directories(server-vision-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/server)
+target_link_libraries(server-vision-tests PRIVATE
+    GTest::gtest_main
+    inference_server
+    qinf-snapshot
+    qinf-orchestration
+    qinf-image
+    qinf-vision
+    qinf-models
+    qinf-loader
+    qinf-engine
+    qinf-state
+    sampling
+    ggml
+)
+target_compile_features(server-vision-tests PRIVATE cxx_std_17)
+gtest_discover_tests(server-vision-tests)
 
 # Session snapshot seams (Phase 0). Model-free — links only qinf-session.
 add_executable(session-tests
@@ -519,6 +574,57 @@ target_link_libraries(forward-pass-base-tests PRIVATE
 
 target_compile_features(forward-pass-base-tests PRIVATE cxx_std_17)
 gtest_discover_tests(forward-pass-base-tests)
+
+# readout (src/engine/readout.cpp): one step with what a client reads back —
+# bitwise against the hand-written sequence, per recipe leg (Qwen + Gemma), and
+# every override restored after return and after throw. Model legs self-skip.
+add_executable(readout-tests
+    unit/test_readout.cpp
+)
+
+target_link_libraries(readout-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+
+target_compile_features(readout-tests PRIVATE cxx_std_17)
+gtest_discover_tests(readout-tests)
+
+# embed (src/engine/embed.cpp): framing, pooling, normalisation (always), and
+# the gemma-embedding2 gate — token ids and cosine >= 0.9999 against llama.cpp's
+# embeddings (tests/fixtures/embed/) — when EMBEDDINGGEMMA2_MODEL_PATH is set.
+add_executable(embed-tests
+    unit/test_embed.cpp
+)
+target_compile_definitions(embed-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embed-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+target_compile_features(embed-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embed-tests)
+
+# worst_case_reserve (src/engine/worst_case_reserve.cpp): slots empty after the
+# reservation, and a later step bitwise-identical to an unreserved pass.
+add_executable(worst-case-reserve-tests
+    unit/test_worst_case_reserve.cpp
+)
+target_link_libraries(worst-case-reserve-tests PRIVATE
+    GTest::gtest_main
+    qinf-orchestration
+    qinf-models
+    qinf-engine
+    ggml
+)
+target_compile_features(worst-case-reserve-tests PRIVATE cxx_std_17)
+gtest_discover_tests(worst-case-reserve-tests)
 
 # feed_tokens Phase 1 — qwen36 head-less state-advance + mid-decode
 # differential (docs/plan-feed-tokens.md). Self-skips when model absent.
@@ -895,6 +1001,8 @@ target_link_libraries(gemma4-tokenizer-tests PRIVATE
     qinf-loader
     qinf-models
 )
+target_compile_definitions(gemma4-tokenizer-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
 target_compile_features(gemma4-tokenizer-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma4-tokenizer-tests)
 
@@ -1116,6 +1224,21 @@ target_link_libraries(chat-input-tests PRIVATE GTest::gtest_main)
 target_compile_features(chat-input-tests PRIVATE cxx_std_17)
 gtest_discover_tests(chat-input-tests)
 
+# The CLI's --embed path (src/cli/embed_mode.cpp compiled directly). Pure
+# helpers always; end to end against the llama.cpp fixture with
+# EMBEDDINGGEMMA2_MODEL_PATH.
+add_executable(embed-mode-tests
+    unit/test_embed_mode.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/embed_mode.cpp
+)
+target_include_directories(embed-mode-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/cli)
+target_compile_definitions(embed-mode-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(embed-mode-tests PRIVATE
+    GTest::gtest_main qinf-orchestration qinf-models qinf-engine ggml)
+target_compile_features(embed-mode-tests PRIVATE cxx_std_17)
+gtest_discover_tests(embed-mode-tests)
+
 # Per-slot rows-vs-positions bookkeeping on ForwardPassBase (pure arithmetic —
 # a stub recipe that only counts KV rows; no ggml graph, no model file).
 add_executable(rope-divergence-tests
@@ -1260,9 +1383,8 @@ target_compile_features(gemma4-final-softcap-tests PRIVATE cxx_std_17)
 gtest_discover_tests(gemma4-final-softcap-tests)
 
 # PLE (per-layer embedding) op tests ─────────────────────────────────
-# Covers: build_ple lookup + projection against a synthetic oracle.  PLE is
-# inactive in the 26B-A4B checkpoint (embedding_length_per_layer_input=0);
-# this is the synthetic-config gate the dense 31B follow-up will promote.
+# Covers: build_ple_inputs + build_ple_inject against the formula in doubles.
+# The real-model gate is EmbeddingGemma-2 vs llama.cpp (embed-tests).
 # No model file required.
 add_executable(ple-tests
     unit/test_ple.cpp
@@ -1655,6 +1777,25 @@ set_tests_properties(cli-rejects-temp-typo PROPERTIES
 add_test(NAME cli-rejects-flag-without-value COMMAND qwenium-cli --kv-type)
 set_tests_properties(cli-rejects-flag-without-value PROPERTIES
     PASS_REGULAR_EXPRESSION "--kv-type: expected a value")
+
+# --embed refuses before load: a flag the embedding would ignore, a missing
+# input, and the file flags without --embed.
+add_test(NAME cli-embed-rejects-chat
+         COMMAND qwenium-cli /nonexistent-model.gguf --embed -p hi --chat)
+set_tests_properties(cli-embed-rejects-chat PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected no --chat")
+add_test(NAME cli-embed-rejects-no-input COMMAND qwenium-cli /nonexistent-model.gguf --embed)
+set_tests_properties(cli-embed-rejects-no-input PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected exactly one input.*neither")
+add_test(NAME cli-embed-in-needs-embed
+         COMMAND qwenium-cli /nonexistent-model.gguf --embed-in texts.txt)
+set_tests_properties(cli-embed-in-needs-embed PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed-in: expected together with --embed")
+
+add_test(NAME server-embed-rejects-generation-flag
+         COMMAND qwenium-server --embed -m /nonexistent-model.gguf --conversational)
+set_tests_properties(server-embed-rejects-generation-flag PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed: expected no --conversational")
 
 add_test(NAME server-rejects-unknown-flag COMMAND qwenium-server --no-such-flag)
 set_tests_properties(server-rejects-unknown-flag PROPERTIES WILL_FAIL TRUE)

@@ -13,6 +13,7 @@ add_library(qinf-models STATIC
     gemma2.cpp
     gemma3.cpp
     gemma4.cpp           # tokenizer/chat surface + G4.8 stub
+    gemma_embedding2.cpp # encoder: EmbeddingGemma-2 (no cache, no decode)
     model_registry.cpp
 )
 

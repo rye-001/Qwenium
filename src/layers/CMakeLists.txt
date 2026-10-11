@@ -9,7 +9,7 @@ add_library(qinf-layers STATIC
     moe.cpp
     routing_trace.cpp
     norm.cpp
-    ple.cpp           # Per-Layer Embedding lookup + projection
+    ple.cpp           # Per-Layer Embeddings (Gemma 4 family)
     transformer_block.cpp
 )
 

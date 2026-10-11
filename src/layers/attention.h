@@ -120,6 +120,28 @@ ggml_tensor* build_attention(
     float             softcap = 0.0f,
     bool              use_flash = false);
 
+// Encoder attention: one pass over a whole sequence, no KV cache.
+// Q/K/V come straight from this pass's projections. The mask is the CALLER's:
+// [n_tokens, n_tokens], F32 — or F16 when use_flash (ggml_flash_attn_ext
+// requires it; build_attn_mha refuses otherwise). A recipe builds one mask per
+// distinct pattern and shares it across layers, rather than one per layer
+// (24 identical [n, n] masks at 10K tokens would be ~9.6 GB). Same core as
+// build_attention (build_attn_mha) minus the cache write and read. Added
+// 2026-10-07 for EmbeddingGemma-2, the first recipe without a KV cache.
+//
+// k, v: [head_dim, n_head_kv, n_tokens] (the projections, reshaped).
+ggml_tensor* build_uncached_attention(
+    ggml_context* ctx,
+    ggml_cgraph*  gf,
+    ggml_tensor*  q,
+    ggml_tensor*  k,
+    ggml_tensor*  v,
+    ggml_tensor*  kq_mask,
+    float         kq_scale,
+    int           il,
+    float         softcap = 0.0f,
+    bool          use_flash = false);
+
 // Decode / batched multi-slot attention.
 // Scatters K/V into each slot, gathers the full KV history via indices,
 // applies a shared causal mask, then runs MHA.

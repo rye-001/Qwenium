@@ -45,6 +45,14 @@
 //   GEMMA3_MODEL_PATH  — gemma3 (interleaved local/global attention)
 //   GEMMA4_MODEL_PATH  — gemma4 (the cross-family falsifier)
 //
+// Since 2026-10-03 (the lens moved to qemmi-lens-server) this file also holds
+// the end-to-end engine checks the lens used to provide: a flash prefill under
+// a materialized decode (FlashPrefillUnderMaterializedDecodeKeepsTheTap,
+// FlashDecodeWithATapFailsLoud) and MoE routing replay through a recipe
+// (ForwardPassRoutingReplayTest, MoE legs only; GEMMA4_MOE_MODEL_PATH names the
+// Gemma 4 MoE leg). Mechanical rules only — whether a change moves a client's
+// DECISIONS is that client's gate (architecture.md §11).
+//
 // A passing leg answers the MECHANICAL question only — "does the tap return
 // live attention rows on this recipe". It says nothing about whether the lens
 // CONSTANTS transfer (citations pinned to L3H13, coverage to layer 11 at
@@ -684,6 +692,238 @@ TEST_P(ForwardPassTapTest, RoutingCaptureAfterSameShapePassGetsItsOwnPlan) {
         << b.size() << " layers differ";
 }
 
+// ── A flash PREFILL under a materialized DECODE keeps the decode tap ─────────
+// DecodePolicy scopes the attention implementation per phase. A client may run
+// the prefill on the flash kernel and still read decode rows, because only the
+// decode is tapped (the lens licenses this per model; whether it MOVES a
+// client's decisions is that client's gate, not this test). The mechanical
+// rule checked here: with prefill = Flash and decode = Materialized, the
+// prefill graph carries the flash node, the decode graph does not, and the
+// decode tap is the live softmax over every position the flash prefill wrote.
+namespace {
+int count_op(ggml_cgraph* gf, ggml_op op) {
+    int n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) n += ggml_graph_node(gf, i)->op == op;
+    return n;
+}
+}  // namespace
+
+TEST_P(ForwardPassTapTest, FlashPrefillUnderMaterializedDecodeKeepsTheTap) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    const auto& meta = model_->get_metadata();
+    auto fp = make_fp();
+    if (!fp->supports_flash_attn()) GTEST_SKIP() << "recipe does not support flash attention";
+    const std::vector<int> layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+
+    fp->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Flash);
+    ASSERT_EQ(fp->attn_impl(), ForwardPassBase::AttnImpl::Materialized);
+
+    fp->clear_slot(0);
+    fp->set_cache_pos(0, 0);
+    ggml_cgraph* pre = fp->build_prefill_graph(kPrompt, 0, 0);
+    EXPECT_GT(count_op(pre, GGML_OP_FLASH_ATTN_EXT), 0)
+        << "arch " << meta.architecture << ": prefill_attn_impl=Flash expected a "
+           "FLASH_ATTN_EXT node in the prefill graph, actual none";
+    fp->clear_slot(0);
+
+    fp->set_attention_taps(layers);
+    std::vector<ForwardPassBase::AttentionTap> tapped;
+    const std::vector<float> logits = decode_once(*fp, sched, kPrompt, &tapped);
+    fp->set_attention_taps({});
+
+    for (float v : logits) ASSERT_TRUE(std::isfinite(v)) << "arch " << meta.architecture;
+    ASSERT_EQ(tapped.size(), layers.size());
+    const int expect_kv = (int)kPrompt.size() + 1;
+    for (const auto& tap : tapped) {
+        EXPECT_EQ(tap.n_kv, expect_kv) << "arch " << meta.architecture << " layer " << tap.layer;
+        for (int h = 0; h < tap.n_head; ++h) {
+            double s = 0.0;
+            for (int j = 0; j < tap.n_kv; ++j) s += tap.rows[(size_t)h * tap.n_kv + j];
+            EXPECT_NEAR(s, 1.0, 1e-3)
+                << "arch " << meta.architecture << " layer " << tap.layer << " head " << h
+                << ": decode row after a flash prefill expected a softmax summing to 1";
+        }
+    }
+
+    // The decode graph itself stays materialized.
+    std::vector<int32_t>  tokens    = {kPrompt.back()};
+    std::vector<uint32_t> slots     = {0};
+    std::vector<int32_t>  positions = {(int)fp->get_cache_pos(0)};
+    ggml_cgraph* dec = fp->build_decoding_graph(tokens, slots, positions);
+    EXPECT_EQ(count_op(dec, GGML_OP_FLASH_ATTN_EXT), 0)
+        << "arch " << meta.architecture << ": decode expected materialized under "
+           "prefill_attn_impl=Flash, actual a FLASH_ATTN_EXT node";
+    fp->clear_slot(0);
+}
+
+// Flash on the DECODE removes kq_soft; arming a tap there must fail loud at
+// mark time rather than read some other buffer.
+TEST_P(ForwardPassTapTest, FlashDecodeWithATapFailsLoud) {
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    auto fp = make_fp();
+    if (!fp->supports_flash_attn()) GTEST_SKIP() << "recipe does not support flash attention";
+    const std::vector<int> layers = discover_tap_layers(*fp, sched);
+    if (layers.empty()) GTEST_SKIP() << "recipe materializes no attention rows";
+
+    fp->set_attn_impl(ForwardPassBase::AttnImpl::Flash);
+    fp->set_attention_taps(layers);
+    EXPECT_FALSE(fp->decode_policy().is_attn_impl_coherent());
+    // discover_tap_layers left the prompt's K/V in slot 0 (written materialized);
+    // a decode graph over it is all this needs.
+    std::vector<int32_t>  tokens    = {kPrompt.back()};
+    std::vector<uint32_t> slots     = {0};
+    std::vector<int32_t>  positions = {(int)fp->get_cache_pos(0)};
+    ggml_cgraph* dec = fp->build_decoding_graph(tokens, slots, positions);
+    EXPECT_THROW(fp->mark_attention_taps(dec), std::runtime_error)
+        << model_->get_metadata().architecture << ": a tap armed on a flash decode "
+           "expected a fail-loud refusal at mark time, actual none";
+    fp->set_attention_taps({});
+    fp->clear_slot(0);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Recipes, ForwardPassTapTest, ::testing::ValuesIn(leg_params()),
+    [](const ::testing::TestParamInfo<std::string>& info) { return info.param; });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MoE routing REPLAY through a recipe (architecture.md §10). MoE legs only; a
+// dense model has no selection to replay and skips. Cross-family: the Qwen 3.6
+// hybrid MoE and Gemma 4's MoE select experts through one shared function
+// (moe_build_expert_idx) inside structurally different layers.
+//
+//   QWEN36_MODEL_PATH      — qwen35moe (Qwen 3.6-35B-A3B)
+//   GEMMA4_MOE_MODEL_PATH  — gemma4 MoE (e.g. gemma-4-26B-A4B-it)
+//
+// What the client gate cannot cover and these do: the replay path is LIVE (a
+// changed selection changes the result), FAITHFUL (replaying a captured pass
+// reproduces it bit for bit — this is what catches the Replay-path
+// ggml_set_output(logits) invariant: without it the selection is right and the
+// gating weights are read from a reused buffer), and FAIL-LOUD on a trace that
+// cannot cover the pass.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+std::vector<std::string> moe_leg_params() { return {"QWEN36_MODEL_PATH", "GEMMA4_MOE_MODEL_PATH"}; }
+}  // namespace
+
+class ForwardPassRoutingReplayTest : public ForwardPassTapTest {
+protected:
+    // Capture the routing of one prefill on a fresh slot; returns its logits.
+    std::vector<float> capture(ForwardPassBase& fp, const std::vector<int32_t>& prompt,
+                               RoutingTrace& trace) {
+        fp.set_routing_replay(nullptr);
+        fp.set_routing_capture(&trace);
+        fp.clear_slot(0); fp.set_cache_pos(0, 0);
+        std::vector<float> logits = fp.run_prefill(prompt, 0, 0, model_->get_scheduler());
+        fp.set_routing_capture(nullptr);
+        fp.clear_slot(0);
+        return logits;
+    }
+    std::vector<float> replay(ForwardPassBase& fp, const std::vector<int32_t>& prompt,
+                              const RoutingTrace& trace) {
+        fp.set_routing_replay(&trace);
+        fp.clear_slot(0); fp.set_cache_pos(0, 0);
+        std::vector<float> logits;
+        try {
+            logits = fp.run_prefill(prompt, 0, 0, model_->get_scheduler());
+        } catch (...) {
+            fp.set_routing_replay(nullptr);
+            fp.clear_slot(0);
+            throw;
+        }
+        fp.set_routing_replay(nullptr);
+        fp.clear_slot(0);
+        return logits;
+    }
+};
+
+TEST_P(ForwardPassRoutingReplayTest, ReplayOfACapturedPassIsBitwiseIdentical) {
+    auto fp = make_fp();
+    // A document-sized pass (300 tokens). NOTE what this does NOT prove: with
+    // the Replay-path ggml_set_output(logits) line in layers/moe.cpp removed
+    // (architecture.md §10), this test and the split variant below still pass —
+    // checked 2026-10-04 on Qwen3.6-35B-A3B and on gemma-4-26B-A4B (Q2_K and
+    // UD-Q4_K_XL), at 12 and 300 tokens and split 278+22, ggml b10964. The
+    // invariant's original failure does not reproduce here, so it is kept on
+    // the strength of its 2026-09-16 measurement, not of this test.
+    std::vector<int32_t> prompt;
+    for (int32_t t = 1; t <= 300; ++t) prompt.push_back(t);
+    RoutingTrace trace;
+    const std::vector<float> captured = capture(*fp, prompt, trace);
+    if (trace.per_layer().empty()) GTEST_SKIP() << "dense recipe: no routing to replay";
+    const std::vector<float> replayed = replay(*fp, prompt, trace);
+    ASSERT_EQ(captured.size(), replayed.size());
+    EXPECT_EQ(0, std::memcmp(captured.data(), replayed.data(), captured.size() * sizeof(float)))
+        << model_->get_metadata().architecture << ": replaying the captured routing of the same "
+           "prefill expected bitwise-identical logits, actual differ";
+}
+
+TEST_P(ForwardPassRoutingReplayTest, ReplayIsLiveOneChangedExpertChangesLogits) {
+    auto fp = make_fp();
+    RoutingTrace trace;
+    const std::vector<float> captured = capture(*fp, kPrompt, trace);
+    if (trace.per_layer().empty()) GTEST_SKIP() << "dense recipe: no routing to replay";
+
+    // At the first MoE layer and the last position, swap the first selected
+    // expert for one the router did not select.
+    RoutingTrace edited = trace;
+    const int il = trace.by_layer().begin()->first;
+    const size_t pos = kPrompt.size() - 1;
+    const int k = trace.top_k();
+    std::vector<int32_t> sel(trace.at(il, pos), trace.at(il, pos) + k);
+    int32_t other = 0;
+    while (std::find(sel.begin(), sel.end(), other) != sel.end()) ++other;
+    sel[0] = other;
+    edited.write(il, pos, sel.data(), k);
+
+    const std::vector<float> replayed = replay(*fp, kPrompt, edited);
+    ASSERT_EQ(captured.size(), replayed.size());
+    EXPECT_NE(0, std::memcmp(captured.data(), replayed.data(), captured.size() * sizeof(float)))
+        << model_->get_metadata().architecture << ": replay with expert " << other
+        << " forced at layer " << il << " position " << pos
+        << " expected different logits, actual identical — the replayed selection is not used";
+}
+
+TEST_P(ForwardPassRoutingReplayTest, ReplayRefusesAPositionTheTraceNeverRecorded) {
+    auto fp = make_fp();
+    RoutingTrace trace;
+    const std::vector<int32_t> head(kPrompt.begin(), kPrompt.begin() + 6);
+    (void)capture(*fp, head, trace);
+    if (trace.per_layer().empty()) GTEST_SKIP() << "dense recipe: no routing to replay";
+    EXPECT_THROW(replay(*fp, kPrompt, trace), std::runtime_error)
+        << model_->get_metadata().architecture << ": a trace of 6 positions replayed over "
+        << kPrompt.size() << " expected a fail-loud refusal, actual none";
+}
+
+// SPLIT prefill: a long chunk, then a short suffix on the same scheduler — the
+// shape in which the suffix pass reuses the long pass's memory plan.
+TEST_P(ForwardPassRoutingReplayTest, ReplayOfACapturedSplitPrefillIsBitwiseIdentical) {
+    auto fp = make_fp();
+    std::vector<int32_t> head, tail;
+    for (int32_t t = 1; t <= 278; ++t) head.push_back(t);
+    for (int32_t t = 279; t <= 300; ++t) tail.push_back(t);
+    ggml_backend_sched_t sched = model_->get_scheduler();
+    auto run = [&](RoutingTrace* cap, const RoutingTrace* rep) {
+        fp->set_routing_capture(cap);
+        fp->set_routing_replay(rep);
+        fp->clear_slot(0); fp->set_cache_pos(0, 0);
+        fp->run_prefill(head, 0, 0, sched);
+        std::vector<float> out = fp->run_prefill(tail, (int)head.size(), 0, sched);
+        fp->set_routing_capture(nullptr);
+        fp->set_routing_replay(nullptr);
+        fp->clear_slot(0);
+        return out;
+    };
+    RoutingTrace trace;
+    const std::vector<float> captured = run(&trace, nullptr);
+    if (trace.per_layer().empty()) GTEST_SKIP() << "dense recipe: no routing to replay";
+    const std::vector<float> replayed = run(nullptr, &trace);
+    ASSERT_EQ(captured.size(), replayed.size());
+    EXPECT_EQ(0, std::memcmp(captured.data(), replayed.data(), captured.size() * sizeof(float)))
+        << model_->get_metadata().architecture << ": replaying a captured split prefill "
+           "expected bitwise-identical suffix logits, actual differ";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MoeRecipes, ForwardPassRoutingReplayTest, ::testing::ValuesIn(moe_leg_params()),
     [](const ::testing::TestParamInfo<std::string>& info) { return info.param; });

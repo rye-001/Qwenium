@@ -18,7 +18,11 @@ enum class NormalizerKind {
 // normalizer         — whitespace normalization algorithm (see above).
 // byte_fallback      — true for Llama/Gemma: unknown codepoints decompose
 //                      into <0xNN> byte tokens instead of UNK.
-// add_bos_token      — prepend BOS when encoding a prompt.
+// add_bos_token      — prepend BOS when encoding a prompt. Read by
+//                      engine/embed::frame; the generation front ends still
+//                      read the GGUF's flag (ModelMetadata::add_bos_token).
+// add_eos_token      — append EOS (an encoder's trained framing; read by
+//                      engine/embed::frame only).
 // extra_chat_specials — token strings to force-promote to the special-token
 //                      table even when the GGUF marks them as NORMAL type.
 //                      Needed for GGUF exports that mislabel chat-control
@@ -27,5 +31,6 @@ struct TokenizerConfig {
     NormalizerKind           normalizer          = NormalizerKind::None;
     bool                     byte_fallback       = false;
     bool                     add_bos_token       = false;
+    bool                     add_eos_token       = false;
     std::vector<std::string> extra_chat_specials;
 };

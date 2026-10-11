@@ -19,8 +19,15 @@
 
 #include <gtest/gtest.h>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "engine/model.h"
+#include "../../src/models/model_registry.h"
 
 #include "../../src/loader/tokenizer.h"
 #include "../../src/loader/tokenizer_config.h"
@@ -83,8 +90,14 @@ ModelMetadata make_minimal_gemma4_vocab()
     add(std::string(SPM_UNDER) + "worl",  TokenType::NORMAL, -5.5f);
     add(std::string(SPM_UNDER) + "world", TokenType::NORMAL, -3.0f);
 
-    // tokenizer.ggml.model = "gemma4" — the value is metadata, not behavior.
+    // tokenizer.ggml.model = "gemma4" — since 2026-10-07 this IS behaviour:
+    // a gemma4 vocabulary merges by RANK in its merges list (real Gemma 4
+    // files carry every score as -1000), so the toy vocab carries the merge
+    // ladder its scores used to encode.
     m.tokenizer_type = "gemma4";
+    const std::string U = SPM_UNDER;
+    m.merges = {"h e", "he l", "hel l", "hell o",
+                U + " w", U + "w o", U + "wo r", U + "wor l", U + "worl d"};
 
     m.id_to_token = std::move(ids);
     m.token_types = std::move(types);
@@ -199,4 +212,95 @@ TEST(Gemma4Tokenizer, DecodeReplacesUnderscoreWithSpace) {
     int32_t under_world = find_id(m, std::string(SPM_UNDER) + "world");
     ASSERT_GE(under_world, 0);
     EXPECT_EQ(t.decode(under_world), " world");
+}
+
+
+// ── Rank-ordered BPE (tokenizer.ggml.model "gemma4", 2026-10-07) ─────────────
+//
+// Every Gemma 4 vocabulary ships its scores as one value (-1000), so score
+// order is no order; the merges list is the order, as llama.cpp reads it.
+
+namespace {
+
+// a, b, c, "\n"; tokens ab, bc, abc, "a\n"; merges rank b+c first, then a+b,
+// then ab+c. Equal scores everywhere, like a real Gemma 4 file.
+ModelMetadata make_rank_vocab() {
+    ModelMetadata m;
+    m.tokenizer_type = "gemma4";
+    m.bos_token_id = 2; m.eos_token_id = 1; m.unknown_token_id = 3;
+    m.id_to_token = {"<pad>", "<eos>", "<bos>", "<unk>",
+                     "a", "b", "c", "\n", "ab", "bc", "abc", "a\n"};
+    m.token_types = {TokenType::CONTROL, TokenType::CONTROL, TokenType::CONTROL, TokenType::UNKNOWN};
+    m.token_types.resize(m.id_to_token.size(), TokenType::NORMAL);
+    m.scores.assign(m.id_to_token.size(), -1000.0f);
+    m.merges = {"b c", "a b", "ab c", "a \n"};
+    m.vocab_size = m.id_to_token.size();
+    return m;
+}
+
+}  // namespace
+
+// Rank 0 (b+c) fires first; a+bc is not a listed merge, so "abc" — a token,
+// and what an equal-score merge happily produced — is never reached.
+TEST(Gemma4Tokenizer, MergesFollowRankNotScore) {
+    auto m = make_rank_vocab();
+    Tokenizer t(&m, gemma4_tokenizer_config());
+    EXPECT_EQ(t.encode("abc"), (std::vector<int32_t>{find_id(m, "a"), find_id(m, "bc")}));
+    EXPECT_EQ(t.encode("ab"),  (std::vector<int32_t>{find_id(m, "ab")}));
+}
+
+// llama.cpp's gemma4 pre-tokenizer splits on newline runs: "a\n" is a token
+// and a listed merge, but a merge never crosses the newline boundary.
+TEST(Gemma4Tokenizer, MergesNeverCrossANewline) {
+    auto m = make_rank_vocab();
+    Tokenizer t(&m, gemma4_tokenizer_config());
+    EXPECT_EQ(t.encode("a\nb"),
+              (std::vector<int32_t>{find_id(m, "a"), find_id(m, "\n"), find_id(m, "b")}));
+}
+
+TEST(Gemma4Tokenizer, RefusesAGemma4VocabWithoutMerges) {
+    auto m = make_rank_vocab();
+    m.merges.clear();
+    EXPECT_THROW({ Tokenizer t(&m, gemma4_tokenizer_config()); }, std::runtime_error);
+}
+
+// The real vocabulary against llama.cpp: tests/fixtures/tokenizer/
+// gemma4_llamacpp.txt (llama-tokenize f498f864f on gemma-4-12B-it — chat
+// markers, newline runs, indentation, multi-byte text, digits). Metadata only:
+// no weights are loaded. Self-skips without GEMMA4_MODEL_PATH.
+TEST(Gemma4Tokenizer, RealVocabMatchesLlamaCpp) {
+    const char* path = std::getenv("GEMMA4_MODEL_PATH");
+    if (!path || !*path) GTEST_SKIP() << "GEMMA4_MODEL_PATH not set";
+    register_builtin_models();
+    Model model;
+    model.load_metadata(path);
+    const ModelMetadata& meta = model.get_metadata();
+    ASSERT_EQ(meta.tokenizer_type, "gemma4");
+    Tokenizer t(&meta, gemma4_tokenizer_config());
+
+    std::ifstream f(QINF_TEST_FIXTURES_DIR "/tokenizer/gemma4_llamacpp.txt");
+    ASSERT_TRUE(f) << "fixture gemma4_llamacpp.txt expected readable";
+    std::string line, text;
+    int checked = 0;
+    while (std::getline(f, line)) {
+        if (line.rfind("text ", 0) == 0) {
+            text.clear();
+            for (size_t i = 5; i < line.size(); ++i) {
+                if (line[i] == '\\' && i + 1 < line.size()) {
+                    text += line[i + 1] == 'n' ? '\n' : line[i + 1];
+                    ++i;
+                } else {
+                    text += line[i];
+                }
+            }
+        } else if (line.rfind("tokens ", 0) == 0) {
+            std::istringstream ss(line.substr(7));
+            size_t n; ss >> n;
+            std::vector<int32_t> want(n);
+            for (auto& id : want) ss >> id;
+            EXPECT_EQ(t.encode(text), want) << "text: " << text;
+            ++checked;
+        }
+    }
+    EXPECT_EQ(checked, 8);
 }

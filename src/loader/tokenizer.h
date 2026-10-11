@@ -101,6 +101,10 @@ private:
     bool                    is_llama_tokenizer_ = false;
     std::vector<int32_t>    byte_fallback_ids_;     // 256 entries when llama
     std::vector<float>      scores_;                // alias of metadata_->scores
+    // tokenizer.ggml.model "gemma4" only: merge priority by RANK in the GGUF's
+    // merges list ("left right" → index), not by score — every Gemma 4 score is
+    // the same -1000, so a score order is no order at all (2026-10-07).
+    std::unordered_map<std::string, int32_t> bpe_ranks_;
     void initialize_llama_byte_fallback();
     std::vector<int32_t>    encode_llama(const std::string& text) const;
     std::string             decode_llama(int32_t token_id) const;

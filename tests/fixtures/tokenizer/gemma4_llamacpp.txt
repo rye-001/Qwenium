@@ -1,0 +1,18 @@
+# Gemma 4 tokenizer reference from llama.cpp f498f864f (llama-tokenize --no-bos --ids, specials parsed)
+# model: gemma-4-12B-it-Q8_0.gguf; 'text' lines escape \n and \\
+text task: search result | query: Which planet is known as the Red Planet?
+tokens 16 8071 236787 3927 1354 1109 7609 236787 15311 13401 563 3224 618 506 4855 38342 236881
+text Hello, world! How are you today?
+tokens 9 9259 236764 1902 236888 2088 659 611 3124 236881
+text <|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n
+tokens 15 105 2364 107 3689 563 506 5279 529 7001 236881 106 107 105 4368 107
+text line one\n\nline two\n\n\nline three\n
+tokens 9 1257 886 108 1257 1156 109 1257 1806 107
+text def add(a, b):\n    return a + b  # adds two numbers\n
+tokens 19 2063 1138 236769 236746 236764 518 1473 107 140 2060 496 900 518 138 236865 13586 1156 4945 107
+text Café naïve — 東京 to Zürich costs €42.50 (approx.) 🚀
+tokens 19 160319 236859 120362 2192 86459 531 116315 5384 11361 236812 236778 236761 236810 236771 568 17868 2907 236743 242015
+text    leading spaces and trailing   
+tokens 6 139 26016 9952 532 45330 139
+text The quick brown fox jumps over the lazy dog. 1234567890
+tokens 21 818 3823 8864 37423 38167 1024 506 31770 4799 236761 236743 236770 236778 236800 236812 236810 236825 236832 236828 236819 236771
