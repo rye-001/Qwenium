@@ -1830,7 +1830,8 @@ int main(int argc, char* argv[]) {
                       << "  --embed                   Serve an embedding model "
                          "(e.g. EmbeddingGemma-2): POST /v1/embeddings (OpenAI shape, "
                          "float or base64), GET /health, GET /v1/models only. --ctx "
-                         "bounds one text in tokens; --flash-attn applies; "
+                         "bounds one input in tokens; --flash-attn applies; "
+                         "--mmproj (a gemma4v image tower) adds image_url items; "
                          "generation flags are refused\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
@@ -1860,7 +1861,6 @@ int main(int argc, char* argv[]) {
     if (embed) {
         struct Conflict { bool set; const char* flag; };
         const Conflict conflicts[] = {
-            {!mmproj_path.empty(),            "--mmproj"},
             {!image_embed_cache_dir.empty(),  "--image-embed-cache"},
             {!image_prefix_cache_dir.empty(), "--image-prefix-cache"},
             {!prefix_cache_dir.empty(),       "--prefix-cache"},
@@ -1886,8 +1886,10 @@ int main(int argc, char* argv[]) {
 
     if (embed) {
         try {
+            // --mmproj with --embed loads an embedding model's image tower
+            // (gemma4v): /v1/embeddings then also takes image_url items.
             qinf::server::EmbeddingService service(model_path, static_cast<uint32_t>(max_ctx),
-                                                   flash_attn);
+                                                   flash_attn, mmproj_path);
             httplib::Server http;
             setup_embedding_routes(http, service);
             std::thread shutdown_thread([&http]() {
@@ -1900,7 +1902,9 @@ int main(int argc, char* argv[]) {
             });
             std::cout << "Embedding server (" << service.model_id() << ", dim "
                       << service.dim() << ", up to " << service.max_tokens()
-                      << " tokens per text) on http://0.0.0.0:" << port << std::endl;
+                      << " tokens per input"
+                      << (service.serves_images() ? ", images: yes (image_url items)" : ", text only")
+                      << ") on http://0.0.0.0:" << port << std::endl;
             std::cout << "Endpoints:\n  GET  /health\n  POST /v1/embeddings\n  GET  /v1/models"
                       << std::endl;
             http.listen("0.0.0.0", port);

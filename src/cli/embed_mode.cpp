@@ -4,6 +4,11 @@
 #include "engine/model.h"
 #include "../loader/tokenizer.h"
 #include "../models/model_registry.h"
+#include "../models/i_image_embeddable.h"
+#include "image/image_loader.h"
+#include "vision/vision_loader.h"
+#include "vision/vision_model.h"
+#include "vision/vision_profile.h"
 
 #include <cstdio>
 #include <fstream>
@@ -16,8 +21,6 @@ std::string embed_mode_refusal(const CliArgs& args)
     struct Conflict { bool set; const char* flag; };
     const Conflict conflicts[] = {
         {args.chat_mode,                       "--chat"},
-        {!args.image_path.empty(),             "--image"},
-        {!args.mmproj_path.empty(),            "--mmproj"},
         {!args.grammar_file.empty(),           "--grammar-file"},
         {args.speculative,                     "--speculative"},
         {!args.save_session_path.empty(),      "--save-session"},
@@ -32,13 +35,23 @@ std::string embed_mode_refusal(const CliArgs& args)
     for (const Conflict& c : conflicts)
         if (c.set)
             return std::string("--embed: expected no ") + c.flag +
-                   " (an embedding has no chat, decode, cache or image path), actual: " +
+                   " (an embedding has no chat, decode or cache path), actual: " +
                    c.flag + " given";
+    // An image is embedded with the embedding model's own image tower
+    // (docs/plan-embed-image.md G6): --image and --mmproj come together.
+    const bool has_image  = !args.image_path.empty();
+    const bool has_mmproj = !args.mmproj_path.empty();
+    if (has_image != has_mmproj)
+        return has_image
+            ? std::string("--embed --image: expected --mmproj (the embedding model's image tower), actual: none")
+            : std::string("--embed --mmproj: expected --image PATH (the image to embed), actual: none");
     const bool has_prompt = !args.prompt.empty();
     const bool has_file   = !args.embed_in_path.empty();
-    if (has_prompt == has_file)
-        return std::string("--embed: expected exactly one input, -p TEXT or --embed-in FILE, actual: ") +
-               (has_prompt ? "both" : "neither");
+    const int n_inputs = (has_prompt ? 1 : 0) + (has_file ? 1 : 0) + (has_image ? 1 : 0);
+    if (n_inputs != 1)
+        return std::string("--embed: expected exactly one input, -p TEXT, --embed-in FILE or "
+                           "--image PATH, actual: ") +
+               (n_inputs == 0 ? "none" : std::to_string(n_inputs));
     return "";
 }
 
@@ -82,7 +95,9 @@ int run_embed(Model& model, const CliArgs& args)
 {
     std::vector<std::string> texts;
     try {
-        if (!args.prompt.empty()) {
+        if (!args.image_path.empty()) {
+            // one image: no texts
+        } else if (!args.prompt.empty()) {
             texts.push_back(args.prompt);
         } else {
             std::ifstream f(args.embed_in_path);
@@ -130,6 +145,41 @@ int run_embed(Model& model, const CliArgs& args)
     std::ostream& out = file_out.is_open() ? static_cast<std::ostream&>(file_out) : std::cout;
 
     const TokenizerConfig cfg = lookup_tokenizer_config(meta.architecture);
+    if (!args.image_path.empty()) {
+        // The embedding model's image tower: refused unless it is gemma4v and
+        // the recipe hosts images. Output: one record, index 0, n_tokens = the
+        // framed sequence ([BOS] <|image> soft×n <image|> [EOS]).
+        if (!dynamic_cast<IImageEmbeddable*>(fp.get())) {
+            std::cerr << "--embed --image: architecture '" << meta.architecture
+                      << "' expected an embedding model that hosts images, actual: text only\n";
+            return 1;
+        }
+        qinf::vision::VisionModel vmodel;
+        qinf::vision::VisionLoader vloader;
+        vloader.parse_metadata(args.mmproj_path, vmodel);
+        if (vmodel.config().projector_type != qinf::vision::VisionProjectorType::Gemma4V) {
+            std::cerr << "--mmproj: '" << args.mmproj_path
+                      << "' expected a gemma4v projector (an embedding model's image tower), actual: "
+                      << qinf::vision::to_string(vmodel.config().projector_type) << "\n";
+            return 1;
+        }
+        ggml_backend_t backend = model.get_backend_metal() ? model.get_backend_metal()
+                                                           : model.get_backend_cpu();
+        vloader.load_tensors(vmodel, backend);
+        qinf::vision::VisionProfile prof = qinf::vision::make_vision_profile(
+            vmodel, backend, meta.id_to_token, "--embed: parameter '--mmproj'");
+        const auto bmp = qinf::image::load_image_to_bitmap(args.image_path, prof.preprocess);
+        const uint32_t n = prof.encoder->mm_tokens_for(bmp);
+        qinf::engine::embed::EmbedInput in = qinf::engine::embed::image_input(
+            cfg, meta, prof.boi_id, prof.soft_id, prof.eoi_id, prof.encoder->encode(bmp), n);
+        const size_t n_tokens = in.tokens.size();
+        const std::vector<float> v =
+            qinf::engine::embed::run(*fp, model.get_scheduler(), std::move(in), meta.architecture);
+        out << format_embedding_line(0, n_tokens, v) << "\n";
+        if (args.verbose)
+            std::cerr << "[embed] image '" << args.image_path << "': " << n << " soft tokens, "
+                      << n_tokens << " framed\n";
+    }
     for (size_t i = 0; i < texts.size(); ++i) {
         const std::vector<int32_t> tokens = qinf::engine::embed::frame(
             cfg, meta, model.get_tokenizer()->encode(texts[i]));

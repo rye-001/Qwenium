@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
@@ -124,16 +125,18 @@ void VisionLoader::parse_metadata(const std::string& path,
             proj_type = meta.raw_kv.get_string_opt("clip.projector_type");
         if (!proj_type.has_value()) {
             throw_slot("clip(.vision).projector_type",
-                       "'gemma3', 'gemma4uv' or 'qwen3vl_merger'", "absent");
+                       "'gemma3', 'gemma4uv', 'gemma4v' or 'qwen3vl_merger'", "absent");
         } else if (*proj_type == "gemma3") {
             cfg.projector_type = qinf::vision::VisionProjectorType::Gemma3Siglip;
         } else if (*proj_type == "gemma4uv") {
             cfg.projector_type = qinf::vision::VisionProjectorType::Gemma4Uv;
         } else if (*proj_type == "qwen3vl_merger") {
             cfg.projector_type = qinf::vision::VisionProjectorType::Qwen3VlMerger;
+        } else if (*proj_type == "gemma4v") {
+            cfg.projector_type = qinf::vision::VisionProjectorType::Gemma4V;
         } else {
             throw_slot("clip.projector_type",
-                       "'gemma3', 'gemma4uv' or 'qwen3vl_merger'",
+                       "'gemma3', 'gemma4uv', 'gemma4v' or 'qwen3vl_merger'",
                        "'" + *proj_type + "'");
         }
     }
@@ -246,6 +249,76 @@ void VisionLoader::parse_metadata(const std::string& path,
                        "present in mmproj inventory", "absent");
         }
         // mm.a.* audio tensors are intentionally ignored (out of scope).
+        break;
+    }
+    case qinf::vision::VisionProjectorType::Gemma4V: {
+        // Values asserted against models/embeddinggemma-2-mmproj-BF16.gguf
+        // (963 tensors: 208 v.blk + 4 vision/projection + 751 audio), read
+        // 2026-10-16. Port reference: llama.cpp ceefd16da gemma4v.cpp.
+        cfg.num_channels      = 3;
+        cfg.image_size        = meta.raw_kv.get_uint32("clip.vision.image_size");        // 224 (informational; dyn size)
+        cfg.patch_size        = meta.raw_kv.get_uint32("clip.vision.patch_size");        // 16
+        cfg.hidden_size       = meta.raw_kv.get_uint32("clip.vision.embedding_length");  // 768
+        cfg.num_layers        = meta.raw_kv.get_uint32("clip.vision.block_count");       // 16
+        cfg.num_attn_heads    = meta.raw_kv.get_uint32("clip.vision.attention.head_count");  // 12
+        cfg.intermediate_size = meta.raw_kv.get_uint32("clip.vision.feed_forward_length");   // 3072
+        cfg.layer_norm_eps    = meta.raw_kv.get_float ("clip.vision.attention.layer_norm_epsilon");  // 1e-6
+        cfg.projection_dim    = meta.raw_kv.get_uint32("clip.vision.projection_dim");    // 512
+        // Pooling kernel (Gemma4VisionPooler): upstream reads the same optional
+        // key with default 3; config.json pooling_kernel_size = 3.
+        cfg.n_merge           = meta.raw_kv.get_uint32_opt("clip.vision.projector.scale_factor").value_or(3);
+        cfg.pool_factor       = cfg.n_merge;
+        cfg.mm_tokens_per_image = 0;   // per image (70…280 at the card's budget)
+        // Activation: tanh GELU — the model's config.json says
+        // gelu_pytorch_tanh (user decision 2026-10-16, plan-embed-image §7).
+        // llama.cpp falls back to GELU-quick because its converter never writes
+        // clip.use_gelu; we follow the model, not that fallback. Measured cost of
+        // the difference: pooled vectors at cosine >= 0.9998, same retrieval. A
+        // SiLU tower is not this projector.
+        if (meta.raw_kv.get_bool_opt("clip.use_silu").value_or(false))
+            throw_slot("clip.use_silu", "false/absent for gemma4v (gated GELU)", "true");
+        cfg.ffn_act = qinf::vision::VisionFfnAct::GeluTanh;
+
+        // Standardize and clipped linears (config.json standardize /
+        // use_clipped_linears, both false here) are NOT implemented: refuse a
+        // file that carries their tensors rather than silently skip them.
+        for (const auto& [name, t] : meta.tensor_inventory) {
+            (void)t;
+            const bool vision = name.rfind("v.", 0) == 0 || name.rfind("mm.input_projection", 0) == 0;
+            if (!vision) continue;
+            for (const char* suffix : {".input_max", ".input_min", ".output_max", ".output_min"})
+                if (name.size() > std::strlen(suffix) &&
+                    name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0)
+                    throw_slot("tensor:" + name, "absent (clipped linears unimplemented for gemma4v)", "present");
+            if (name == "v.std_bias" || name == "v.std_scale" ||
+                name == "v.std_bias.weight" || name == "v.std_scale.weight")
+                throw_slot("tensor:" + name, "absent (standardize unimplemented for gemma4v)", "present");
+        }
+
+        require_tensor_shape_2d(meta, "mm.input_projection.weight",
+                                cfg.hidden_size, cfg.projection_dim);            // [768, 512]
+        for (const char* t : {"v.patch_embd.weight", "v.position_embd.weight"})   // rank 4 / rank 3
+            if (meta.tensor_inventory.find(t) == meta.tensor_inventory.end())
+                throw_slot(std::string("tensor:") + t, "present in mmproj inventory", "absent");
+        if (cfg.num_attn_heads == 0 || cfg.hidden_size % cfg.num_attn_heads != 0)
+            throw_slot("clip.vision.attention.head_count",
+                       "a divisor of embedding_length " + std::to_string(cfg.hidden_size),
+                       std::to_string(cfg.num_attn_heads));
+        const uint32_t d_head = cfg.hidden_size / cfg.num_attn_heads;          // 64
+        for (uint32_t il = 0; il < cfg.num_layers; ++il) {
+            const std::string b = "v.blk." + std::to_string(il) + ".";
+            for (const char* w : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out.weight"})
+                require_tensor_shape_2d(meta, b + w, cfg.hidden_size, cfg.hidden_size);
+            require_tensor_shape_1d(meta, b + "attn_q_norm.weight", d_head);
+            require_tensor_shape_1d(meta, b + "attn_k_norm.weight", d_head);
+            for (const char* w : {"ln1.weight", "ln2.weight", "attn_post_norm.weight", "ffn_post_norm.weight"})
+                require_tensor_shape_1d(meta, b + w, cfg.hidden_size);
+            require_tensor_shape_2d(meta, b + "ffn_gate.weight", cfg.hidden_size, cfg.intermediate_size);
+            require_tensor_shape_2d(meta, b + "ffn_up.weight",   cfg.hidden_size, cfg.intermediate_size);
+            require_tensor_shape_2d(meta, b + "ffn_down.weight", cfg.intermediate_size, cfg.hidden_size);
+        }
+        // a.* / mm.a.* (the audio conformer) are out of scope and are NOT
+        // loaded (load_tensors filters them for this projector).
         break;
     }
     case qinf::vision::VisionProjectorType::Qwen3VlMerger: {
@@ -410,7 +483,25 @@ void VisionLoader::load_tensors(VisionModel& model, ggml_backend_t backend) {
     // Build ggml_tensor metadata for every inventory entry. This populates
     // the (name → tensor*) map but does NOT allocate storage yet.
     std::unordered_map<std::string, ggml_tensor*> tensors;
-    gguf_->load_tensor_metadata(ctx, tensors);
+    if (model.config().projector_type == qinf::vision::VisionProjectorType::Gemma4V) {
+        // Vision part only (plan-embed-image G2): v.* and the image
+        // projection. The audio conformer in the same file (a.*, mm.a.*) is
+        // never created, so it costs neither metadata nor device memory.
+        for (const auto& [name, tm] : meta.tensor_inventory) {
+            const bool vision = name.rfind("v.", 0) == 0 || name.rfind("mm.input_projection", 0) == 0;
+            if (!vision) continue;
+            std::vector<int64_t> shape(tm.shape.begin(), tm.shape.end());
+            ggml_tensor* t = ggml_new_tensor(ctx, tm.type, static_cast<int>(shape.size()), shape.data());
+            if (t == nullptr) {
+                ggml_free(ctx);
+                throw_slot("ggml_new_tensor(" + name + ")", "non-null", "nullptr");
+            }
+            ggml_set_name(t, name.c_str());
+            tensors[name] = t;
+        }
+    } else {
+        gguf_->load_tensor_metadata(ctx, tensors);
+    }
 
     // Allocate the backend buffer to hold all of those tensors.
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);

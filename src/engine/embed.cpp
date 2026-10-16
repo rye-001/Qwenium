@@ -99,4 +99,45 @@ std::vector<float> run(ForwardPassBase& fp, ggml_backend_sched_t sched,
     return pool_and_normalize(per_token, dim, n, emb->pooling());
 }
 
+EmbedInput image_input(const TokenizerConfig& cfg, const ModelMetadata& meta,
+                       int32_t boi_id, int32_t soft_id, int32_t eoi_id,
+                       std::vector<float> embd, uint32_t n_tokens)
+{
+    if (boi_id < 0 || soft_id < 0 || eoi_id < 0)
+        throw std::runtime_error(
+            "embed::image_input: 'boi_id, soft_id, eoi_id': expected all >= 0, got: " +
+            std::to_string(boi_id) + ", " + std::to_string(soft_id) + ", " + std::to_string(eoi_id));
+    if (n_tokens == 0)
+        throw std::runtime_error("embed::image_input: 'n_tokens': expected > 0, got: 0");
+    std::vector<int32_t> inner;
+    inner.reserve(n_tokens + 2);
+    inner.push_back(boi_id);
+    inner.insert(inner.end(), n_tokens, soft_id);
+    inner.push_back(eoi_id);
+    EmbedInput in;
+    in.tokens = frame(cfg, meta, std::move(inner));
+    const int32_t lead = cfg.add_bos_token ? 1 : 0;
+    in.images.push_back(EmbedImageSpan{lead + 1, n_tokens, std::move(embd)});
+    return in;
+}
+
+std::vector<float> run(ForwardPassBase& fp, ggml_backend_sched_t sched,
+                       EmbedInput input, const std::string& architecture)
+{
+    if (input.images.empty())
+        return run(fp, sched, input.tokens, architecture);
+    if (input.images.size() > 1)
+        throw std::runtime_error(
+            "embed::run: 'images': expected at most 1 per input (Seam B arms one span per "
+            "build), got: " + std::to_string(input.images.size()));
+    auto* img = dynamic_cast<IImageEmbeddable*>(&fp);
+    if (!img)
+        throw std::runtime_error(
+            "embed::run: architecture '" + architecture +
+            "' IImageEmbeddable: expected implemented (an image was given), got: not implemented");
+    EmbedImageSpan& span = input.images.front();
+    img->set_image_embeddings(std::move(span.embd), span.span_start, span.n_tokens);
+    return run(fp, sched, input.tokens, architecture);
+}
+
 }  // namespace qinf::engine::embed

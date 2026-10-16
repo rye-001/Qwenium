@@ -33,6 +33,10 @@
 #include "loader/tokenizer.h"
 #include "models/model_registry.h"
 #include "models/gemma_embedding2.h"
+#include "image/image_loader.h"
+#include "vision/vision_loader.h"
+#include "vision/vision_model.h"
+#include "vision/vision_profile.h"
 
 using qinf::engine::embed::frame;
 using qinf::engine::embed::pool_and_normalize;
@@ -120,6 +124,31 @@ TEST(EmbedFrame, RefusesAFramingTokenTheFileLacks) {
     TokenizerConfig cfg;
     cfg.add_eos_token = true;
     EXPECT_THROW(frame(cfg, meta, {10}), std::runtime_error);
+}
+
+// ── Pure: one image's framing (docs/plan-embed-image.md G4) ──────────────────
+
+TEST(EmbedImageInput, FramesTheSpanBetweenTheMarkers) {
+    ModelMetadata meta;
+    meta.bos_token_id = 2;
+    meta.eos_token_id = 1;
+    const auto in = qinf::engine::embed::image_input(gemma_embedding2_tokenizer_config(), meta,
+                                                     255999, 258880, 258882,
+                                                     std::vector<float>(3 * 4, 0.5f), 3);
+    EXPECT_EQ(in.tokens, (std::vector<int32_t>{2, 255999, 258880, 258880, 258880, 258882, 1}));
+    ASSERT_EQ(in.images.size(), 1u);
+    EXPECT_EQ(in.images[0].span_start, 2);   // after [BOS] <|image>
+    EXPECT_EQ(in.images[0].n_tokens, 3u);
+    EXPECT_EQ(in.images[0].embd.size(), 12u);
+}
+
+TEST(EmbedImageInput, RefusesAMissingMarkerOrAnEmptySpan) {
+    ModelMetadata meta;
+    meta.bos_token_id = 2;
+    meta.eos_token_id = 1;
+    const auto cfg = gemma_embedding2_tokenizer_config();
+    EXPECT_THROW(qinf::engine::embed::image_input(cfg, meta, -1, 5, 6, {1.0f}, 1), std::runtime_error);
+    EXPECT_THROW(qinf::engine::embed::image_input(cfg, meta, 4, 5, 6, {}, 0), std::runtime_error);
 }
 
 // ── Model gate: EmbeddingGemma-2 against llama.cpp ───────────────────────────
@@ -268,3 +297,130 @@ TEST(EmbedRun, RefusesARecipeWithoutIEmbeddingOutput) {
                                           model.get_metadata().architecture),
                  std::runtime_error);
 }
+
+// ── Image gate: EmbeddingGemma-2 + its gemma4v tower against llama.cpp ───────
+//
+// docs/plan-embed-image.md phase 4. Seven synthetic images (tests/fixtures/
+// embed_image): preprocess (phase 2, byte-identical), encode (phase 3, tanh
+// GELU — the user's default), splice through Seam B, pool. Reference: the pooled
+// vectors llama-server returned for the same images with tanh GELU
+// (reference_t280_gelu.txt; the scratch mmproj with clip.use_gelu = true).
+// Bar: cosine >= 0.9999 per image, the text gate's bar. Needs
+// EMBEDDINGGEMMA2_MODEL_PATH and the mmproj (EMBEDDINGGEMMA2_MMPROJ_PATH or the
+// models/ default).
+
+namespace {
+
+struct RefImage {
+    std::string name;
+    size_t n_tokens = 0;
+    std::vector<float> embedding;
+};
+
+std::vector<RefImage> load_image_reference() {
+    const std::string path = QINF_TEST_FIXTURES_DIR "/embed_image/reference_t280_gelu.txt";
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("image reference not found: " + path);
+    std::vector<RefImage> out;
+    std::string line;
+    bool in_image = false;
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string tag;
+        is >> tag;
+        if (tag == "image") { out.emplace_back(); is >> out.back().name; in_image = true; }
+        else if (tag == "caption") in_image = false;
+        else if (in_image && tag == "tokens") is >> out.back().n_tokens;
+        else if (in_image && tag == "embedding") {
+            size_t n = 0;
+            is >> n;
+            out.back().embedding.resize(n);
+            for (float& x : out.back().embedding) is >> x;
+        }
+    }
+    return out;
+}
+
+class EmbeddingGemma2ImageTest : public EmbeddingGemma2Test {
+protected:
+    void SetUp() override {
+        EmbeddingGemma2Test::SetUp();
+        if (IsSkipped()) return;
+        const char* e = std::getenv("EMBEDDINGGEMMA2_MMPROJ_PATH");
+        const std::string mm = (e && *e) ? e : "models/embeddinggemma-2-mmproj-BF16.gguf";
+        if (!std::ifstream(mm).good()) GTEST_SKIP() << "mmproj not found at " << mm;
+        backend_ = model_->get_backend_metal() ? model_->get_backend_metal() : model_->get_backend_cpu();
+        loader_.parse_metadata(mm, vmodel_);
+        loader_.load_tensors(vmodel_, backend_);
+        profile_ = qinf::vision::make_vision_profile(vmodel_, backend_, model_->get_metadata().id_to_token,
+                                                     "embed-tests: parameter 'mmproj'");
+    }
+    void TearDown() override {
+        profile_ = {};
+        EmbeddingGemma2Test::TearDown();
+    }
+
+    qinf::engine::embed::EmbedInput image_of(const std::string& name) {
+        const auto bmp = qinf::image::load_image_to_bitmap(
+            QINF_TEST_FIXTURES_DIR "/embed_image/" + name + ".png", profile_.preprocess);
+        const uint32_t n = profile_.encoder->mm_tokens_for(bmp);
+        const ModelMetadata& meta = model_->get_metadata();
+        return qinf::engine::embed::image_input(lookup_tokenizer_config(meta.architecture), meta,
+                                                profile_.boi_id, profile_.soft_id, profile_.eoi_id,
+                                                profile_.encoder->encode(bmp), n);
+    }
+    std::vector<float> embed_input(qinf::engine::embed::EmbedInput in) {
+        return qinf::engine::embed::run(*fp_, model_->get_scheduler(), std::move(in),
+                                        model_->get_metadata().architecture);
+    }
+
+    ggml_backend_t backend_ = nullptr;
+    qinf::vision::VisionModel vmodel_;
+    qinf::vision::VisionLoader loader_;
+    qinf::vision::VisionProfile profile_;
+};
+
+}  // namespace
+
+TEST_F(EmbeddingGemma2ImageTest, ProfileIsGemma4vWithTanhGelu) {
+    EXPECT_EQ(profile_.projector_tag, "gemma4v");
+    EXPECT_EQ(profile_.boi_id, 255999);
+    EXPECT_EQ(profile_.eoi_id, 258882);
+    EXPECT_EQ(vmodel_.config().ffn_act, qinf::vision::VisionFfnAct::GeluTanh);
+}
+
+TEST_F(EmbeddingGemma2ImageTest, ImageEmbeddingsMatchLlamaCpp) {
+    double worst = 1.0;
+    for (const RefImage& r : load_image_reference()) {
+        auto in = image_of(r.name);
+        EXPECT_EQ(in.tokens.size(), r.n_tokens) << r.name << ": framed token count";
+        const auto got = embed_input(std::move(in));
+        ASSERT_EQ(got.size(), r.embedding.size());
+        const double c = cosine(got, r.embedding);
+        worst = std::min(worst, c);
+        std::printf("[ gate ] %-24s %4zu tokens  cosine %.7f\n", r.name.c_str(), r.n_tokens, c);
+        EXPECT_GE(c, kMinCosine) << r.name;
+        EXPECT_NEAR(norm2(got), 1.0, 1e-5);
+    }
+    std::printf("[ gate ] images: worst cosine vs llama.cpp = %.7f\n", worst);
+}
+
+// An armed image is consumed by its own pass: the text embedding after an image
+// is bit-identical to the same text embedded with no image before it, and the
+// same image twice gives the same bits.
+TEST_F(EmbeddingGemma2ImageTest, ImagesDoNotLeakAndRepeatBitwise) {
+    const auto ref = load_reference();
+    const auto text_before = embed(ref[0].tokens);
+    const auto a = embed_input(image_of("page_850x1100"));
+    const auto text_after = embed(ref[0].tokens);
+    const auto b = embed_input(image_of("page_850x1100"));
+    EXPECT_EQ(text_before, text_after);
+    EXPECT_EQ(a, b);
+}
+
+TEST_F(EmbeddingGemma2ImageTest, RefusesTwoImagesInOneInput) {
+    auto in = image_of("red_circle_224");
+    in.images.push_back(in.images.front());
+    EXPECT_THROW(embed_input(in), std::runtime_error);
+}
+

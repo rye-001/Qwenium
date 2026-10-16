@@ -12,6 +12,8 @@
 //   frame              — [BOS] ids [EOS], as the ARCHITECTURE's TokenizerConfig says
 //   pool_and_normalize — pure: per-token vectors → one unit vector (no model)
 //   run                — build → alloc → inputs → compute → read → pool
+//   image_input        — one image as an EmbedInput: [BOS] <boi> soft×n <eoi> [EOS]
+//   run(EmbedInput)    — the same pass with image soft tokens armed (Seam B)
 //
 // This is where a client gets an embedding (architecture.md §6): the lens
 // server, and the CLI's --embed (S2). Retrieval, ranking and indexes are the
@@ -28,6 +30,7 @@
 #include "../loader/tokenizer_config.h"
 #include "../models/forward_pass_base.h"
 #include "../models/i_embedding_output.h"
+#include "../models/i_image_embeddable.h"
 
 namespace qinf::engine::embed {
 
@@ -54,5 +57,36 @@ std::vector<float> pool_and_normalize(const std::vector<float>& per_token,
 std::vector<float> run(ForwardPassBase& fp, ggml_backend_sched_t sched,
                        const std::vector<int32_t>& tokens,
                        const std::string& architecture);
+
+// Image soft tokens placed in a framed sequence (docs/plan-embed-image.md G4):
+// `embd` is [hidden_dim × n_tokens] from an IVisionEncoder (the encoder's
+// projection_dim equals the text model's width); it replaces the token
+// embeddings at [span_start, span_start + n_tokens) of EmbedInput::tokens.
+struct EmbedImageSpan {
+    int32_t            span_start = -1;
+    uint32_t           n_tokens   = 0;
+    std::vector<float> embd;
+};
+
+// An already-framed sequence plus its image spans. At most ONE image per input
+// today (Seam B arms one span per build); more is refused fail-loud.
+struct EmbedInput {
+    std::vector<int32_t>        tokens;
+    std::vector<EmbedImageSpan> images;
+};
+
+// One image as the model reads it (llama.cpp mtmd framing, model card: no
+// prefix on images): frame(<boi>, soft × n, <eoi>), i.e. [BOS] <|image>
+// <|image|>×n <image|> [EOS] for EmbeddingGemma-2. The soft ids are
+// placeholders the splice overwrites. Marker ids come from the vision profile.
+EmbedInput image_input(const TokenizerConfig& cfg, const ModelMetadata& meta,
+                       int32_t boi_id, int32_t soft_id, int32_t eoi_id,
+                       std::vector<float> embd, uint32_t n_tokens);
+
+// The pass with images: arms each span on the recipe's IImageEmbeddable (fail-
+// loud, naming the architecture, when it has none), then exactly run(tokens).
+// No images ⇒ identical to run(fp, sched, input.tokens, architecture).
+std::vector<float> run(ForwardPassBase& fp, ggml_backend_sched_t sched,
+                       EmbedInput input, const std::string& architecture);
 
 }  // namespace qinf::engine::embed

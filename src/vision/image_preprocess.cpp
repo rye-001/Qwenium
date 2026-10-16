@@ -22,6 +22,18 @@ ImagePreprocess gemma4uv_preprocess(int align, int min_tokens, int max_tokens) {
     return pp;
 }
 
+ImagePreprocess gemma4v_preprocess(int align, int min_tokens, int max_tokens) {
+    ImagePreprocess pp;
+    pp.sizing     = ImagePreprocess::Sizing::DynSmartResize;
+    pp.resample   = ImagePreprocess::Resample::PillowBicubic;
+    pp.align      = align;
+    pp.min_tokens = min_tokens;
+    pp.max_tokens = max_tokens;
+    pp.mean[0]   = pp.mean[1]   = pp.mean[2]   = 0.0f;   // clip.vision.image_mean
+    pp.stddev[0] = pp.stddev[1] = pp.stddev[2] = 1.0f;   // clip.vision.image_std
+    return pp;
+}
+
 ImagePreprocess qwen3vl_preprocess(int align, int min_tokens, int max_tokens) {
     ImagePreprocess pp;
     pp.sizing     = ImagePreprocess::Sizing::DynSmartResize;

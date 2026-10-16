@@ -232,13 +232,13 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | Directory | Concept | Key files |
 |---|---|---|
 | `src/layers/` | Layer modules — graph-building ML primitives | `attention` (GQA, QK-norm, RoPE/p-RoPE, softcap, sliding-window mask), `ffn` (SwiGLU/GEGLU), `moe` (top-k routing, 3× `mul_mat_id`, shared expert), `deltanet` (gated delta rule), `norm` (RMSNorm + Gemma `(1+w)` variant), `ple` (per-layer embeddings: the once-per-pass per-layer inputs and the post-FFN gated injection — the real Gemma 4-family flow, first hosted by `gemma_embedding2`; rewritten 2026-10-07, the earlier block-entry `build_ple` matched no real model), `transformer_block` (standard block assembly) |
-| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`, and the encoder `gemma_embedding2`), `i_embedding_output` (the embedding capability: build per-token vectors, report the pooling — §6), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (the recipe interface plus the graph scaffolding recipes share: embed, output head, the Seam B image splice, decode masks — each of which builds nodes *and* declares the typed input they consume; per-step arming lives here too. Context and run-time policy were extracted out to `graph_arena` / `decode_policy`), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
+| `src/models/` | Recipes + registry | one file per family (`qwen3`, `qwen35`, `qwen36`, `gemma1`–`gemma4`, and the encoder `gemma_embedding2`), `i_embedding_output` (the embedding capability: build per-token vectors, report the pooling — §6), `model_registry` (GGUF arch string → factory + tensor-inventory validator), `forward_pass_base` (the recipe interface plus the graph scaffolding recipes share: embed, output head, the Seam B image splice, decode masks — each of which builds nodes *and* declares the typed input they consume; per-step arming lives here too. Context and run-time policy were extracted out to `graph_arena` / `decode_policy`), `i_image_embeddable` (Seam B, §7 — implemented by `gemma3`, `gemma4`, `qwen36`, `qwen35`, and the encoder `gemma_embedding2`), `graph_arena` (the per-pass ggml context + metadata buffer, held not inherited), `decode_policy` (the pass's run-time policy as one value; its defaults are the byte-reproducible path), `qwen35_family` (what the two Qwen 3.5-family hybrids share: typed-input declarations and the layer body, with the FFN as a parameter), `i_mtp_draftable` (MTP/NextN draft capability — qwen36 only; see §5; qwen35 binds NextN weights when the GGUF carries a head, e.g. Qwen 3.8, but does not yet draft from it) |
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `bidirectional_mask` (an encoder's: open, or a band |q − k| ≤ radius), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD) + `suffix_decoding` (SuffixDecoding: session-scoped, adaptive-length lookup, §5), `sampling_snapshot` |
 | `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the three fail-loud gates: tensor **type** — is every ggml type id one this build knows, checked at parse because `ggml_type_size`'s own bounds check is a plain `assert` that Release removes; **architecture** — is `general.architecture` in the registry allow-list; **inventory** — does the file carry every tensor the recipe needs, correctly shaped), `tokenizer` (a `gemma4` vocabulary merges by **rank** in its merges list, as llama.cpp does — every Gemma 4 score is -1000; until 2026-10-07 it merged by score and mis-split common words, " result" → " re"+"su"+"lt"), `chat_template` (per-family prompt rendering), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
-| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `worst_case_reserve` (size the scheduler once for the deepest decode batch and the largest prefill — one copy for every server), `embed` (one text embedding: frame BOS/EOS, run an `IEmbeddingOutput` recipe, pool, L2-normalise — §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
-| `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes), `vision_loader` (3 projectors: `gemma3`, `gemma4uv`, `qwen3vl_merger`), `vision_model`, `bitmap` |
+| `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `worst_case_reserve` (size the scheduler once for the deepest decode batch and the largest prefill — one copy for every server), `embed` (one embedding: frame BOS/EOS, run an `IEmbeddingOutput` recipe, pool, L2-normalise; an `EmbedInput` can carry one image span armed through Seam B — §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
+| `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `gemma4v_encoder` (EmbeddingGemma-2's ViT: Gemma blocks, 2-D learned positions + 2-D RoPE, 3×3 pool), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes; a `resample` parameter: align-corners bilinear by default, Pillow bicubic for gemma4v), `vision_loader` (4 projectors: `gemma3`, `gemma4uv`, `gemma4v` — vision tensors only, its audio tower is never loaded — and `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
 | `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
@@ -691,17 +691,51 @@ mask memory is 2·n² and not 24·n²), `layers/attention`'s cache-free
 name. The engine stops at the vector: indexes, chunking and ranking are the
 client's.
 
+**Image embeddings (2026-10-16, `docs/plan-embed-image.md`).** The same
+recipe embeds an image. `engine/embed::image_input` frames it the way
+llama.cpp mtmd does: `[BOS] <|image> <|image|>×n <image|> [EOS]`, with no
+prefix (the model card: prefixes apply to text only).
+`run(fp, sched, EmbedInput)` arms the encoder's soft tokens on the recipe's
+`IImageEmbeddable` and then runs the ordinary pass.
+
+- **The splice point:** between the √d scale and the PLE projection, so image
+  rows enter unscaled and feed the per-layer inputs. This is llama.cpp's
+  order.
+- **One image per input** today.
+- **The encoder:** `vision/gemma4v_encoder` with tanh GELU, the model's
+  `config.json` value (user decision). llama.cpp falls back to GELU-quick
+  for this file. The pooled vectors differ by cosine ≥ 0.9998, and retrieval
+  is the same.
+- **Budget:** 70…280 soft tokens (the card's default).
+- **Gates:**
+  - preprocessing byte-identical to llama.cpp;
+  - encoder soft tokens bit-identical on Metal, for both activations;
+  - pooled vectors cosine ≥ **0.9999991** on 7 synthetic images
+    (`embed-tests`);
+  - the text path unchanged, bitwise.
+- **Cost on M1 Pro, Metal** (`embed-image-cost`):
+  - the tower adds +352 MB;
+  - a page takes ≈ 0.47 s at the default budget, of which ~85% is the
+    encoder;
+  - an A4 page at the 1,120 ceiling takes 2.9 s.
+
 **CLI `--embed`** (`cli/embed_mode`, 2026-10-07): `qwenium MODEL --embed`
 with `-p TEXT` or `--embed-in FILE` (one text per line; a blank line is refused
 by number) writes one JSONL record per text — `{"index","n_tokens","dim",
 "embedding"}`, floats at 9 significant digits — to stdout or `--embed-out FILE`.
-Flags an embedding would silently ignore (chat, image, grammar, speculative,
+**Images (2026-10-16):** `--image PATH` with `--mmproj` embeds one image
+through the embedding model's gemma4v tower, giving one record whose
+`n_tokens` is the framed count. The existing chat flags are reused, so no
+new flag was added. `--image` without `--mmproj`, the reverse, and an image
+together with a text are each refused by name, and a non-gemma4v projector is
+refused. Flags an embedding would silently ignore (chat, grammar, speculative,
 sessions, caches, persistent graph, KV type, system prompt) are refused before
 the model loads; `--flash-attn` and `--ctx-size` (the longest text, in tokens)
 apply. A generation model under `--embed` is refused by architecture name, and
 the encoder under generation names `--embed` in its refusal. Gate:
 `embed-mode-tests` (end to end against the llama.cpp fixture, cosine ≥ 0.9999)
-and three `cli-embed-*` argument tests.
+and four `cli-embed-*` argument tests. The image path is gated end to end
+against llama.cpp at cosine ≥ 0.9999.
 
 **Server `--embed`** (`server/embedding_service`, 2026-10-07):
 `qwenium-server --embed -m MODEL` serves `POST /v1/embeddings` in the OpenAI
@@ -709,8 +743,21 @@ shape — `input` a string or an array of up to 2048 strings, `encoding_format`
 `float` or `base64` (little-endian float32; the OpenAI Python client's
 default), `usage.prompt_tokens` — plus `/health` and `/v1/models` (id = the
 file name). The generation routes are not registered, and every generation-only
-flag (`--mmproj`, caches, `--conversational`, `--speculative`, `--kv-type`,
-`--slots`, `--token-log`) is refused before the load. Refused requests: token-id
+flag (caches, `--conversational`, `--speculative`, `--kv-type`, `--slots`,
+`--token-log`) is refused before the load.
+
+**Images (2026-10-16):** `--mmproj` with `--embed` loads the model's
+gemma4v image tower. The tower is refused unless it is gemma4v and the recipe
+hosts images. An `input` array may then mix texts with **image items in the
+chat-completions shape**,
+`{"type":"image_url","image_url":{"url":"data:…"}}` — our extension; OpenAI
+has no image-embedding shape.
+
+- **Data URIs only:** a remote URL is refused, never fetched.
+- **Validated before any compute:** every image is decoded and preprocessed
+  first, and `usage` counts its framed tokens.
+- **Without `--mmproj`:** an image item is refused (400), naming the flag.
+- **Text-only requests are byte-identical** to the server without a tower. Refused requests: token-id
 input, empty texts, `dimensions` other than the model's width (400); a text over
 `--ctx` tokens, named by index, or too many texts (413) — all validated and
 tokenized before anything is embedded. It does not use `InferenceServer` (no
@@ -719,7 +766,8 @@ one pass, measured 0.05 s for an 18-token text on M1 Pro; batching texts into
 one pass is a later optimisation. A generation model under `--embed` fails at
 startup by name; an embedding model without it names `--embed`. Gate:
 `embedding-service-tests` (the contract through fake callbacks; the model end
-to end against the llama.cpp fixture, base64 decoded bit-for-bit) and
+to end against the llama.cpp fixture, base64 decoded bit-for-bit; an image
+data URI end to end against the llama.cpp image reference) and
 `server-embed-rejects-generation-flag`.
 
 | gate | test |
@@ -753,13 +801,19 @@ Two interfaces carry the whole boundary, and both have two implementations
   `Gemma4UvEncoder`: *blockless* — im2col patchify, LayerNorms, linear
   projection, no attention at all → 40–280 tokens, count decided by
   `smart_resize` in preprocessing and known before prefill.
+  `Gemma4vEncoder` (EmbeddingGemma-2): a 16-block ViT with Gemma blocks
+  (RMS norms, QK-norm, V-norm, gated FFN), two learned position tables
+  **and** a 2-D NeoX RoPE, then a 3×3 average pool and a projection to the
+  text model's width (512). Four implementations of Seam A now.
 - **Seam B** — `models/i_image_embeddable.h`: what a recipe must offer to host
   an image. The splice is `ggml_set_2d` overwriting the residual stream at the
   reserved placeholder span, *after* Gemma's √d embedding scale (image rows
   enter unscaled). Gemma 3's span attends bidirectionally (a mask parameter);
   Gemma 4's is plain causal — hosting it *removed* an interface parameter,
-  which is the pressure test passing. Four implementations now: `gemma3`,
-  `gemma4`, `qwen36` (`qwen35moe`) and `qwen35`. The two Qwen recipes add 2-D
+  which is the pressure test passing. Five implementations now: `gemma3`,
+  `gemma4`, `qwen36` (`qwen35moe`), `qwen35`, and the encoder
+  `gemma_embedding2` (2026-10-16). The encoder hosted the seam with no change
+  to `IImageEmbeddable`: the second pressure test passed. The two Qwen recipes add 2-D
   positions via `image_span_is_2d()` and the optional `grid_w`/`grid_h`
   parameters — additive, so the Gemma recipes ignore them unchanged.
 
@@ -1471,6 +1525,18 @@ Current, verified against the tree at time of writing:
   interface; (2) embedding GGUFs share `general.architecture` "qwen3" with chat
   models, and the registry keys on that string — the embedding capability has
   to be decided per FILE (e.g. by `pooling_type`), not per architecture.
+- **Image embeddings are Gemma-only (G8, accepted 2026-10-16).**
+  - **Gemma-only:** the new code is a Gemma encoder (`gemma4v`) and a Seam B
+    host on a Gemma encoder recipe. Seams A and B already have Qwen
+    implementations, so nothing here is presumed Gemma-shaped beyond the
+    tower itself. The Qwen counterpart (Qwen3-VL-Embedding) would need a
+    download.
+  - **The CPU backend is not gated for this tower:** its BF16 matmul rounds
+    activations, and the worst soft-token rel-L2 is 5.4e-3. Metal is
+    bit-identical.
+  - **One image per `EmbedInput`:** the model card also interleaves text and
+    several images in one embedding, which needs more than one Seam B span
+    per build.
 - **The window is checked against HF's source, not against an HF vector.**
   transformers' `embedding_gemma2` config defines `sliding_window` (512) as an
   inclusive radius and masks with `abs(q_idx - kv_idx) <= sliding_window`

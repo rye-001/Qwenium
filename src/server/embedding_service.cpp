@@ -5,6 +5,12 @@
 #include "loader/tokenizer.h"
 #include "models/model_registry.h"
 #include "models/i_embedding_output.h"
+#include "models/i_image_embeddable.h"
+#include "image/image_loader.h"
+#include "image_data_uri.h"
+#include "vision/vision_loader.h"
+#include "vision/vision_model.h"
+#include "vision/vision_profile.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -49,7 +55,8 @@ std::string base64_f32(const std::vector<float>& v)
 HttpReply handle_embeddings(const std::string& request_body,
                             const std::string& model_id, uint32_t dim,
                             uint32_t max_tokens,
-                            const TokenizeFn& tokenize, const EmbedFn& embed)
+                            const TokenizeFn& tokenize, const EmbedFn& embed,
+                            const ImageFns* images)
 {
     json body;
     try {
@@ -59,13 +66,15 @@ HttpReply handle_embeddings(const std::string& request_body,
     }
     if (!body.is_object()) return refuse(400, "request body: expected a JSON object");
 
-    // input: a string or a non-empty array of strings.
+    // input: a string, or a non-empty array of texts and (with an image tower)
+    // image items.
     if (!body.contains("input"))
         return refuse(400, "'input': expected a string or an array of strings, actual: absent");
     const json& input = body["input"];
-    std::vector<std::string> texts;
+    struct Item { bool image = false; std::string value; };   // value: the text, or image_url.url
+    std::vector<Item> items;
     if (input.is_string()) {
-        texts.push_back(input.get<std::string>());
+        items.push_back({false, input.get<std::string>()});
     } else if (input.is_array()) {
         if (input.empty())
             return refuse(400, "'input': expected at least one text, actual: an empty array");
@@ -73,20 +82,33 @@ HttpReply handle_embeddings(const std::string& request_body,
             return refuse(413, "'input': expected at most " + std::to_string(kMaxInputs) +
                                " texts, actual: " + std::to_string(input.size()));
         for (size_t i = 0; i < input.size(); ++i) {
-            if (input[i].is_number_integer() || input[i].is_array())
+            const std::string at = "'input[" + std::to_string(i) + "]'";
+            const json& it = input[i];
+            if (it.is_number_integer() || it.is_array())
                 return refuse(400, "'input': expected text, actual: token ids (not supported — "
                                    "send the text)");
-            if (!input[i].is_string())
-                return refuse(400, "'input[" + std::to_string(i) + "]': expected a string, actual: " +
-                                   std::string(input[i].type_name()));
-            texts.push_back(input[i].get<std::string>());
+            if (it.is_object()) {
+                if (it.value("type", std::string()) != "image_url" || !it.contains("image_url") ||
+                    !it["image_url"].is_object() || !it["image_url"].contains("url") ||
+                    !it["image_url"]["url"].is_string())
+                    return refuse(400, at + ": expected a string or {\"type\":\"image_url\","
+                                       "\"image_url\":{\"url\":\"data:...\"}}, actual: " + it.dump());
+                if (!images)
+                    return refuse(400, at + ": expected a text (this server has no image tower; "
+                                       "start it with --embed --mmproj), actual: an image_url item");
+                items.push_back({true, it["image_url"]["url"].get<std::string>()});
+                continue;
+            }
+            if (!it.is_string())
+                return refuse(400, at + ": expected a string, actual: " + std::string(it.type_name()));
+            items.push_back({false, it.get<std::string>()});
         }
     } else {
         return refuse(400, "'input': expected a string or an array of strings, actual: " +
                            std::string(input.type_name()));
     }
-    for (size_t i = 0; i < texts.size(); ++i)
-        if (texts[i].empty())
+    for (size_t i = 0; i < items.size(); ++i)
+        if (!items[i].image && items[i].value.empty())
             return refuse(400, "'input[" + std::to_string(i) + "]': expected a non-empty text, "
                                "actual: an empty string");
 
@@ -102,22 +124,34 @@ HttpReply handle_embeddings(const std::string& request_body,
                                d.dump());
     }
 
-    // Tokenize every text first: a refused request costs no forward pass.
-    std::vector<std::vector<int32_t>> tokens(texts.size());
+    // Tokenize every text and prepare every image first: a refused request
+    // costs no forward pass.
+    std::vector<std::vector<int32_t>> tokens(items.size());
     size_t total = 0;
-    for (size_t i = 0; i < texts.size(); ++i) {
-        tokens[i] = tokenize(texts[i]);
-        if (tokens[i].size() > max_tokens)
+    for (size_t i = 0; i < items.size(); ++i) {
+        size_t n = 0;
+        if (items[i].image) {
+            try {
+                n = images->prepare(items[i].value);
+            } catch (const std::exception& e) {
+                return refuse(400, "'input[" + std::to_string(i) + "]': " + e.what());
+            }
+        } else {
+            tokens[i] = tokenize(items[i].value);
+            n = tokens[i].size();
+        }
+        if (n > max_tokens)
             return refuse(413, "'input[" + std::to_string(i) + "]': expected at most " +
                                std::to_string(max_tokens) + " tokens (--ctx), actual: " +
-                               std::to_string(tokens[i].size()));
-        total += tokens[i].size();
+                               std::to_string(n));
+        total += n;
     }
 
     json data = json::array();
     try {
-        for (size_t i = 0; i < texts.size(); ++i) {
-            const std::vector<float> v = embed(tokens[i]);
+        for (size_t i = 0; i < items.size(); ++i) {
+            const std::vector<float> v = items[i].image ? images->embed(items[i].value)
+                                                        : embed(tokens[i]);
             json item = {{"object", "embedding"}, {"index", i}};
             if (format == "base64") item["embedding"] = base64_f32(v);
             else                    item["embedding"] = v;
@@ -137,7 +171,14 @@ HttpReply handle_embeddings(const std::string& request_body,
 
 // ── EmbeddingService ─────────────────────────────────────────────────────────
 
-EmbeddingService::EmbeddingService(const std::string& model_path, uint32_t max_tokens, bool flash)
+struct EmbeddingService::Vision {
+    qinf::vision::VisionModel   model;
+    qinf::vision::VisionLoader  loader;
+    qinf::vision::VisionProfile profile;
+};
+
+EmbeddingService::EmbeddingService(const std::string& model_path, uint32_t max_tokens, bool flash,
+                                   const std::string& mmproj_path)
     : model_(std::make_unique<Model>()), max_tokens_(max_tokens)
 {
     register_builtin_models();
@@ -153,6 +194,24 @@ EmbeddingService::EmbeddingService(const std::string& model_path, uint32_t max_t
     if (flash) fp_->set_prefill_attn_impl(ForwardPassBase::AttnImpl::Flash);
     dim_ = emb->embedding_dim();
 
+    if (!mmproj_path.empty()) {
+        if (!dynamic_cast<IImageEmbeddable*>(fp_.get()))
+            throw std::runtime_error(
+                "--mmproj: architecture '" + meta.architecture +
+                "' expected an embedding model that hosts images (IImageEmbeddable), actual: text only");
+        vision_ = std::make_unique<Vision>();
+        vision_->loader.parse_metadata(mmproj_path, vision_->model);
+        if (vision_->model.config().projector_type != qinf::vision::VisionProjectorType::Gemma4V)
+            throw std::runtime_error(
+                "--mmproj: '" + mmproj_path + "' expected a gemma4v projector (an embedding model's "
+                "image tower), actual: " + qinf::vision::to_string(vision_->model.config().projector_type));
+        ggml_backend_t backend = model_->get_backend_metal() ? model_->get_backend_metal()
+                                                             : model_->get_backend_cpu();
+        vision_->loader.load_tensors(vision_->model, backend);
+        vision_->profile = qinf::vision::make_vision_profile(vision_->model, backend, meta.id_to_token,
+                                                             "--embed: parameter '--mmproj'");
+    }
+
     // The id clients see in "model": the file name without its directory or .gguf.
     model_id_ = model_path.substr(model_path.find_last_of('/') + 1);
     if (model_id_.size() > 5 && model_id_.compare(model_id_.size() - 5, 5, ".gguf") == 0)
@@ -166,6 +225,27 @@ HttpReply EmbeddingService::handle(const std::string& request_body)
     std::lock_guard<std::mutex> lock(mu_);
     const ModelMetadata& meta = model_->get_metadata();
     const TokenizerConfig cfg = lookup_tokenizer_config(meta.architecture);
+    ImageFns image_fns;
+    if (vision_) {
+        auto bitmap_of = [this](const std::string& url) {
+            const qinf::DecodedImage img = qinf::decode_image_data_uri(url);
+            return qinf::image::load_image_to_bitmap_from_memory(img.bytes.data(), img.bytes.size(),
+                                                                 vision_->profile.preprocess);
+        };
+        image_fns.prepare = [this, bitmap_of, &cfg](const std::string& url) -> size_t {
+            const size_t n = vision_->profile.encoder->mm_tokens_for(bitmap_of(url));
+            return n + 2 + (cfg.add_bos_token ? 1 : 0) + (cfg.add_eos_token ? 1 : 0);
+        };
+        image_fns.embed = [this, bitmap_of, &cfg, &meta](const std::string& url) {
+            const auto bmp = bitmap_of(url);
+            const auto& prof = vision_->profile;
+            return qinf::engine::embed::run(
+                *fp_, model_->get_scheduler(),
+                qinf::engine::embed::image_input(cfg, meta, prof.boi_id, prof.soft_id, prof.eoi_id,
+                                                 prof.encoder->encode(bmp), prof.encoder->mm_tokens_for(bmp)),
+                meta.architecture);
+        };
+    }
     HttpReply reply = handle_embeddings(
         request_body, model_id_, dim_, max_tokens_,
         [&](const std::string& text) {
@@ -173,7 +253,8 @@ HttpReply EmbeddingService::handle(const std::string& request_body)
         },
         [&](const std::vector<int32_t>& tokens) {
             return qinf::engine::embed::run(*fp_, model_->get_scheduler(), tokens, meta.architecture);
-        });
+        },
+        vision_ ? &image_fns : nullptr);
     if (reply.status == 200) ++requests_served_;
     return reply;
 }

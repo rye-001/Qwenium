@@ -2,13 +2,15 @@
 // embed_mode.h — the CLI's --embed path: text in, one embedding per text out.
 //
 // Responsibility: the front end over engine/embed. Read the texts (-p TEXT, or
-//   --embed-in FILE with one text per line), tokenize, frame, embed, and write
+//   --embed-in FILE with one text per line) — or one image (--image PATH with
+//   --mmproj, the embedding model's gemma4v image tower; docs/plan-embed-image.md
+//   G6) — tokenize, frame, embed, and write
 //   one JSON object per text — JSONL — to --embed-out FILE or to stdout:
 //     {"index":0,"n_tokens":18,"dim":768,"embedding":[0.0287212,...]}
 //   Floats are printed with 9 significant digits, enough to round-trip a float.
 //   Only models whose recipe implements IEmbeddingOutput embed; any other model
 //   is refused by name.
-// Flags that mean nothing for an embedding (chat, image, grammar, speculative,
+// Flags that mean nothing for an embedding (chat, grammar, speculative,
 //   sessions, caches, persistent graph, a KV type) are refused before the model
 //   loads — a flag the run would silently ignore is a misread run waiting to
 //   happen. Allowed alongside: --flash-attn (the one pass), --ctx-size (the

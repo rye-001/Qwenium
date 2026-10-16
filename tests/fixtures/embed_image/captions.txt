@@ -1,0 +1,7 @@
+red_circle_224	a red circle on a white background
+blue_squares_640x480	two blue squares side by side
+green_triangle_1200x300	a wide green triangle
+stripes_300x1200	black and white horizontal stripes
+page_850x1100	a document page with lines of text and a signature box
+yellow_tiny_40	a plain yellow square
+checker_512	a black and white checkerboard

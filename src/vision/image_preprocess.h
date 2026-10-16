@@ -29,6 +29,17 @@ struct ImagePreprocess {
         DynSmartResize,      // Qwen-VL smart_resize to variable dims (Gemma 4)
     };
     Sizing sizing = Sizing::FixedSquarePadCeil;
+    // How the picture is resampled to its canvas. The default is the
+    // align-corners bilinear every recipe before gemma4v was gated against
+    // (llama.cpp's older img_tool::resize_bilinear); PillowBicubic is the
+    // Pillow-compatible separable bicubic (a = −0.5, 22-bit fixed point) that
+    // llama.cpp's mtmd uses for gemma4v. A parameter, not a second pipeline:
+    // sizing, letterbox and normalization are shared.
+    enum class Resample {
+        BilinearAlignCorners,
+        PillowBicubic,
+    };
+    Resample resample = Resample::BilinearAlignCorners;
 
     // FixedSquarePadCeil:
     int fixed_target = 896;
@@ -54,6 +65,16 @@ ImagePreprocess gemma3_preprocess(int target = 896);
 // patch (patch_size·n_merge = 16·3 = 48).
 ImagePreprocess gemma4uv_preprocess(int align = 48,
                                     int min_tokens = 40, int max_tokens = 280);
+
+// EmbeddingGemma-2 vision (`gemma4v`, a ViT) preprocessing
+// (docs/plan-embed-image.md). Same DynSmartResize as gemma4uv with align =
+// patch_size·n_merge = 16·3 = 48 and mean 0 / std 1 (the mmproj's
+// clip.vision.image_{mean,std}), but resampled with Pillow bicubic as
+// llama.cpp does for this projector. Budget 70…280: 70 is upstream's floor
+// for gemma4v; 280 is the model card's default (upstream's own max is 1120;
+// the card allows up to 1120 too, so the parameter stays).
+ImagePreprocess gemma4v_preprocess(int align = 48,
+                                   int min_tokens = 70, int max_tokens = 280);
 
 // Qwen 3.5-family (`qwen3vl_merger`) preprocessing. Same DynSmartResize
 // machinery as Gemma 4 — this is a different set of PARAMETERS, not a

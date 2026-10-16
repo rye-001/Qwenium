@@ -167,6 +167,78 @@ TEST(EmbeddingsHandler, AnEngineFailureIsA500NotACrash) {
     EXPECT_NE(r.body["error"].get<std::string>().find("compute failed"), std::string::npos);
 }
 
+// ── Handler: image items (docs/plan-embed-image.md G7) ──────────────────────
+
+namespace {
+
+// Fake image tower: "data:ok,N" prepares to N framed tokens and embeds to
+// [0, 0, 1]; anything else is refused by prepare. Counts embeds.
+struct FakeImages {
+    int embeds = 0;
+    qinf::server::ImageFns fns{
+        [](const std::string& url) -> size_t {
+            if (url.rfind("data:ok,", 0) != 0) throw std::runtime_error("image_url.url: expected data:ok,N");
+            return static_cast<size_t>(std::stoul(url.substr(8)));
+        },
+        [this](const std::string&) { ++embeds; return std::vector<float>{0.0f, 0.0f, 1.0f}; }};
+};
+
+json image_item(const std::string& url) {
+    return {{"type", "image_url"}, {"image_url", {{"url", url}}}};
+}
+
+}  // namespace
+
+TEST(EmbeddingsHandler, ImageItemsSitBesideTextsInOrder) {
+    Fake f;
+    FakeImages im;
+    const json body = {{"input", json::array({"ab", image_item("data:ok,12"), "c"})}};
+    const HttpReply r = handle_embeddings(body.dump(), "fake-model", 3, 64, f.tokenize, f.embed, &im.fns);
+    ASSERT_EQ(r.status, 200) << r.body.dump();
+    ASSERT_EQ(r.body["data"].size(), 3u);
+    EXPECT_EQ(r.body["data"][1]["embedding"], json::array({0.0, 0.0, 1.0}));
+    EXPECT_EQ(r.body["data"][1]["index"], 1);
+    EXPECT_EQ(r.body["usage"]["prompt_tokens"], 4 + 12 + 3);   // texts framed, the image's framed count
+    EXPECT_EQ(im.embeds, 1);
+    EXPECT_EQ(f.embeds, 2);
+}
+
+TEST(EmbeddingsHandler, AnImageWithoutAnImageTowerIsRefused) {
+    Fake f;
+    const HttpReply r = f.call({{"input", json::array({image_item("data:ok,5")})}});
+    EXPECT_EQ(r.status, 400);
+    EXPECT_NE(r.body["error"].get<std::string>().find("--mmproj"), std::string::npos) << r.body.dump();
+    EXPECT_EQ(f.embeds, 0);
+}
+
+TEST(EmbeddingsHandler, ABadImageIsRefusedByIndexBeforeAnyEmbedding) {
+    Fake f;
+    FakeImages im;
+    auto call = [&](const json& input) {
+        return handle_embeddings(json{{"input", input}}.dump(), "fake-model", 3, 64, f.tokenize, f.embed, &im.fns);
+    };
+    HttpReply r = call(json::array({"a", image_item("https://example.com/x.png")}));
+    EXPECT_EQ(r.status, 400);
+    EXPECT_NE(r.body["error"].get<std::string>().find("'input[1]'"), std::string::npos) << r.body.dump();
+    r = call(json::array({"a", json{{"type", "image_url"}}}));                // no image_url.url
+    EXPECT_EQ(r.status, 400);
+    r = call(json::array({"a", json{{"type", "text"}, {"text", "x"}}}));      // not an image item
+    EXPECT_EQ(r.status, 400);
+    r = call(json::array({"a", image_item("data:ok,65")}));                   // over --ctx
+    EXPECT_EQ(r.status, 413);
+    EXPECT_EQ(f.embeds + im.embeds, 0);
+}
+
+TEST(EmbeddingsHandler, ATextOnlyRequestIsUnchangedByAnImageTower) {
+    Fake f;
+    FakeImages im;
+    const json body = {{"input", json::array({"ab", "c"})}, {"encoding_format", "base64"}};
+    const HttpReply with = handle_embeddings(body.dump(), "fake-model", 3, 64, f.tokenize, f.embed, &im.fns);
+    const HttpReply without = f.call(body);
+    EXPECT_EQ(with.status, 200);
+    EXPECT_EQ(with.body.dump(), without.body.dump());
+}
+
 // ── Service: the real model ──────────────────────────────────────────────────
 
 TEST(EmbeddingService, MatchesLlamaCppAndBase64RoundTrips) {
@@ -219,3 +291,66 @@ TEST(EmbeddingService, RefusesAGenerationModel) {
     if (!path || !*path) GTEST_SKIP() << "QWEN3_MODEL_PATH not set";
     EXPECT_THROW(qinf::server::EmbeddingService(path, 512, false), std::runtime_error);
 }
+
+// Images end to end: the service with --mmproj, one fixture image as a data
+// URI, against llama.cpp's pooled vector (tanh reference, plan phase 4).
+TEST(EmbeddingService, ServesAnImageMatchingLlamaCpp) {
+    const char* path = std::getenv("EMBEDDINGGEMMA2_MODEL_PATH");
+    if (!path || !*path) GTEST_SKIP() << "EMBEDDINGGEMMA2_MODEL_PATH not set";
+    const char* e = std::getenv("EMBEDDINGGEMMA2_MMPROJ_PATH");
+    const std::string mm = (e && *e) ? e : "models/embeddinggemma-2-mmproj-BF16.gguf";
+    if (!std::ifstream(mm).good()) GTEST_SKIP() << "mmproj not found at " << mm;
+
+    // The reference vector and framed token count for red_circle_224.
+    std::ifstream ref(QINF_TEST_FIXTURES_DIR "/embed_image/reference_t280_gelu.txt");
+    ASSERT_TRUE(ref);
+    std::vector<float> want;
+    size_t want_tokens = 0;
+    std::string line;
+    bool in_it = false;
+    while (std::getline(ref, line)) {
+        if (line == "image red_circle_224") in_it = true;
+        else if (line.rfind("image ", 0) == 0 || line.rfind("caption ", 0) == 0) in_it = false;
+        else if (in_it && line.rfind("tokens ", 0) == 0) want_tokens = std::stoul(line.substr(7));
+        else if (in_it && line.rfind("embedding ", 0) == 0) {
+            std::istringstream ss(line.substr(10));
+            size_t n; ss >> n;
+            want.resize(n);
+            for (auto& x : want) ss >> x;
+        }
+    }
+    ASSERT_EQ(want.size(), 768u);
+
+    std::ifstream png(QINF_TEST_FIXTURES_DIR "/embed_image/red_circle_224.png", std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(png)), std::istreambuf_iterator<char>());
+    std::string b64;   // standard base64 of the PNG bytes (base64_f32 encodes floats, not bytes)
+    {
+        static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        size_t i = 0;
+        const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+        for (; i + 2 < bytes.size(); i += 3) {
+            const uint32_t n = (p[i] << 16) | (p[i + 1] << 8) | p[i + 2];
+            b64 += tbl[(n >> 18) & 63]; b64 += tbl[(n >> 12) & 63]; b64 += tbl[(n >> 6) & 63]; b64 += tbl[n & 63];
+        }
+        if (i < bytes.size()) {
+            uint32_t n = p[i] << 16;
+            if (i + 1 < bytes.size()) n |= p[i + 1] << 8;
+            b64 += tbl[(n >> 18) & 63]; b64 += tbl[(n >> 12) & 63];
+            b64 += (i + 1 < bytes.size()) ? tbl[(n >> 6) & 63] : '=';
+            b64 += '=';
+        }
+    }
+
+    qinf::server::EmbeddingService svc(path, 4096, /*flash=*/false, mm);
+    EXPECT_TRUE(svc.serves_images());
+    const HttpReply r = svc.handle(json{{"input", json::array({image_item("data:image/png;base64," + b64)})}}.dump());
+    ASSERT_EQ(r.status, 200) << r.body.dump();
+    const auto got = r.body["data"][0]["embedding"].get<std::vector<float>>();
+    double d = 0, ng = 0, nw = 0;
+    for (size_t k = 0; k < got.size(); ++k) {
+        d += (double)got[k] * want[k]; ng += (double)got[k] * got[k]; nw += (double)want[k] * want[k];
+    }
+    EXPECT_GE(d / std::sqrt(ng * nw), 0.9999);
+    EXPECT_EQ(r.body["usage"]["prompt_tokens"], want_tokens);
+}
+
