@@ -562,7 +562,7 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text, OpenAI `image_url` when `--mmproj` is loaded, and OpenAI `tools` on a model with a measured tool format),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
 
-**Tool calling (2026-10-27, `docs/plan-tool-calling.md` P0–P3).**
+**Tool calling (2026-10-27, `docs/plan-tool-calling.md` P0–P4).**
 `/v1/chat/completions` serves OpenAI `tools`, non-streaming.
 
 - **Which requests count.** A request is a tool request when it carries
@@ -582,8 +582,7 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
     naming the field (400):
     - `tools`: 1–128 functions with valid, unique names. `strict:true` is
       refused.
-    - `tool_choice`: `auto` or `none`. `required` and a named function are
-      refused until P4.
+    - `tool_choice`: `auto`, `none`, `required`, or a named function.
     - `parallel_tool_calls:false` is refused.
     - Messages: one leading system message; arguments a JSON-object string;
       call ids unique; every tool result answers a call.
@@ -607,6 +606,37 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
   - A slot with bans does not speculate. Drafts are accepted by argmax
     comparison and never pass through the sampler, the same reason a grammar
     already disables speculation.
+- **`required` / a named function (P4).** `ToolFormat::grammar` gives a
+  GBNF grammar for **exactly one** call in the format (the server ends a
+  grammar slot at its first accepting state, so parallel calls stay an
+  `auto` feature).
+  - **What the grammar fixes:** tool and parameter names; values typed by
+    the schema (JSON type and enum) on Qwen-XML and Gemma; any JSON object on
+    Hermes. Required parameters and the rest of the schema subset are still
+    checked by `parse`.
+  - **Reasoning is not in the grammar.** The new **reasoning gate**,
+    `Sampler::set_grammar_gate(opener, closer, start_inside)` and
+    `InferenceRequest.grammar_gate_*`, leaves the model's reasoning block
+    unconstrained, with no vocab scan. The block runs between single tokens:
+    `<think>`…`</think>`, or `<|channel>`…`<channel|>`. The grammar applies
+    from the closer on; the first token may instead go straight into the
+    call. A Qwen3.5+ prompt that opened `<think>` starts inside the block.
+  - **Literal whitespace.** The tool grammars write whitespace as literals.
+    A character class there would hit GrammarVocab's known permissive spot
+    (any token whose first character is in a standalone class is valid): at
+    the "call or not" point, `" Sure"` passed and the slot was forced to stop
+    (§12).
+  - **A reply with no call** (a thought that never closed), or a call to
+    another function than the named one, is a 502.
+  - **Cost on M1 Pro, grammar active:** +12–17 ms per token (Qwen3.5-0.8B,
+    248k vocab; Qwen3-0.6B, 151k), 52 vs 35 ms per token, wall time
+    including prefill.
+- **The server's grammar vocabulary is decoded text** (fixed 2026-10-27).
+  It used to be the raw GGUF strings, where a space is `Ġ` or `▁` and a
+  newline `Ċ`, so a request grammar with a space or newline in a literal
+  could never match an ordinary token. `GrammarVocab` requires decoded
+  strings, and the CLI chat path already passed them.
+  `server_grammar_smoke.sh` still passes.
 - **Reply.** `ToolFormat::parse` splits the output into
   `reasoning_content`, `content` and `tool_calls`.
   - Each call gets an id `call_<24 hex>` and `arguments` as a JSON string.
@@ -615,8 +645,13 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
     checked schema subset, or a call under `none` gives **502**
     `{error, raw_output, finish_reason, usage}`. It is never returned as an
     answer.
-- **Gates:** `tool-request-tests`, `tool-format-tests` (G1 render, G2 parse
-  round trip), and `sampling-tests` `BannedTokensTest`.
+- **Gates:**
+  - `tool-request-tests`;
+  - `tool-format-tests`: G1 render, G2 parse round trip, and G4 grammar
+    acceptance of every rendered one-call turn, plus refusals including the
+    `" Sure"` regression;
+  - `sampling-tests`: `BannedTokensTest` and `GrammarGateTest`;
+  - `grammar-test-sparse-differential` still passes: sparse equals dense.
 - **Live (P3).** Checked on Qwen3-0.6B and Qwen3.5-0.8B: `auto` calls,
   tool result → answer, `none`, thinking on and off. Gemma 3 1B refuses. The
   end-to-end smoke for each family is P5.
@@ -1637,6 +1672,15 @@ Current, verified against the tree at time of writing:
   (`type`, `description`, `properties`, `required`, `nullable`) from the
   declaration the model sees. The tool path refuses such tools on that
   checkpoint (T6); the 12B template renders them.
+- **GrammarVocab is too permissive at a standalone character class**
+  (pre-existing, `grammar_vocab.cpp` "KNOWN BUG"). Any token whose first
+  character is in the class is marked valid, even when its tail leaves the
+  grammar. The grammar then dies and the slot is forced to stop.
+  - A correct fix was measured at ~10× slower decode and was not landed.
+  - The tool grammars keep character classes away from decision points;
+    whitespace is literals. Free text (XML values, Gemma strings) still uses
+    classes, so a model that breaks out mid-value can end in a forced stop.
+    The result is then a 502, never a wrong call.
 - **Text that spells a special token is tokenized as that token.** A user
   message or a tool result containing `<tool_call>` or `<|im_end|>` becomes
   the control token. This is not new behaviour, but tool results — text from

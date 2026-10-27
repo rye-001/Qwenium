@@ -19,6 +19,7 @@
 #include <string>
 
 #include "../../src/loader/tool_format.h"
+#include "../../src/sampling/grammar_vocab.h"
 
 namespace fs = std::filesystem;
 using qinf::tools::ojson;
@@ -454,4 +455,197 @@ TEST(ToolFormat, Gemma4NamesWhatIsMalformed) {
               "{...} or [...]), actual: \"Paris}<tool_call|>\" (offset 34)");
     EXPECT_EQ(parse_error(kGemma, "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}", chat),
               "tool_calls[0]: expected <tool_call|> after the arguments, actual: \"\" (offset 50)");
+}
+
+// ── P4: the grammar for tool_choice "required" / a named function (G4) ───────
+
+namespace {
+
+// A toy vocabulary: every byte as a token, plus the dialect's special tokens as
+// whole tokens — so a text is fed the way the model emits it (special tokens
+// atomic, everything else in pieces the grammar must accept piece by piece).
+struct ToyVocab {
+    std::vector<std::string> v;
+    std::vector<std::string> specials;
+    explicit ToyVocab(std::vector<std::string> sp) : specials(std::move(sp)) {
+        for (int b = 0; b < 256; ++b) v.push_back(std::string(1, static_cast<char>(b)));
+        for (const auto& s : specials) v.push_back(s);
+    }
+    // The next token id at `pos`: the longest special that starts there, else the byte.
+    int32_t next(const std::string& text, size_t pos, size_t& len) const {
+        int32_t best = static_cast<unsigned char>(text[pos]);
+        len = 1;
+        for (size_t i = 0; i < specials.size(); ++i)
+            if (text.compare(pos, specials[i].size(), specials[i]) == 0 && specials[i].size() > len) {
+                best = static_cast<int32_t>(256 + i);
+                len = specials[i].size();
+            }
+        return best;
+    }
+};
+
+ToyVocab toy_for(qinf::tools::ToolDialect d) {
+    if (d == qinf::tools::ToolDialect::Gemma4)
+        return ToyVocab({"<|tool_call>", "<tool_call|>", "<|\"|>", "<|channel>", "<channel|>", "<|tool_response>"});
+    return ToyVocab({"<tool_call>", "</tool_call>", "<think>", "</think>"});
+}
+
+// "" when the grammar accepts `text` as a whole; else where and what it refused.
+std::string grammar_verdict(const std::string& gbnf, const ToyVocab& vocab, const std::string& text) {
+    auto g = qinf::GrammarVocab::parse_impl(gbnf);
+    if (!g) return "grammar does not parse";
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t len = 0;
+        const int32_t id = vocab.next(text, pos, len);
+        const auto valid = g->get_valid_tokens(vocab.v);
+        if (std::find(valid.begin(), valid.end(), id) == valid.end())
+            return "refused " + ojson(vocab.v[id]).dump() + " at offset " + std::to_string(pos);
+        g->accept_token(id, vocab.v);
+        pos += len;
+    }
+    return g->is_accepting_state() ? "" : "not accepting at the end";
+}
+
+qinf::tools::ToolGrammar grammar_of(const std::string& h, const ToolChat& chat, const std::string* only = nullptr) {
+    return qinf::tools::lookup_tool_format(h)->grammar(chat, only);
+}
+
+}  // namespace
+
+// Every one-call model turn the template renders (what the model was trained
+// to emit), with the reasoning block cut where the sampler's gate hands over,
+// is accepted by the "required" grammar and by the grammar naming its tool —
+// on every measured template, both tool sets.
+TEST(ToolFormat, RequiredGrammarAcceptsWhatTheTemplateRendersAsACall) {
+    std::map<std::string, int> accepted;
+    for (const std::string& h : qinf::tools::measured_tool_templates()) {
+        const auto* fmt = qinf::tools::lookup_tool_format(h);
+        const ToyVocab vocab = toy_for(fmt->dialect());
+        const std::string call_end = fmt->dialect() == qinf::tools::ToolDialect::Gemma4 ? "<tool_call|>" : "</tool_call>";
+        for (const ojson& c : cases()["cases"]) {
+            const std::string name = c["name"].get<std::string>();
+            if (name == "number_null_escape_forms" || name == "content_then_call") continue;   // asserted below
+            const ToolChat full = chat_of(c);
+            for (size_t k = 0; k < full.messages.size(); ++k) {
+                const ToolTurn& m = full.messages[k];
+                if (m.tool_calls.size() != 1 || !py_strip_ascii(m.content).empty()) continue;
+                ToolChat before = full, upto = full;
+                before.messages.resize(k);
+                upto.messages.resize(k + 1);
+                upto.add_generation_prompt = false;
+                std::string P, Q;
+                try { P = render(h, before); Q = render(h, upto); } catch (const std::invalid_argument&) { continue; }
+                const std::string empty_thought = "<|channel>thought\n<channel|>";
+                size_t cut = P.size();
+                if (Q.rfind(P, 0) != 0) cut = P.size() - empty_thought.size();   // Gemma, thinking off (P2)
+                std::string gen = Q.substr(cut);
+                const auto g = grammar_of(h, before);
+                if (!g.gate_closer.empty()) {
+                    const size_t close = gen.find(g.gate_closer);
+                    if (close != std::string::npos) gen = gen.substr(close + g.gate_closer.size());
+                }
+                gen = gen.substr(0, gen.find(call_end) + call_end.size());
+                const std::string what = h + "/" + name + " k=" + std::to_string(k);
+                EXPECT_EQ(grammar_verdict(g.gbnf, vocab, gen), "") << what << "\n" << gen;
+                EXPECT_EQ(grammar_verdict(grammar_of(h, before, &m.tool_calls[0].name).gbnf, vocab, gen), "") << what;
+                ++accepted[h];
+            }
+        }
+    }
+    for (const std::string& h : qinf::tools::measured_tool_templates())
+        EXPECT_GE(accepted[h], 8) << h << ": too few accepted calls";
+}
+
+TEST(ToolFormat, RequiredGrammarRefusesWhatIsNotACallOfTheTools) {
+    const ToolChat weather = case_named("tools_only");
+    ToolChat rich = case_named("bool_true_arg");
+    rich.messages.resize(1);
+    const std::string time_name = "get_time";
+    // Hermes: another tool's name, text before the call, the named grammar.
+    {
+        const ToyVocab v = toy_for(qinf::tools::ToolDialect::HermesJson);
+        ToolChat off = weather;
+        off.enable_thinking = false;
+        const std::string call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+        EXPECT_EQ(grammar_verdict(grammar_of(kQwen3, off).gbnf, v, call), "");
+        EXPECT_NE(grammar_verdict(grammar_of(kQwen3, off).gbnf, v,
+                  "<tool_call>\n{\"name\": \"get_wether\", \"arguments\": {}}\n</tool_call>"), "");
+        EXPECT_NE(grammar_verdict(grammar_of(kQwen3, off).gbnf, v, "Sure! " + call), "");
+        EXPECT_NE(grammar_verdict(grammar_of(kQwen3, off, &time_name).gbnf, v, call), "");
+        const std::string nope = "nope";
+        EXPECT_THROW(grammar_of(kQwen3, off, &nope), std::invalid_argument);
+    }
+    // Qwen-XML: an unknown parameter, an integer that is not one, an enum miss.
+    {
+        const ToyVocab v = toy_for(qinf::tools::ToolDialect::QwenXml);
+        const auto g = grammar_of(kQwen35, rich).gbnf;
+        const std::string head = "<tool_call>\n<function=create_event>\n<parameter=title>\nT\n</parameter>\n";
+        EXPECT_EQ(grammar_verdict(g, v, head + "<parameter=duration_min>\n90\n</parameter>\n</function>\n</tool_call>"), "");
+        EXPECT_NE(grammar_verdict(g, v, head + "<parameter=venue>\nx\n</parameter>\n</function>\n</tool_call>"), "");
+        EXPECT_NE(grammar_verdict(g, v, head + "<parameter=duration_min>\nninety\n</parameter>\n</function>\n</tool_call>"), "");
+        ToolChat w = weather;
+        w.enable_thinking = false;
+        const auto gw = grammar_of(kQwen35, w).gbnf;
+        const std::string wh = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n";
+        EXPECT_EQ(grammar_verdict(gw, v, wh + "<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>"), "");
+        EXPECT_NE(grammar_verdict(gw, v, wh + "<parameter=unit>\nkelvin\n</parameter>\n</function>\n</tool_call>"), "");
+        // A multi-line string value is text, as the template renders it.
+        EXPECT_EQ(grammar_verdict(gw, v, "<tool_call>\n<function=get_weather>\n<parameter=city>\nNew\nYork\n"
+                                         "</parameter>\n</function>\n</tool_call>"), "");
+    }
+    // Gemma: typed values, the string delimiter, an enum miss.
+    {
+        const ToyVocab v = toy_for(qinf::tools::ToolDialect::Gemma4);
+        const auto g = grammar_of(kGemma, rich).gbnf;
+        EXPECT_EQ(grammar_verdict(g, v, "<|tool_call>call:create_event{all_day:true,duration_min:90,title:<|\"|>a <b>, c<|\"|>}"
+                                        "<tool_call|>"), "");
+        EXPECT_NE(grammar_verdict(g, v, "<|tool_call>call:create_event{duration_min:<|\"|>90<|\"|>}<tool_call|>"), "");
+        const auto gw = grammar_of(kGemma, weather).gbnf;
+        EXPECT_NE(grammar_verdict(gw, v, "<|tool_call>call:get_weather{unit:<|\"|>kelvin<|\"|>}<tool_call|>"), "");
+    }
+}
+
+// The gate tokens follow the template's thinking state.
+TEST(ToolFormat, RequiredGrammarGatesTheReasoningBlock) {
+    ToolChat chat = case_named("tools_only");
+    auto g = grammar_of(kQwen3, chat);                 // Qwen3: thinks by default, opens <think> itself
+    EXPECT_EQ(g.gate_opener + g.gate_closer, "<think></think>");
+    EXPECT_FALSE(g.gate_start_inside);
+    g = grammar_of(kQwen38_27, chat);                  // 3.8: the prompt opened <think>
+    EXPECT_EQ(g.gate_closer, "</think>");
+    EXPECT_TRUE(g.gate_start_inside);
+    g = grammar_of(kQwen35, chat);                     // 3.5: thinking off by default — no gate
+    EXPECT_EQ(g.gate_closer, "");
+    g = grammar_of(kGemma, chat);
+    EXPECT_EQ(g.gate_closer, "");
+    chat.enable_thinking = true;
+    g = grammar_of(kGemma, chat);
+    EXPECT_EQ(g.gate_opener + g.gate_closer, "<|channel><channel|>");
+    chat.enable_thinking = false;
+    EXPECT_EQ(grammar_of(kQwen3, chat).gate_closer, "");
+}
+
+// The live failure of 2026-10-27: under "required", Qwen3-0.6B's first token
+// was " Sure". GrammarVocab marks any token whose first character is in a
+// standalone character class as valid, and the call's leading whitespace was
+// one — the token passed, the grammar died on "Sure", the slot was forced to
+// stop. Whitespace is now literals: a multi-character token that leaves the
+// call's form is refused at the start, on every format.
+TEST(ToolFormat, RequiredGrammarRefusesATextTokenAtTheStart) {
+    ToolChat chat = case_named("tools_only");
+    chat.enable_thinking = false;
+    for (const std::string& h : qinf::tools::measured_tool_templates()) {
+        const auto* fmt = qinf::tools::lookup_tool_format(h);
+        ToyVocab vocab = toy_for(fmt->dialect());
+        for (const char* t : {" Sure", "\nSure", "  Here", "\n\nI"}) vocab.v.push_back(t);
+        auto g = qinf::GrammarVocab::parse_impl(fmt->grammar(chat, nullptr).gbnf);
+        ASSERT_TRUE(g) << h;
+        const auto valid = g->get_valid_tokens(vocab.v);
+        for (size_t id = vocab.v.size() - 4; id < vocab.v.size(); ++id)
+            EXPECT_EQ(std::count(valid.begin(), valid.end(), static_cast<int32_t>(id)), 0)
+                << h << ": " << ojson(vocab.v[id]).dump() << " is valid at the start";
+        EXPECT_NE(std::count(valid.begin(), valid.end(), static_cast<int32_t>(256)), 0)   // the call opener
+            << h << ": the opener is not valid at the start";
+    }
 }

@@ -92,6 +92,24 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// The output constraint for tool_choice "required" (any of the tools) or a
+// named function: a GBNF grammar for EXACTLY ONE call in this format — the
+// server ends a grammar slot at its first accepting state, so parallel calls
+// stay an "auto" feature. The call's form and the tool and parameter names are
+// fixed; values are typed where the format and the schema allow (Qwen-XML and
+// Gemma by the parameter's JSON type and enum, Hermes as any JSON object);
+// required parameters and the rest of the schema subset are checked by parse.
+// Reasoning is not in the grammar: the sampler's gate (Sampler::
+// set_grammar_gate) leaves the model's reasoning block free and applies the
+// grammar after it. gate_opener / gate_closer are the block's delimiter TOKENS
+// as text ("" = no gate: thinking is off and the prompt closed the block).
+struct ToolGrammar {
+    std::string gbnf;
+    std::string gate_opener;
+    std::string gate_closer;
+    bool        gate_start_inside = false;   // the generation prompt opened the block
+};
+
 class ToolFormat {
 public:
     virtual ~ToolFormat() = default;
@@ -124,6 +142,11 @@ public:
     // tools block): render(chat) up to and including the first occurrence is
     // the request's recurring, cacheable prefix.
     virtual const char* system_turn_end() const = 0;
+
+    // The grammar for tool_choice "required" (only_tool null) or the named
+    // function `*only_tool` (one of chat.tools; throws std::invalid_argument
+    // otherwise).
+    virtual ToolGrammar grammar(const ToolChat& chat, const std::string* only_tool) const = 0;
 };
 
 // sha256 of the template text, the first 16 hex digits.

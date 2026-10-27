@@ -104,16 +104,23 @@ TEST(ToolRequest, RefusesWhatV1DoesNotServeWithTools) {
     EXPECT_EQ(refusal(body(R"([{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}])")),
               "'messages[0].content[0].type': expected \"text\" (images and audio are not served with tools in v1), "
               "actual: \"image_url\"");
-    EXPECT_EQ(refusal(body(kUser, R"("tool_choice":"required")")),
-              "'tool_choice': expected \"auto\" or \"none\" (\"required\" and a named function come with the grammar, "
-              "plan-tool-calling P4), actual: \"required\"");
-    EXPECT_EQ(refusal(body(kUser, R"("tool_choice":{"type":"function","function":{"name":"get_weather"}})")),
-              "'tool_choice': expected \"auto\" or \"none\" (\"required\" and a named function come with the grammar, "
-              "plan-tool-calling P4), actual: an object");
     EXPECT_EQ(refusal(body(kUser, R"("tool_choice":"any")")),
-              "'tool_choice': expected \"auto\" or \"none\", actual: \"any\"");
+              "'tool_choice': expected \"auto\", \"none\", \"required\" or {\"type\":\"function\",\"function\":"
+              "{\"name\":...}}, actual: \"any\"");
+    EXPECT_EQ(refusal(body(kUser, R"("tool_choice":{"type":"function","function":{"name":"get_time"}})")),
+              "'tool_choice.function.name': expected the name of one of the request's tools, actual: \"get_time\"");
+    EXPECT_EQ(refusal(body(kUser, R"("tool_choice":{"type":"allowed_tools"})")),
+              "'tool_choice.type': expected \"function\", actual: \"allowed_tools\"");
     EXPECT_EQ(refusal(body(kUser, R"("parallel_tool_calls":false)")),
               "'parallel_tool_calls': expected true or absent (false is not enforced in v1), actual: false");
+}
+
+TEST(ToolRequest, RequiredAndNamedToolChoice) {
+    EXPECT_EQ(parse_tool_request(body(kUser, R"("tool_choice":"required")")).choice,
+              qinf::server::ToolChoice::Required);
+    const auto r = parse_tool_request(body(kUser, R"("tool_choice":{"type":"function","function":{"name":"get_weather"}})"));
+    EXPECT_EQ(r.choice, qinf::server::ToolChoice::Named);
+    EXPECT_EQ(r.named, "get_weather");
 }
 
 TEST(ToolRequest, RefusesMalformedTools) {

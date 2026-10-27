@@ -11,8 +11,9 @@
 //   tools               1..128 {"type":"function","function":{name, description?,
 //                       parameters?}}; name ^[A-Za-z0-9_-]{1,64}$, unique; "strict":
 //                       true refused (only a top-level schema subset is checked)
-//   tool_choice         "auto" (default) | "none"; "required" and a named
-//                       function come with the grammar (P4) and are refused
+//   tool_choice         "auto" (default) | "none" | "required" |
+//                       {"type":"function","function":{"name":N}} — the last two
+//                       constrain the reply to exactly one call by grammar (P4)
 //   parallel_tool_calls true (default); false is refused (not enforced in v1)
 //   messages            system (first only), user, assistant (content, tool_calls
 //                       with arguments as a JSON-object string, reasoning_content),
@@ -41,11 +42,12 @@ std::string refuse_legacy_tool_fields(const nlohmann::json& body);
 // True when `body` is a tool request (see the header comment).
 bool is_tool_request(const nlohmann::json& body);
 
-enum class ToolChoice { Auto, None };
+enum class ToolChoice { Auto, None, Required, Named };
 
 struct ToolRequest {
     qinf::tools::ToolChat chat;
     ToolChoice            choice = ToolChoice::Auto;
+    std::string           named;   // ToolChoice::Named: the function's name
 };
 
 // The validated tool request, from the raw request body: it is re-parsed in

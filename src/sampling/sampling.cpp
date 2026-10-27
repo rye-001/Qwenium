@@ -31,12 +31,13 @@ void Sampler::apply_bans_sparse(std::vector<float>& sparse_logits,
 }
 
 std::vector<int32_t> Sampler::peek_valid_set() {
-    if (!grammar_ || vocab_.empty()) {
+    if (!grammar_active() || vocab_.empty()) {   // no grammar, or inside the gated reasoning
         cached_valid_ids_valid_ = false;
         return {};
     }
 
     std::vector<int32_t> valid = grammar_->get_valid_tokens(vocab_);
+    if (gate_ == Gate::AwaitFirst && gate_opener_ >= 0) valid.push_back(gate_opener_);
 
     // If the grammar is in an accepting state, ensure all registered stop
     // tokens are included in the valid set.
@@ -70,7 +71,7 @@ void Sampler::build_token_trie(const std::vector<std::string>& vocab) {
 
 void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                         const std::vector<std::string>& token_strs) {
-    if (!grammar_) return;
+    if (!grammar_active()) return;   // no grammar, or inside the gated reasoning
 
     // Lazily build the trie on first grammar use if not yet built.
     if (!token_trie_ && !token_strs.empty()) {
@@ -100,6 +101,8 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
         cached_valid_ids_valid_ = false;
     } else {
         valid_tokens = grammar_->get_valid_tokens(token_strs);
+        // (peek_valid_set already added the opener to a cached set.)
+        if (gate_ == Gate::AwaitFirst && gate_opener_ >= 0) valid_tokens.push_back(gate_opener_);
     }
 
     if (valid_tokens.empty()) {

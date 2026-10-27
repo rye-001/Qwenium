@@ -13,6 +13,7 @@
 #include <string>
 
 #include "../../src/sampling/sampling.h"
+#include "../../src/sampling/grammar_vocab.h"
 
 using qinf::GreedySampler;
 
@@ -111,4 +112,79 @@ TEST(BannedTokensTest, NoBanLeavesSamplingUnchanged) {
     const auto before = logits;
     EXPECT_EQ(s.sample(logits, {}), 3);
     EXPECT_EQ(logits, before);
+}
+
+// The reasoning gate (tool_choice "required", docs/plan-tool-calling.md P4):
+// the grammar does not constrain the reasoning block between the opener and
+// the closer, and neither marker is fed to it.
+namespace {
+//                                    0    1    2      3       4
+const std::vector<std::string> kVocab = {"a", "b", "<t>", "</t>", "x"};
+std::vector<float> favour(int id) {
+    std::vector<float> l(kVocab.size(), 1.0f);
+    l[id] = 10.0f;
+    return l;
+}
+}  // namespace
+
+TEST(GrammarGateTest, ReasoningRunsFreeThenTheGrammarHolds) {
+    auto g = qinf::GrammarVocab::parse_impl("root ::= \"ab\"");
+    GreedySampler s;
+    s.set_grammar(g.get());
+    s.build_token_trie(kVocab);
+    s.set_grammar_gate(/*opener=*/2, /*closer=*/3, /*start_inside=*/false);
+
+    auto l = favour(4);   // "x" is not grammar-valid; the opener is the allowed runner-up
+    l[2] = 9.0f;
+    int t = s.sample(l, {}, kVocab);
+    EXPECT_EQ(t, 2);
+    s.accept_token(t);
+    EXPECT_FALSE(s.grammar_active());
+    l = favour(4);         // inside the reasoning anything goes
+    t = s.sample(l, {}, kVocab);
+    EXPECT_EQ(t, 4);
+    s.accept_token(t);
+    l = favour(3);
+    t = s.sample(l, {}, kVocab);
+    EXPECT_EQ(t, 3);
+    s.accept_token(t);
+    EXPECT_TRUE(s.grammar_active());
+    l = favour(4);         // after the closer the grammar holds: "a", then "b"
+    t = s.sample(l, {}, kVocab);
+    EXPECT_EQ(t, 0);
+    s.accept_token(t);
+    l = favour(4);
+    EXPECT_EQ(s.sample(l, {}, kVocab), 1);
+    s.accept_token(1);
+    EXPECT_TRUE(g->is_accepting_state());
+}
+
+TEST(GrammarGateTest, AFirstTokenThatIsNotTheOpenerActivatesTheGrammar) {
+    auto g = qinf::GrammarVocab::parse_impl("root ::= \"ab\"");
+    GreedySampler s;
+    s.set_grammar(g.get());
+    s.build_token_trie(kVocab);
+    s.set_grammar_gate(2, 3, false);
+    auto l = favour(0);
+    EXPECT_EQ(s.sample(l, {}, kVocab), 0);
+    s.accept_token(0);
+    l = favour(2);         // the opener is no longer allowed: only "b"
+    EXPECT_EQ(s.sample(l, {}, kVocab), 1);
+}
+
+TEST(GrammarGateTest, StartInsideIsUnconstrainedUntilTheCloser) {
+    auto g = qinf::GrammarVocab::parse_impl("root ::= \"ab\"");
+    GreedySampler s;
+    s.set_grammar(g.get());
+    s.build_token_trie(kVocab);
+    s.set_grammar_gate(2, 3, /*start_inside=*/true);
+    EXPECT_FALSE(s.grammar_active());
+    EXPECT_TRUE(s.peek_valid_set().empty());   // no sparse set while ungated text runs
+    auto l = favour(1);
+    EXPECT_EQ(s.sample(l, {}, kVocab), 1);
+    s.accept_token(1);
+    s.accept_token(3);
+    EXPECT_TRUE(s.grammar_active());
+    l = favour(1);
+    EXPECT_EQ(s.sample(l, {}, kVocab), 0);
 }

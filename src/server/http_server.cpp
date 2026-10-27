@@ -195,8 +195,18 @@ public:
 
         // Cache the vocabulary once (id -> token string). Passed as token_strs to
         // sample() so a slot's grammar can mask logits, and used to build each
-        // grammar slot's TokenTrie. ~vocab_size strings; fetched a single time.
-        vocab_ = tokenizer_->get_vocabulary();
+        // grammar slot's TokenTrie. ~vocab_size strings; built a single time.
+        // DECODED text, as GrammarVocab requires ("vocab[i] is the decoded
+        // string of token i") and the CLI chat path already does: the raw
+        // GGUF strings spell a space "Ġ" / "▁" and a newline "Ċ", so until
+        // 2026-10-27 a server grammar with a space or newline in a literal
+        // could never match an ordinary token (the tool-call grammars of
+        // docs/plan-tool-calling.md P4 are full of both).
+        {
+            const size_t n = tokenizer_->get_vocabulary().size();
+            vocab_.reserve(n);
+            for (size_t i = 0; i < n; ++i) vocab_.push_back(tokenizer_->decode(static_cast<int32_t>(i)));
+        }
 
         // F6: render prompts with the architecture's registered ChatTemplate
         // (Qwen <|im_start|> vs Gemma <start_of_turn> vs Gemma-4's own markers),
@@ -536,6 +546,12 @@ public:
     // Tool calling: null when the model's chat template was never measured.
     const qinf::tools::ToolFormat* tool_format() const { return tool_format_; }
     int32_t tool_opener_id() const { return tool_opener_id_; }
+    // The id of the special token spelled `text`, or -1 when it is not one.
+    int32_t special_token_id(const std::string& text) const {
+        const int32_t id = tokenizer_->get_special_token_id(text);
+        const auto& vocab = model_.get_metadata().id_to_token;
+        return (id >= 0 && static_cast<size_t>(id) < vocab.size() && vocab[id] == text) ? id : -1;
+    }
     const std::string& tool_template_sha16() const { return tool_template_sha16_; }
 
     // ── Vision (image input) capability surface, read by the chat route ──────
@@ -628,6 +644,9 @@ private:
                     "failed to parse GBNF grammar");
             sampler->set_grammar(grammar.get());
             sampler->build_token_trie(vocab_);  // trie + cached vocab for accept_token
+            if (req.grammar_gate_closer >= 0)   // the reasoning block runs unconstrained
+                sampler->set_grammar_gate(req.grammar_gate_opener, req.grammar_gate_closer,
+                                          req.grammar_gate_start_inside);
             // Let the grammar terminate: an accepting state adds these to the
             // valid set so the model may emit a stop token.
             for (int32_t id : model_.get_metadata().stop_token_ids)
@@ -1430,6 +1449,26 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             }
             if (tool_req->choice == qinf::server::ToolChoice::None)
                 inf_req->banned_tokens.push_back(integration.tool_opener_id());
+            // "required" / a named function: a grammar for exactly one call,
+            // gated off inside the model's reasoning block.
+            if (tool_req->choice == qinf::server::ToolChoice::Required ||
+                tool_req->choice == qinf::server::ToolChoice::Named) {
+                const auto g = fmt->grammar(tool_req->chat,
+                                            tool_req->choice == qinf::server::ToolChoice::Named ? &tool_req->named : nullptr);
+                inf_req->grammar = g.gbnf;
+                if (!g.gate_closer.empty()) {
+                    inf_req->grammar_gate_opener = g.gate_opener.empty() ? -1 : integration.special_token_id(g.gate_opener);
+                    inf_req->grammar_gate_closer = integration.special_token_id(g.gate_closer);
+                    inf_req->grammar_gate_start_inside = g.gate_start_inside;
+                    if (inf_req->grammar_gate_closer < 0 || (!g.gate_opener.empty() && inf_req->grammar_gate_opener < 0)) {
+                        res.status = 500;
+                        res.set_content(json({{"error", "tool grammar gate '" + g.gate_opener + "' / '" + g.gate_closer +
+                                               "': expected special tokens, actual: not in the vocabulary"}}).dump(),
+                                        "application/json");
+                        return;
+                    }
+                }
+            }
             // The system turn carries the tools block: the part an agent re-sends
             // every turn, so it is the cacheable prefix (no-op unless
             // --prefix-cache is wired). Every tool render opens with it.
@@ -1479,8 +1518,9 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         inf_req->top_p = body.value("top_p", inf_req->top_p);
         inf_req->top_k = body.value("top_k", inf_req->top_k);
         inf_req->seed  = body.value("seed", static_cast<long long>(-1));
-        // Optional GBNF grammar for constrained (structured) output.
-        inf_req->grammar = body.value("grammar", "");
+        // Optional GBNF grammar for constrained (structured) output. (A tool
+        // request refuses a client grammar; its own was set above.)
+        if (!tool_req) inf_req->grammar = body.value("grammar", "");
 
         // Stop sequences: OpenAI allows a single string or an array of strings.
         if (body.contains("stop")) {
@@ -1644,6 +1684,18 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                     reply = integration.tool_format()->parse(inf_req->output_text, tool_req->chat);
                 } catch (const qinf::tools::ToolCallError& e) {
                     bad_gateway(std::string("tool call: ") + e.what());
+                    return;
+                }
+                if ((tool_req->choice == qinf::server::ToolChoice::Required ||
+                     tool_req->choice == qinf::server::ToolChoice::Named) && reply.calls.empty()) {
+                    bad_gateway(std::string("tool call: tool_calls: expected a call (tool_choice is ") +
+                                (tool_req->choice == qinf::server::ToolChoice::Named ? "\"" + tool_req->named + "\"" : "\"required\"") +
+                                "), actual: none" + (inf_req->finish_reason == "length" ? " (the reply hit max_tokens)" : ""));
+                    return;
+                }
+                if (tool_req->choice == qinf::server::ToolChoice::Named && reply.calls[0].name != tool_req->named) {
+                    bad_gateway("tool call: tool_calls[0].name: expected \"" + tool_req->named + "\", actual: \"" +
+                                reply.calls[0].name + "\"");
                     return;
                 }
                 if (tool_req->choice == qinf::server::ToolChoice::None && !reply.calls.empty()) {

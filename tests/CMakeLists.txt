@@ -283,7 +283,7 @@ add_executable(tool-format-tests
 )
 target_compile_definitions(tool-format-tests PRIVATE
     QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
-target_link_libraries(tool-format-tests PRIVATE qinf-loader GTest::gtest_main)
+target_link_libraries(tool-format-tests PRIVATE qinf-loader sampling GTest::gtest_main)
 target_compile_features(tool-format-tests PRIVATE cxx_std_17)
 gtest_discover_tests(tool-format-tests)
 

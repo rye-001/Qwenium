@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <stdexcept>
 
 namespace qinf::tools {
@@ -452,6 +453,94 @@ void parse_calls(const std::string& text, size_t pos, const std::string& opener,
     }
 }
 
+// ── Grammars for tool_choice "required" / a named function (P4) ─────────────
+// GBNF in the subset GrammarVocab parses: literals, character classes (bytes,
+// negatable), groups, * + ?, alternation. A free-text span that must stop at a
+// closing literal is written as "no prefix of the closer, then the closer";
+// its classes also exclude the closer's first character, so the closer can
+// never be swallowed as text (the price: that character cannot repeat right
+// before the closer).
+
+std::string gbnf_lit(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:   out += c;
+        }
+    }
+    return out + "\"";
+}
+
+// JSON, plus the bounded whitespace every format allows between parts (up to
+// 3 characters; twice that before the call, where the model may end a
+// reasoning block or blank content with a few newlines). Whitespace is
+// LITERALS, not a character class: GrammarVocab marks every token whose first
+// character is in a standalone class as valid (its known too-permissive spot,
+// grammar_vocab.cpp), so a class here let " Sure" open a "required" reply —
+// the token is allowed, the grammar dies on its tail, the slot is forced to
+// stop. Literal alternatives are checked through the whole token.
+const char* kJsonRules = R"(json-value ::= json-object | json-array | json-string | json-number | "true" | "false" | "null"
+json-object ::= "{" ws ( json-string ws ":" ws json-value ( ws "," ws json-string ws ":" ws json-value )* )? ws "}"
+json-array ::= "[" ws ( json-value ( ws "," ws json-value )* )? ws "]"
+json-string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] | "\\u" hex hex hex hex )* "\""
+hex ::= [0-9a-fA-F]
+json-number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+json-int ::= "-"? ( "0" | [1-9] [0-9]* )
+ws ::= ( "\t" | " " | "\n" | "  " | " \n" | "\n " | "\n\n" | "   " | "  \n" | " \n " | " \n\n" | "\n  " | "\n \n" | "\n\n " | "\n\n\n" )?
+)";
+
+// The tools a grammar may call: all of them, or the one named.
+std::vector<const ojson*> grammar_tools(const ToolChat& chat, const std::string* only) {
+    std::vector<const ojson*> out;
+    for (const ojson& t : chat.tools)
+        if (!only || t["function"]["name"] == *only) out.push_back(&t);
+    if (out.empty())
+        refuse("tool_choice.function.name", "the name of one of the request's tools", "\"" + *only + "\"");
+    return out;
+}
+
+// A string enum as literal alternatives, or "" when the schema has none (or a
+// non-string member).
+std::string enum_alternatives(const ojson* schema, const std::function<std::string(const std::string&)>& lit) {
+    if (!schema || !schema->contains("enum") || !(*schema)["enum"].is_array() || (*schema)["enum"].empty()) return "";
+    std::string alts;
+    for (const ojson& e : (*schema)["enum"]) {
+        if (!e.is_string()) return "";
+        alts += (alts.empty() ? "" : " | ") + lit(e.get<std::string>());
+    }
+    return "( " + alts + " )";
+}
+
+// The value expression for a parameter, by its declared types. `text` is the
+// format's free string, `str_enum` its quoted enum (or ""), `obj`/`arr` its
+// object and array rules, `booleans` its boolean spellings.
+std::string typed_value(const ojson* schema, const std::string& text, const std::string& str_enum,
+                        const std::string& obj, const std::string& arr, const std::string& booleans,
+                        const std::string& null_rule, const std::string& any) {
+    const auto ts = schema_types(schema);
+    if (ts.empty()) return str_enum.empty() ? any : str_enum;
+    std::vector<std::string> alts;
+    for (const std::string& t : ts) {
+        if (t == "string")       alts.push_back(str_enum.empty() ? text : str_enum);
+        else if (t == "integer") alts.push_back("json-int");
+        else if (t == "number")  alts.push_back("json-number");
+        else if (t == "boolean") alts.push_back(booleans);
+        else if (t == "null")    alts.push_back(null_rule);
+        else if (t == "object")  alts.push_back(obj);
+        else if (t == "array")   alts.push_back(arr);
+        else                     alts.push_back(any);
+    }
+    if (alts.size() == 1) return alts[0];
+    std::string s = "( ";
+    for (size_t i = 0; i < alts.size(); ++i) s += (i ? " | " : "") + alts[i];
+    return s + " )";
+}
+
 // ── HermesJson: Qwen3 ────────────────────────────────────────────────────────
 
 const char* kHermesToolsHead =
@@ -559,6 +648,19 @@ public:
             return close + 12;
         });
         return r;
+    }
+
+    // root: one <tool_call> of one tool; the arguments any JSON object.
+    ToolGrammar grammar(const ToolChat& chat, const std::string* only_tool) const override {
+        ToolGrammar g;
+        std::string names;
+        for (const ojson* t : grammar_tools(chat, only_tool))
+            names += (names.empty() ? "" : " | ") +
+                     gbnf_lit((*t)["function"]["name"].get<std::string>() + "\", \"arguments\": ");
+        g.gbnf = "root ::= ws ws " + gbnf_lit("<tool_call>\n{\"name\": \"") + " ( " + names + " ) json-object " +
+                 gbnf_lit("}\n</tool_call>") + "\n" + kJsonRules;
+        if (chat.enable_thinking != false) { g.gate_opener = "<think>"; g.gate_closer = "</think>"; }
+        return g;
     }
 
 private:
@@ -748,6 +850,41 @@ public:
         return r;
     }
 
+    // root: one <tool_call> of one tool; parameter names from its schema (any
+    // order — required ones are checked by parse), each value typed by it.
+    ToolGrammar grammar(const ToolChat& chat, const std::string* only_tool) const override {
+        ToolGrammar g;
+        std::string fns, rules;
+        const auto tools = grammar_tools(chat, only_tool);
+        for (size_t i = 0; i < tools.size(); ++i) {
+            const ojson& f = (*tools[i])["function"];
+            const std::string fn = "x-fn-" + std::to_string(i), param = "x-param-" + std::to_string(i);
+            fns += (fns.empty() ? "" : " | ") + fn;
+            rules += fn + " ::= " + gbnf_lit(f["name"].get<std::string>() + ">\n") + " " + param + "*\n";
+            const ojson* params = params_of(*tools[i]);
+            std::string alts;
+            if (params && params->contains("properties") && (*params)["properties"].is_object())
+                for (auto it = (*params)["properties"].begin(); it != (*params)["properties"].end(); ++it) {
+                    const ojson* ps = it.value().is_object() ? &it.value() : nullptr;
+                    const std::string v = typed_value(ps, "xml-text", enum_alternatives(ps, gbnf_lit), "json-object",
+                        "json-array", "( \"true\" | \"false\" | \"True\" | \"False\" )", "( \"null\" | \"None\" )",
+                        "xml-text");
+                    alts += (alts.empty() ? "" : " | ") + gbnf_lit(it.key() + ">\n") + " " + v;
+                }
+            if (alts.empty()) alts = "[^>\\n]+ \">\\n\" xml-text";   // no declared parameters: any name
+            rules += param + " ::= \"<parameter=\" ( " + alts + " ) " + gbnf_lit("\n</parameter>\n") + "\n";
+        }
+        g.gbnf = "root ::= ws ws " + gbnf_lit("<tool_call>\n<function=") + " ( " + fns + " ) " +
+                 gbnf_lit("</function>\n</tool_call>") + "\n" + rules +
+                 // Free text until "\n</parameter>": a run of newlines must be
+                 // followed by a character that is not '<' (or the closer).
+                 "xml-text ::= ( [^\\n] | \"\\n\"+ [^<\\n] )*\n" + kJsonRules;
+        const bool opened = chat.add_generation_prompt &&
+                            (p_.thinking_default_on ? chat.enable_thinking != false : chat.enable_thinking == true);
+        if (opened) { g.gate_opener = "<think>"; g.gate_closer = "</think>"; g.gate_start_inside = true; }
+        return g;
+    }
+
 private:
     Params p_;
 };
@@ -880,6 +1017,44 @@ public:
             return p + 12;
         });
         return r;
+    }
+
+    // root: one <|tool_call> of one tool; keys from its schema, values in
+    // Gemma's notation, typed by it.
+    ToolGrammar grammar(const ToolChat& chat, const std::string* only_tool) const override {
+        ToolGrammar g;
+        std::string fns, rules;
+        const auto tools = grammar_tools(chat, only_tool);
+        for (size_t i = 0; i < tools.size(); ++i) {
+            const ojson& f = (*tools[i])["function"];
+            const std::string fn = "g-fn-" + std::to_string(i), kv = "g-kv-" + std::to_string(i);
+            fns += (fns.empty() ? "" : " | ") + fn;
+            rules += fn + " ::= " + gbnf_lit(f["name"].get<std::string>() + "{") + " ( " + kv + " ( \",\" " + kv +
+                     " )* )? \"}\"\n";
+            const ojson* params = params_of(*tools[i]);
+            std::string alts;
+            if (params && params->contains("properties") && (*params)["properties"].is_object())
+                for (auto it = (*params)["properties"].begin(); it != (*params)["properties"].end(); ++it) {
+                    const ojson* ps = it.value().is_object() ? &it.value() : nullptr;
+                    const std::string en = enum_alternatives(ps, gbnf_lit);
+                    const std::string v = typed_value(ps, "g-string", en.empty() ? "" : gbnf_lit(kQ) + " " + en + " " + gbnf_lit(kQ),
+                        "g-obj", "g-arr", "( \"true\" | \"false\" )", "( \"null\" | \"None\" )", "g-value");
+                    alts += (alts.empty() ? "" : " | ") + gbnf_lit(it.key() + ":") + " " + v;
+                }
+            if (alts.empty()) alts = "g-key \":\" g-value";   // no declared parameters: any key
+            rules += kv + " ::= " + alts + "\n";
+        }
+        g.gbnf = "root ::= ws ws " + gbnf_lit("<|tool_call>call:") + " ( " + fns + " ) " + gbnf_lit("<tool_call|>") + "\n" +
+                 rules +
+                 "g-value ::= g-string | json-number | \"true\" | \"false\" | \"null\" | g-obj | g-arr\n"
+                 "g-string ::= " + gbnf_lit(kQ) + " g-text " + gbnf_lit(kQ) + "\n"
+                 // Free text until <|"|>: no prefix of the delimiter, then it.
+                 "g-text ::= ( [^<] | \"<\" [^|<] | \"<|\" [^\"<] | \"<|\\\"\" [^|<] | \"<|\\\"|\" [^><] )*\n"
+                 "g-obj ::= \"{\" ( g-key \":\" g-value ( \",\" g-key \":\" g-value )* )? \"}\"\n"
+                 "g-key ::= [^:{}<,]+\n"
+                 "g-arr ::= \"[\" ( g-value ( \",\" g-value )* )? \"]\"\n" + kJsonRules;
+        if (chat.enable_thinking == true) { g.gate_opener = "<|channel>"; g.gate_closer = "<channel|>"; }
+        return g;
     }
 
 private:

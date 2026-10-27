@@ -151,10 +151,21 @@ ToolRequest parse_tool_request(const std::string& request_body) {
         const ojson& c = body["tool_choice"];
         if (c == "auto") out.choice = ToolChoice::Auto;
         else if (c == "none") out.choice = ToolChoice::None;
-        else if (c == "required" || c.is_object())
-            refuse("tool_choice", "\"auto\" or \"none\" (\"required\" and a named function come with the "
-                                  "grammar, plan-tool-calling P4)", describe(c));
-        else refuse("tool_choice", "\"auto\" or \"none\"", describe(c));
+        else if (c == "required") out.choice = ToolChoice::Required;
+        else if (c.is_object()) {
+            if (!c.contains("type") || c["type"] != "function")
+                refuse("tool_choice.type", "\"function\"", c.contains("type") ? describe(c["type"]) : "absent");
+            if (!c.contains("function") || !c["function"].is_object() || !c["function"].contains("name") ||
+                !c["function"]["name"].is_string() || !names.count(c["function"]["name"].get<std::string>()))
+                refuse("tool_choice.function.name", "the name of one of the request's tools",
+                       c.contains("function") && c["function"].is_object() && c["function"].contains("name")
+                           ? describe(c["function"]["name"]) : "absent");
+            out.choice = ToolChoice::Named;
+            out.named = c["function"]["name"].get<std::string>();
+        } else {
+            refuse("tool_choice", "\"auto\", \"none\", \"required\" or {\"type\":\"function\",\"function\":"
+                                  "{\"name\":...}}", describe(c));
+        }
     }
     if (present(body, "parallel_tool_calls") && body["parallel_tool_calls"] != true)
         refuse("parallel_tool_calls", "true or absent (false is not enforced in v1)",
