@@ -276,6 +276,17 @@ target_link_libraries(image-data-uri-tests PRIVATE
 target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-data-uri-tests)
 
+# Tool requests rendered in each measured template's own format, byte for byte
+# against the captured HF / llama.cpp renderings (docs/plan-tool-calling.md G1).
+add_executable(tool-format-tests
+    unit/test_tool_format.cpp
+)
+target_compile_definitions(tool-format-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(tool-format-tests PRIVATE qinf-loader GTest::gtest_main)
+target_compile_features(tool-format-tests PRIVATE cxx_std_17)
+gtest_discover_tests(tool-format-tests)
+
 # Chat-request tool fields refused by name (docs/plan-tool-calling.md P0).
 add_executable(tool-request-tests
     unit/test_tool_request.cpp

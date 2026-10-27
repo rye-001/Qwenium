@@ -77,3 +77,4 @@ qemmi.config.*
 claude-memory
 !docs/note-verdict-img-ground.md
 !docs/note-repo-split.md
+tests/fixtures/chat_tools/

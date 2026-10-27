@@ -6,6 +6,7 @@ add_library(qinf-loader STATIC
     chat_template.cpp
     multimodal_check.cpp
     channel_filter.cpp
+    tool_format.cpp
 )
 
 target_include_directories(qinf-loader PUBLIC
@@ -14,7 +15,9 @@ target_include_directories(qinf-loader PUBLIC
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
-target_link_libraries(qinf-loader PUBLIC ggml)
+# nlohmann_json: tool_format walks tool schemas and arguments (docs/plan-tool-calling.md).
+# Fetched by src/server/CMakeLists.txt, which is configured first.
+target_link_libraries(qinf-loader PUBLIC ggml nlohmann_json::nlohmann_json)
 
 set_target_properties(qinf-loader PROPERTIES
     POSITION_INDEPENDENT_CODE ON
