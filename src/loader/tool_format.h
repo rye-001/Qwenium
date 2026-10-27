@@ -1,6 +1,7 @@
 #pragma once
 // tool_format.h — a tool request rendered in the model's own trained format
-// (docs/plan-tool-calling.md, phase P1: rendering).
+// and the model's reply parsed back (docs/plan-tool-calling.md: P1 rendering,
+// P2 parsing).
 //
 // Three dialects, one per text protocol (split, not parameterised — no call
 // site uses two of them together):
@@ -28,6 +29,7 @@
 // Unit test: tests/unit/test_tool_format.cpp
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,31 @@ enum class ToolDialect { HermesJson, QwenXml, Gemma4 };
 
 const char* to_string(ToolDialect d);
 
+// One call the model made. The server assigns the OpenAI id.
+struct ParsedCall {
+    std::string name;
+    ojson       arguments;   // a JSON object, in the order the model wrote it
+};
+
+// What the model generated after the generation prompt, split up.
+struct ParsedReply {
+    std::string             reasoning;   // the thinking text, trimmed; "" when none
+    std::string             content;     // the text outside reasoning and calls, trimmed
+    std::vector<ParsedCall> calls;       // empty: the model answered without a call
+};
+
+// The model's output does not parse as this format's tool calls, or a call
+// does not fit its tool's schema (the checked subset: required parameters
+// present; no unknown parameter when additionalProperties is false; each
+// top-level value of its declared JSON type and, with an enum, one of it).
+// The server answers 502 with the raw output; the text is never passed off as
+// an answer. The message names the call, the field, the expected and the
+// actual value.
+class ToolCallError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class ToolFormat {
 public:
     virtual ~ToolFormat() = default;
@@ -76,6 +103,13 @@ public:
     // token). Throws std::invalid_argument on a request the template does not
     // render faithfully.
     virtual std::string render(const ToolChat& chat) const = 0;
+
+    // The model's reply to render(chat): `generated` is the decoded text after
+    // the generation prompt, the stop token excluded (a trailing end-of-turn or
+    // Gemma's <|tool_response> marker is tolerated). Qwen-XML parameter values
+    // are raw text and are typed by the tool's schema; the other dialects'
+    // values carry their own types. Throws ToolCallError.
+    virtual ParsedReply parse(const std::string& generated, const ToolChat& chat) const = 0;
 };
 
 // sha256 of the template text, the first 16 hex digits.

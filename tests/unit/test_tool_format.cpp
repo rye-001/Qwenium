@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -221,4 +222,236 @@ TEST(ToolFormat, RefusesAnUnknownReasoningEffortAndEffortWithThinkingOff) {
     EXPECT_EQ(refusal(kQwen38_27, chat),
               "'reasoning_effort': expected absent when enable_thinking is false (the template ignores it), "
               "actual: \"low\"");
+}
+
+// ── P2: parsing the reply (gate G2) ──────────────────────────────────────────
+
+namespace {
+
+using qinf::tools::ParsedReply;
+using qinf::tools::ToolCallError;
+
+ParsedReply parse(const std::string& sha16, const std::string& text, const ToolChat& chat) {
+    return qinf::tools::lookup_tool_format(sha16)->parse(text, chat);
+}
+
+std::string parse_error(const std::string& sha16, const std::string& text, const ToolChat& chat) {
+    try {
+        parse(sha16, text, chat);
+    } catch (const ToolCallError& e) {
+        return e.what();
+    }
+    return "(parsed, no error)";
+}
+
+// Key order aside (Gemma's template sorts keys), the same JSON value.
+bool same_json(const ojson& a, const ojson& b) {
+    return nlohmann::json::parse(a.dump()) == nlohmann::json::parse(b.dump());
+}
+
+std::string py_strip_ascii(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\n\r\f\v");
+    if (a == std::string::npos) return "";
+    return s.substr(a, s.find_last_not_of(" \t\n\r\f\v") - a + 1);
+}
+
+const std::string kGemma = kGemma26;   // the parsers do not differ between Gemma checkpoints
+
+}  // namespace
+
+// The round trip: an assistant turn with calls, rendered into history by the
+// template, is exactly what the model was trained to emit after the
+// generation prompt. So render(messages[:k]) + generation prompt must be a
+// prefix of render(messages[:k+1]), and parsing the rest must give back the
+// calls of messages[k] — on every measured template, every fixture case with
+// calls. Two exclusions, each asserted: number_null_escape_forms breaks its
+// own schema (all_day null for a boolean), so every dialect must REFUSE it;
+// Gemma renders a calling turn's content AFTER the calls, which the parser
+// refuses as text after a call (the model is expected to stop on
+// <|tool_response>), so content_then_call is a refusal there too.
+TEST(ToolFormat, ParsesBackWhatTheTemplateRendersAsAModelTurn) {
+    std::map<std::string, int> round_trips;
+    for (const std::string& h : qinf::tools::measured_tool_templates()) {
+        const auto dialect = qinf::tools::lookup_tool_format(h)->dialect();
+        for (const ojson& c : cases()["cases"]) {
+            const std::string name = c["name"].get<std::string>();
+            const ToolChat full = chat_of(c);
+            for (size_t k = 0; k < full.messages.size(); ++k) {
+                if (full.messages[k].tool_calls.empty()) continue;
+                ToolChat before = full, upto = full;
+                before.messages.resize(k);
+                upto.messages.resize(k + 1);
+                upto.add_generation_prompt = false;
+                std::string P, Q;
+                try { P = render(h, before); Q = render(h, upto); } catch (const std::invalid_argument&) { continue; }
+                // Gemma with thinking off: the generation prompt ends in the empty
+                // thought block, which history never re-renders — the reply
+                // follows it, so it is what follows "<|turn>model\n" in history.
+                const std::string empty_thought = "<|channel>thought\n<channel|>";
+                size_t cut = P.size();
+                if (Q.rfind(P, 0) != 0 && P.size() >= empty_thought.size() &&
+                    P.compare(P.size() - empty_thought.size(), empty_thought.size(), empty_thought) == 0 &&
+                    Q.rfind(P.substr(0, P.size() - empty_thought.size()), 0) == 0)
+                    cut = P.size() - empty_thought.size();
+                else
+                    ASSERT_EQ(Q.rfind(P, 0), 0u) << h << "/" << name << ": the generation prompt is not a prefix";
+                const std::string gen = Q.substr(cut);
+                const std::string what = h + "/" + name + " k=" + std::to_string(k);
+                if (name == "number_null_escape_forms") {
+                    EXPECT_NE(parse_error(h, gen, before).find("tool_calls[0].arguments.all_day: expected boolean"),
+                              std::string::npos) << what << ": " << parse_error(h, gen, before);
+                    continue;
+                }
+                if (dialect == qinf::tools::ToolDialect::Gemma4 && name == "content_then_call") {
+                    EXPECT_NE(parse_error(h, gen, before).find("after tool_calls[0]: expected another <|tool_call>"),
+                              std::string::npos) << what << ": " << parse_error(h, gen, before);
+                    continue;
+                }
+                const ParsedReply r = parse(h, gen, before);
+                const ToolTurn& m = full.messages[k];
+                ASSERT_EQ(r.calls.size(), m.tool_calls.size()) << what << "\n" << gen;
+                for (size_t i = 0; i < r.calls.size(); ++i) {
+                    EXPECT_EQ(r.calls[i].name, m.tool_calls[i].name) << what;
+                    EXPECT_TRUE(same_json(r.calls[i].arguments, m.tool_calls[i].arguments))
+                        << what << ": " << r.calls[i].arguments.dump() << " vs " << m.tool_calls[i].arguments.dump();
+                }
+                if (dialect != qinf::tools::ToolDialect::Gemma4)
+                    EXPECT_EQ(r.content, py_strip_ascii(m.content)) << what;
+                const bool shown = m.reasoning && gen.find(*m.reasoning) != std::string::npos;
+                EXPECT_EQ(r.reasoning, shown ? *m.reasoning : "") << what;
+                ++round_trips[h];
+            }
+        }
+    }
+    for (const std::string& h : qinf::tools::measured_tool_templates()) {
+        EXPECT_GE(round_trips[h], 9) << h << ": too few round trips";
+        RecordProperty("round_trips_" + h, round_trips[h]);
+    }
+}
+
+TEST(ToolFormat, HermesParsesContentReasoningAndParallelCalls) {
+    const ToolChat chat = case_named("tools_only");
+    const ParsedReply r = parse(kQwen3,
+        "<think>\nTwo lookups.\n</think>\n\nChecking.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": "
+        "{\"tz\": \"Europe/Paris\"}}\n</tool_call><|im_end|>", chat);
+    EXPECT_EQ(r.reasoning, "Two lookups.");
+    EXPECT_EQ(r.content, "Checking.");
+    ASSERT_EQ(r.calls.size(), 2u);
+    EXPECT_EQ(r.calls[1].name, "get_time");
+    EXPECT_EQ(r.calls[1].arguments.dump(), "{\"tz\":\"Europe/Paris\"}");
+    const ParsedReply plain = parse(kQwen3, "<think>\n\n</think>\n\nIt is sunny.", chat);
+    EXPECT_TRUE(plain.calls.empty());
+    EXPECT_EQ(plain.content, "It is sunny.");
+}
+
+TEST(ToolFormat, HermesNamesWhatIsMalformed) {
+    const ToolChat chat = case_named("tools_only");
+    EXPECT_EQ(parse_error(kQwen3, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par", chat),
+              "tool_calls[0]: expected a call closed by </tool_call>, actual: unterminated, "
+              "\"<tool_call>\\n{\\\"name\\\": \\\"get_weather\\\", \\\"arg\"... (offset 0)");
+    EXPECT_EQ(parse_error(kQwen3, "<tool_call>\n{\"name\": get_weather}\n</tool_call>", chat),
+              "tool_calls[0]: expected a JSON object {\"name\": ..., \"arguments\": {...}}, actual: "
+              "\"\\n{\\\"name\\\": get_weather}\\n</tool_call>\" (offset 11)");
+    EXPECT_EQ(parse_error(kQwen3, "<tool_call>\n{\"name\": \"get_wether\", \"arguments\": {}}\n</tool_call>", chat),
+              "tool_calls[0].name: expected one of the request's tools (get_weather, get_time), actual: \"get_wether\"");
+    EXPECT_EQ(parse_error(kQwen3, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n"
+                                  "</tool_call>\nDone.", chat),
+              "after tool_calls[0]: expected another <tool_call> or the end of the reply, actual: \"Done.\" (offset 81)");
+    EXPECT_EQ(parse_error(kQwen3, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"{}\"}\n</tool_call>", chat),
+              "tool_calls[0].arguments: expected a JSON object, actual: \"{}\"");
+}
+
+// The checked schema subset (T5), the same for every dialect.
+TEST(ToolFormat, ChecksArgumentsAgainstTheSchemaSubset) {
+    ToolChat chat = case_named("tools_only");
+    const auto call = [](const std::string& args) {
+        return "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": " + args + "}\n</tool_call>";
+    };
+    EXPECT_EQ(parse_error(kQwen3, call("{}"), chat),
+              "tool_calls[0].arguments.city: expected present (required), actual: absent");
+    EXPECT_EQ(parse_error(kQwen3, call("{\"city\": 5}"), chat),
+              "tool_calls[0].arguments.city: expected string, actual: a number 5");
+    EXPECT_EQ(parse_error(kQwen3, call("{\"city\": \"Paris\", \"unit\": \"kelvin\"}"), chat),
+              "tool_calls[0].arguments.unit: expected one of [\"celsius\",\"fahrenheit\"], actual: \"kelvin\"");
+    EXPECT_EQ(parse_error(kQwen3, call("{\"city\": \"Paris\", \"days\": 3}"), chat), "(parsed, no error)");
+    chat.tools[0]["function"]["parameters"]["additionalProperties"] = false;
+    EXPECT_EQ(parse_error(kQwen3, call("{\"city\": \"Paris\", \"days\": 3}"), chat),
+              "tool_calls[0].arguments.days: expected no such parameter (additionalProperties is false), actual: present");
+}
+
+TEST(ToolFormat, QwenXmlTypesValuesByTheSchema) {
+    ToolChat chat = case_named("bool_true_arg");
+    chat.messages.resize(1);
+    const ParsedReply r = parse(kQwen38_27,
+        "The user wants an event.\n</think>\n\n<tool_call>\n<function=create_event>\n"
+        "<parameter=title>\n Planning \n</parameter>\n<parameter=duration_min>\n90\n</parameter>\n"
+        "<parameter=all_day>\nTrue\n</parameter>\n<parameter=attendees>\n[\"a@x.org\"]\n</parameter>\n"
+        "<parameter=location>\n{\"name\": \"München\", \"lat\": 48.1}\n</parameter>\n</function>\n</tool_call>", chat);
+    EXPECT_EQ(r.reasoning, "The user wants an event.");
+    ASSERT_EQ(r.calls.size(), 1u);
+    EXPECT_EQ(r.calls[0].arguments.dump(),
+              "{\"title\":\" Planning \",\"duration_min\":90,\"all_day\":true,\"attendees\":[\"a@x.org\"],"
+              "\"location\":{\"name\":\"München\",\"lat\":48.1}}");
+    // Thinking off: the reply starts after the empty block, no reasoning.
+    chat.enable_thinking = false;
+    const ParsedReply off = parse(kQwen35, "<tool_call>\n<function=create_event>\n<parameter=title>\nT\n"
+                                           "</parameter>\n<parameter=duration_min>\n5\n</parameter>\n</function>\n"
+                                           "</tool_call>", chat);
+    EXPECT_EQ(off.reasoning, "");
+    EXPECT_EQ(off.calls[0].arguments.dump(), "{\"title\":\"T\",\"duration_min\":5}");
+}
+
+TEST(ToolFormat, QwenXmlNamesWhatIsMalformed) {
+    ToolChat chat = case_named("bool_true_arg");
+    chat.messages.resize(1);
+    chat.enable_thinking = false;
+    const std::string head = "<tool_call>\n<function=create_event>\n<parameter=title>\nT\n</parameter>\n";
+    EXPECT_EQ(parse_error(kQwen35, head + "<parameter=duration_min>\nninety\n</parameter>\n</function>\n</tool_call>", chat),
+              "tool_calls[0].arguments.duration_min: expected integer, actual: \"ninety\"");
+    EXPECT_EQ(parse_error(kQwen35, "<tool_call>\n<funtion=create_event>\n", chat),
+              "tool_calls[0]: expected <function=NAME> after <tool_call>, actual: \"<funtion=create_event>\\n\" (offset 12)");
+    EXPECT_EQ(parse_error(kQwen35, head + "<parameter=duration_min>\n9", chat),
+              "tool_calls[0].arguments.duration_min: expected a value closed by </parameter>, actual: unterminated, "
+              "\"9\" (offset 94)");
+    EXPECT_EQ(parse_error(kQwen35, head + "<parameter=title>\nU\n</parameter>\n</function>\n</tool_call>", chat),
+              "tool_calls[0].arguments.title: expected each parameter once, actual: a second value");
+    EXPECT_EQ(parse_error(kQwen35, head + "<parameter=duration_min>\n5\n</parameter>\n</function>\n", chat),
+              "tool_calls[0]: expected </tool_call> after </function>, actual: \"\" (offset 121)");
+}
+
+TEST(ToolFormat, Gemma4ParsesItsNotation) {
+    ToolChat chat = case_named("tools_only");
+    chat.enable_thinking = true;
+    const ParsedReply r = parse(kGemma,
+        "<|channel>thought\nTwo calls.<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,"
+        "unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_call>call:get_time{tz:<|\"|>Europe/Paris<|\"|>}<tool_call|>"
+        "<|tool_response>", chat);
+    EXPECT_EQ(r.reasoning, "Two calls.");
+    EXPECT_EQ(r.content, "");
+    ASSERT_EQ(r.calls.size(), 2u);
+    EXPECT_EQ(r.calls[0].arguments.dump(), "{\"city\":\"Paris\",\"unit\":\"celsius\"}");
+    ToolChat rich = case_named("bool_true_arg");
+    rich.messages.resize(1);
+    const ParsedReply n = parse(kGemma,
+        "<|tool_call>call:create_event{all_day:false,attendees:[<|\"|>a@x.org<|\"|>,<|\"|>b@x.org<|\"|>],"
+        "duration_min:90,location:{lat:-48.5e1,name:<|\"|>a, {b}: c<|\"|>},title:<|\"|>T<|\"|>}<tool_call|>", rich);
+    EXPECT_EQ(n.calls[0].arguments.dump(),
+              "{\"all_day\":false,\"attendees\":[\"a@x.org\",\"b@x.org\"],\"duration_min\":90,"
+              "\"location\":{\"lat\":-485.0,\"name\":\"a, {b}: c\"},\"title\":\"T\"}");
+}
+
+TEST(ToolFormat, Gemma4NamesWhatIsMalformed) {
+    const ToolChat chat = case_named("tools_only");
+    EXPECT_EQ(parse_error(kGemma, "<|tool_call>call:get_weather{city:<|\"|>Par", chat),
+              "tool_calls[0].arguments.city: expected a string closed by <|\"|>, actual: unterminated, "
+              "\"<|\\\"|>Par\" (offset 34)");
+    EXPECT_EQ(parse_error(kGemma, "<|tool_call>get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>", chat),
+              "tool_calls[0]: expected call:NAME{...} after <|tool_call>, actual: "
+              "\"get_weather{city:<|\\\"|>Paris<|\\\"|>}<tool_c\"... (offset 12)");
+    EXPECT_EQ(parse_error(kGemma, "<|tool_call>call:get_weather{city:Paris}<tool_call|>", chat),
+              "tool_calls[0].arguments.city: expected a value (<|\"|>string<|\"|>, number, true, false, null, "
+              "{...} or [...]), actual: \"Paris}<tool_call|>\" (offset 34)");
+    EXPECT_EQ(parse_error(kGemma, "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}", chat),
+              "tool_calls[0]: expected <tool_call|> after the arguments, actual: \"\" (offset 50)");
 }

@@ -1,5 +1,7 @@
 #include "tool_format.h"
 
+#include "channel_filter.h"
+
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
@@ -275,6 +277,181 @@ void refuse_kwarg_absent_from_template(const std::optional<std::string>& v, cons
     if (v) refuse(name, "absent (this checkpoint's template has no such switch)", "\"" + *v + "\"");
 }
 
+// ── Parsing the reply ────────────────────────────────────────────────────────
+
+[[noreturn]] void bad_call(const std::string& where, const std::string& expected,
+                           const std::string& actual) {
+    throw ToolCallError(where + ": expected " + expected + ", actual: " + actual);
+}
+
+// A short, quoted look at the text at `pos`, for an error message.
+std::string snippet(const std::string& s, size_t pos) {
+    std::string t = s.substr(pos, 40);
+    return ojson(t).dump(-1, ' ', false, ojson::error_handler_t::replace) +
+           (pos + 40 < s.size() ? "..." : "") + " (offset " + std::to_string(pos) + ")";
+}
+
+size_t skip_ws(const std::string& s, size_t pos) {
+    while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+    return pos;
+}
+
+bool at(const std::string& s, size_t pos, const std::string& lit) { return s.compare(pos, lit.size(), lit) == 0; }
+
+// The reasoning block at the head of a Qwen reply. `opened`: the generation
+// prompt already wrote "<think>\n", so the reply starts inside it. Otherwise a
+// reply may still open one itself. Reasoning ends at "</think>" or — the model
+// skipping the closer — at the first call opener; with neither, the whole
+// reply is reasoning (a truncated thought, not a malformed call).
+size_t split_think(const std::string& text, bool opened, const std::string& opener, std::string& reasoning) {
+    size_t start = 0;
+    if (!opened) {
+        const size_t p = skip_ws(text, 0);
+        if (!at(text, p, "<think>")) return 0;
+        start = p + 7;
+    }
+    const size_t close = text.find("</think>", start);
+    const size_t call  = text.find(opener, start);
+    if (close != std::string::npos && (call == std::string::npos || close < call)) {
+        reasoning = py_strip(text.substr(start, close - start));
+        return close + 8;
+    }
+    const size_t end = call == std::string::npos ? text.size() : call;
+    reasoning = py_strip(text.substr(start, end - start));
+    return end;
+}
+
+const ojson* tool_named(const ojson& tools, const std::string& name) {
+    for (const ojson& t : tools)
+        if (t["function"]["name"] == name) return &t;
+    return nullptr;
+}
+
+// The tool's parameters schema, or null when it declares none.
+const ojson* params_of(const ojson& tool) {
+    const ojson& f = tool["function"];
+    return f.contains("parameters") && f["parameters"].is_object() ? &f["parameters"] : nullptr;
+}
+
+const ojson* property_schema(const ojson* params, const std::string& key) {
+    if (!params || !params->contains("properties") || !(*params)["properties"].is_object()) return nullptr;
+    const ojson& props = (*params)["properties"];
+    return props.contains(key) && props[key].is_object() ? &props[key] : nullptr;
+}
+
+// The JSON types a schema declares ("type": a name or a list of names).
+std::vector<std::string> schema_types(const ojson* schema) {
+    std::vector<std::string> out;
+    if (!schema || !schema->contains("type")) return out;
+    const ojson& t = (*schema)["type"];
+    if (t.is_string()) out.push_back(t.get<std::string>());
+    else if (t.is_array())
+        for (const ojson& x : t) if (x.is_string()) out.push_back(x.get<std::string>());
+    return out;
+}
+
+bool has_type(const std::vector<std::string>& ts, const char* t) {
+    return std::find(ts.begin(), ts.end(), t) != ts.end();
+}
+
+bool is_of_type(const ojson& v, const std::string& t) {
+    if (t == "string")  return v.is_string();
+    if (t == "boolean") return v.is_boolean();
+    if (t == "null")    return v.is_null();
+    if (t == "object")  return v.is_object();
+    if (t == "array")   return v.is_array();
+    if (t == "number")  return v.is_number();
+    if (t == "integer") return v.is_number_integer() || (v.is_number_float() && v.get<double>() == static_cast<double>(static_cast<int64_t>(v.get<double>())));
+    return true;   // a type this subset does not check
+}
+
+std::string join_types(const std::vector<std::string>& ts) {
+    std::string s;
+    for (size_t i = 0; i < ts.size(); ++i) s += (i ? " or " : "") + ts[i];
+    return s;
+}
+
+// The checked schema subset (T5): required present, no unknown parameter under
+// additionalProperties:false, each top-level value of its declared type and in
+// its enum.
+void check_arguments(const ParsedCall& c, const std::string& where, const ojson& tool) {
+    const ojson* params = params_of(tool);
+    if (!params) return;
+    if (params->contains("required") && (*params)["required"].is_array())
+        for (const ojson& r : (*params)["required"])
+            if (r.is_string() && !c.arguments.contains(r.get<std::string>()))
+                bad_call(where + ".arguments." + r.get<std::string>(), "present (required)", "absent");
+    const bool closed = params->contains("additionalProperties") && (*params)["additionalProperties"] == false;
+    for (auto it = c.arguments.begin(); it != c.arguments.end(); ++it) {
+        const std::string field = where + ".arguments." + it.key();
+        const ojson* ps = property_schema(params, it.key());
+        if (!ps) {
+            if (closed) bad_call(field, "no such parameter (additionalProperties is false)", "present");
+            continue;
+        }
+        const auto ts = schema_types(ps);
+        if (!ts.empty() && std::none_of(ts.begin(), ts.end(), [&](const std::string& t) { return is_of_type(it.value(), t); }))
+            bad_call(field, join_types(ts), std::string("a ") + it.value().type_name() + " " + it.value().dump());
+        if (ps->contains("enum") && (*ps)["enum"].is_array()) {
+            const ojson& e = (*ps)["enum"];
+            if (std::find(e.begin(), e.end(), it.value()) == e.end())
+                bad_call(field, "one of " + e.dump(), it.value().dump());
+        }
+    }
+}
+
+// Qwen-XML values are raw text: type them by the parameter's schema, as the
+// qwen3_coder parsers of vLLM and llama.cpp do — a string parameter keeps the
+// text; otherwise the text is read as the declared JSON type (booleans also in
+// the Python spelling the history renders, True/False/None); a union tries its
+// non-string types first and falls back to the text when string is allowed.
+ojson type_xml_value(const std::string& raw, const ojson* schema, const std::string& field) {
+    const auto ts = schema_types(schema);
+    if (ts.empty() || (ts.size() == 1 && ts[0] == "string")) return raw;
+    const std::string t = py_strip(raw);
+    if (has_type(ts, "null") && (t == "null" || t == "None")) return nullptr;
+    if (has_type(ts, "boolean")) {
+        if (t == "true" || t == "True") return true;
+        if (t == "false" || t == "False") return false;
+    }
+    const ojson j = ojson::parse(t, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_discarded())
+        for (const std::string& ty : ts)
+            if (ty != "string" && ty != "null" && ty != "boolean" && is_of_type(j, ty)) return j;
+    if (has_type(ts, "string")) return raw;
+    bad_call(field, join_types(ts), ojson(raw).dump());
+}
+
+// Calls follow one another separated only by whitespace; after the last only
+// whitespace or a trailer (the end-of-turn marker the server may leave) may
+// follow — text after a call is not an answer the template ever renders.
+template <typename ParseOne>
+void parse_calls(const std::string& text, size_t pos, const std::string& opener,
+                 const std::vector<std::string>& trailers, ParsedReply& r, const ToolChat& chat,
+                 ParseOne parse_one) {
+    while (pos != std::string::npos) {
+        const std::string where = "tool_calls[" + std::to_string(r.calls.size()) + "]";
+        ParsedCall c;
+        const size_t end = parse_one(text, pos, where, c);
+        const ojson* tool = tool_named(chat.tools, c.name);
+        if (!tool) {
+            std::string names;
+            for (const ojson& t : chat.tools) names += (names.empty() ? "" : ", ") + t["function"]["name"].get<std::string>();
+            bad_call(where + ".name", "one of the request's tools (" + names + ")", "\"" + c.name + "\"");
+        }
+        check_arguments(c, where, *tool);
+        r.calls.push_back(std::move(c));
+        pos = skip_ws(text, end);
+        if (pos == text.size()) break;
+        if (at(text, pos, opener)) continue;
+        bool trailer = false;
+        for (const std::string& t : trailers)
+            if (at(text, pos, t) && skip_ws(text, pos + t.size()) == text.size()) trailer = true;
+        if (trailer) break;
+        bad_call("after " + where, "another " + opener + " or the end of the reply", snippet(text, pos));
+    }
+}
+
 // ── HermesJson: Qwen3 ────────────────────────────────────────────────────────
 
 const char* kHermesToolsHead =
@@ -352,6 +529,33 @@ public:
             if (chat.enable_thinking == false) out += "<think>\n\n</think>\n\n";
         }
         return out;
+    }
+
+    // <tool_call>\n{"name": N, "arguments": {...}}\n</tool_call>, repeated.
+    ParsedReply parse(const std::string& text, const ToolChat& chat) const override {
+        ParsedReply r;
+        const size_t pos = split_think(text, /*opened=*/false, "<tool_call>", r.reasoning);
+        const size_t first = text.find("<tool_call>", pos);
+        r.content = py_strip(text.substr(pos, first == std::string::npos ? std::string::npos : first - pos));
+        if (first == std::string::npos) return r;
+        parse_calls(text, first, "<tool_call>", {"<|im_end|>"}, r, chat,
+                    [](const std::string& s, size_t at_pos, const std::string& where, ParsedCall& c) {
+            const size_t body = at_pos + 11;
+            const size_t close = s.find("</tool_call>", body);
+            if (close == std::string::npos)
+                bad_call(where, "a call closed by </tool_call>", "unterminated, " + snippet(s, at_pos));
+            const ojson j = ojson::parse(s.substr(body, close - body), nullptr, false);
+            if (j.is_discarded() || !j.is_object())
+                bad_call(where, "a JSON object {\"name\": ..., \"arguments\": {...}}", snippet(s, body));
+            if (!j.contains("name") || !j["name"].is_string())
+                bad_call(where + ".name", "a string", j.contains("name") ? j["name"].dump() : "absent");
+            c.name = j["name"].get<std::string>();
+            c.arguments = j.contains("arguments") ? j["arguments"] : ojson::object();
+            if (!c.arguments.is_object())
+                bad_call(where + ".arguments", "a JSON object", c.arguments.dump());
+            return close + 12;
+        });
+        return r;
     }
 
 private:
@@ -489,6 +693,55 @@ public:
         return out;
     }
 
+    // <tool_call>\n<function=N>\n<parameter=K>\nV\n</parameter>\n…</function>\n</tool_call>
+    ParsedReply parse(const std::string& text, const ToolChat& chat) const override {
+        ParsedReply r;
+        const bool opened = chat.add_generation_prompt &&
+                            (p_.thinking_default_on ? chat.enable_thinking != false : chat.enable_thinking == true);
+        const size_t pos = split_think(text, opened, "<tool_call>", r.reasoning);
+        const size_t first = text.find("<tool_call>", pos);
+        r.content = py_strip(text.substr(pos, first == std::string::npos ? std::string::npos : first - pos));
+        if (first == std::string::npos) return r;
+        parse_calls(text, first, "<tool_call>", {"<|im_end|>"}, r, chat,
+                    [&chat](const std::string& s, size_t at_pos, const std::string& where, ParsedCall& c) {
+            size_t p = skip_ws(s, at_pos + 11);
+            if (!at(s, p, "<function="))
+                bad_call(where, "<function=NAME> after <tool_call>", snippet(s, p));
+            const size_t name_end = s.find('>', p + 10);
+            if (name_end == std::string::npos)
+                bad_call(where + ".name", "a name closed by '>'", "unterminated, " + snippet(s, p));
+            c.name = s.substr(p + 10, name_end - p - 10);
+            const ojson* tool = tool_named(chat.tools, c.name);
+            const ojson* params = tool ? params_of(*tool) : nullptr;
+            c.arguments = ojson::object();
+            p = skip_ws(s, name_end + 1);
+            while (at(s, p, "<parameter=")) {
+                const size_t key_end = s.find('>', p + 11);
+                if (key_end == std::string::npos)
+                    bad_call(where, "a parameter name closed by '>'", "unterminated, " + snippet(s, p));
+                const std::string key = s.substr(p + 11, key_end - p - 11);
+                const std::string field = where + ".arguments." + key;
+                size_t v = key_end + 1;
+                if (at(s, v, "\n")) ++v;   // the template's newline after the tag
+                const size_t close = s.find("</parameter>", v);
+                if (close == std::string::npos)
+                    bad_call(field, "a value closed by </parameter>", "unterminated, " + snippet(s, v));
+                std::string raw = s.substr(v, close - v);
+                if (!raw.empty() && raw.back() == '\n') raw.pop_back();   // and the one before the closer
+                if (c.arguments.contains(key)) bad_call(field, "each parameter once", "a second value");
+                c.arguments[key] = type_xml_value(raw, property_schema(params, key), field);
+                p = skip_ws(s, close + 12);
+            }
+            if (!at(s, p, "</function>"))
+                bad_call(where, "<parameter=...> or </function>", snippet(s, p));
+            p = skip_ws(s, p + 11);
+            if (!at(s, p, "</tool_call>"))
+                bad_call(where, "</tool_call> after </function>", snippet(s, p));
+            return p + 12;
+        });
+        return r;
+    }
+
 private:
     Params p_;
 };
@@ -581,7 +834,117 @@ public:
         return out;
     }
 
+    // [<|channel>thought…<channel|>] text <|tool_call>call:N{k:v,…}<tool_call|>…
+    ParsedReply parse(const std::string& text, const ToolChat& chat) const override {
+        ParsedReply r;
+        size_t pos = skip_ws(text, 0);
+        while (at(text, pos, "<|channel>")) {   // the model's own thought channel(s)
+            const size_t close = text.find("<channel|>", pos);
+            const size_t call = text.find("<|tool_call>", pos);
+            const size_t end = close != std::string::npos && (call == std::string::npos || close < call)
+                                   ? close : (call == std::string::npos ? text.size() : call);
+            std::string block = text.substr(pos + 10, end - pos - 10);
+            if (at(block, 0, "thought")) block.erase(0, 7);
+            const std::string t = py_strip(block);
+            if (!t.empty()) r.reasoning += (r.reasoning.empty() ? "" : "\n") + t;
+            pos = end == close ? skip_ws(text, close + 10) : end;
+        }
+        const size_t first = text.find("<|tool_call>", pos);
+        // Content keeps no channel framing (a stray <channel|> or an empty
+        // thought block the model appends — what ChannelFilter strips).
+        r.content = py_strip(ChannelFilter::strip(
+            text.substr(pos, first == std::string::npos ? std::string::npos : first - pos)));
+        if (first == std::string::npos) return r;
+        parse_calls(text, first, "<|tool_call>", {"<|tool_response>", "<turn|>"}, r, chat,
+                    [](const std::string& s, size_t at_pos, const std::string& where, ParsedCall& c) {
+            size_t p = at_pos + 12;
+            if (!at(s, p, "call:")) bad_call(where, "call:NAME{...} after <|tool_call>", snippet(s, p));
+            const size_t brace = s.find('{', p + 5);
+            if (brace == std::string::npos)
+                bad_call(where, "call:NAME{...}", "no '{', " + snippet(s, p));
+            c.name = s.substr(p + 5, brace - p - 5);
+            p = brace;
+            c.arguments = gemma_value(s, p, where + ".arguments");
+            if (!c.arguments.is_object()) bad_call(where + ".arguments", "an object", c.arguments.dump());
+            p = skip_ws(s, p);
+            if (!at(s, p, "<tool_call|>")) bad_call(where, "<tool_call|> after the arguments", snippet(s, p));
+            return p + 12;
+        });
+        return r;
+    }
+
 private:
+    // One value in Gemma 4's argument notation, advancing `p`: <|"|>string<|"|>,
+    // {key:value,…} (keys bare, or in <|"|> as the declarations write them),
+    // [value,…], true/false, null (None, as the history renders it), a JSON
+    // number.
+    static ojson gemma_value(const std::string& s, size_t& p, const std::string& field) {
+        p = skip_ws(s, p);
+        if (at(s, p, kQ)) {
+            const size_t close = s.find(kQ, p + kQ.size());
+            if (close == std::string::npos)
+                bad_call(field, "a string closed by <|\"|>", "unterminated, " + snippet(s, p));
+            const std::string v = s.substr(p + kQ.size(), close - p - kQ.size());
+            p = close + kQ.size();
+            return v;
+        }
+        if (at(s, p, "{")) {
+            ojson obj = ojson::object();
+            p = skip_ws(s, p + 1);
+            if (at(s, p, "}")) { ++p; return obj; }
+            while (true) {
+                p = skip_ws(s, p);
+                std::string key;
+                if (at(s, p, kQ)) {
+                    const size_t close = s.find(kQ, p + kQ.size());
+                    if (close == std::string::npos) bad_call(field, "a key closed by <|\"|>", snippet(s, p));
+                    key = s.substr(p + kQ.size(), close - p - kQ.size());
+                    p = close + kQ.size();
+                } else {
+                    const size_t colon = s.find_first_of(":}", p);
+                    if (colon == std::string::npos || s[colon] != ':')
+                        bad_call(field, "key:value", snippet(s, p));
+                    key = py_strip(s.substr(p, colon - p));
+                    p = colon;
+                }
+                p = skip_ws(s, p);
+                if (!at(s, p, ":")) bad_call(field + "." + key, "':' after the key", snippet(s, p));
+                ++p;
+                if (obj.contains(key)) bad_call(field + "." + key, "each key once", "a second value");
+                obj[key] = gemma_value(s, p, field + "." + key);
+                p = skip_ws(s, p);
+                if (at(s, p, ",")) { ++p; continue; }
+                if (at(s, p, "}")) { ++p; return obj; }
+                bad_call(field, "',' or '}'", snippet(s, p));
+            }
+        }
+        if (at(s, p, "[")) {
+            ojson arr = ojson::array();
+            p = skip_ws(s, p + 1);
+            if (at(s, p, "]")) { ++p; return arr; }
+            while (true) {
+                arr.push_back(gemma_value(s, p, field + "[" + std::to_string(arr.size()) + "]"));
+                p = skip_ws(s, p);
+                if (at(s, p, ",")) { ++p; continue; }
+                if (at(s, p, "]")) { ++p; return arr; }
+                bad_call(field, "',' or ']'", snippet(s, p));
+            }
+        }
+        for (const auto& [lit, val] : {std::pair<const char*, ojson>{"true", true}, {"false", false},
+                                       {"null", nullptr}, {"None", nullptr}})
+            if (at(s, p, lit)) { p += std::string(lit).size(); return val; }
+        size_t e = p;
+        if (e < s.size() && s[e] == '-') ++e;
+        while (e < s.size() && (std::isdigit(static_cast<unsigned char>(s[e])) || s[e] == '.' || s[e] == 'e' ||
+                                s[e] == 'E' || s[e] == '+' || s[e] == '-'))
+            ++e;
+        const ojson num = e > p ? ojson::parse(s.substr(p, e - p), nullptr, false) : ojson(ojson::value_t::discarded);
+        if (num.is_discarded() || !num.is_number())
+            bad_call(field, "a value (<|\"|>string<|\"|>, number, true, false, null, {...} or [...])", snippet(s, p));
+        p = e;
+        return num;
+    }
+
     // The template's strip_thinking macro: drop every <|channel>…<channel|>
     // span, then trim.
     static std::string strip_thinking(const std::string& text) {
