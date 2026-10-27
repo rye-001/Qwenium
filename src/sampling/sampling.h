@@ -58,6 +58,13 @@ public:
         pruned_vocab_ = pruned_vocab;
     }
 
+    // Tokens this sampler must never return (optional; empty = none). Their
+    // logits are set to -inf on every path, dense and sparse, before any other
+    // constraint. The server bans a tool format's call opener for
+    // tool_choice "none" (docs/plan-tool-calling.md).
+    void set_banned_tokens(std::vector<int32_t> ids) { banned_tokens_ = std::move(ids); }
+    const std::vector<int32_t>& banned_tokens() const { return banned_tokens_; }
+
     // Register a stop token ID. Call once per stop token at init;
     // duplicates are silently ignored.
     void add_eos_token_id(int32_t id) {
@@ -90,7 +97,8 @@ public:
     }
 
 protected:
-    void apply_vocab_pruning(std::vector<float>& logits);
+    void apply_vocab_pruning(std::vector<float>& logits);   // and the banned tokens
+    void apply_bans_sparse(std::vector<float>& sparse_logits, const std::vector<int32_t>& valid_ids) const;
     void apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                    const std::vector<std::string>& token_strs);
     static void apply_repetition_penalty_sparse(std::vector<float>& sparse_logits,
@@ -100,6 +108,7 @@ protected:
 
     GrammarVocab* grammar_     = nullptr;
     const std::unordered_set<int32_t>* pruned_vocab_ = nullptr;
+    std::vector<int32_t> banned_tokens_;
     std::vector<int32_t> eos_token_ids_;
     std::unique_ptr<TokenTrie> token_trie_;
     std::vector<std::string> vocab_; // cached at build_token_trie time

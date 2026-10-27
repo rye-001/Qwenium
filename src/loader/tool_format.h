@@ -110,6 +110,20 @@ public:
     // are raw text and are typed by the tool's schema; the other dialects'
     // values carry their own types. Throws ToolCallError.
     virtual ParsedReply parse(const std::string& generated, const ToolChat& chat) const = 0;
+
+    // The text that opens a call — one special token in every dialect, so
+    // tool_choice "none" is enforced by banning that token.
+    virtual const char* call_opener() const = 0;
+
+    // Stop strings a tool request adds to the client's: Gemma 4 emits
+    // <|tool_response> after a call and must stop there (Google's format page:
+    // "an additional stop sequence"), or it invents the tool's answer.
+    virtual std::vector<std::string> extra_stops() const = 0;
+
+    // What closes the system turn every tool render opens with (it carries the
+    // tools block): render(chat) up to and including the first occurrence is
+    // the request's recurring, cacheable prefix.
+    virtual const char* system_turn_end() const = 0;
 };
 
 // sha256 of the template text, the first 16 hex digits.

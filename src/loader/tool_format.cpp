@@ -470,6 +470,9 @@ public:
     enum class ToolResponseTest { Contains, StartsAndEnds };
     explicit HermesJsonToolFormat(ToolResponseTest t) : test_(t) {}
     ToolDialect dialect() const override { return ToolDialect::HermesJson; }
+    const char* call_opener() const override { return "<tool_call>"; }
+    std::vector<std::string> extra_stops() const override { return {}; }
+    const char* system_turn_end() const override { return "<|im_end|>\n"; }
 
     std::string render(const ToolChat& chat) const override {
         check_chat(chat);
@@ -595,6 +598,9 @@ public:
     };
     explicit QwenXmlToolFormat(Params p) : p_(p) {}
     ToolDialect dialect() const override { return ToolDialect::QwenXml; }
+    const char* call_opener() const override { return "<tool_call>"; }
+    std::vector<std::string> extra_stops() const override { return {}; }
+    const char* system_turn_end() const override { return "<|im_end|>\n"; }
 
     std::string render(const ToolChat& chat) const override {
         check_chat(chat);
@@ -765,6 +771,9 @@ public:
     };
     explicit Gemma4ToolFormat(Params p) : p_(p) {}
     ToolDialect dialect() const override { return ToolDialect::Gemma4; }
+    const char* call_opener() const override { return "<|tool_call>"; }
+    std::vector<std::string> extra_stops() const override { return {"<|tool_response>"}; }
+    const char* system_turn_end() const override { return "<turn|>\n"; }
 
     std::string render(const ToolChat& chat) const override {
         check_chat(chat);

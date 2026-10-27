@@ -12,11 +12,22 @@
 namespace qinf {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
+    for (int32_t id : banned_tokens_)
+        if (id >= 0 && static_cast<size_t>(id) < logits.size())
+            logits[id] = -std::numeric_limits<float>::infinity();
     if (!pruned_vocab_) return;
     for (size_t i = 0; i < logits.size(); ++i) {
         if (pruned_vocab_->find(static_cast<int32_t>(i)) == pruned_vocab_->end())
             logits[i] = -std::numeric_limits<float>::infinity();
     }
+}
+
+void Sampler::apply_bans_sparse(std::vector<float>& sparse_logits,
+                                const std::vector<int32_t>& valid_ids) const {
+    if (banned_tokens_.empty()) return;
+    for (size_t j = 0; j < valid_ids.size() && j < sparse_logits.size(); ++j)
+        if (std::find(banned_tokens_.begin(), banned_tokens_.end(), valid_ids[j]) != banned_tokens_.end())
+            sparse_logits[j] = -std::numeric_limits<float>::infinity();
 }
 
 std::vector<int32_t> Sampler::peek_valid_set() {
@@ -179,6 +190,7 @@ int32_t GreedySampler::sample_sparse(std::vector<float>& sparse_logits,
         throw std::runtime_error("sample_sparse: sparse_logits.size() != valid_ids.size(); expected: equal, actual: "
                                  + std::to_string(sparse_logits.size()) + " vs "
                                  + std::to_string(valid_ids.size()));
+    apply_bans_sparse(sparse_logits, valid_ids);
     Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
                                               repetition_penalty_, repetition_lookback_);
     const size_t j = static_cast<size_t>(
@@ -307,6 +319,7 @@ int32_t TemperatureSampler::sample_sparse(std::vector<float>& sparse_logits,
                                  + std::to_string(sparse_logits.size()) + " vs "
                                  + std::to_string(valid_ids.size()));
 
+    apply_bans_sparse(sparse_logits, valid_ids);
     Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
                                               repetition_penalty_, repetition_lookback_);
 

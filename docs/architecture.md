@@ -236,11 +236,11 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/graph_inputs/` | Typed graph inputs — named tensors a recipe declares and a setter fills at run time | `tokens`, `positions`, `mrope_positions` (4 components/token, component-major — Qwen 3.5 family), `attn_mask` (causal/sliding/bidi-span), `bidirectional_mask` (an encoder's: open, or a band |q − k| ≤ radius), `sparse_head`, `output_ids`, `image_embeddings`, `gather_indices` |
 | `src/state/` | What persists across tokens | `kv_cache_simple` (append semantics, O(1) truncate, per-slot batch axis, cross-layer KV sharing), `recurrent_state` + `deltanet_state` (overwrite semantics, checkpoint/restore), `token_sequence_section` |
 | `src/sampling/` | Decode-time algorithms | `sampling` (greedy/temperature+top-k/top-p/rep-penalty, sparse variants), `grammar_vocab` (GBNF engine, §8), `token-trie` (candidate narrowing), `speculative` + `draft_source` (draft-source seam: `IDraftSource`) + `prompt_lookup` (PLD) + `suffix_decoding` (SuffixDecoding: session-scoped, adaptive-length lookup, §5), `sampling_snapshot` |
-| `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the three fail-loud gates: tensor **type** — is every ggml type id one this build knows, checked at parse because `ggml_type_size`'s own bounds check is a plain `assert` that Release removes; **architecture** — is `general.architecture` in the registry allow-list; **inventory** — does the file carry every tensor the recipe needs, correctly shaped), `tokenizer` (a `gemma4` vocabulary merges by **rank** in its merges list, as llama.cpp does — every Gemma 4 score is -1000; until 2026-10-07 it merged by score and mis-split common words, " result" → " re"+"su"+"lt"), `chat_template` (per-family prompt rendering), `tool_format` (a tool request rendered in the checkpoint's own trained format. There are three dialects: hermes-json for Qwen3, qwen-xml for Qwen3.5/3.6/3.8, and gemma4. The format is chosen by the sha256 of the GGUF's chat template; only the 8 measured templates have one, each gated byte for byte against Hugging Face's renderer. It also parses the model's reply back into calls, typing Qwen-XML values by the schema and checking each call against the schema's top level; a failure throws `ToolCallError`. These are P1 and P2 of `docs/plan-tool-calling.md`; neither is wired to the server yet. It is the reason `qinf-loader` links nlohmann_json), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
+| `src/loader/` | GGUF → live model | `gguf_loader` (mmap + metadata, and the three fail-loud gates: tensor **type** — is every ggml type id one this build knows, checked at parse because `ggml_type_size`'s own bounds check is a plain `assert` that Release removes; **architecture** — is `general.architecture` in the registry allow-list; **inventory** — does the file carry every tensor the recipe needs, correctly shaped), `tokenizer` (a `gemma4` vocabulary merges by **rank** in its merges list, as llama.cpp does — every Gemma 4 score is -1000; until 2026-10-07 it merged by score and mis-split common words, " result" → " re"+"su"+"lt"), `chat_template` (per-family prompt rendering), `tool_format` (a tool request rendered in the checkpoint's own trained format. There are three dialects: hermes-json for Qwen3, qwen-xml for Qwen3.5/3.6/3.8, and gemma4. The format is chosen by the sha256 of the GGUF's chat template; only the 8 measured templates have one, each gated byte for byte against Hugging Face's renderer. It also parses the model's reply back into calls, typing Qwen-XML values by the schema and checking each call against the schema's top level; a failure throws `ToolCallError`. These are P1 and P2 of `docs/plan-tool-calling.md`, and P3 wired both into the chat route, §6. It is the reason `qinf-loader` links nlohmann_json), `channel_filter` (Gemma 4 thought/answer channel split), `multimodal_check`, `gguf_value` (generic GGUF scalar/array KV bag), `platform` (mmap wrapper) |
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `worst_case_reserve` (size the scheduler once for the deepest decode batch and the largest prefill — one copy for every server), `embed` (one embedding: frame BOS/EOS, run an `IEmbeddingOutput` recipe, pool, L2-normalise; an `EmbedInput` can carry one image span armed through Seam B — §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `gemma4v_encoder` (EmbeddingGemma-2's ViT: Gemma blocks, 2-D learned positions + 2-D RoPE, 3×3 pool), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes; a `resample` parameter: align-corners bilinear by default, Pillow bicubic for gemma4v), `vision_loader` (4 projectors: `gemma3`, `gemma4uv`, `gemma4v` — vision tensors only, its audio tower is never loaded — and `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` and `tool_request` (both in `qinf-server`. `image_data_uri` was the library's only source after the lens and the image verdict moved to qemmi-lens-server on 2026-10-03. `tool_request` holds the chat request's tool fields, refused by name until tool calling lands, §6) |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` and `tool_request` (both in `qinf-server`. `image_data_uri` was the library's only source after the lens and the image verdict moved to qemmi-lens-server on 2026-10-03. `tool_request` holds the chat request's tool contract: tool requests parsed into a `ToolChat`, every unserved field refused by name, and the reply message, §6) |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -559,24 +559,67 @@ counts the stop token where the OpenAI `usage.completion_tokens` does not, and
 the ids are losslessly reversible to the prompt text, which is why it is opt-in.
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`,
-`/v1/chat/completions` (text + OpenAI `image_url` when `--mmproj` is loaded),
+`/v1/chat/completions` (text, OpenAI `image_url` when `--mmproj` is loaded, and OpenAI `tools` on a model with a measured tool format),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
 
-**Tool calling is refused, not ignored (2026-10-27, P0 of
-`docs/plan-tool-calling.md`).**
-- **What gets a 400.** A chat request carrying any of these is refused, and
-  the error names the field, the expected value and the actual value:
-  - `tools`, `tool_choice`, `parallel_tool_calls`, `functions` or
-    `function_call` (`null` counts as absent);
-  - a message with role `tool` or `function`;
-  - an assistant message with non-empty `tool_calls` or a `function_call`.
-- **Why.** Until then such a request was served as plain chat. The model
-  never saw the tools, a tool-calls-only turn rendered empty, and
-  `role:"tool"` rendered as a turn no Qwen template has.
-- **Where.** `server/tool_request` (in `qinf-server`, model-free). Gate:
-  `tool-request-tests`.
-- **Next.** Phases P1–P5 of the plan replace the refusal with the model's
-  own tool formats.
+**Tool calling (2026-10-27, `docs/plan-tool-calling.md` P0–P3).**
+`/v1/chat/completions` serves OpenAI `tools`, non-streaming.
+
+- **Which requests count.** A request is a tool request when it carries
+  `tools`, or a message with `tool_calls` or role `tool`.
+- **Selection.** The format is chosen once at load: the sha256 of the GGUF's
+  `tokenizer.chat_template` (from `raw_kv`) looks it up in
+  `loader/tool_format`'s table of measured templates.
+  - A model whose template was never measured refuses a tool request with a
+    400 that names the model and the hash.
+  - The startup log line `Tool calling: <dialect> (template <sha16>)` says
+    which.
+- **Request** (`server/tool_request`, model-free, in `qinf-server`, which now
+  links `qinf-loader`):
+  - The body is re-parsed in key order, because Qwen renders the tools with
+    `tojson` exactly as the client wrote them.
+  - Validated into a `ToolChat` before anything is queued, every refusal
+    naming the field (400):
+    - `tools`: 1–128 functions with valid, unique names. `strict:true` is
+      refused.
+    - `tool_choice`: `auto` or `none`. `required` and a named function are
+      refused until P4.
+    - `parallel_tool_calls:false` is refused.
+    - Messages: one leading system message; arguments a JSON-object string;
+      call ids unique; every tool result answers a call.
+    - With tools, `stream`, `conversation_id`, `grammar` and image parts are
+      refused.
+    - The legacy `functions` / `function_call` / role `function` are refused
+      on every request.
+- **Prompt.** `ToolFormat::render` produces the checkpoint's own format,
+  byte-identical to Hugging Face on every measured template.
+  - The thinking default is the template's own: Qwen3.5 off; Qwen3, 3.6 and
+    3.8 on.
+  - Gemma 4 requests add the stop string `<|tool_response>`, or the model
+    invents the tool's answer.
+  - Under `--prefix-cache`, the cacheable prefix is the rendered system turn
+    that carries the tools block.
+- **`tool_choice:"none"`.** The tools are still rendered, and the format's
+  call opener, which is one special token in every dialect, is put in
+  `InferenceRequest.banned_tokens`.
+  - `Sampler::set_banned_tokens` sets that token to −inf on the dense and the
+    sparse path.
+  - A slot with bans does not speculate. Drafts are accepted by argmax
+    comparison and never pass through the sampler, the same reason a grammar
+    already disables speculation.
+- **Reply.** `ToolFormat::parse` splits the output into
+  `reasoning_content`, `content` and `tool_calls`.
+  - Each call gets an id `call_<24 hex>` and `arguments` as a JSON string.
+  - `finish_reason` is `"tool_calls"` when there are calls.
+  - Output that does not parse as the format, a call that breaks the
+    checked schema subset, or a call under `none` gives **502**
+    `{error, raw_output, finish_reason, usage}`. It is never returned as an
+    answer.
+- **Gates:** `tool-request-tests`, `tool-format-tests` (G1 render, G2 parse
+  round trip), and `sampling-tests` `BannedTokensTest`.
+- **Live (P3).** Checked on Qwen3-0.6B and Qwen3.5-0.8B: `auto` calls,
+  tool result → answer, `none`, thinking on and off. Gemma 3 1B refuses. The
+  end-to-end smoke for each family is P5.
 
 **Speculative decoding (opt-in `--speculative [pld|mtp|suffix]`, off by
 default).** The draft sources, the verify/rewind mechanics, and the
@@ -1570,6 +1613,34 @@ Current, verified against the tree at time of writing:
 - **`transformer_block`'s `ple_residual` hook is dormant.** It adds a residual
   at block entry for G4.3's speculative PLE; real PLE injects after the FFN
   (`layers/ple`). No caller passes it — a deletion candidate.
+- **The no-tools chat renderer is not the GGUF template** (found 2026-10-27,
+  `docs/plan-tool-calling.md`). Tool requests render byte-identical to each
+  checkpoint's template; plain chat still goes through `QwenChatTemplate` /
+  `Gemma4ChatTemplate`, which differ from it:
+  - **Qwen3.5 thinking:** the family default is "on", but the Qwen3.5
+    template's default is "off". The 0.8B card agrees with the template.
+  - **History:** past assistant turns after the last user query get no
+    `<think>` block.
+  - **Whitespace:** content is not `|trim`-med.
+  - The same model can therefore think on a tool request and not on a plain
+    one, or the reverse. Fixing this means routing plain chat through the
+    same measured renderers. That is a decision, not a cleanup.
+- **Two GGUFs of one family carry different templates.**
+  - Qwen3.8-9B carries the reference Qwen3.5 template.
+  - Qwen3.8-27B carries an Unsloth-modified one, with `reasoning_effort` and
+    `preserve_thinking` on by default. The two Qwen3.6 GGUFs are
+    Unsloth-modified too.
+  - The tool format is keyed by template hash for this reason. A re-download
+    with another template turns tool calling off until that template is
+    measured.
+- **Gemma 4 26B's template drops tool parameters named like schema keywords**
+  (`type`, `description`, `properties`, `required`, `nullable`) from the
+  declaration the model sees. The tool path refuses such tools on that
+  checkpoint (T6); the 12B template renders them.
+- **Text that spells a special token is tokenized as that token.** A user
+  message or a tool result containing `<tool_call>` or `<|im_end|>` becomes
+  the control token. This is not new behaviour, but tool results — text from
+  outside the conversation — make it reachable without the user typing it.
 
 ## 13. Keeping this document alive
 

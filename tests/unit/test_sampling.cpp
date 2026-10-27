@@ -82,3 +82,33 @@ TEST(GreedySamplerTest, EmptyLogitsFailLoud) {
     std::vector<float> empty;
     EXPECT_THROW(s.sample(empty, {}), std::runtime_error);
 }
+
+// Banned tokens (tool_choice "none" bans a tool format's call opener,
+// docs/plan-tool-calling.md): never returned, on the dense and the sparse path,
+// greedy or sampled.
+TEST(BannedTokensTest, NeverReturnedDenseOrSparse) {
+    GreedySampler g;
+    g.set_banned_tokens({3});
+    auto logits = peaked_logits();
+    EXPECT_EQ(g.sample(logits, {}), 4);   // the runner-up, not the banned argmax
+    std::vector<float> sparse = {10.0f, 4.0f};
+    EXPECT_EQ(g.sample_sparse(sparse, {3, 4}, {}), 4);
+
+    qinf::TemperatureSampler t(/*temperature=*/1.0f, /*repetition_penalty=*/1.0f, 64, /*top_k=*/5, /*top_p=*/1.0f);
+    t.seed(7);
+    t.set_banned_tokens({3});
+    for (int i = 0; i < 200; ++i) {
+        std::vector<float> l = {1.0f, 1.0f, 1.0f, 50.0f, 1.0f};
+        ASSERT_NE(t.sample(l, {}, {}), 3);
+        std::vector<float> sp = {50.0f, 1.0f};
+        ASSERT_NE(t.sample_sparse(sp, {3, 4}, {}), 3);
+    }
+}
+
+TEST(BannedTokensTest, NoBanLeavesSamplingUnchanged) {
+    GreedySampler s;
+    auto logits = peaked_logits();
+    const auto before = logits;
+    EXPECT_EQ(s.sample(logits, {}), 3);
+    EXPECT_EQ(logits, before);
+}
