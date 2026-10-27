@@ -276,6 +276,18 @@ target_link_libraries(image-data-uri-tests PRIVATE
 target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-data-uri-tests)
 
+# Chat-request tool fields refused by name (docs/plan-tool-calling.md P0).
+add_executable(tool-request-tests
+    unit/test_tool_request.cpp
+)
+target_link_libraries(tool-request-tests PRIVATE
+    qinf-server
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
+)
+target_compile_features(tool-request-tests PRIVATE cxx_std_17)
+gtest_discover_tests(tool-request-tests)
+
 # ServerVision's accessors (prepare_image, encoder, marker ids, projector_tag,
 # projection_dim) on one (model, mmproj) pair per projector family; each leg
 # self-skips without its files. server_vision.cpp is in no library (only the

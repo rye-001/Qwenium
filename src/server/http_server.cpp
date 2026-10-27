@@ -38,6 +38,7 @@
 #include "image_data_uri.h"
 #include "server_vision.h"
 #include "embedding_service.h"
+#include "tool_request.h"
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
@@ -1290,6 +1291,14 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             res.status = 400;
             res.set_content(json({{"error", "Missing or empty 'messages' array"}}).dump(),
                             "application/json");
+            return;
+        }
+
+        // Tool calling is not served yet (docs/plan-tool-calling.md P0): refuse
+        // every tool field by name rather than answer a tool request as plain chat.
+        if (const std::string refusal = qinf::server::refuse_tool_fields(body); !refusal.empty()) {
+            res.status = 400;
+            res.set_content(json({{"error", refusal}}).dump(), "application/json");
             return;
         }
 

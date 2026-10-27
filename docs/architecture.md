@@ -240,7 +240,7 @@ Every directory in `src/` is concept-named; each module's unit test lives at
 | `src/engine/` | The loaded model, and the orchestration of one step over it | `model` (owns weights/backend/scheduler; the load path), `decode_plan`/`decode_step` (batched decode orchestration), `decode_graph_cache` (opt-in persistent decode graph — reuse one built+allocated graph across steps on a dedicated scheduler, §5), `multimodal_prefill`, `readout` (one prefill or decode step with what a client reads back — taps, logits, MoE routing — every override scoped to the call; the client seam, §6), `worst_case_reserve` (size the scheduler once for the deepest decode batch and the largest prefill — one copy for every server), `embed` (one embedding: frame BOS/EOS, run an `IEmbeddingOutput` recipe, pool, L2-normalise; an `EmbedInput` can carry one image span armed through Seam B — §6), `graph_compute` (the one place a compute status is checked — fail-loud on backend failure) |
 | `src/vision/` | Image → soft tokens (§7) | `i_vision_encoder` (Seam A), `siglip_encoder` (Gemma 3, 27-layer ViT), `gemma4uv_encoder` (Gemma 4, blockless), `qwen3vl_encoder` (Qwen 3.5 family, ViT + 2×2 merger, in-ViT M-RoPE), `gemma4v_encoder` (EmbeddingGemma-2's ViT: Gemma blocks, 2-D learned positions + 2-D RoPE, 3×3 pool), `vision_profile` (projector → encoder+recipe dispatch), `image_preprocess` (preprocessing recipes; a `resample` parameter: align-corners bilinear by default, Pillow bicubic for gemma4v), `vision_loader` (4 projectors: `gemma3`, `gemma4uv`, `gemma4v` — vision tensors only, its audio tower is never loaded — and `qwen3vl_merger`), `vision_model`, `bitmap` |
 | `src/session/` | Persisting and reusing session state | The **format**: `snapshot_io`, `session_manifest`, `compat_header`, `section_ids` — versioned, sectioned, fail-loud on mismatch (built as `qinf-session`, deliberately dependency-free so it unit-tests in isolation). The **services** on top of it: `slot_snapshot` (extract/restore a slot), `prefix_library` (disk warm-KV blobs, hash-keyed, version-gated), `image_embedding_cache` + `persistent_image_embedding_store`. The services that need `models/`/`graph_inputs/` build into `qinf-engine` or `qinf-snapshot` rather than into `qinf-session` — directory is the concept, target is the layering (see `session/CMakeLists.txt`). As of 2026-08-30 every one of them has exactly one home: `image_embedding_cache` is pure std so it joined `qinf-session`; `slot_snapshot` needs the model, so it is `qinf-snapshot`. |
-| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` (in `qinf-server`, the one source that library holds since the lens and the image verdict moved to qemmi-lens-server on 2026-10-03, §6) |
+| `src/server/` | HTTP serving (§6) | `inference_server.h` (slots, queues, batching, warm paths — the engine-agnostic core), `http_server.cpp` (endpoints, SSE, OpenAI mapping), `server_vision` (image input on chat; its accessors also serve the lens server's image verdict), `embedding_service` (`/v1/embeddings` under `--embed`, §6), `image_data_uri` and `tool_request` (both in `qinf-server`. `image_data_uri` was the library's only source after the lens and the image verdict moved to qemmi-lens-server on 2026-10-03. `tool_request` holds the chat request's tool fields, refused by name until tool calling lands, §6) |
 | `src/image/` | Host-side image pipeline (IO, not encoding) | `image_loader` (decode/resample/normalize → `Bitmap`; the encoder is content-blind, and the preprocessing *recipe* it applies lives in `vision/image_preprocess`), `image_prompt` (token-level marker expansion → the soft-token span). Both front ends consume these, which is why they are not in `cli/`. |
 | `src/cli/` | Terminal front end | `main` (flag parsing, wiring), `chat`/`complete`, `session_mode`, `speculative-bridge` |
 | `src/qinf_error.h` | The fail-loud error contract: errors name the slot/parameter, expected, then actual | `QINF_ASSERT`. The format is the rule, not the macro — most errors are written by hand, e.g. `assign_tensor_pointers`' `require()` |
@@ -561,6 +561,22 @@ the ids are losslessly reversible to the prompt text, which is why it is opt-in.
 Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text + OpenAI `image_url` when `--mmproj` is loaded),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
+
+**Tool calling is refused, not ignored (2026-10-27, P0 of
+`docs/plan-tool-calling.md`).**
+- **What gets a 400.** A chat request carrying any of these is refused, and
+  the error names the field, the expected value and the actual value:
+  - `tools`, `tool_choice`, `parallel_tool_calls`, `functions` or
+    `function_call` (`null` counts as absent);
+  - a message with role `tool` or `function`;
+  - an assistant message with non-empty `tool_calls` or a `function_call`.
+- **Why.** Until then such a request was served as plain chat. The model
+  never saw the tools, a tool-calls-only turn rendered empty, and
+  `role:"tool"` rendered as a turn no Qwen template has.
+- **Where.** `server/tool_request` (in `qinf-server`, model-free). Gate:
+  `tool-request-tests`.
+- **Next.** Phases P1–P5 of the plan replace the refusal with the model's
+  own tool formats.
 
 **Speculative decoding (opt-in `--speculative [pld|mtp|suffix]`, off by
 default).** The draft sources, the verify/rewind mechanics, and the

@@ -50,8 +50,11 @@ target_link_libraries(inference_server INTERFACE
 # main(), and the second has no consumer other than the executable, so it needs
 # no library.
 #
+# tool_request (2026-10-27, docs/plan-tool-calling.md) is model-free JSON
+# checking on the chat request, so it lives here and its test needs no model.
 add_library(qinf-server STATIC
     image_data_uri.cpp
+    tool_request.cpp
 )
 
 target_include_directories(qinf-server PUBLIC
