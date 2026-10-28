@@ -89,7 +89,7 @@ def main():
             for n in sorted(names):
                 g.write(f"{n} arch={arch} bos={bos!r} eos={eos!r}\n")
         for c in cases["cases"]:
-            tools = cases["tool_sets"][c["tools"]] if "tools" in c else None
+            tools = cases["tool_sets"][c["tools"]] if "tools" in c and c.get("declare_tools", True) else None
             base = os.path.join(d, c["name"])
             for stale in (base + ".hf.txt", base + ".hf.err"):
                 if os.path.exists(stale):

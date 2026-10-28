@@ -49,6 +49,7 @@ const ojson& cases() {
 ToolChat chat_of(const ojson& c) {
     ToolChat chat;
     chat.tools = cases()["tool_sets"][c["tools"].get<std::string>()];
+    chat.declare_tools = c.value("declare_tools", true);
     for (const ojson& m : c["messages"]) {
         ToolTurn t;
         t.role = m["role"].get<std::string>();
@@ -150,8 +151,8 @@ TEST(ToolFormat, RendersLikeHuggingFaceOnEveryMeasuredTemplate) {
             ++compared;
         }
     }
-    EXPECT_EQ(compared, 8 * 19 - refused);
-    EXPECT_EQ(refused, 6 * 1 /*preserve*/ + 7 * 2 /*effort*/);
+    EXPECT_EQ(compared, 8 * 27 - refused);
+    EXPECT_EQ(refused, 6 * 1 /*preserve*/ + 7 * 3 /*effort*/);
 }
 
 // The cross-check: llama.cpp's Jinja engine agrees with HF on every rendering

@@ -15,8 +15,8 @@
 #   stopped      the reply ends at the call: for Gemma 4 this is the
 #                <|tool_response> stop — a model that went on to invent the
 #                tool's answer would be text after the call, a 502
-#   none         tool_choice "none" → no call; an answer that ends on its own
-#                and is about the question
+#   none         tool_choice "none" (tools undeclared to the model) → no call;
+#                an answer that ends on its own and is about the question
 #   required     tool_choice "required" on a prompt with no reason to call → a call
 #   named        tool_choice naming get_time on a weather question → get_time
 #   think        thinking on + "required" → reasoning_content and the call
@@ -82,6 +82,7 @@ if case == "answer":
         {"role": "tool", "tool_call_id": "call_1", "content": "17 C, light rain"}]
 elif case == "none":
     b["tool_choice"] = "none"
+    b["max_tokens"] = 400   # a toolless answer explains itself (Qwen3.5-0.8B: 246 tokens)
 elif case == "required":
     b["messages"] = [{"role": "user", "content": "Tell me a short joke."}]
     b["tool_choice"] = "required"

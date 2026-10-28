@@ -80,7 +80,8 @@ int main(int argc, char** argv) {
             const std::string name = c["name"].get<std::string>();
             common_json inp = common_json::object();
             inp["messages"] = c["messages"];
-            if (c.contains("tools")) inp["tools"] = cases["tool_sets"][c["tools"].get<std::string>()];
+            // declare_tools false: tools undefined, the template's no-tools branch.
+            if (c.contains("tools") && c.value("declare_tools", true)) inp["tools"] = cases["tool_sets"][c["tools"].get<std::string>()];
             inp["add_generation_prompt"] = true;
             inp["bos_token"] = bos;
             inp["eos_token"] = eos;

@@ -12,8 +12,10 @@
 //                       parameters?}}; name ^[A-Za-z0-9_-]{1,64}$, unique; "strict":
 //                       true refused (only a top-level schema subset is checked)
 //   tool_choice         "auto" (default) | "none" | "required" |
-//                       {"type":"function","function":{"name":N}} — the last two
-//                       constrain the reply to exactly one call by grammar (P4)
+//                       {"type":"function","function":{"name":N}} — "none"
+//                       renders the request without declaring the tools
+//                       (ToolChat::declare_tools); the last two constrain the
+//                       reply to exactly one call by grammar (P4)
 //   parallel_tool_calls true (default); false is refused (not enforced in v1)
 //   messages            system (first only), user, assistant (content, tool_calls
 //                       with arguments as a JSON-object string, reasoning_content),
@@ -22,7 +24,8 @@
 //                       reasoning_effort}, reasoning_effort — passed to the template
 //                       (which refuses a switch it lacks)
 //   refused with tools: stream, conversation_id, grammar, image parts
-//   refused always:     functions, function_call, role "function" (legacy)
+//   refused always:     functions, function_call, role "function" (legacy);
+//                       response_format other than {"type":"text"}
 //
 // Unit test: tests/unit/test_tool_request.cpp
 
@@ -38,6 +41,11 @@ namespace qinf::server {
 // function_call, role "function", an assistant function_call) — refused on
 // every request, tool request or not, naming its replacement.
 std::string refuse_legacy_tool_fields(const nlohmann::json& body);
+
+// "" unless `body` asks for structured output by `response_format`
+// (json_object, json_schema, anything but {"type":"text"}) — refused on every
+// chat request rather than ignored; the served constraint is `grammar`.
+std::string refuse_response_format(const nlohmann::json& body);
 
 // True when `body` is a tool request (see the header comment).
 bool is_tool_request(const nlohmann::json& body);

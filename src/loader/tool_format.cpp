@@ -570,11 +570,16 @@ public:
         const auto& msgs = chat.messages;
         const size_t n = msgs.size();
 
-        std::string out = "<|im_start|>system\n";
-        if (msgs[0].role == "system") out += msgs[0].content + "\n\n";
-        out += kHermesToolsHead;
-        for (const auto& t : chat.tools) out += "\n" + py_dumps(t);
-        out += kHermesToolsTail;
+        std::string out;
+        if (chat.declare_tools) {
+            out = "<|im_start|>system\n";
+            if (msgs[0].role == "system") out += msgs[0].content + "\n\n";
+            out += kHermesToolsHead;
+            for (const auto& t : chat.tools) out += "\n" + py_dumps(t);
+            out += kHermesToolsTail;
+        } else if (msgs[0].role == "system") {
+            out = "<|im_start|>system\n" + msgs[0].content + "<|im_end|>\n";
+        }
 
         size_t last_query = n - 1;
         for (size_t k = n; k-- > 0;) {
@@ -697,6 +702,8 @@ public:
         bool     reasoning_effort;       // 3.8-27B: the effort sentence in the system turn
         bool     split_think_in_content; // a "</think>" in an assistant content is split off (not 3.8-27B)
         bool     scalars_as_json;        // a non-string argument prints as JSON (3.8-27B) vs Python str()
+        bool     blank_system_turn;      // tools undeclared, a blank system message still opens a
+                                         // system turn (3.5, 3.8-9B); 3.6 and 3.8-27B merge it away
     };
     explicit QwenXmlToolFormat(Params p) : p_(p) {}
     ToolDialect dialect() const override { return ToolDialect::QwenXml; }
@@ -725,16 +732,20 @@ public:
                    "\"" + *chat.reasoning_effort + "\"");
         }
 
-        std::string out = "<|im_start|>system\n";
-        if (!effort.empty()) out += effort + "\n\n";
-        out += kXmlToolsHead;
-        for (const auto& t : chat.tools) out += "\n" + py_dumps(t);
-        out += kXmlToolsTail;
-        if (msgs[0].role == "system") {
-            const std::string sys = py_strip(msgs[0].content);
+        const std::string sys = msgs[0].role == "system" ? py_strip(msgs[0].content) : "";
+        std::string out;
+        if (chat.declare_tools) {
+            out = "<|im_start|>system\n";
+            if (!effort.empty()) out += effort + "\n\n";
+            out += kXmlToolsHead;
+            for (const auto& t : chat.tools) out += "\n" + py_dumps(t);
+            out += kXmlToolsTail;
             if (!sys.empty()) out += "\n\n" + sys;
+            out += "<|im_end|>\n";
+        } else if (!sys.empty() || !effort.empty() || (msgs[0].role == "system" && p_.blank_system_turn)) {
+            out = "<|im_start|>system\n" + effort + (!effort.empty() && !sys.empty() ? "\n\n" : "") + sys +
+                  "<|im_end|>\n";
         }
-        out += "<|im_end|>\n";
 
         size_t last_query = n;   // check_chat guarantees a user message
         for (size_t k = n; k-- > 0;) {
@@ -918,13 +929,18 @@ public:
         refuse_kwarg_absent_from_template(chat.reasoning_effort, "reasoning_effort");
         const bool think = chat.enable_thinking == true;
 
-        std::string out = "<|turn>system\n";
-        if (think) out += "<|think|>\n";
+        std::string out;
         size_t first = 0;
-        if (chat.messages[0].role == "system") { out += py_strip(chat.messages[0].content); first = 1; }
-        for (size_t i = 0; i < chat.tools.size(); ++i)
-            out += "<|tool>" + py_strip(declaration(chat.tools[i], "tools[" + std::to_string(i) + "]")) + "<tool|>";
-        out += "<turn|>\n";
+        if (think || chat.declare_tools || chat.messages[0].role == "system") {
+            out = "<|turn>system\n";
+            if (think) out += "<|think|>\n";
+            if (chat.messages[0].role == "system") { out += py_strip(chat.messages[0].content); first = 1; }
+            if (chat.declare_tools)
+                for (size_t i = 0; i < chat.tools.size(); ++i)
+                    out += "<|tool>" + py_strip(declaration(chat.tools[i], "tools[" + std::to_string(i) + "]")) +
+                           "<tool|>";
+            out += "<turn|>\n";
+        }
 
         std::vector<const ToolTurn*> loop;
         for (size_t i = first; i < chat.messages.size(); ++i) loop.push_back(&chat.messages[i]);
@@ -1316,11 +1332,12 @@ const std::vector<Measured>& measured() {
     using G = Gemma4ToolFormat;
     static const H qwen3_06b(H::ToolResponseTest::Contains);
     static const H qwen3_17b(H::ToolResponseTest::StartsAndEnds);
-    //                       think on  preserve                effort split  json scalars
-    static const X qwen35   ({false,   X::Preserve::Absent,     false, true,  false});
-    static const X qwen36   ({true,    X::Preserve::DefaultOff, false, true,  false});
-    static const X qwen38_9b({true,    X::Preserve::Absent,     false, true,  false});
-    static const X qwen38_27({true,    X::Preserve::DefaultOn,  true,  false, true});
+    //                       think on  preserve                effort split  json   blank
+    //                                                                       scalars system
+    static const X qwen35   ({false,   X::Preserve::Absent,     false, true,  false, true});
+    static const X qwen36   ({true,    X::Preserve::DefaultOff, false, true,  false, false});
+    static const X qwen38_9b({true,    X::Preserve::Absent,     false, true,  false, true});
+    static const X qwen38_27({true,    X::Preserve::DefaultOn,  true,  false, true,  false});
     static const G gemma4_26b({/*filter_every_properties_map=*/true,  /*turn_end_on_rendered_content=*/false});
     static const G gemma4_12b({/*filter_every_properties_map=*/false, /*turn_end_on_rendered_content=*/true});
     static const std::vector<Measured> rows = {

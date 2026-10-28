@@ -562,7 +562,15 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
 `/v1/chat/completions` (text, OpenAI `image_url` when `--mmproj` is loaded, and OpenAI `tools` on a model with a measured tool format),
 `DELETE /v1/conversations/{id}` and `/v1/conversations`.
 
-**Tool calling (2026-10-27, `docs/plan-tool-calling.md` P0–P4).**
+**Structured output on chat is `grammar` (GBNF), not `response_format`.**
+Since 2026-10-27 a chat request whose `response_format` is anything but
+`{"type":"text"}` (`json_object`, `json_schema`) is refused with a 400 that
+names the field and points to `grammar`. Before, it was silently ignored, so
+a client could take free text for validated JSON. Absent, null and
+`{"type":"text"}` are served (`server/tool_request`
+`refuse_response_format`; `server_grammar_smoke.sh` checks 6).
+
+**Tool calling (2026-10-27, `docs/plan-tool-calling.md` P0–P5).**
 `/v1/chat/completions` serves OpenAI `tools`, non-streaming.
 
 - **Which requests count.** A request is a tool request when it carries
@@ -597,15 +605,26 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
   - Gemma 4 requests add the stop string `<|tool_response>`, or the model
     invents the tool's answer.
   - Under `--prefix-cache`, the cacheable prefix is the rendered system turn
-    that carries the tools block.
-- **`tool_choice:"none"`.** The tools are still rendered, and the format's
-  call opener, which is one special token in every dialect, is put in
-  `InferenceRequest.banned_tokens`.
-  - `Sampler::set_banned_tokens` sets that token to −inf on the dense and the
-    sparse path.
-  - A slot with bans does not speculate. Drafts are accepted by argmax
-    comparison and never pass through the sampler, the same reason a grammar
-    already disables speculation.
+    that carries the tools block. Under `none` there may be no system turn;
+    the prefix is then the first turn.
+- **`tool_choice:"none"`: the tools are not declared** (decided
+  2026-10-27, every family). `ToolChat::declare_tools = false` renders the
+  template's own no-tools branch: no tools block, and a system turn only
+  where the template opens one without tools. Earlier calls and results in
+  the history still render. Gated byte for byte like every other case (8
+  `undeclared_*` fixture cases per template).
+  - **Why not ban the opener.** P3 rendered the tools and banned the call
+    opener token. Gemma 4 degenerated under that on both checkpoints,
+    looping on empty thought blocks or writing junk, while Qwen answered.
+    With the tools undeclared, no family needs a ban, and the slot may
+    speculate.
+  - **What it costs.** The model no longer knows the tools exist; OpenAI's
+    `none` hides nothing. An agent that alternates `auto` and `none` gets a
+    different system turn on each switch, so the prefix cache misses there.
+  - A call the model writes anyway is a 502 (below).
+  - `Sampler::set_banned_tokens` and `InferenceRequest.banned_tokens` (−inf
+    on the dense and the sparse path, no speculation on a slot with bans)
+    stay, unit-tested, but nothing in the server sets them now.
 - **`required` / a named function (P4).** `ToolFormat::grammar` gives a
   GBNF grammar for **exactly one** call in the format (the server ends a
   grammar slot at its first accepting state, so parallel calls stay an
@@ -654,16 +673,13 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`,
   - `grammar-test-sparse-differential` still passes: sparse equals dense;
   - end to end: `tests/smoke/server_tools_smoke.sh`, 11 checks per model,
     run per family (P5).
-- **`none` on Gemma 4 is OPEN.** With its tools shown and the call opener
-  banned, the model degenerates on both checkpoints, looping on empty
-  thought blocks or writing junk; Qwen answers sensibly under the same ban
-  (P5 log in the plan).
 - **`--chat-prefix-cache` in a tool loop.** About 95% of the prompt is
   reused from a call to its result on Qwen3.5+, and on Qwen3 with thinking
   on. There is no reuse after a new user turn, nor on Qwen3 with thinking
   off: the templates drop or re-shape the think block there (P5, G8).
 - **Live (P3–P5).** Checked on Qwen3-0.6B, Qwen3.5-0.8B and Gemma 4
-  (12B, 26B-A4B); Gemma 3 1B refuses.
+  (12B, 26B-A4B), 11/11 smoke checks each with `none` undeclared; Gemma 3
+  1B refuses.
 
 **Speculative decoding (opt-in `--speculative [pld|mtp|suffix]`, off by
 default).** The draft sources, the verify/rewind mechanics, and the

@@ -227,10 +227,9 @@ public:
         }
         if (tool_format_) {
             const std::string opener = tool_format_->call_opener();
-            tool_opener_id_ = tokenizer_->get_special_token_id(opener);
+            const int32_t opener_id = tokenizer_->get_special_token_id(opener);
             const auto& vocab = model_.get_metadata().id_to_token;
-            if (tool_opener_id_ < 0 || static_cast<size_t>(tool_opener_id_) >= vocab.size() ||
-                vocab[tool_opener_id_] != opener)
+            if (opener_id < 0 || static_cast<size_t>(opener_id) >= vocab.size() || vocab[opener_id] != opener)
                 throw std::runtime_error(
                     "QweniumServerIntegration: tool format " + std::string(qinf::tools::to_string(tool_format_->dialect())) +
                     " call opener '" + opener + "': expected one special token, actual: not in the vocabulary");
@@ -545,7 +544,6 @@ public:
 
     // Tool calling: null when the model's chat template was never measured.
     const qinf::tools::ToolFormat* tool_format() const { return tool_format_; }
-    int32_t tool_opener_id() const { return tool_opener_id_; }
     // The id of the special token spelled `text`, or -1 when it is not one.
     int32_t special_token_id(const std::string& text) const {
         const int32_t id = tokenizer_->get_special_token_id(text);
@@ -1020,7 +1018,6 @@ private:
     const ChatTemplate* chat_template_ = nullptr;  // F6: arch-registered renderer
     const qinf::tools::ToolFormat* tool_format_ = nullptr;  // by the GGUF template's hash; null = no tools
     std::string tool_template_sha16_;
-    int32_t tool_opener_id_ = -1;
     int max_ctx_per_slot_;
     int max_slots_;
 
@@ -1360,6 +1357,13 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             res.set_content(json({{"error", refusal}}).dump(), "application/json");
             return;
         }
+        // Structured output by response_format is not served: refused, never
+        // ignored (a client would take free text for validated JSON).
+        if (const std::string refusal = qinf::server::refuse_response_format(body); !refusal.empty()) {
+            res.status = 400;
+            res.set_content(json({{"error", refusal}}).dump(), "application/json");
+            return;
+        }
 
         // A tool request (tools, or tool calls / results in the history) is
         // rendered in the checkpoint's own trained format and its reply parsed
@@ -1447,8 +1451,6 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 res.set_content(json({{"error", std::string(e.what())}}).dump(), "application/json");
                 return;
             }
-            if (tool_req->choice == qinf::server::ToolChoice::None)
-                inf_req->banned_tokens.push_back(integration.tool_opener_id());
             // "required" / a named function: a grammar for exactly one call,
             // gated off inside the model's reasoning block.
             if (tool_req->choice == qinf::server::ToolChoice::Required ||
@@ -1471,7 +1473,9 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             }
             // The system turn carries the tools block: the part an agent re-sends
             // every turn, so it is the cacheable prefix (no-op unless
-            // --prefix-cache is wired). Every tool render opens with it.
+            // --prefix-cache is wired). A render with the tools undeclared
+            // (tool_choice "none") may have no system turn: its first turn is
+            // the prefix then.
             if (integration.text_prefix_cache_enabled()) {
                 const std::string end = fmt->system_turn_end();
                 const size_t at = inf_req->prompt.find(end);

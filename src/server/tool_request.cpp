@@ -60,6 +60,17 @@ bool valid_tool_name(const std::string& n) {
 
 }  // namespace
 
+std::string refuse_response_format(const json& body) {
+    if (!body.is_object() || !present(body, "response_format")) return "";
+    const json& f = body["response_format"];
+    if (f.is_object() && f.size() == 1 && f.contains("type") && f["type"] == "text") return "";
+    return "'response_format': expected absent or {\"type\":\"text\"} (json_object and json_schema are "
+           "not served; constrain the output with 'grammar', GBNF), actual: " +
+           (!f.is_object() || !f.contains("type") ? describe(f)
+            : f["type"] == "text"                 ? std::string("type \"text\" with other keys")
+                                                  : "type " + describe(f["type"]));
+}
+
 std::string refuse_legacy_tool_fields(const json& body) {
     if (!body.is_object()) return "";
     if (present(body, "functions"))
@@ -167,6 +178,11 @@ ToolRequest parse_tool_request(const std::string& request_body) {
                                   "{\"name\":...}}", describe(c));
         }
     }
+    // "none": the tools are not declared to the model at all (the template's
+    // no-tools branch) — declaring them and banning the call opener
+    // degenerates Gemma 4 (docs/plan-tool-calling.md P5). A call the model
+    // makes anyway is a 502.
+    chat.declare_tools = out.choice != ToolChoice::None;
     if (present(body, "parallel_tool_calls") && body["parallel_tool_calls"] != true)
         refuse("parallel_tool_calls", "true or absent (false is not enforced in v1)",
                describe(body["parallel_tool_calls"]));

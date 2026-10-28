@@ -57,6 +57,13 @@ struct ToolTurn {
 struct ToolChat {
     std::vector<ToolTurn>      messages;
     ojson                      tools;         // the request's tools array, as sent
+    // false: the tools are not declared to the model — rendered as the
+    // template renders a request without tools (its no-tools branch; earlier
+    // calls and results in the history still render). How tool_choice "none"
+    // is served: a declared tool with its call opener banned degenerates
+    // Gemma 4 (docs/plan-tool-calling.md P5). `tools` stays the request's
+    // array either way; parse and grammar still read it.
+    bool                       declare_tools = true;
     bool                       add_generation_prompt = true;
     std::optional<bool>        enable_thinking;    // absent = the template's default
     std::optional<bool>        preserve_thinking;  // only where the template has it
@@ -129,8 +136,9 @@ public:
     // values carry their own types. Throws ToolCallError.
     virtual ParsedReply parse(const std::string& generated, const ToolChat& chat) const = 0;
 
-    // The text that opens a call — one special token in every dialect, so
-    // tool_choice "none" is enforced by banning that token.
+    // The text that opens a call — one special token in every dialect (the
+    // server checks the vocabulary has it at startup, and the grammar for
+    // "required" begins with it).
     virtual const char* call_opener() const = 0;
 
     // Stop strings a tool request adds to the client's: Gemma 4 emits
@@ -140,7 +148,9 @@ public:
 
     // What closes the system turn every tool render opens with (it carries the
     // tools block): render(chat) up to and including the first occurrence is
-    // the request's recurring, cacheable prefix.
+    // the request's recurring, cacheable prefix. With the tools undeclared
+    // there may be no system turn; the first occurrence then closes the first
+    // turn, still a prefix of the render.
     virtual const char* system_turn_end() const = 0;
 
     // The grammar for tool_choice "required" (only_tool null) or the named

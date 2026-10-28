@@ -57,6 +57,25 @@ TEST(ToolRequest, LegacyFunctionCallingIsRefusedOnEveryRequest) {
     EXPECT_EQ(refuse_legacy_tool_fields(json::parse(R"({"messages":[{"role":"user","content":"x"}],"functions":null})")), "");
 }
 
+// response_format is refused on every chat request unless it is the default
+// {"type":"text"}; absent or null passes.
+TEST(ToolRequest, StructuredResponseFormatIsRefused) {
+    using qinf::server::refuse_response_format;
+    const std::string served = "'response_format': expected absent or {\"type\":\"text\"} (json_object and "
+                               "json_schema are not served; constrain the output with 'grammar', GBNF), actual: ";
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[],"response_format":{"type":"json_object"}})")),
+              served + "type \"json_object\"");
+    EXPECT_EQ(refuse_response_format(json::parse(
+                  R"({"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{}}}})")),
+              served + "type \"json_schema\"");
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[],"response_format":"json"})")), served + "\"json\"");
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[],"response_format":{"type":"text","x":1}})")),
+              served + "type \"text\" with other keys");
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[],"response_format":{"type":"text"}})")), "");
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[],"response_format":null})")), "");
+    EXPECT_EQ(refuse_response_format(json::parse(R"({"messages":[]})")), "");
+}
+
 TEST(ToolRequest, WhatIsAToolRequest) {
     EXPECT_FALSE(is_tool_request(json::parse(R"({"messages":[{"role":"user","content":"hi"}]})")));
     EXPECT_FALSE(is_tool_request(json::parse(R"({"messages":[{"role":"user","content":"hi"}],"tools":null})")));
@@ -121,6 +140,17 @@ TEST(ToolRequest, RequiredAndNamedToolChoice) {
     const auto r = parse_tool_request(body(kUser, R"("tool_choice":{"type":"function","function":{"name":"get_weather"}})"));
     EXPECT_EQ(r.choice, qinf::server::ToolChoice::Named);
     EXPECT_EQ(r.named, "get_weather");
+}
+
+// "none" leaves the tools undeclared to the model; they stay in the chat for
+// the parser. Every other choice declares them.
+TEST(ToolRequest, NoneToolChoiceLeavesTheToolsUndeclared) {
+    const auto none = parse_tool_request(body(kUser, R"("tool_choice":"none")"));
+    EXPECT_EQ(none.choice, qinf::server::ToolChoice::None);
+    EXPECT_FALSE(none.chat.declare_tools);
+    EXPECT_EQ(none.chat.tools.size(), 1u);
+    EXPECT_TRUE(parse_tool_request(body(kUser)).chat.declare_tools);
+    EXPECT_TRUE(parse_tool_request(body(kUser, R"("tool_choice":"required")")).chat.declare_tools);
 }
 
 TEST(ToolRequest, RefusesMalformedTools) {
