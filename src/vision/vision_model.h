@@ -42,6 +42,20 @@ enum class VisionProjectorType {
     Qwen3VlMerger,  // Qwen 3.5-family ViT + 2×2 merger (qwen3vl_merger);
                     // variable token count. P1 parses it; no encoder until P3,
                     // so constructing one still refuses fail-loud.
+    Gemma4V,        // Gemma 4 / EmbeddingGemma-2 ViT (gemma4v): 16 Gemma-style
+                    // blocks, 2-D learned positions + 2-D RoPE, 3×3 avg pool,
+                    // projection (docs/plan-embed-image.md); variable tokens.
+};
+
+// The gated-FFN activation of a ViT whose blocks are gated (gemma4v). Named
+// rather than implied because the two references disagree for gemma4v: the
+// model's config.json says gelu_pytorch_tanh, while llama.cpp (no clip.use_gelu
+// key in the mmproj) falls back to GELU-quick. The loader sets tanh for gemma4v
+// (user decision 2026-10-16, docs/plan-embed-image.md §7); GeluQuick stays for
+// the parity test against llama.cpp's own output.
+enum class VisionFfnAct {
+    GeluQuick,   // x·σ(1.702x) — ggml_geglu_quick_split (llama.cpp's fallback)
+    GeluTanh,    // tanh-approximate GELU — ggml_geglu_split (gelu_pytorch_tanh)
 };
 
 // SigLIP / Gemma mmproj config. Fields named after the upstream GGUF
@@ -66,6 +80,9 @@ struct SigLIPConfig {
     // n_merge (16·3 = 48). SigLIP does its merge as a separate 4×4 pool, so its
     // n_merge here is 1 (the pool lives in pool_factor below).
     uint32_t n_merge         = 1;
+
+    // Gated-FFN activation (gemma4v only; the other towers hardcode theirs).
+    VisionFfnAct ffn_act = VisionFfnAct::GeluQuick;
 
     // ── Pool + projection + soft-emb-norm ────────────────────────────────────
     uint32_t pool_factor          = 4;    // 4×4 avg pool on the patch grid

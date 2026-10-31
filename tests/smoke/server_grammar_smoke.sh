@@ -16,6 +16,9 @@
 #                        no crash).
 #   5. NON-GRAMMAR     — a request without a grammar is still coherent prose
 #                        (the grammar path doesn't disturb the default path).
+#   6. RESPONSE_FORMAT — on /v1/chat/completions, response_format json_object is
+#                        refused (400, naming the field and 'grammar'), never
+#                        ignored; {"type":"text"} is served.
 #
 # Heavy: loads a model on Metal. The constraint is model-independent (the mask
 # forces conformance), so this runs cross-family unchanged.
@@ -89,6 +92,16 @@ PLAIN="$(curl -fsS "$URL" -H 'Content-Type: application/json' \
   --data '{"prompt":"Name one ocean.","max_tokens":40,"temperature":0.0}' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["choices"][0]["text"])')"
 check "non-grammar-coherent" '[[ -n "$(printf "%s" "$PLAIN" | tr -d "[:space:]")" ]]'
+
+# --- 6: response_format on chat -> json_object refused by name, text served ---
+CHAT_URL="http://127.0.0.1:$PORT/v1/chat/completions"
+RF_CODE="$(curl -sS -o "$WORK/rf.json" -w '%{http_code}' "$CHAT_URL" -H 'Content-Type: application/json' \
+  --data '{"messages":[{"role":"user","content":"Return JSON."}],"max_tokens":10,"response_format":{"type":"json_object"}}')"
+RT_CODE="$(curl -sS -o "$WORK/rt.json" -w '%{http_code}' "$CHAT_URL" -H 'Content-Type: application/json' \
+  --data '{"messages":[{"role":"user","content":"Name one ocean."}],"max_tokens":10,"temperature":0.0,"response_format":{"type":"text"}}')"
+echo "  response_format -> json_object HTTP $RF_CODE body=$(cat "$WORK/rf.json"); text HTTP $RT_CODE"
+check "response-format-refused" '[[ "$RF_CODE" == "400" ]] && grep -q "response_format" "$WORK/rf.json" && grep -q "grammar" "$WORK/rf.json"'
+check "response-format-text"    '[[ "$RT_CODE" == "200" ]]'
 
 [[ "$pass" -eq 0 ]] || { echo "================ SERVER GRAMMAR SMOKE FAIL ================"; exit 1; }
 echo "================ SERVER GRAMMAR SMOKE PASS ================"

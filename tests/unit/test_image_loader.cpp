@@ -374,3 +374,114 @@ TEST(ImageLoader, Qwen3VlTokenBudgetMatchesReferencePixelBudget) {
     EXPECT_EQ(pp.min_tokens * pp.align * pp.align, 8192);
     EXPECT_EQ(pp.max_tokens * pp.align * pp.align, 4194304);
 }
+
+// ── gemma4v (EmbeddingGemma-2 vision) — docs/plan-embed-image.md phase 2 ─────
+//
+// Seven synthetic PNGs (py/gen_embed_images.py) through llama.cpp ceefd16da's
+// dyn-size preprocessor for gemma4v: Pillow bicubic, align 48, budget 70…280,
+// mean 0 / std 1 (tests/fixtures/embed_image/README.md). The gate is BYTE
+// identity of the whole planar f32 tensor: the fixture stores an FNV-1a 64 of
+// those bytes (`prefnv`), which is exactly what Bitmap::content_id computes, so
+// no 2–7 MB tensor is committed. The 512 probe points per image only say WHERE
+// a mismatch is.
+namespace {
+std::string find_embed_image_fixture(const char* name) {
+    std::vector<std::string> dirs;
+    if (const char* e = std::getenv("QINF_EMBED_IMAGE_FIXTURE_DIR"); e && e[0])
+        dirs.push_back(e);
+    dirs.insert(dirs.end(), {"tests/fixtures/embed_image", "../tests/fixtures/embed_image",
+                             "../../tests/fixtures/embed_image",
+                             "../../../tests/fixtures/embed_image"});
+    for (const auto& d : dirs) {
+        std::string p = d + "/" + name;
+        std::ifstream f(p);
+        if (f.good()) return d;
+    }
+    return {};
+}
+
+struct Gemma4vPreRef {
+    std::string name;
+    int c = 0, h = 0, w = 0;
+    uint64_t fnv = 0;
+    std::vector<std::pair<size_t, float>> probes;   // planar index -> value
+};
+
+std::vector<Gemma4vPreRef> read_gemma4v_pre_refs(const std::string& path) {
+    std::vector<Gemma4vPreRef> out;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string tag;
+        is >> tag;
+        if (tag == "image") {
+            out.emplace_back();
+            is >> out.back().name;
+        } else if (tag == "pre" && !out.empty()) {
+            is >> out.back().c >> out.back().h >> out.back().w;
+        } else if (tag == "prefnv" && !out.empty()) {
+            std::string hex;
+            is >> hex;
+            out.back().fnv = std::stoull(hex, nullptr, 16);
+        } else if (tag == "probes" && !out.empty()) {
+            auto& r = out.back();
+            size_t n = 0;
+            is >> n;
+            for (size_t i = 0; i < n; ++i) {
+                int c, y, x;
+                float v;
+                is >> c >> y >> x >> v;
+                r.probes.emplace_back((static_cast<size_t>(c) * r.h + y) * r.w + x, v);
+            }
+        }
+    }
+    return out;
+}
+}  // namespace
+
+TEST(ImageLoader, MatchesLlamaCppGemma4vReference) {
+    const std::string dir = find_embed_image_fixture("reference_t280.txt");
+    if (dir.empty())
+        GTEST_SKIP() << "embed_image fixtures not found (set QINF_EMBED_IMAGE_FIXTURE_DIR "
+                        "or run from repo root)";
+    const auto refs = read_gemma4v_pre_refs(dir + "/reference_t280.txt");
+    ASSERT_EQ(refs.size(), 7u) << "reference_t280.txt: expected 7 images";
+    for (const auto& r : refs) {
+        SCOPED_TRACE(r.name);
+        ASSERT_EQ(r.c, 3);
+        ASSERT_FALSE(r.probes.empty());
+        auto bmp = load_image_to_bitmap(dir + "/" + r.name + ".png", qinf::vision::gemma4v_preprocess());
+        ASSERT_EQ(bmp.width, r.w) << "canvas width (smart_resize) differs";
+        ASSERT_EQ(bmp.height, r.h) << "canvas height (smart_resize) differs";
+        size_t probe_miss = 0;
+        for (const auto& [i, v] : r.probes)
+            if (bmp.pixels[i] != v) ++probe_miss;
+        EXPECT_EQ(probe_miss, 0u) << probe_miss << " of " << r.probes.size() << " probes differ";
+        EXPECT_EQ(bmp.content_id, r.fnv) << "whole-tensor FNV-1a differs: not byte-identical";
+    }
+}
+
+// The parameter is honoured: the same picture through the bilinear default and
+// through gemma4v's bicubic gives the same canvas but different bytes — and
+// the existing recipes keep the bilinear default (their fixtures stay valid).
+TEST(ImageLoader, Gemma4vResampleIsAParameter) {
+    EXPECT_EQ(qinf::vision::gemma4v_preprocess().resample,
+              qinf::vision::ImagePreprocess::Resample::PillowBicubic);
+    EXPECT_EQ(qinf::vision::gemma4uv_preprocess().resample,
+              qinf::vision::ImagePreprocess::Resample::BilinearAlignCorners);
+    EXPECT_EQ(qinf::vision::qwen3vl_preprocess().resample,
+              qinf::vision::ImagePreprocess::Resample::BilinearAlignCorners);
+    EXPECT_EQ(qinf::vision::gemma3_preprocess().resample,
+              qinf::vision::ImagePreprocess::Resample::BilinearAlignCorners);
+    const std::string dir = find_embed_image_fixture("page_850x1100.png");
+    if (dir.empty()) GTEST_SKIP() << "embed_image fixtures not found";
+    auto bicubic = qinf::vision::gemma4v_preprocess();
+    auto bilinear = bicubic;
+    bilinear.resample = qinf::vision::ImagePreprocess::Resample::BilinearAlignCorners;
+    const auto a = load_image_to_bitmap(dir + "/page_850x1100.png", bicubic);
+    const auto b = load_image_to_bitmap(dir + "/page_850x1100.png", bilinear);
+    EXPECT_EQ(a.width, b.width);
+    EXPECT_EQ(a.height, b.height);
+    EXPECT_NE(a.content_id, b.content_id);
+}

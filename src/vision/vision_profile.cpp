@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "gemma4uv_encoder.h"
+#include "gemma4v_encoder.h"
 #include "qwen3vl_encoder.h"
 #include "siglip_encoder.h"
 
@@ -15,6 +16,7 @@ std::string to_string(PT type) {
         case PT::Gemma3Siglip:  return "Gemma3Siglip";
         case PT::Gemma4Uv:      return "Gemma4Uv";
         case PT::Qwen3VlMerger: return "Qwen3VlMerger";
+        case PT::Gemma4V:       return "Gemma4V";
     }
     return "<unregistered VisionProjectorType>";
 }
@@ -95,6 +97,24 @@ VisionProfile make_vision_profile(const VisionModel&              vmodel,
                 vmodel, backend, cfg.projection_dim);
             return profile;
         }
+        case PT::Gemma4V: {
+            profile.projector_tag = "gemma4v";
+            // EmbeddingGemma-2 (docs/plan-embed-image.md): llama.cpp mtmd frames
+            // the span <|image> … <image|> (ids 255999 / 258882 in its vocab);
+            // the filler <|image|> is overwritten by the substitution. No chat
+            // and no thinking: this tower serves an encoder, and the model card
+            // gives images no prefix.
+            resolve_markers(profile, id_to_token,
+                            "<|image>", "<|image|>", "<image|>", error_prefix);
+            profile.marker_prefix  = "<|image>";
+            profile.wants_thinking = false;
+            profile.preprocess = gemma4v_preprocess(
+                static_cast<int>(cfg.patch_size * cfg.n_merge));
+            // Encoder LAST — see the Gemma3Siglip case.
+            profile.encoder = std::make_unique<Gemma4vEncoder>(
+                vmodel, backend, cfg.projection_dim);
+            return profile;
+        }
         case PT::Qwen3VlMerger: {
             profile.projector_tag = "qwen3vl-merger";
             // Qwen 3.5-family markers, per the GGUF chat template.
@@ -116,8 +136,8 @@ VisionProfile make_vision_profile(const VisionModel&              vmodel,
     // cannot host. Refusing beats silently encoding with the wrong tower.
     throw std::runtime_error(
         error_prefix + ": expected a projector this build can host (" +
-        to_string(PT::Gemma3Siglip) + ", " + to_string(PT::Gemma4Uv) + " or " +
-        to_string(PT::Qwen3VlMerger) + "), actual: " +
+        to_string(PT::Gemma3Siglip) + ", " + to_string(PT::Gemma4Uv) + ", " +
+        to_string(PT::Gemma4V) + " or " + to_string(PT::Qwen3VlMerger) + "), actual: " +
         to_string(cfg.projector_type) + " from mmproj '" +
         vmodel.mmproj_path() + "'");
 }

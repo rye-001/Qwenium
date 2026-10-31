@@ -12,6 +12,9 @@
 namespace qinf {
 
 void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
+    for (int32_t id : banned_tokens_)
+        if (id >= 0 && static_cast<size_t>(id) < logits.size())
+            logits[id] = -std::numeric_limits<float>::infinity();
     if (!pruned_vocab_) return;
     for (size_t i = 0; i < logits.size(); ++i) {
         if (pruned_vocab_->find(static_cast<int32_t>(i)) == pruned_vocab_->end())
@@ -19,13 +22,22 @@ void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     }
 }
 
+void Sampler::apply_bans_sparse(std::vector<float>& sparse_logits,
+                                const std::vector<int32_t>& valid_ids) const {
+    if (banned_tokens_.empty()) return;
+    for (size_t j = 0; j < valid_ids.size() && j < sparse_logits.size(); ++j)
+        if (std::find(banned_tokens_.begin(), banned_tokens_.end(), valid_ids[j]) != banned_tokens_.end())
+            sparse_logits[j] = -std::numeric_limits<float>::infinity();
+}
+
 std::vector<int32_t> Sampler::peek_valid_set() {
-    if (!grammar_ || vocab_.empty()) {
+    if (!grammar_active() || vocab_.empty()) {   // no grammar, or inside the gated reasoning
         cached_valid_ids_valid_ = false;
         return {};
     }
 
     std::vector<int32_t> valid = grammar_->get_valid_tokens(vocab_);
+    if (gate_ == Gate::AwaitFirst && gate_opener_ >= 0) valid.push_back(gate_opener_);
 
     // If the grammar is in an accepting state, ensure all registered stop
     // tokens are included in the valid set.
@@ -59,7 +71,7 @@ void Sampler::build_token_trie(const std::vector<std::string>& vocab) {
 
 void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                         const std::vector<std::string>& token_strs) {
-    if (!grammar_) return;
+    if (!grammar_active()) return;   // no grammar, or inside the gated reasoning
 
     // Lazily build the trie on first grammar use if not yet built.
     if (!token_trie_ && !token_strs.empty()) {
@@ -89,6 +101,8 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
         cached_valid_ids_valid_ = false;
     } else {
         valid_tokens = grammar_->get_valid_tokens(token_strs);
+        // (peek_valid_set already added the opener to a cached set.)
+        if (gate_ == Gate::AwaitFirst && gate_opener_ >= 0) valid_tokens.push_back(gate_opener_);
     }
 
     if (valid_tokens.empty()) {
@@ -179,6 +193,7 @@ int32_t GreedySampler::sample_sparse(std::vector<float>& sparse_logits,
         throw std::runtime_error("sample_sparse: sparse_logits.size() != valid_ids.size(); expected: equal, actual: "
                                  + std::to_string(sparse_logits.size()) + " vs "
                                  + std::to_string(valid_ids.size()));
+    apply_bans_sparse(sparse_logits, valid_ids);
     Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
                                               repetition_penalty_, repetition_lookback_);
     const size_t j = static_cast<size_t>(
@@ -307,6 +322,7 @@ int32_t TemperatureSampler::sample_sparse(std::vector<float>& sparse_logits,
                                  + std::to_string(sparse_logits.size()) + " vs "
                                  + std::to_string(valid_ids.size()));
 
+    apply_bans_sparse(sparse_logits, valid_ids);
     Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
                                               repetition_penalty_, repetition_lookback_);
 

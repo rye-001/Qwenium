@@ -13,6 +13,7 @@ add_library(qinf-vision STATIC
     siglip_encoder.cpp
     gemma4uv_encoder.cpp
     qwen3vl_encoder.cpp
+    gemma4v_encoder.cpp
     image_preprocess.cpp
     vision_profile.cpp
 )

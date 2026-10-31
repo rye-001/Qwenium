@@ -241,7 +241,7 @@ target_compile_definitions(embedding-service-tests PRIVATE
     QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
 target_link_libraries(embedding-service-tests PRIVATE
     GTest::gtest_main nlohmann_json::nlohmann_json
-    qinf-orchestration qinf-models qinf-engine ggml)
+    qinf-orchestration qinf-models qinf-engine qinf-server qinf-vision qinf-image ggml)
 target_compile_features(embedding-service-tests PRIVATE cxx_std_17)
 gtest_discover_tests(embedding-service-tests)
 
@@ -275,6 +275,29 @@ target_link_libraries(image-data-uri-tests PRIVATE
 )
 target_compile_features(image-data-uri-tests PRIVATE cxx_std_17)
 gtest_discover_tests(image-data-uri-tests)
+
+# Tool requests rendered in each measured template's own format, byte for byte
+# against the captured HF / llama.cpp renderings (docs/plan-tool-calling.md G1).
+add_executable(tool-format-tests
+    unit/test_tool_format.cpp
+)
+target_compile_definitions(tool-format-tests PRIVATE
+    QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
+target_link_libraries(tool-format-tests PRIVATE qinf-loader sampling GTest::gtest_main)
+target_compile_features(tool-format-tests PRIVATE cxx_std_17)
+gtest_discover_tests(tool-format-tests)
+
+# Chat-request tool fields refused by name (docs/plan-tool-calling.md P0).
+add_executable(tool-request-tests
+    unit/test_tool_request.cpp
+)
+target_link_libraries(tool-request-tests PRIVATE
+    qinf-server
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
+)
+target_compile_features(tool-request-tests PRIVATE cxx_std_17)
+gtest_discover_tests(tool-request-tests)
 
 # ServerVision's accessors (prepare_image, encoder, marker ids, projector_tag,
 # projection_dim) on one (model, mmproj) pair per projector family; each leg
@@ -606,6 +629,8 @@ target_link_libraries(embed-tests PRIVATE
     qinf-orchestration
     qinf-models
     qinf-engine
+    qinf-vision
+    qinf-image
     ggml
 )
 target_compile_features(embed-tests PRIVATE cxx_std_17)
@@ -1235,7 +1260,7 @@ target_include_directories(embed-mode-tests PRIVATE ${PROJECT_SOURCE_DIR}/src/cl
 target_compile_definitions(embed-mode-tests PRIVATE
     QINF_TEST_FIXTURES_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures")
 target_link_libraries(embed-mode-tests PRIVATE
-    GTest::gtest_main qinf-orchestration qinf-models qinf-engine ggml)
+    GTest::gtest_main qinf-orchestration qinf-models qinf-engine qinf-vision qinf-image ggml)
 target_compile_features(embed-mode-tests PRIVATE cxx_std_17)
 gtest_discover_tests(embed-mode-tests)
 
@@ -1308,6 +1333,27 @@ if(GGML_USE_METAL)
     target_compile_definitions(qwen3vl-encoder-tests PRIVATE QINF_TEST_HAS_METAL)
 endif()
 gtest_discover_tests(qwen3vl-encoder-tests)
+
+# gemma4v (EmbeddingGemma-2 vision) encoder vs llama.cpp soft tokens
+# (docs/plan-embed-image.md phase 3). Skips without the mmproj.
+add_executable(gemma4v-encoder-tests
+    unit/test_gemma4v_encoder.cpp
+)
+target_link_libraries(gemma4v-encoder-tests PRIVATE
+    GTest::gtest_main
+    qinf-vision
+    qinf-image
+    qinf-loader
+    qinf-models
+    qinf-engine
+    ggml
+)
+target_compile_features(gemma4v-encoder-tests PRIVATE cxx_std_17)
+if(GGML_USE_METAL)
+    target_link_libraries(gemma4v-encoder-tests PRIVATE ggml-metal)
+    target_compile_definitions(gemma4v-encoder-tests PRIVATE QINF_TEST_HAS_METAL)
+endif()
+gtest_discover_tests(gemma4v-encoder-tests)
 
 # Phase 7 image-embedding reuse cache — no model file needed (counting lambda).
 add_executable(image-embedding-cache-tests
@@ -1786,7 +1832,7 @@ set_tests_properties(cli-embed-rejects-chat PROPERTIES
     PASS_REGULAR_EXPRESSION "--embed: expected no --chat")
 add_test(NAME cli-embed-rejects-no-input COMMAND qwenium-cli /nonexistent-model.gguf --embed)
 set_tests_properties(cli-embed-rejects-no-input PROPERTIES
-    PASS_REGULAR_EXPRESSION "--embed: expected exactly one input.*neither")
+    PASS_REGULAR_EXPRESSION "--embed: expected exactly one input.*actual: none")
 add_test(NAME cli-embed-in-needs-embed
          COMMAND qwenium-cli /nonexistent-model.gguf --embed-in texts.txt)
 set_tests_properties(cli-embed-in-needs-embed PROPERTIES
@@ -1805,3 +1851,18 @@ set_tests_properties(server-rejects-unknown-flag-reason PROPERTIES
 add_test(NAME server-rejects-flag-without-value COMMAND qwenium-server --ctx)
 set_tests_properties(server-rejects-flag-without-value PROPERTIES
     PASS_REGULAR_EXPRESSION "--ctx: expected a value")
+
+# --embed --image needs the embedding model's image tower (docs/plan-embed-image.md G6).
+add_test(NAME cli-embed-image-needs-mmproj
+         COMMAND qwenium-cli /nonexistent-model.gguf --embed --image x.png)
+set_tests_properties(cli-embed-image-needs-mmproj PROPERTIES
+    PASS_REGULAR_EXPRESSION "--embed --image: expected --mmproj")
+
+# Image-embedding cost (docs/plan-embed-image.md phase 6): footprint with both
+# GGUFs, and preprocess / encode / text-pass time per image, each on its own.
+add_executable(embed-image-cost
+    perf/embed_image_cost.cpp
+)
+target_link_libraries(embed-image-cost PRIVATE
+    qinf-orchestration qinf-models qinf-engine qinf-vision qinf-image ggml)
+target_compile_features(embed-image-cost PRIVATE cxx_std_17)

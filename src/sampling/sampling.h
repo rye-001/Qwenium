@@ -58,6 +58,33 @@ public:
         pruned_vocab_ = pruned_vocab;
     }
 
+    // Tokens this sampler must never return (optional; empty = none). Their
+    // logits are set to -inf on every path, dense and sparse, before any other
+    // constraint. The server bans a tool format's call opener for
+    // tool_choice "none" (docs/plan-tool-calling.md).
+    void set_banned_tokens(std::vector<int32_t> ids) { banned_tokens_ = std::move(ids); }
+    const std::vector<int32_t>& banned_tokens() const { return banned_tokens_; }
+
+    // Reasoning gate for the grammar (optional): the grammar does not apply
+    // inside the model's reasoning block, which a single opener token and a
+    // single closer token delimit (<think>…</think>, <|channel>…<channel|>).
+    //   start_inside=false: the first token may be the opener (then reasoning
+    //     runs unconstrained) or any grammar-valid token (then the grammar is
+    //     active from there on).
+    //   start_inside=true: the prompt already opened the block, so sampling is
+    //     unconstrained until the closer.
+    // After the closer the grammar is active; the opener and closer are never
+    // fed to the grammar. Used by tool_choice "required" / a named function
+    // (docs/plan-tool-calling.md P4): the thought is free and costs no grammar
+    // scan, the call is constrained.
+    void set_grammar_gate(int32_t opener, int32_t closer, bool start_inside) {
+        gate_opener_ = opener;
+        gate_closer_ = closer;
+        gate_ = start_inside ? Gate::AwaitCloser : Gate::AwaitFirst;
+    }
+    // True when the grammar (if any) constrains the next token.
+    bool grammar_active() const { return grammar_ && gate_ != Gate::AwaitCloser; }
+
     // Register a stop token ID. Call once per stop token at init;
     // duplicates are silently ignored.
     void add_eos_token_id(int32_t id) {
@@ -86,11 +113,20 @@ public:
     // Advance grammar state after a token is committed.
     // No-op when no grammar is attached.
     void accept_token(int32_t token_id) {
+        if (gate_ == Gate::AwaitCloser) {
+            if (token_id == gate_closer_) gate_ = Gate::Active;
+            return;
+        }
+        if (gate_ == Gate::AwaitFirst) {
+            if (token_id == gate_opener_) { gate_ = Gate::AwaitCloser; return; }
+            gate_ = Gate::Active;
+        }
         if (grammar_) grammar_->accept_token(token_id, vocab_);
     }
 
 protected:
-    void apply_vocab_pruning(std::vector<float>& logits);
+    void apply_vocab_pruning(std::vector<float>& logits);   // and the banned tokens
+    void apply_bans_sparse(std::vector<float>& sparse_logits, const std::vector<int32_t>& valid_ids) const;
     void apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                    const std::vector<std::string>& token_strs);
     static void apply_repetition_penalty_sparse(std::vector<float>& sparse_logits,
@@ -100,6 +136,11 @@ protected:
 
     GrammarVocab* grammar_     = nullptr;
     const std::unordered_set<int32_t>* pruned_vocab_ = nullptr;
+    std::vector<int32_t> banned_tokens_;
+    enum class Gate { Active, AwaitFirst, AwaitCloser };
+    Gate    gate_        = Gate::Active;   // Active: no gate (the default)
+    int32_t gate_opener_ = -1;
+    int32_t gate_closer_ = -1;
     std::vector<int32_t> eos_token_ids_;
     std::unique_ptr<TokenTrie> token_trie_;
     std::vector<std::string> vocab_; // cached at build_token_trie time

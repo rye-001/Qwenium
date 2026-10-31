@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -47,6 +48,125 @@ void resize_bilinear_u8(const unsigned char* src, int w, int h,
                     static_cast<unsigned char>(lerp(top, bot, yf));
             }
         }
+    }
+}
+
+// Pillow-compatible separable bicubic resize of an interleaved 8-bit RGB source
+// to new_w × new_h (docs/plan-embed-image.md, gemma4v). Byte-for-byte port of
+// llama.cpp mtmd `img_tool::resize_pillow` with RESIZE_ALGO_BICUBIC at
+// ceefd16da (itself from Pillow's Resample.c): Keys cubic with a = −0.5,
+// pixel-centre mapping, the filter widened by the scale when downsampling,
+// weights normalised then rounded to 22-bit fixed point (+/−0.5 then truncate),
+// a horizontal pass then a vertical pass, each through a uint8 intermediate with
+// a 0.5 rounding bias and a clamp. An axis whose size does not change is not
+// resampled at all.
+void resize_pillow_bicubic_u8(const unsigned char* src, int w, int h,
+                              std::vector<unsigned char>& dst, int new_w, int new_h) {
+    constexpr int kPrecisionBits = 32 - 8 - 2;
+    constexpr double kSupport = 2.0;   // bicubic
+    auto filter = [](double x) -> double {
+        constexpr double a = -0.5;
+        if (x < 0.0) x = -x;
+        if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+        if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+        return 0.0;
+    };
+    auto clip8 = [](int v) -> unsigned char {
+        return static_cast<unsigned char>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    };
+    // Coefficients for one axis: bounds[2·o] = first input index, bounds[2·o+1]
+    // = count; weights[o·ksize + k] in fixed point. Returns ksize.
+    auto weights_for = [&](int in_size, int out_size, std::vector<int>& bounds,
+                           std::vector<int32_t>& weights) -> int {
+        const double scale = static_cast<double>(in_size) / out_size;
+        const double filterscale = scale < 1.0 ? 1.0 : scale;
+        const double support = kSupport * filterscale;
+        const int ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+        std::vector<double> pre(static_cast<size_t>(out_size) * ksize);
+        bounds.assign(static_cast<size_t>(out_size) * 2, 0);
+        for (int xx = 0; xx < out_size; ++xx) {
+            const double center = (xx + 0.5) * scale;
+            const double ss = 1.0 / filterscale;
+            int xmin = static_cast<int>(center - support + 0.5);
+            if (xmin < 0) xmin = 0;
+            int xmax = static_cast<int>(center + support + 0.5);
+            if (xmax > in_size) xmax = in_size;
+            xmax -= xmin;
+            double ww = 0.0;
+            int x = 0;
+            for (; x < xmax; ++x) {
+                const double wv = filter((x + xmin - center + 0.5) * ss);
+                pre[static_cast<size_t>(xx) * ksize + x] = wv;
+                ww += wv;
+            }
+            for (x = 0; x < xmax; ++x)
+                if (ww != 0.0) pre[static_cast<size_t>(xx) * ksize + x] /= ww;
+            for (; x < ksize; ++x) pre[static_cast<size_t>(xx) * ksize + x] = 0;
+            bounds[xx * 2 + 0] = xmin;
+            bounds[xx * 2 + 1] = xmax;
+        }
+        weights.resize(static_cast<size_t>(out_size) * ksize);
+        const double fxp = std::ldexp(1.0, kPrecisionBits);
+        for (size_t i = 0; i < weights.size(); ++i)
+            weights[i] = static_cast<int32_t>(pre[i] * fxp + (pre[i] < 0 ? -0.5 : 0.5));
+        return ksize;
+    };
+    auto horizontal = [&](const unsigned char* in, int in_nx, int in_ny, int out_nx) {
+        std::vector<int> b;
+        std::vector<int32_t> k;
+        const int ksize = weights_for(in_nx, out_nx, b, k);
+        std::vector<unsigned char> out(static_cast<size_t>(out_nx) * in_ny * 3);
+        for (int yy = 0; yy < in_ny; ++yy) {
+            const unsigned char* row = in + static_cast<size_t>(yy) * in_nx * 3;
+            unsigned char* orow = out.data() + static_cast<size_t>(yy) * out_nx * 3;
+            for (int xx = 0; xx < out_nx; ++xx) {
+                const int xmin = b[xx * 2], xcnt = b[xx * 2 + 1];
+                const int32_t* kk = &k[static_cast<size_t>(xx) * ksize];
+                const unsigned char* p = row + static_cast<size_t>(xmin) * 3;
+                int32_t s0 = 1 << (kPrecisionBits - 1), s1 = s0, s2 = s0;
+                for (int x = 0; x < xcnt; ++x, p += 3) {
+                    s0 += p[0] * kk[x];
+                    s1 += p[1] * kk[x];
+                    s2 += p[2] * kk[x];
+                }
+                orow[xx * 3 + 0] = clip8(s0 >> kPrecisionBits);
+                orow[xx * 3 + 1] = clip8(s1 >> kPrecisionBits);
+                orow[xx * 3 + 2] = clip8(s2 >> kPrecisionBits);
+            }
+        }
+        return out;
+    };
+    auto vertical = [&](const unsigned char* in, int in_nx, int in_ny, int out_ny) {
+        std::vector<int> b;
+        std::vector<int32_t> k;
+        const int ksize = weights_for(in_ny, out_ny, b, k);
+        const size_t row_elems = static_cast<size_t>(in_nx) * 3;
+        std::vector<unsigned char> out(row_elems * out_ny);
+        std::vector<int32_t> acc(row_elems);
+        for (int yy = 0; yy < out_ny; ++yy) {
+            const int ymin = b[yy * 2], ycnt = b[yy * 2 + 1];
+            const int32_t* kk = &k[static_cast<size_t>(yy) * ksize];
+            std::fill(acc.begin(), acc.end(), 1 << (kPrecisionBits - 1));
+            for (int y = 0; y < ycnt; ++y) {
+                const unsigned char* row = in + static_cast<size_t>(ymin + y) * row_elems;
+                const int32_t wv = kk[y];
+                for (size_t i = 0; i < row_elems; ++i) acc[i] += row[i] * wv;
+            }
+            unsigned char* orow = out.data() + static_cast<size_t>(yy) * row_elems;
+            for (size_t i = 0; i < row_elems; ++i) orow[i] = clip8(acc[i] >> kPrecisionBits);
+        }
+        return out;
+    };
+    const bool need_h = new_w != w, need_v = new_h != h;
+    if (need_h && need_v) {
+        const std::vector<unsigned char> tmp = horizontal(src, w, h, new_w);
+        dst = vertical(tmp.data(), new_w, h, new_h);
+    } else if (need_h) {
+        dst = horizontal(src, w, h, new_w);
+    } else if (need_v) {
+        dst = vertical(src, w, h, new_h);
+    } else {
+        dst.assign(src, src + static_cast<size_t>(3) * w * h);
     }
 }
 
@@ -135,7 +255,10 @@ qinf::vision::Bitmap bitmap_from_rgb(const unsigned char* data, int w, int h,
     const int new_h = std::min(static_cast<int>(std::ceil(h * scale)), target_h);
 
     std::vector<unsigned char> resized;
-    resize_bilinear_u8(data, w, h, resized, new_w, new_h);  // caller owns/frees `data`
+    if (pp.resample == qinf::vision::ImagePreprocess::Resample::PillowBicubic)
+        resize_pillow_bicubic_u8(data, w, h, resized, new_w, new_h);
+    else
+        resize_bilinear_u8(data, w, h, resized, new_w, new_h);  // caller owns/frees `data`
 
     const int off_x = (target_w - new_w) / 2;
     const int off_y = (target_h - new_h) / 2;

@@ -99,6 +99,16 @@ struct InferenceRequest {
     // reaches an accepting state. A parse failure is a fail-loud request error.
     std::string grammar;
     std::vector<std::string> stop;  // Optional: generation ends before first match
+    // Token ids the slot's sampler must never return (tool_choice "none" bans
+    // the tool format's call opener). Empty for every other request. A slot
+    // with bans does not speculate (drafts bypass the sampler).
+    std::vector<int32_t> banned_tokens;
+    // Reasoning gate for `grammar` (tool_choice "required" / a named function):
+    // the grammar does not apply between these two token ids (the model's
+    // reasoning block). -1 = no gate. See Sampler::set_grammar_gate.
+    int32_t grammar_gate_opener = -1;
+    int32_t grammar_gate_closer = -1;
+    bool    grammar_gate_start_inside = false;
     bool skip_template = false;  // true => `prompt` is ALREADY fully templated
                                  // (e.g. a rendered <|im_start|> chat conversation
                                  // from /v1/chat/completions); tokenize it raw

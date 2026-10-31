@@ -3,12 +3,18 @@
 // (qwenium-server --embed).
 //
 // Responsibility: the OpenAI embeddings contract over engine/embed.
-//   Request:  {"input": "text" | ["text", ...], "model"?: any,
+//   Request:  {"input": "text" | [item, ...], "model"?: any,
 //              "encoding_format"?: "float" | "base64", "dimensions"?: int,
 //              "user"?: any}
 //   Response: {"object":"list","model":<id>,
 //              "data":[{"object":"embedding","index":i,"embedding":[...] | "<b64>"}],
 //              "usage":{"prompt_tokens":N,"total_tokens":N}}
+//   An item is a text, or — on a server started with --embed --mmproj (an
+//   embedding model with an image tower, docs/plan-embed-image.md G7) — an image
+//   in the chat-completions shape, our EXTENSION to the OpenAI contract:
+//     {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+//   Data URIs only (never fetched). A text-only request is unchanged byte for
+//   byte. usage counts an image's framed tokens.
 //   "base64" is the little-endian float32 bytes of the vector — what the
 //   OpenAI Python client requests by default and decodes.
 //   Refused (400): token-id inputs, an empty input or text, a non-string item,
@@ -55,11 +61,22 @@ using TokenizeFn = std::function<std::vector<int32_t>(const std::string&)>;
 // framed token ids → one L2-normalised vector of length `dim`.
 using EmbedFn = std::function<std::vector<float>(const std::vector<int32_t>&)>;
 
-// The whole request → reply mapping, model-free.
+// Image items (null = this server has no image tower). `prepare` validates one
+// image_url.url — decode + preprocess, no encoder — and returns the image's
+// FRAMED token count; it throws std::runtime_error naming what is wrong (→ 400).
+// `embed` turns the same url into one L2-normalised vector.
+struct ImageFns {
+    std::function<size_t(const std::string& url)>             prepare;
+    std::function<std::vector<float>(const std::string& url)> embed;
+};
+
+// The whole request → reply mapping, model-free. Every item is validated (and
+// every image prepared) before any is embedded.
 HttpReply handle_embeddings(const std::string& request_body,
                             const std::string& model_id, uint32_t dim,
                             uint32_t max_tokens,
-                            const TokenizeFn& tokenize, const EmbedFn& embed);
+                            const TokenizeFn& tokenize, const EmbedFn& embed,
+                            const ImageFns* images = nullptr);
 
 // Little-endian float32 bytes, standard base64 with padding.
 std::string base64_f32(const std::vector<float>& v);
@@ -68,9 +85,12 @@ std::string base64_f32(const std::vector<float>& v);
 class EmbeddingService {
 public:
     // Loads `model_path`; fail-loud (throws) unless its recipe implements
-    // IEmbeddingOutput. `max_tokens` bounds one text; `flash` selects flash
-    // attention for the pass.
-    EmbeddingService(const std::string& model_path, uint32_t max_tokens, bool flash);
+    // IEmbeddingOutput. `max_tokens` bounds one input; `flash` selects flash
+    // attention for the pass. A non-empty `mmproj_path` loads the image tower
+    // too: refused unless it is a gemma4v projector and the recipe hosts images
+    // (IImageEmbeddable).
+    EmbeddingService(const std::string& model_path, uint32_t max_tokens, bool flash,
+                     const std::string& mmproj_path = "");
     ~EmbeddingService();
 
     HttpReply handle(const std::string& request_body);
@@ -79,9 +99,12 @@ public:
     uint32_t dim() const { return dim_; }
     uint32_t max_tokens() const { return max_tokens_; }
     uint64_t requests_served() const { return requests_served_.load(); }
+    bool serves_images() const { return vision_ != nullptr; }
 
 private:
+    struct Vision;                                          // the image tower, if loaded
     std::unique_ptr<Model>           model_;
+    std::unique_ptr<Vision>          vision_;
     std::unique_ptr<ForwardPassBase> fp_;
     std::string                      model_id_;
     uint32_t                         dim_ = 0;

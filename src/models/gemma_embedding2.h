@@ -27,11 +27,20 @@
 // recipe is tolerable; a second encoder is the trigger to give encoders their
 // own base (architecture.md §12).
 //
-// Reference: llama.cpp src/models/gemma-embedding2.cpp at f498f864f.
+// Images (2026-10-16, docs/plan-embed-image.md G3): the recipe hosts image
+// soft tokens through Seam B (IImageEmbeddable), its fifth implementation and
+// the first on an encoder. The splice sits between the √d scale and the PLE
+// projection, so image rows enter unscaled AND feed the per-layer inputs —
+// exactly llama.cpp's order (scale_rows on token rows only; PLE from the
+// post-splice residual stream).
+//
+// Reference: llama.cpp src/models/gemma-embedding2.cpp at f498f864f (text) and
+// ceefd16da (text + vision).
 // Gate: tests/unit/test_embed.cpp (cosine vs llama.cpp's embeddings).
 
 #include "forward_pass_base.h"
 #include "i_embedding_output.h"
+#include "i_image_embeddable.h"
 #include "../loader/tokenizer_config.h"
 
 #include <cstdint>
@@ -78,7 +87,8 @@ void validate_gemma_embedding2_inventory(const ModelMetadata& meta);
 // The Gemma 4 vocabulary and normalisation (tokenizer.ggml.model "gemma4").
 TokenizerConfig gemma_embedding2_tokenizer_config();
 
-class GemmaEmbedding2ForwardPass : public ForwardPassBase, public IEmbeddingOutput {
+class GemmaEmbedding2ForwardPass : public ForwardPassBase, public IEmbeddingOutput,
+                                   public IImageEmbeddable {
 public:
     // context_len bounds the sequence length one pass accepts (no cache is
     // allocated). The registry factory's batch size and KV type have nothing
@@ -91,6 +101,18 @@ public:
     ggml_cgraph* build_embedding_graph(const std::vector<int32_t>& tokens) override;
     uint32_t embedding_dim() const override { return config_.embd_out; }
     Pooling  pooling() const override { return config_.pooling; }
+
+    // ── IImageEmbeddable (Seam B) ───────────────────────────────────────────
+    // Arms one image's soft tokens for the next build_embedding_graph: they
+    // replace the scaled token embeddings at [span_start, span_start + n_tokens).
+    // Positions are scalar, so the grid is accepted and ignored. Consumed by the
+    // next build; re-arm to repeat.
+    void set_image_embeddings(std::vector<float> embd, int32_t span_start, uint32_t n_tokens,
+                              uint32_t /*grid_w*/ = 0, uint32_t /*grid_h*/ = 0) override {
+        image_embd_       = std::move(embd);
+        image_span_start_ = span_start;
+        image_n_tokens_   = n_tokens;
+    }
 
     // ── ForwardPassBase: an encoder has no logits, cache or decode ──────────
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos,
@@ -112,6 +134,11 @@ public:
 private:
     GemmaEmbedding2Config config_;
     uint32_t              max_tokens_;
+
+    // Armed image soft tokens for the next build (empty = text only).
+    std::vector<float> image_embd_;
+    int32_t            image_span_start_ = -1;
+    uint32_t           image_n_tokens_   = 0;
 
     struct BlockWeights {
         ggml_tensor* attn_norm       = nullptr;

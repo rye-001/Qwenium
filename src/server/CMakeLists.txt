@@ -50,8 +50,11 @@ target_link_libraries(inference_server INTERFACE
 # main(), and the second has no consumer other than the executable, so it needs
 # no library.
 #
+# tool_request (2026-10-27, docs/plan-tool-calling.md) is the chat request's
+# tool contract — model-free, so it lives here and its test needs no model.
 add_library(qinf-server STATIC
     image_data_uri.cpp
+    tool_request.cpp
 )
 
 target_include_directories(qinf-server PUBLIC
@@ -59,8 +62,10 @@ target_include_directories(qinf-server PUBLIC
     ${PROJECT_SOURCE_DIR}/src
 )
 
+# qinf-loader: tool_request parses into loader/tool_format's ToolChat.
 target_link_libraries(qinf-server PUBLIC
     nlohmann_json::nlohmann_json
+    qinf-loader
 )
 
 set_target_properties(qinf-server PROPERTIES

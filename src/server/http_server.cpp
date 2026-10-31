@@ -38,6 +38,8 @@
 #include "image_data_uri.h"
 #include "server_vision.h"
 #include "embedding_service.h"
+#include "tool_request.h"
+#include "loader/tool_format.h"
 // Text prefix cache (server §1 decision A follow-on): the shipped, transparent,
 // content-keyed L2 PrefixLibrary wired into the TEXT prefill path — a recurring
 // system-prompt block skips its prefill on a HIT (mirrors the vision V2 move).
@@ -193,8 +195,18 @@ public:
 
         // Cache the vocabulary once (id -> token string). Passed as token_strs to
         // sample() so a slot's grammar can mask logits, and used to build each
-        // grammar slot's TokenTrie. ~vocab_size strings; fetched a single time.
-        vocab_ = tokenizer_->get_vocabulary();
+        // grammar slot's TokenTrie. ~vocab_size strings; built a single time.
+        // DECODED text, as GrammarVocab requires ("vocab[i] is the decoded
+        // string of token i") and the CLI chat path already does: the raw
+        // GGUF strings spell a space "Ġ" / "▁" and a newline "Ċ", so until
+        // 2026-10-27 a server grammar with a space or newline in a literal
+        // could never match an ordinary token (the tool-call grammars of
+        // docs/plan-tool-calling.md P4 are full of both).
+        {
+            const size_t n = tokenizer_->get_vocabulary().size();
+            vocab_.reserve(n);
+            for (size_t i = 0; i < n; ++i) vocab_.push_back(tokenizer_->decode(static_cast<int32_t>(i)));
+        }
 
         // F6: render prompts with the architecture's registered ChatTemplate
         // (Qwen <|im_start|> vs Gemma <start_of_turn> vs Gemma-4's own markers),
@@ -205,6 +217,29 @@ public:
                 "QweniumServerIntegration: no chat template registered for arch '" +
                 arch + "'");
         std::cout << "Tokenizer + chat template wired for arch=" << arch << std::endl;
+
+        // Tool calling (docs/plan-tool-calling.md): a format only for a GGUF
+        // chat template that was measured (its renderings gated byte for
+        // byte); any other model refuses tool requests by name.
+        if (const auto tmpl = model_.get_metadata().raw_kv.get_string_opt("tokenizer.chat_template")) {
+            tool_template_sha16_ = qinf::tools::template_sha16(*tmpl);
+            tool_format_ = qinf::tools::lookup_tool_format(tool_template_sha16_);
+        }
+        if (tool_format_) {
+            const std::string opener = tool_format_->call_opener();
+            const int32_t opener_id = tokenizer_->get_special_token_id(opener);
+            const auto& vocab = model_.get_metadata().id_to_token;
+            if (opener_id < 0 || static_cast<size_t>(opener_id) >= vocab.size() || vocab[opener_id] != opener)
+                throw std::runtime_error(
+                    "QweniumServerIntegration: tool format " + std::string(qinf::tools::to_string(tool_format_->dialect())) +
+                    " call opener '" + opener + "': expected one special token, actual: not in the vocabulary");
+            std::cout << "Tool calling: " << qinf::tools::to_string(tool_format_->dialect())
+                      << " (template " << tool_template_sha16_ << ")" << std::endl;
+        } else {
+            std::cout << "Tool calling: off (template "
+                      << (tool_template_sha16_.empty() ? "absent" : tool_template_sha16_)
+                      << " is not a measured tool template)" << std::endl;
+        }
 
         // Initialize forward pass with max_slots_ slots (KV cache is sized
         // ctx × slots × kv_type_, so fewer slots frees context headroom — the
@@ -470,8 +505,12 @@ public:
             // disables speculation outright): draft tokens are never checked
             // against the grammar, so accepting one could emit something the
             // grammar would have masked out.
+            // Banned tokens likewise: a draft is accepted by comparing it with
+            // the model's argmax, never through the slot's sampler, so a ban
+            // (tool_choice "none") would not hold on a speculating slot.
             server.set_speculative_eligible([this](int slot_id) {
-                return slot_grammars_[slot_id] == nullptr;
+                return slot_grammars_[slot_id] == nullptr &&
+                       slot_samplers_[slot_id]->banned_tokens().empty();
             });
         }
 
@@ -502,6 +541,16 @@ public:
     int max_ctx_per_slot() const { return max_ctx_per_slot_; }
     int max_slots() const { return max_slots_; }
     const ChatTemplate* chat_template() const { return chat_template_; }
+
+    // Tool calling: null when the model's chat template was never measured.
+    const qinf::tools::ToolFormat* tool_format() const { return tool_format_; }
+    // The id of the special token spelled `text`, or -1 when it is not one.
+    int32_t special_token_id(const std::string& text) const {
+        const int32_t id = tokenizer_->get_special_token_id(text);
+        const auto& vocab = model_.get_metadata().id_to_token;
+        return (id >= 0 && static_cast<size_t>(id) < vocab.size() && vocab[id] == text) ? id : -1;
+    }
+    const std::string& tool_template_sha16() const { return tool_template_sha16_; }
 
     // ── Vision (image input) capability surface, read by the chat route ──────
     // All delegate to ServerVision; the accessors below image_marker_prefix /
@@ -593,11 +642,17 @@ private:
                     "failed to parse GBNF grammar");
             sampler->set_grammar(grammar.get());
             sampler->build_token_trie(vocab_);  // trie + cached vocab for accept_token
+            if (req.grammar_gate_closer >= 0)   // the reasoning block runs unconstrained
+                sampler->set_grammar_gate(req.grammar_gate_opener, req.grammar_gate_closer,
+                                          req.grammar_gate_start_inside);
             // Let the grammar terminate: an accepting state adds these to the
             // valid set so the model may emit a stop token.
             for (int32_t id : model_.get_metadata().stop_token_ids)
                 sampler->add_eos_token_id(id);
         }
+
+        // tool_choice "none": the call opener can never be sampled.
+        sampler->set_banned_tokens(req.banned_tokens);
 
         slot_samplers_[slot_id] = std::move(sampler);
         slot_grammars_[slot_id] = std::move(grammar);  // null clears any prior grammar
@@ -961,6 +1016,8 @@ private:
     ggml_backend_sched_t scheduler_;
     std::mutex model_mutex_;  // Protects all model operations
     const ChatTemplate* chat_template_ = nullptr;  // F6: arch-registered renderer
+    const qinf::tools::ToolFormat* tool_format_ = nullptr;  // by the GGUF template's hash; null = no tools
+    std::string tool_template_sha16_;
     int max_ctx_per_slot_;
     int max_slots_;
 
@@ -1293,6 +1350,49 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             return;
         }
 
+        // Legacy function calling (functions / function_call / role "function")
+        // is refused by name on every request (docs/plan-tool-calling.md §3).
+        if (const std::string refusal = qinf::server::refuse_legacy_tool_fields(body); !refusal.empty()) {
+            res.status = 400;
+            res.set_content(json({{"error", refusal}}).dump(), "application/json");
+            return;
+        }
+        // Structured output by response_format is not served: refused, never
+        // ignored (a client would take free text for validated JSON).
+        if (const std::string refusal = qinf::server::refuse_response_format(body); !refusal.empty()) {
+            res.status = 400;
+            res.set_content(json({{"error", refusal}}).dump(), "application/json");
+            return;
+        }
+
+        // A tool request (tools, or tool calls / results in the history) is
+        // rendered in the checkpoint's own trained format and its reply parsed
+        // back into tool_calls (docs/plan-tool-calling.md). Validated in full
+        // before anything is queued; a model without a measured tool format
+        // refuses it by name.
+        std::optional<qinf::server::ToolRequest> tool_req;
+        if (qinf::server::is_tool_request(body)) {
+            if (!integration.tool_format()) {
+                res.status = 400;
+                std::string measured;
+                for (const auto& h : qinf::tools::measured_tool_templates()) measured += (measured.empty() ? "" : ", ") + h;
+                res.set_content(json({{"error",
+                    "'tools': expected a model with a measured tool format (hermes-json, qwen-xml or gemma4; "
+                    "measured chat templates " + measured + "), actual: " + integration.model_label() +
+                    ", chat template " + (integration.tool_template_sha16().empty() ? std::string("absent")
+                                                                                    : integration.tool_template_sha16())}}).dump(),
+                    "application/json");
+                return;
+            }
+            try {
+                tool_req = qinf::server::parse_tool_request(req.body);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(json({{"error", std::string(e.what())}}).dump(), "application/json");
+                return;
+            }
+        }
+
         // Detect image content parts up front so the capability gate fires
         // before we attempt to decode anything.
         bool wants_image = false;
@@ -1342,6 +1442,51 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                     "application/json");
                 return;
             }
+        } else if (tool_req) {
+            const qinf::tools::ToolFormat* fmt = integration.tool_format();
+            try {
+                inf_req->prompt = fmt->render(tool_req->chat);
+            } catch (const std::invalid_argument& e) {
+                res.status = 400;
+                res.set_content(json({{"error", std::string(e.what())}}).dump(), "application/json");
+                return;
+            }
+            // "required" / a named function: a grammar for exactly one call,
+            // gated off inside the model's reasoning block.
+            if (tool_req->choice == qinf::server::ToolChoice::Required ||
+                tool_req->choice == qinf::server::ToolChoice::Named) {
+                const auto g = fmt->grammar(tool_req->chat,
+                                            tool_req->choice == qinf::server::ToolChoice::Named ? &tool_req->named : nullptr);
+                inf_req->grammar = g.gbnf;
+                if (!g.gate_closer.empty()) {
+                    inf_req->grammar_gate_opener = g.gate_opener.empty() ? -1 : integration.special_token_id(g.gate_opener);
+                    inf_req->grammar_gate_closer = integration.special_token_id(g.gate_closer);
+                    inf_req->grammar_gate_start_inside = g.gate_start_inside;
+                    if (inf_req->grammar_gate_closer < 0 || (!g.gate_opener.empty() && inf_req->grammar_gate_opener < 0)) {
+                        res.status = 500;
+                        res.set_content(json({{"error", "tool grammar gate '" + g.gate_opener + "' / '" + g.gate_closer +
+                                               "': expected special tokens, actual: not in the vocabulary"}}).dump(),
+                                        "application/json");
+                        return;
+                    }
+                }
+            }
+            // The system turn carries the tools block: the part an agent re-sends
+            // every turn, so it is the cacheable prefix (no-op unless
+            // --prefix-cache is wired). A render with the tools undeclared
+            // (tool_choice "none") may have no system turn: its first turn is
+            // the prefix then.
+            if (integration.text_prefix_cache_enabled()) {
+                const std::string end = fmt->system_turn_end();
+                const size_t at = inf_req->prompt.find(end);
+                if (at == std::string::npos) {
+                    res.status = 500;
+                    res.set_content(json({{"error", std::string("tool render: expected a system turn closed by '") +
+                                           end + "', actual: none (a tool_format bug)"}}).dump(), "application/json");
+                    return;
+                }
+                inf_req->cacheable_prefix_text = inf_req->prompt.substr(0, at + end.size());
+            }
         } else {
             const std::optional<bool> enable_thinking = extract_enable_thinking(body);
             inf_req->prompt = render_chat(body["messages"],
@@ -1377,8 +1522,9 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
         inf_req->top_p = body.value("top_p", inf_req->top_p);
         inf_req->top_k = body.value("top_k", inf_req->top_k);
         inf_req->seed  = body.value("seed", static_cast<long long>(-1));
-        // Optional GBNF grammar for constrained (structured) output.
-        inf_req->grammar = body.value("grammar", "");
+        // Optional GBNF grammar for constrained (structured) output. (A tool
+        // request refuses a client grammar; its own was set above.)
+        if (!tool_req) inf_req->grammar = body.value("grammar", "");
 
         // Stop sequences: OpenAI allows a single string or an array of strings.
         if (body.contains("stop")) {
@@ -1396,6 +1542,11 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
                 return;
             }
         }
+
+        // Gemma 4 emits <|tool_response> after a call and must stop there.
+        if (tool_req)
+            for (const std::string& stop : integration.tool_format()->extra_stops())
+                inf_req->stop.push_back(stop);
 
         const std::string model_name = body.value("model", "qwen-local");
         const long created = static_cast<long>(std::time(nullptr));
@@ -1515,6 +1666,62 @@ void setup_routes(httplib::Server& http, qinf::InferenceServer& inference, Qweni
             std::cout << "=========Qwenium Response===========" << std::endl;
             std::cout << inf_req->output_text << std::endl;
             std::cout << "=========Qwenium Response End===========" << std::endl;
+
+            const json usage = {
+                {"prompt_tokens", inf_req->prompt_tokens},
+                {"completion_tokens", inf_req->completion_tokens},
+                {"total_tokens", inf_req->prompt_tokens + inf_req->completion_tokens}
+            };
+            if (tool_req) {
+                // The reply parsed back into calls. Output that does not parse as
+                // the format, or a call that breaks its schema, is a 502 with the
+                // raw text — never an answer (docs/plan-tool-calling.md §4).
+                const auto bad_gateway = [&](const std::string& why) {
+                    res.status = 502;
+                    res.set_content(json({{"error", why},
+                                          {"raw_output", inf_req->output_text},
+                                          {"finish_reason", chat_finish_reason(inf_req->finish_reason)},
+                                          {"usage", usage}}).dump(), "application/json");
+                };
+                qinf::tools::ParsedReply reply;
+                try {
+                    reply = integration.tool_format()->parse(inf_req->output_text, tool_req->chat);
+                } catch (const qinf::tools::ToolCallError& e) {
+                    bad_gateway(std::string("tool call: ") + e.what());
+                    return;
+                }
+                if ((tool_req->choice == qinf::server::ToolChoice::Required ||
+                     tool_req->choice == qinf::server::ToolChoice::Named) && reply.calls.empty()) {
+                    bad_gateway(std::string("tool call: tool_calls: expected a call (tool_choice is ") +
+                                (tool_req->choice == qinf::server::ToolChoice::Named ? "\"" + tool_req->named + "\"" : "\"required\"") +
+                                "), actual: none" + (inf_req->finish_reason == "length" ? " (the reply hit max_tokens)" : ""));
+                    return;
+                }
+                if (tool_req->choice == qinf::server::ToolChoice::Named && reply.calls[0].name != tool_req->named) {
+                    bad_gateway("tool call: tool_calls[0].name: expected \"" + tool_req->named + "\", actual: \"" +
+                                reply.calls[0].name + "\"");
+                    return;
+                }
+                if (tool_req->choice == qinf::server::ToolChoice::None && !reply.calls.empty()) {
+                    bad_gateway("tool call: tool_calls[0]: expected no call (tool_choice is \"none\"), actual: a call to " +
+                                reply.calls[0].name);
+                    return;
+                }
+                json response = {
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", model_name},
+                    {"choices", {{
+                        {"index", 0},
+                        {"message", qinf::server::tool_reply_message(reply, qinf::server::new_tool_call_id)},
+                        {"finish_reason", reply.calls.empty() ? chat_finish_reason(inf_req->finish_reason)
+                                                              : std::string("tool_calls")}
+                    }}},
+                    {"usage", usage}
+                };
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
 
             json response = {
                 {"object", "chat.completion"},
@@ -1830,7 +2037,8 @@ int main(int argc, char* argv[]) {
                       << "  --embed                   Serve an embedding model "
                          "(e.g. EmbeddingGemma-2): POST /v1/embeddings (OpenAI shape, "
                          "float or base64), GET /health, GET /v1/models only. --ctx "
-                         "bounds one text in tokens; --flash-attn applies; "
+                         "bounds one input in tokens; --flash-attn applies; "
+                         "--mmproj (a gemma4v image tower) adds image_url items; "
                          "generation flags are refused\n"
                       << "  --help,   -h       Show this help\n";
             return 0;
@@ -1860,7 +2068,6 @@ int main(int argc, char* argv[]) {
     if (embed) {
         struct Conflict { bool set; const char* flag; };
         const Conflict conflicts[] = {
-            {!mmproj_path.empty(),            "--mmproj"},
             {!image_embed_cache_dir.empty(),  "--image-embed-cache"},
             {!image_prefix_cache_dir.empty(), "--image-prefix-cache"},
             {!prefix_cache_dir.empty(),       "--prefix-cache"},
@@ -1886,8 +2093,10 @@ int main(int argc, char* argv[]) {
 
     if (embed) {
         try {
+            // --mmproj with --embed loads an embedding model's image tower
+            // (gemma4v): /v1/embeddings then also takes image_url items.
             qinf::server::EmbeddingService service(model_path, static_cast<uint32_t>(max_ctx),
-                                                   flash_attn);
+                                                   flash_attn, mmproj_path);
             httplib::Server http;
             setup_embedding_routes(http, service);
             std::thread shutdown_thread([&http]() {
@@ -1900,7 +2109,9 @@ int main(int argc, char* argv[]) {
             });
             std::cout << "Embedding server (" << service.model_id() << ", dim "
                       << service.dim() << ", up to " << service.max_tokens()
-                      << " tokens per text) on http://0.0.0.0:" << port << std::endl;
+                      << " tokens per input"
+                      << (service.serves_images() ? ", images: yes (image_url items)" : ", text only")
+                      << ") on http://0.0.0.0:" << port << std::endl;
             std::cout << "Endpoints:\n  GET  /health\n  POST /v1/embeddings\n  GET  /v1/models"
                       << std::endl;
             http.listen("0.0.0.0", port);

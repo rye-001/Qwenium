@@ -62,10 +62,38 @@ TEST(EmbedMode, AcceptsAPromptOrAFile) {
 TEST(EmbedMode, RefusesNeitherOrBothInputs) {
     CliArgs a = embed_args();
     a.prompt.clear();
-    EXPECT_NE(embed_mode_refusal(a).find("actual: neither"), std::string::npos);
+    EXPECT_NE(embed_mode_refusal(a).find("actual: none"), std::string::npos);
     a.prompt = "x";
     a.embed_in_path = "texts.txt";
-    EXPECT_NE(embed_mode_refusal(a).find("actual: both"), std::string::npos);
+    EXPECT_NE(embed_mode_refusal(a).find("actual: 2"), std::string::npos);
+}
+
+// ── Images (docs/plan-embed-image.md G6) ─────────────────────────────────────
+
+TEST(EmbedMode, AcceptsAnImageWithItsTower) {
+    CliArgs a = embed_args();
+    a.prompt.clear();
+    a.image_path = "x.png";
+    a.mmproj_path = "mmproj.gguf";
+    EXPECT_EQ(embed_mode_refusal(a), "");
+}
+
+TEST(EmbedMode, RefusesAnImageWithoutItsTowerAndTheReverse) {
+    CliArgs a = embed_args();
+    a.prompt.clear();
+    a.image_path = "x.png";
+    EXPECT_NE(embed_mode_refusal(a).find("expected --mmproj"), std::string::npos) << embed_mode_refusal(a);
+    a.image_path.clear();
+    a.mmproj_path = "mmproj.gguf";
+    a.prompt = "text";
+    EXPECT_NE(embed_mode_refusal(a).find("expected --image PATH"), std::string::npos) << embed_mode_refusal(a);
+}
+
+TEST(EmbedMode, RefusesAnImageAndATextTogether) {
+    CliArgs a = embed_args();   // has -p
+    a.image_path = "x.png";
+    a.mmproj_path = "mmproj.gguf";
+    EXPECT_NE(embed_mode_refusal(a).find("exactly one input"), std::string::npos);
 }
 
 TEST(EmbedMode, RefusesFlagsAnEmbeddingWouldIgnore) {
@@ -75,7 +103,7 @@ TEST(EmbedMode, RefusesFlagsAnEmbeddingWouldIgnore) {
     };
     CliArgs a;
     a = embed_args(); a.chat_mode = true;                 EXPECT_TRUE(refusal_names(a, "--chat"));
-    a = embed_args(); a.image_path = "x.png";             EXPECT_TRUE(refusal_names(a, "--image"));
+    a = embed_args(); a.image_embed_cache_dir = "c";      EXPECT_TRUE(refusal_names(a, "--image-embed-cache"));
     a = embed_args(); a.grammar_file = "g.gbnf";          EXPECT_TRUE(refusal_names(a, "--grammar-file"));
     a = embed_args(); a.speculative = true;               EXPECT_TRUE(refusal_names(a, "--speculative"));
     a = embed_args(); a.save_session_path = "s.bin";      EXPECT_TRUE(refusal_names(a, "--save-session"));
@@ -189,3 +217,49 @@ TEST(EmbedMode, RefusesAGenerationModel) {
     EXPECT_EQ(run_embed(model, args), 1);
     EXPECT_FALSE(std::ifstream(out_path).good());
 }
+
+// One fixture image through the CLI path, against llama.cpp's pooled vector
+// (tanh reference, plan phase 4).
+TEST(EmbedMode, EndToEndImageMatchesLlamaCpp) {
+    const char* model_path = std::getenv("EMBEDDINGGEMMA2_MODEL_PATH");
+    if (!model_path || !*model_path) GTEST_SKIP() << "EMBEDDINGGEMMA2_MODEL_PATH not set";
+    const char* e = std::getenv("EMBEDDINGGEMMA2_MMPROJ_PATH");
+    const std::string mm = (e && *e) ? e : "models/embeddinggemma-2-mmproj-BF16.gguf";
+    if (!std::ifstream(mm).good()) GTEST_SKIP() << "mmproj not found at " << mm;
+
+    std::ifstream ref(QINF_TEST_FIXTURES_DIR "/embed_image/reference_t280_gelu.txt");
+    ASSERT_TRUE(ref);
+    std::vector<float> want;
+    std::string line;
+    bool in_it = false;
+    while (std::getline(ref, line)) {
+        if (line == "image checker_512") in_it = true;
+        else if (line.rfind("image ", 0) == 0 || line.rfind("caption ", 0) == 0) in_it = false;
+        else if (in_it && line.rfind("embedding ", 0) == 0) {
+            std::istringstream ss(line.substr(10));
+            size_t n; ss >> n;
+            want.resize(n);
+            for (auto& x : want) ss >> x;
+        }
+    }
+    ASSERT_EQ(want.size(), 768u);
+
+    register_builtin_models();
+    Model model;
+    model.load_metadata(model_path);
+    model.load_tensors();
+    const std::string out_path = ::testing::TempDir() + "embed_mode_image.jsonl";
+    CliArgs args;
+    args.embed = true;
+    args.image_path = QINF_TEST_FIXTURES_DIR "/embed_image/checker_512.png";
+    args.mmproj_path = mm;
+    args.embed_out_path = out_path;
+    ASSERT_EQ(embed_mode_refusal(args), "");
+    ASSERT_EQ(run_embed(model, args), 0);
+    std::ifstream out(out_path);
+    std::getline(out, line);
+    EXPECT_EQ(line.rfind("{\"index\":0,\"n_tokens\":125,", 0), 0u) << line.substr(0, 80);
+    EXPECT_GE(cosine(parse_vector(line), want), 0.9999);
+    std::remove(out_path.c_str());
+}
+

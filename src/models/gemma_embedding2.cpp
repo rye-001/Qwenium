@@ -294,10 +294,14 @@ ggml_tensor* GemmaEmbedding2ForwardPass::build_block(
 ggml_cgraph* GemmaEmbedding2ForwardPass::build_embedding_graph(const std::vector<int32_t>& tokens)
 {
     const uint32_t n_tokens = static_cast<uint32_t>(tokens.size());
-    if (n_tokens == 0 || n_tokens > max_tokens_)
+    if (n_tokens == 0 || n_tokens > max_tokens_) {
+        image_embd_.clear();   // a refused build must not leave an image armed for the next one
+        image_span_start_ = -1;
+        image_n_tokens_   = 0;
         throw std::runtime_error(
             "gemma-embedding2: 'tokens': expected 1.." + std::to_string(max_tokens_) +
             " (the pass's context_len), got: " + std::to_string(n_tokens));
+    }
 
     reset_context();
     ggml_cgraph* gf = new_graph();
@@ -345,8 +349,22 @@ ggml_cgraph* GemmaEmbedding2ForwardPass::build_embedding_graph(const std::vector
             BidirectionalMaskInput::open("kq_mask_global")));
     }
 
-    // Per-layer inputs are a projection of the SCALED embeddings — computed
-    // once, sliced per layer.
+    // Image soft tokens (Seam B): spliced AFTER the √d scale (image rows enter
+    // unscaled) and BEFORE the PLE projection (image rows feed the per-layer
+    // inputs) — llama.cpp's order. graph_inputs_ was cleared above, so the
+    // ImageEmbeddingsInput the splice registers survives (ordering contract,
+    // forward_pass_base.h). Consumed here.
+    if (!image_embd_.empty()) {
+        inpL = build_image_substitution(gf, inpL, std::move(image_embd_), image_span_start_,
+                                        image_n_tokens_, static_cast<int>(config_.hidden_dim),
+                                        n_tokens);
+        image_embd_.clear();
+        image_span_start_ = -1;
+        image_n_tokens_   = 0;
+    }
+
+    // Per-layer inputs are a projection of the SCALED embeddings (with any
+    // image rows already in place) — computed once, sliced per layer.
     ggml_tensor* ple_inputs = build_ple_inputs(ctx, gf, inpL, ple_model_proj_, ple_proj_norm_,
                                                config_.ple_dim, config_.n_layers,
                                                config_.rms_norm_eps);
